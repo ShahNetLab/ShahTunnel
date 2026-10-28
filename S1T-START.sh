@@ -9,7 +9,8 @@ OWNER="ShahNetLab"
 REPO="ShahTunnel"
 VERSION="1.6.2"
 GO_VERSION="1.26.10"
-GO_BASE="https://go.dev/dl"
+GO_BASE="https://dl.google.com/go"
+GO_FALLBACK_BASE="https://go.dev/dl"
 STATE_DIR="/usr/local/lib/shah-tunnel"
 PHASE_HAS_DOWNLOAD=0
 RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/main"
@@ -243,8 +244,14 @@ build_from_official_go_toolchain() {
   echo "Downloading official Go ${GO_VERSION} (${TARGET_ARCH}) from ${GO_BASE}..." >&2
   if ! curl_download "${GO_BASE}/${go_archive}" "$TMP/$go_archive" \
       --retry 2 --retry-delay 1 --connect-timeout 12 --max-time 300; then
-    echo "Could not download the official Go toolchain from ${GO_BASE}." >&2
-    return 1
+    echo "Primary official Go host failed; retrying via ${GO_FALLBACK_BASE}..." >&2
+    if ! curl_download "${GO_FALLBACK_BASE}/${go_archive}" "$TMP/$go_archive" \
+        --retry 2 --retry-delay 1 --connect-timeout 12 --max-time 300; then
+      echo "Could not download the official Go toolchain from either official host:" >&2
+      echo "  ${GO_BASE}/${go_archive}" >&2
+      echo "  ${GO_FALLBACK_BASE}/${go_archive}" >&2
+      return 1
+    fi
   fi
 
   printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null \
@@ -299,7 +306,7 @@ build_from_official_go_toolchain() {
 
 if ! build_from_official_go_toolchain; then
   echo "Installation stopped: no verified ShahTunnel binary was built." >&2
-  echo "Go is downloaded only from ${GO_BASE}; the source is built locally, without GitHub Release assets." >&2
+  echo "Go is downloaded from official Go distribution hosts only; the source is built locally, without GitHub Release assets." >&2
   exit 1
 fi
 
