@@ -1360,3 +1360,21 @@ func makeDNSQueryForTest(domain string) []byte {
 	q = append(q, 0, 0, 1, 0, 1) // root, QTYPE A, QCLASS IN
 	return q
 }
+
+func TestDNSFilterCanBeConfiguredOnHubAndRejectsOpenResolver(t *testing.T) {
+	base := Config{
+		Version: version, Role: "hub", Transport: transportAuto,
+		Token: strings.Repeat("a", 64), ControlListen: "127.0.0.1:19443",
+		CertFile: "/tmp/shah-test-hub.crt", KeyFile: "/tmp/shah-test-hub.key",
+		Ports:            []PortMapping{{ID: "main", Listen: "127.0.0.1:19444"}},
+		DNSFilterEnabled: true, DNSFilterListen: "127.0.0.1:19553",
+		DNSFilterUpstream: "1.1.1.1:53", DNSFilterAllowedCIDRs: []string{"127.0.0.1/32"},
+	}
+	if err := validateConfig(base); err != nil {
+		t.Fatalf("Hub should allow an explicitly configured DNS filter: %v", err)
+	}
+	base.DNSFilterAllowedCIDRs = []string{"0.0.0.0/0"}
+	if err := validateConfig(base); err == nil || !strings.Contains(err.Error(), "unrestricted") {
+		t.Fatalf("expected unrestricted public DNS resolver to be rejected, got %v", err)
+	}
+}

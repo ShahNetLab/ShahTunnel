@@ -67,6 +67,94 @@ func newDNSAdFilter(c Config) (*dnsAdFilter, error) {
 	return f, nil
 }
 
+// bindDNSListeners first tries the requested address. If a wildcard :53 bind
+// conflicts with a local stub resolver (common on Linux), it retries on each
+// non-loopback interface address instead of disabling the filter altogether.
+func bindDNSListeners(address string) ([]net.PacketConn, []net.Listener, error) {
+	udp, udpErr := net.ListenPacket("udp", address)
+	if udpErr == nil {
+		tcp, tcpErr := net.Listen("tcp", address)
+		if tcpErr == nil {
+			return []net.PacketConn{udp}, []net.Listener{tcp}, nil
+		}
+		_ = udp.Close()
+		udpErr = tcpErr
+	}
+
+	host, port, splitErr := net.SplitHostPort(address)
+	if splitErr != nil || (host != "" && host != "0.0.0.0" && host != "::" && host != "[::]") {
+		return nil, nil, fmt.Errorf("UDP/TCP bind failed: %w", udpErr)
+	}
+
+	var udpListeners []net.PacketConn
+	var tcpListeners []net.Listener
+	seen := make(map[string]struct{})
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, nil, fmt.Errorf("wildcard bind failed (%v); enumerate interfaces: %w", udpErr, err)
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, raw := range addrs {
+			var ip net.IP
+			switch v := raw.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() {
+				continue
+			}
+			if ip.To4() != nil {
+				ip = ip.To4()
+			} else {
+				ip = ip.To16()
+			}
+			if ip == nil {
+				continue
+			}
+			bindAddr := net.JoinHostPort(ip.String(), port)
+			if _, ok := seen[bindAddr]; ok {
+				continue
+			}
+			seen[bindAddr] = struct{}{}
+			u, uErr := net.ListenPacket("udp", bindAddr)
+			if uErr != nil {
+				continue
+			}
+			t, tErr := net.Listen("tcp", bindAddr)
+			if tErr != nil {
+				_ = u.Close()
+				continue
+			}
+			udpListeners = append(udpListeners, u)
+			tcpListeners = append(tcpListeners, t)
+		}
+	}
+	if len(udpListeners) == 0 || len(tcpListeners) == 0 {
+		for _, l := range udpListeners {
+			_ = l.Close()
+		}
+		for _, l := range tcpListeners {
+			_ = l.Close()
+		}
+		return nil, nil, fmt.Errorf("wildcard bind failed (%v) and no interface address could bind both UDP and TCP on port %s", udpErr, port)
+	}
+	addresses := make([]string, 0, len(udpListeners))
+	for _, l := range udpListeners {
+		addresses = append(addresses, l.LocalAddr().String())
+	}
+	log.Printf("DNS wildcard bind conflicted with another listener; bound on interface addresses: %s", strings.Join(addresses, ", "))
+	return udpListeners, tcpListeners, nil
+}
+
 func startDNSAdFilter(c Config) error {
 	if !c.DNSFilterEnabled {
 		return nil
@@ -75,18 +163,17 @@ func startDNSAdFilter(c Config) error {
 	if err != nil {
 		return err
 	}
-	udp, err := net.ListenPacket("udp", f.listen)
+	udpListeners, tcpListeners, err := bindDNSListeners(f.listen)
 	if err != nil {
-		return fmt.Errorf("start DNS ad filter UDP listener at %s: %w", f.listen, err)
-	}
-	tcp, err := net.Listen("tcp", f.listen)
-	if err != nil {
-		_ = udp.Close()
-		return fmt.Errorf("start DNS ad filter TCP listener at %s: %w", f.listen, err)
+		return fmt.Errorf("start DNS ad filter listeners at %s: %w", f.listen, err)
 	}
 	log.Printf("best-effort DNS ad/tracker filter listening on %s (allowlisted sources only); YouTube in-stream ads are not guaranteed to be blocked", f.listen)
-	go f.serveUDP(udp)
-	go f.serveTCP(tcp)
+	for _, listener := range udpListeners {
+		go f.serveUDP(listener)
+	}
+	for _, listener := range tcpListeners {
+		go f.serveTCP(listener)
+	}
 	go f.refreshLoop()
 	return nil
 }
