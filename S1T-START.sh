@@ -44,8 +44,8 @@ curl_download() {
   rm -f "$headers" "$log" "$dest"
   if [[ ! -t 2 ]]; then
     if ! curl -fsSL --proto '=https' --proto-redir '=https' --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log"; then
-      cat "$log" >&2
-      rm -f "$headers" "$log"
+      if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
+      rm -f "$headers" "$log" "$dest"
       return 1
     fi
     # No progress bar is visible without a TTY, so let phase_done emit the
@@ -56,14 +56,18 @@ curl_download() {
   fi
   curl -fsSL --proto '=https' --proto-redir '=https' --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log" &
   pid=$!
-  # Keep transfer output quiet until completion. Some mobile SSH clients turn
-  # carriage-return updates into additional rows rather than redrawing in place.
-  while kill -0 "$pid" 2>/dev/null; do sleep 0.12; done
+  # Show a single animated indicator while downloading; hide failed mirror
+  # errors when QUIET_CURL_ERRORS=1 so normal fallback does not look broken.
+  local frame=0
+  while kill -0 "$pid" 2>/dev/null; do
+    draw_indeterminate_bar "$frame"
+    frame=$((frame + 1))
+    sleep 0.12
+  done
   wait "$pid" || rc=$?
+  printf '\r\033[2K' >&2
   if (( rc != 0 )); then
-    printf '\r\033[2K' >&2
-    # Preserve the real error, but never show successful curl progress glyphs.
-    cat "$log" >&2
+    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
     rm -f "$headers" "$log" "$dest"
     return "$rc"
   fi
@@ -225,20 +229,26 @@ build_from_official_go_toolchain() {
   phase_start 1 "Download verified Go toolchain and source"
   # Start with the mirror that worked on this VPS. Failed fallback endpoints
   # remain quiet. An archive is accepted only when SHA-256 matches the pinned hash.
+  # Mirror known to work on the user's VPS first. Slow/blocked fallback hosts
+  # have short per-host deadlines so a fresh install cannot stall for many minutes.
   local -a download_bases=(
     "https://mirror.nju.edu.cn/golang"
+    "https://mirrors.aliyun.com/golang"
     "https://go.dev/dl"
     "https://dl.google.com/go"
     "https://golang.google.cn/dl"
-    "https://mirrors.aliyun.com/golang"
   )
+  local -a download_timeouts=(90 45 12 12 12)
+  local idx=0 timeout_secs
   downloaded=0
   echo "Downloading verified Go ${GO_VERSION} (${TARGET_ARCH})..." >&2
   for url in "${download_bases[@]}"; do
+    timeout_secs="${download_timeouts[$idx]}"
+    idx=$((idx + 1))
     url="${url}/${go_archive}"
     rm -f "$TMP/$go_archive"
-    if ! curl_download "$url" "$TMP/$go_archive" \
-        --retry 1 --retry-delay 1 --connect-timeout 10 --max-time 300 2>/dev/null; then
+    if ! QUIET_CURL_ERRORS=1 curl_download "$url" "$TMP/$go_archive" \
+        --retry 0 --connect-timeout 6 --max-time "$timeout_secs"; then
       rm -f "$TMP/$go_archive"
       continue
     fi
