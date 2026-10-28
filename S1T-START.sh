@@ -233,9 +233,8 @@ build_project_binary() {
 }
 
 build_from_official_go_toolchain() {
-  local go_archive="go${GO_VERSION}.linux-${TARGET_ARCH}.tar.gz"
-  local go_sha source_url go_bin go_root source_dir expected_go
-  local toolchain_version module_url proxy_url sumdb_url module_zip sumdb_file expected_h1
+  local go_archive go_sha source_url go_bin go_root source_dir expected_go url good
+  go_archive="go${GO_VERSION}.linux-${TARGET_ARCH}.tar.gz"
   go_sha="$(official_go_sha256)"
   source_url="https://codeload.github.com/${OWNER}/${REPO}/tar.gz/refs/heads/main"
   expected_go="go version go${GO_VERSION} linux/${TARGET_ARCH}"
@@ -243,136 +242,61 @@ build_from_official_go_toolchain() {
   go_bin=""
   go_root=""
 
-  phase_start 1 "Download official Go and source"
+  phase_start 1 "Download verified Go toolchain and source"
 
-  # First try Go's official toolchain-module distribution. This is the same
-  # verified distribution mechanism used by Go's GOTOOLCHAIN support and can
-  # work when a VPS's network path returns 404 for the regular tar.gz URL.
-  toolchain_version="v0.0.1-go${GO_VERSION}.linux-${TARGET_ARCH}"
-  module_url="https://go.dev/dl/mod/golang.org/toolchain/@v/${toolchain_version}.zip"
-  proxy_url="https://proxy.golang.org/golang.org/toolchain/@v/${toolchain_version}.zip"
-  sumdb_url="https://sum.golang.org/lookup/golang.org/toolchain@${toolchain_version}"
-  module_zip="$TMP/${toolchain_version}.zip"
-  sumdb_file="$TMP/${toolchain_version}.sumdb"
+  # The official archive URLs work in normal networks, but some VPS networks
+  # return synthetic 404/403 responses for Google download hosts. Try official
+  # endpoints first; use mirrors only as transport fallbacks, and accept an
+  # archive only when it matches Go's SHA-256 published on go.dev/dl.
+  local -a download_bases=(
+    "https://go.dev/dl"
+    "https://dl.google.com/go"
+    "https://golang.google.cn/dl"
+    "https://mirror.nju.edu.cn/golang"
+    "https://mirrors.aliyun.com/golang"
+  )
+  local downloaded=0
+  echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}); official SHA-256 verification is mandatory..." >&2
 
-  echo "Downloading official Go ${GO_VERSION} toolchain module (${TARGET_ARCH})..." >&2
-  if ! curl_download "$module_url" "$module_zip" \
-      --retry 1 --retry-delay 1 --connect-timeout 12 --max-time 300; then
-    echo "Primary Go toolchain-module endpoint failed; retrying official Go module proxy..." >&2
-    if ! curl_download "$proxy_url" "$module_zip" \
-        --retry 1 --retry-delay 1 --connect-timeout 12 --max-time 300; then
-      rm -f "$module_zip"
-    fi
-  fi
-
-  if [[ -s "$module_zip" ]]; then
-    if curl_download "$sumdb_url" "$sumdb_file" \
-        --retry 1 --retry-delay 1 --connect-timeout 12 --max-time 45; then
-      expected_h1="$(awk -v v="$toolchain_version" '$1 == "golang.org/toolchain" && $2 == v && $3 ~ /^h1:/ {print $3; exit}' "$sumdb_file")"
-    else
-      expected_h1=""
+  for url in "${download_bases[@]}"; do
+    url="${url}/${go_archive}"
+    echo "Trying: ${url}" >&2
+    rm -f "$TMP/$go_archive"
+    if ! curl_download "$url" "$TMP/$go_archive" \
+        --retry 1 --retry-delay 1 --connect-timeout 10 --max-time 300; then
+      echo "Download endpoint failed; trying next verified endpoint." >&2
+      rm -f "$TMP/$go_archive"
+      continue
     fi
 
-    if [[ "$expected_h1" == h1:* ]]; then
-      if python3 - "$module_zip" "$expected_h1" "$TMP/toolchain-module" "$toolchain_version" <<'PYVERIFY'
-import base64, hashlib, os, pathlib, stat, sys, zipfile
-archive, expected, destination, version = sys.argv[1:]
-prefix = f"golang.org/toolchain@{version}/"
-destination_path = pathlib.Path(destination).resolve()
-try:
-    with zipfile.ZipFile(archive, "r") as zf:
-        infos = zf.infolist()
-        if not infos:
-            raise ValueError("empty toolchain module archive")
-        for item in infos:
-            if not item.filename.startswith(prefix):
-                raise ValueError(f"unexpected path in Go toolchain archive: {item.filename!r}")
-            if "\\" in item.filename or "\n" in item.filename or "\r" in item.filename:
-                raise ValueError(f"unsafe path in Go toolchain archive: {item.filename!r}")
-            relative = item.filename[len(prefix):].rstrip("/")
-            parts = pathlib.PurePosixPath(relative).parts
-            if not relative or any(part in ("", ".", "..") for part in parts):
-                if item.is_dir() and not relative:
-                    continue
-                raise ValueError(f"unsafe relative path in Go toolchain archive: {item.filename!r}")
-        summary = hashlib.sha256()
-        for item in sorted(infos, key=lambda x: x.filename):
-            content = zf.read(item)
-            line = hashlib.sha256(content).hexdigest() + "  " + item.filename + "\n"
-            summary.update(line.encode("utf-8"))
-        actual = "h1:" + base64.b64encode(summary.digest()).decode("ascii")
-        if actual != expected:
-            raise ValueError(f"Go checksum database mismatch (expected {expected}, got {actual})")
-        os.makedirs(destination_path, mode=0o700, exist_ok=True)
-        for item in infos:
-            relative = item.filename[len(prefix):].rstrip("/")
-            if not relative:
-                continue
-            output = (destination_path / pathlib.PurePosixPath(relative)).resolve()
-            if output != destination_path and destination_path not in output.parents:
-                raise ValueError(f"archive path escapes extraction directory: {item.filename!r}")
-            if item.is_dir():
-                output.mkdir(parents=True, exist_ok=True)
-                continue
-            mode = (item.external_attr >> 16) & 0xFFFF
-            if stat.S_IFMT(mode) == stat.S_IFLNK:
-                raise ValueError(f"symlinks are not allowed in Go toolchain archive: {item.filename!r}")
-            output.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(item, "r") as source, open(output, "wb") as target:
-                while True:
-                    block = source.read(1024 * 1024)
-                    if not block:
-                        break
-                    target.write(block)
-            permissions = mode & 0o777
-            os.chmod(output, permissions if permissions else 0o644)
-except Exception as exc:
-    print(f"Go toolchain module verification/extraction failed: {exc}", file=sys.stderr)
-    sys.exit(1)
-PYVERIFY
-      then
-        go_root="$TMP/toolchain-module"
-        go_bin="$go_root/bin/go"
-        echo "Go toolchain module checksum verified against sum.golang.org." >&2
-      else
-        echo "Refusing to use the Go toolchain module because verification failed." >&2
-        go_bin=""
-        go_root=""
-      fi
-    else
-      echo "Could not obtain the official checksum from sum.golang.org; refusing the module archive." >&2
+    if ! printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null 2>&1; then
+      echo "Downloaded file failed Go's official SHA-256 checksum; rejecting it." >&2
+      rm -f "$TMP/$go_archive"
+      continue
     fi
+
+    echo "Go archive SHA-256 verified." >&2
+    downloaded=1
+    break
+  done
+
+  if [[ "$downloaded" -ne 1 ]]; then
+    echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the official checksum." >&2
+    echo "The official archive exists; this VPS network is blocking or rewriting the download requests." >&2
+    echo "Test: curl -fIL https://go.dev/dl/${go_archive}" >&2
+    return 1
   fi
 
-  # Fallback to the standard official tar.gz download URLs, pinned by the
-  # official SHA-256 checksums above.
-  if [[ -z "$go_bin" ]]; then
-    echo "Trying the official Go binary archives as a fallback..." >&2
-    for base in "$GO_BASE" "$GO_FALLBACK_BASE"; do
-      if curl_download "${base}/${go_archive}" "$TMP/$go_archive" \
-          --retry 1 --retry-delay 1 --connect-timeout 12 --max-time 300; then
-        if ! printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null; then
-          echo "Go archive SHA-256 mismatch for ${base}; refusing that archive." >&2
-          rm -f "$TMP/$go_archive"
-          continue
-        fi
-        rm -rf "$TMP/go-root"
-        mkdir -p "$TMP/go-root"
-        if ! tar -xzf "$TMP/$go_archive" -C "$TMP/go-root"; then
-          echo "Could not extract the official Go archive from ${base}." >&2
-          continue
-        fi
-        go_root="$TMP/go-root/go"
-        go_bin="$go_root/bin/go"
-        break
-      fi
-    done
+  rm -rf "$TMP/go-root"
+  mkdir -p "$TMP/go-root"
+  if ! tar -xzf "$TMP/$go_archive" -C "$TMP/go-root"; then
+    echo "Downloaded Go archive could not be extracted." >&2
+    return 1
   fi
-
-  if [[ -z "$go_bin" || ! -x "$go_bin" ]]; then
-    echo "Could not obtain a verified official Go ${GO_VERSION} toolchain." >&2
-    echo "The standard URLs may be returning 404 on this server, or the official module/checksum endpoints may be unreachable." >&2
-    echo "Test network access to go.dev/dl/mod, proxy.golang.org, and sum.golang.org from this VPS." >&2
+  go_root="$TMP/go-root/go"
+  go_bin="$go_root/bin/go"
+  if [[ ! -x "$go_bin" ]]; then
+    echo "Go archive did not contain the expected bin/go executable." >&2
     return 1
   fi
 
@@ -415,9 +339,10 @@ PYVERIFY
   phase_done "Source-built binary verified"
   return 0
 }
+
 if ! build_from_official_go_toolchain; then
   echo "Installation stopped: no verified ShahTunnel binary was built." >&2
-  echo "Go is downloaded only from official Go distribution/toolchain endpoints and checksum-verified; ShahTunnel is built locally without GitHub Release assets." >&2
+  echo "Go is downloaded from official Go endpoints first; fallback mirrors are accepted only when their SHA-256 exactly matches the checksum published by Go. ShahTunnel is built locally without GitHub Release assets." >&2
   exit 1
 fi
 
