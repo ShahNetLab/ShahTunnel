@@ -45,6 +45,12 @@ If the Hub control port is `9443`:
 
 Open only the ports needed by the selected mode. All four transports in this version use TCP.
 
+## Optional DNS ad/tracker filtering
+
+During Agent or Relay setup, you can enable `best-effort DNS ad/tracker filtering`. It starts a DNS resolver on the configured address, blocks known advertising/tracking domains, and attempts to refresh its domain list from the public StevenBlack hosts list in the background. If that list is unavailable, built-in domains remain active. Queries are accepted only from the configured source IP/CIDR allowlist; do not set it to `0.0.0.0/0` casually, because that would expose a public recursive resolver.
+
+For it to affect a device, that device/client must explicitly use the configured server IP and DNS port, and its source IP must match the allowlist. ShahTunnel is a reverse TCP tunnel, not an IP-layer VPN, so it does not automatically change a phone's DNS settings or redirect clients' DNS traffic. **Blocking YouTube mid-roll ads cannot be guaranteed** because ads and video may share delivery domains. This is best-effort filtering of some ad/tracker domains and may cause false positives.
+
 ## Responsible use and privacy
 
 ShahTunnel is a general-purpose TCP relay. Configure it only for servers and services you own or are explicitly authorized to administer. Do not use it to access third-party systems without permission, relay abusive traffic, or disrupt services. Operators are responsible for the endpoints and traffic they choose to forward.
