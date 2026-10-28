@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-
 # Shah Tunnel 1.6.2 installer.
-# Downloads the pinned Go toolchain from the official Go site, verifies its SHA-256,
-# fetches this repository's source archive, and builds the binary on the target server.
-# No prebuilt binary or asset is downloaded from GitHub Releases.
+# Downloads the pinned Go toolchain, verifies its SHA-256, fetches the source,
+# and builds the binary on the target server. No GitHub Release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
 VERSION="1.6.2"
@@ -14,13 +12,11 @@ GO_FALLBACK_BASE="https://go.dev/dl"
 STATE_DIR="/usr/local/lib/shah-tunnel"
 PHASE_HAS_DOWNLOAD=0
 RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/main"
-
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64) TARGET_ARCH="amd64" ;;
   Linux:aarch64|Linux:arm64) TARGET_ARCH="arm64" ;;
   *) echo "Shah Tunnel ${VERSION} supports Linux amd64 and arm64 only." >&2; exit 1 ;;
 esac
-
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "Run as root: bash <(curl -fsSL ${RAW_BASE}/S1T-START.sh)" >&2
   exit 1
@@ -29,12 +25,10 @@ command -v systemctl >/dev/null 2>&1 || { echo "systemd/systemctl is required." 
 for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod tar gzip mktemp rm sleep python3; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "Required command missing: $cmd" >&2; exit 1; }
 done
-
 TMP="$(mktemp -d /tmp/s1t-install.XXXXXX)"
 chmod 0700 "$TMP"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
-
 # Four final pink progress bars for mobile SSH terminals.
 # Do not print intermediate carriage-return bars: some Android SSH clients
 # turn them into extra rows. Print exactly four separate rows at completion.
@@ -48,7 +42,6 @@ curl_download() {
   local headers="${TMP}/curl-headers.$$" log="${TMP}/curl-log.$$"
   local pid=0 rc=0
   rm -f "$headers" "$log" "$dest"
-
   if [[ ! -t 2 ]]; then
     if ! curl -fsSL --proto '=https' --proto-redir '=https' --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log"; then
       cat "$log" >&2
@@ -61,7 +54,6 @@ curl_download() {
     rm -f "$headers" "$log"
     return 0
   fi
-
   curl -fsSL --proto '=https' --proto-redir '=https' --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log" &
   pid=$!
   # Keep transfer output quiet until completion. Some mobile SSH clients turn
@@ -79,7 +71,6 @@ curl_download() {
   PHASE_HAS_DOWNLOAD=1
   rm -f "$headers" "$log"
 }
-
 # Use most of the available terminal width, then shorten each later phase
 # gradually. The first bar is deliberately much wider; all bars remain within
 # the terminal to avoid wrapping on mobile SSH clients.
@@ -102,7 +93,6 @@ phase_bar_width() {
   (( width < 16 )) && width=16
   printf '%s' "$width"
 }
-
 draw_phase_bar() {
   local percent="$1" width filled i
   width="$(phase_bar_width)"
@@ -119,7 +109,6 @@ draw_phase_bar() {
   done
   printf '] %3d%%' "$percent" >&2
 }
-
 draw_indeterminate_bar() {
   local frame="$1" width block=5 start i
   width="$(phase_bar_width)"
@@ -135,14 +124,12 @@ draw_indeterminate_bar() {
   done
   printf ']' >&2
 }
-
 phase_start() {
   # Phase number controls the bar width. Each phase prints one completed bar,
   # avoiding stacked partial snapshots on mobile SSH terminals.
   CURRENT_PHASE="${1:-1}"
   PHASE_HAS_DOWNLOAD=0
 }
-
 draw_four_completion_bars() {
   local cols="${COLUMNS:-}" max_width width i row
   if [[ ! "$cols" =~ ^[0-9]+$ ]] || (( cols < 40 )); then
@@ -154,7 +141,6 @@ draw_four_completion_bars() {
   max_width=$((cols - 12))
   (( max_width > 56 )) && max_width=56
   (( max_width < 20 )) && max_width=20
-
   # Four distinct lines, longest first, then gradually shorter.
   for row in 100 84 68 52; do
     width=$((max_width * row / 100))
@@ -163,11 +149,9 @@ draw_four_completion_bars() {
     for ((i=0; i<width; i++)); do
       printf '%s█%s' "$PINK" "$RESET" >&2
     done
-    printf '] 100%%
-' >&2
+    printf '] 100%%\n' >&2
   done
 }
-
 PROGRESS_BAR_PRINTED=0
 phase_done() {
   # Emit exactly four completion rows once, after installation has succeeded.
@@ -177,7 +161,6 @@ phase_done() {
   fi
   PHASE_HAS_DOWNLOAD=0
 }
-
 run_with_spinner() {
   local label="$1" logfile="$2" rc=0 pid frame=0
   shift 2
@@ -212,7 +195,6 @@ verify_binary() {
   timeout --kill-after=1s 5s "$TMP/S1T-CORE" version 2>/dev/null \
     | grep -Fqx "Shah Tunnel ${VERSION} (linux/${TARGET_ARCH})"
 }
-
 official_go_sha256() {
   case "$TARGET_ARCH" in
     amd64) printf '%s' 'ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5' ;;
@@ -220,7 +202,6 @@ official_go_sha256() {
     *) return 1 ;;
   esac
 }
-
 build_project_binary() {
   local go_bin="$1" source_dir="$2" go_root="$3"
   (
@@ -231,9 +212,8 @@ build_project_binary() {
       -o "$TMP/S1T-CORE" ./S1T-CAPSULE
   )
 }
-
 build_from_official_go_toolchain() {
-  local go_archive go_sha source_url go_bin go_root source_dir expected_go url good
+  local go_archive go_sha source_url go_bin go_root source_dir expected_go url downloaded
   go_archive="go${GO_VERSION}.linux-${TARGET_ARCH}.tar.gz"
   go_sha="$(official_go_sha256)"
   source_url="https://codeload.github.com/${OWNER}/${REPO}/tar.gz/refs/heads/main"
@@ -243,50 +223,37 @@ build_from_official_go_toolchain() {
   go_root=""
 
   phase_start 1 "Download verified Go toolchain and source"
-
-  # The official archive URLs work in normal networks, but some VPS networks
-  # return synthetic 404/403 responses for Google download hosts. Try official
-  # endpoints first; use mirrors only as transport fallbacks, and accept an
-  # archive only when it matches Go's SHA-256 published on go.dev/dl.
+  # Start with the mirror that worked on this VPS. Failed fallback endpoints
+  # remain quiet. An archive is accepted only when SHA-256 matches the pinned hash.
   local -a download_bases=(
+    "https://mirror.nju.edu.cn/golang"
     "https://go.dev/dl"
     "https://dl.google.com/go"
     "https://golang.google.cn/dl"
-    "https://mirror.nju.edu.cn/golang"
     "https://mirrors.aliyun.com/golang"
   )
-  local downloaded=0
-  echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}); official SHA-256 verification is mandatory..." >&2
-
+  downloaded=0
+  echo "Downloading verified Go ${GO_VERSION} (${TARGET_ARCH})..." >&2
   for url in "${download_bases[@]}"; do
     url="${url}/${go_archive}"
-    echo "Trying: ${url}" >&2
     rm -f "$TMP/$go_archive"
     if ! curl_download "$url" "$TMP/$go_archive" \
-        --retry 1 --retry-delay 1 --connect-timeout 10 --max-time 300; then
-      echo "Download endpoint failed; trying next verified endpoint." >&2
+        --retry 1 --retry-delay 1 --connect-timeout 10 --max-time 300 2>/dev/null; then
       rm -f "$TMP/$go_archive"
       continue
     fi
-
     if ! printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null 2>&1; then
-      echo "Downloaded file failed Go's official SHA-256 checksum; rejecting it." >&2
       rm -f "$TMP/$go_archive"
       continue
     fi
-
     echo "Go archive SHA-256 verified." >&2
     downloaded=1
     break
   done
-
   if [[ "$downloaded" -ne 1 ]]; then
-    echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the official checksum." >&2
-    echo "The official archive exists; this VPS network is blocking or rewriting the download requests." >&2
-    echo "Test: curl -fIL https://go.dev/dl/${go_archive}" >&2
+    echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the pinned SHA-256." >&2
     return 1
   fi
-
   rm -rf "$TMP/go-root"
   mkdir -p "$TMP/go-root"
   if ! tar -xzf "$TMP/$go_archive" -C "$TMP/go-root"; then
@@ -299,19 +266,16 @@ build_from_official_go_toolchain() {
     echo "Go archive did not contain the expected bin/go executable." >&2
     return 1
   fi
-
   if [[ "$(GOROOT="$go_root" GOTOOLCHAIN=local "$go_bin" version 2>/dev/null || true)" != "$expected_go" ]]; then
     echo "Unexpected Go toolchain version or architecture; expected: $expected_go" >&2
     return 1
   fi
-
   echo "Downloading ShahTunnel source from ${OWNER}/${REPO} (main branch)..." >&2
   if ! curl_download "$source_url" "$TMP/shah-tunnel-source.tar.gz" \
       --retry 2 --retry-delay 1 --connect-timeout 12 --max-time 180; then
     echo "Could not download the source archive from ${source_url}." >&2
     return 1
   fi
-
   mkdir -p "$source_dir"
   if ! tar -xzf "$TMP/shah-tunnel-source.tar.gz" -C "$source_dir" --strip-components=1; then
     echo "Could not extract the ShahTunnel source archive." >&2
@@ -323,7 +287,6 @@ build_from_official_go_toolchain() {
     echo "The source module path does not match github.com/${OWNER}/${REPO}; refusing to build." >&2
     return 1
   fi
-
   echo "Building Shah Tunnel ${VERSION} with verified Go ${GO_VERSION}..." >&2
   if ! run_with_spinner "Building ShahTunnel" "$TMP/build.log" build_project_binary "$go_bin" "$source_dir" "$go_root"; then
     echo "Source build failed. Build output follows:" >&2
@@ -335,17 +298,15 @@ build_from_official_go_toolchain() {
     echo "Built binary version or architecture validation failed; refusing to install it." >&2
     return 1
   fi
-
   phase_done "Source-built binary verified"
   return 0
 }
 
 if ! build_from_official_go_toolchain; then
   echo "Installation stopped: no verified ShahTunnel binary was built." >&2
-  echo "Go is downloaded from official Go endpoints first; fallback mirrors are accepted only when their SHA-256 exactly matches the checksum published by Go. ShahTunnel is built locally without GitHub Release assets." >&2
+  echo "Go archives must match the pinned SHA-256; ShahTunnel is built locally without GitHub Release assets." >&2
   exit 1
 fi
-
 phase_start 2 "Installing binary and configuring service"
 install -d -o root -g root -m 0700 /etc/ravanreverse
 install -d -o root -g root -m 0755 /usr/local/bin
@@ -358,7 +319,6 @@ fi
 install -o root -g root -m 0750 "$TMP/S1T-CORE" /usr/local/bin/ravanreverse.new
 mv -f /usr/local/bin/ravanreverse.new "$BIN"
 ln -sfn /usr/local/bin/ravanreverse /usr/local/bin/shah-tunnel
-
 # Preserve a working service unit on upgrades; create one only for a fresh install.
 if [[ ! -f /etc/systemd/system/ravanreverse.service ]]; then
   cat > "$TMP/ravanreverse.service" <<'UNIT'
@@ -368,7 +328,6 @@ Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=60
 StartLimitBurst=10
-
 [Service]
 Type=simple
 UMask=0077
@@ -398,7 +357,6 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 ReadWritePaths=/etc/ravanreverse
-
 [Install]
 WantedBy=multi-user.target
 UNIT
@@ -408,7 +366,6 @@ UNIT
     exit 1
   fi
 fi
-
 if [[ -f /etc/ravanreverse/config.json ]]; then
   if ! timeout --kill-after=2s 10s systemctl enable ravanreverse >/dev/null; then
     echo "systemctl enable timed out or failed; stopping here instead of freezing the SSH session." >&2
@@ -432,7 +389,6 @@ if [[ -f /etc/ravanreverse/config.json ]]; then
 else
   :
 fi
-
 phase_done "Binary installed; service/config check complete"
 phase_start 5 "Final cleanup and opening the menu"
 phase_done "All installer phases complete"
