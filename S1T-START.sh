@@ -10,6 +10,7 @@ GO_VERSION="1.26.10"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
 STATE_DIR="/usr/local/lib/shah-tunnel"
+GO_CACHE_DIR="/var/cache/shah-tunnel"
 PHASE_HAS_DOWNLOAD=0
 RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/main"
 case "$(uname -s):$(uname -m)" in
@@ -206,6 +207,60 @@ official_go_sha256() {
     *) return 1 ;;
   esac
 }
+
+# Download one archive in parallel byte ranges when the mirror supports HTTP Range.
+# The final complete archive is still verified against the pinned SHA-256.
+download_go_ranges() {
+  local url="$1" dest="$2" chunks=8 total range_file range_code range_total
+  local probe="$TMP/go-range-probe" headers="$TMP/go-range-headers" parts="$TMP/go-range-parts"
+  local i start end expected pid failed=0
+  rm -rf "$parts"; mkdir -p "$parts"
+  rm -f "$probe" "$headers"
+  if ! curl -fsSL --proto '=https' --proto-redir '=https' --range 0-0 \
+      --connect-timeout 6 --max-time 12 -D "$headers" -o "$probe" "$url" >/dev/null 2>&1; then
+    rm -rf "$parts"; return 1
+  fi
+  range_code="$(awk '/^HTTP\// {code=$2} END {print code}' "$headers")"
+  range_total="$(sed -nE 's/^[Cc]ontent-[Rr]ange:[[:space:]]*bytes 0-0\/([0-9]+).*/\1/p' "$headers" | tail -n 1)"
+  [[ "$range_code" == "206" && "$range_total" =~ ^[0-9]+$ && "$(wc -c < "$probe")" -eq 1 ]] || {
+    rm -rf "$parts"; return 1;
+  }
+  total="$range_total"
+  (( total > chunks )) || { rm -rf "$parts"; return 1; }
+  local -a pids=()
+  for ((i=0; i<chunks; i++)); do
+    start=$((total * i / chunks))
+    end=$((total * (i + 1) / chunks - 1))
+    expected=$((end - start + 1))
+    (
+      local part="$parts/part.$(printf '%02d' "$i")"
+      if ! curl -fsSL --proto '=https' --proto-redir '=https' --range "$start-$end" \
+          --connect-timeout 8 --max-time 120 -o "$part" "$url" >/dev/null 2>&1; then
+        rm -f "$part"; exit 1
+      fi
+      [[ "$(wc -c < "$part")" -eq "$expected" ]]
+    ) &
+    pids+=("$!")
+  done
+  # Keep the existing animated progress display alive while all range jobs run.
+  local running frame=0
+  while :; do
+    running=0
+    for pid in "${pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then running=1; break; fi
+    done
+    (( running == 0 )) && break
+    if [[ -t 2 ]]; then draw_indeterminate_bar "$frame"; frame=$((frame + 1)); fi
+    sleep 0.12
+  done
+  if [[ -t 2 ]]; then printf '\r\033[2K' >&2; fi
+  for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+  if (( failed != 0 )); then rm -rf "$parts"; return 1; fi
+  : > "$dest"
+  for ((i=0; i<chunks; i++)); do cat "$parts/part.$(printf '%02d' "$i")" >> "$dest" || { rm -rf "$parts"; return 1; }; done
+  rm -rf "$parts" "$probe" "$headers"
+  [[ "$(wc -c < "$dest")" -eq "$total" ]]
+}
 build_project_binary() {
   local go_bin="$1" source_dir="$2" go_root="$3"
   (
@@ -227,43 +282,58 @@ build_from_official_go_toolchain() {
   go_root=""
 
   phase_start 1 "Download verified Go toolchain and source"
-  # Start with the mirror that worked on this VPS. Failed fallback endpoints
-  # remain quiet. An archive is accepted only when SHA-256 matches the pinned hash.
-  # Mirror known to work on the user's VPS first. Slow/blocked fallback hosts
-  # have short per-host deadlines so a fresh install cannot stall for many minutes.
-  local -a download_bases=(
-    "https://mirror.nju.edu.cn/golang"
-    "https://mirrors.aliyun.com/golang"
-    "https://go.dev/dl"
-    "https://dl.google.com/go"
-    "https://golang.google.cn/dl"
-  )
-  local -a download_timeouts=(90 45 12 12 12)
-  local idx=0 timeout_secs
+  local cache_archive="$GO_CACHE_DIR/$go_archive"
+  install -d -o root -g root -m 0755 "$GO_CACHE_DIR"
   downloaded=0
-  echo "Downloading verified Go ${GO_VERSION} (${TARGET_ARCH})..." >&2
-  for url in "${download_bases[@]}"; do
-    timeout_secs="${download_timeouts[$idx]}"
-    idx=$((idx + 1))
-    url="${url}/${go_archive}"
-    rm -f "$TMP/$go_archive"
-    if ! QUIET_CURL_ERRORS=1 curl_download "$url" "$TMP/$go_archive" \
-        --retry 0 --connect-timeout 6 --max-time "$timeout_secs"; then
-      rm -f "$TMP/$go_archive"
-      continue
-    fi
-    if ! printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null 2>&1; then
-      rm -f "$TMP/$go_archive"
-      continue
-    fi
-    echo "Go archive SHA-256 verified." >&2
+  go_sha="$(official_go_sha256)"
+
+  # A cached archive is reused only after rechecking the pinned official SHA-256.
+  if [[ -s "$cache_archive" ]] && printf '%s  %s\n' "$go_sha" "$cache_archive" | sha256sum -c - >/dev/null 2>&1; then
+    cp -f "$cache_archive" "$TMP/$go_archive"
+    echo "Using cached, SHA-256-verified Go ${GO_VERSION} archive." >&2
     downloaded=1
-    break
-  done
+  else
+    rm -f "$cache_archive"
+    local -a download_bases=(
+      "https://mirror.nju.edu.cn/golang"
+      "https://mirrors.aliyun.com/golang"
+      "https://mirrors.ustc.edu.cn/golang"
+      "https://mirrors.tuna.tsinghua.edu.cn/golang"
+      "https://go.dev/dl"
+      "https://dl.google.com/go"
+      "https://golang.google.cn/dl"
+    )
+    local base
+    echo "Downloading Go ${GO_VERSION} with parallel chunks when supported..." >&2
+    for base in "${download_bases[@]}"; do
+      url="${base}/${go_archive}"
+      rm -f "$TMP/$go_archive"
+      # Parallel ranges can greatly reduce first-install time on slow mirrors.
+      if download_go_ranges "$url" "$TMP/$go_archive" 2>/dev/null \
+          && printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null 2>&1; then
+        downloaded=1
+        break
+      fi
+      rm -f "$TMP/$go_archive"
+      # Fallback for mirrors that don't support byte-range requests.
+      if QUIET_CURL_ERRORS=1 curl_download "$url" "$TMP/$go_archive" \
+          --retry 0 --connect-timeout 6 --max-time 90 2>/dev/null \
+          && printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null 2>&1; then
+        downloaded=1
+        break
+      fi
+      rm -f "$TMP/$go_archive"
+    done
+    if [[ "$downloaded" -eq 1 ]]; then
+      # Persist only a verified archive, so later reinstall/upgrade skips the 64 MB download.
+      install -o root -g root -m 0644 "$TMP/$go_archive" "$cache_archive"
+    fi
+  fi
   if [[ "$downloaded" -ne 1 ]]; then
     echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the pinned SHA-256." >&2
     return 1
   fi
+  echo "Go archive SHA-256 verified." >&2
   rm -rf "$TMP/go-root"
   mkdir -p "$TMP/go-root"
   if ! tar -xzf "$TMP/$go_archive" -C "$TMP/go-root"; then
