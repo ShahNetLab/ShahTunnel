@@ -101,8 +101,14 @@ type Config struct {
 	Fingerprint   string `json:"fingerprint,omitempty"`
 	// TunnelChannels controls the number of independent authenticated TCP/TLS lanes
 	// between Agent and Hub. Missing values on old configs are upgraded in memory to the current default.
-	TunnelChannels int           `json:"tunnel_channels,omitempty"`
-	Ports          []PortMapping `json:"ports,omitempty"`
+	TunnelChannels int `json:"tunnel_channels,omitempty"`
+	// DNSFilterEnabled starts an optional DNS sinkhole for common ad/tracker domains.
+	// Clients must explicitly use this resolver; it is not a packet-level VPN filter.
+	DNSFilterEnabled      bool          `json:"dns_filter_enabled,omitempty"`
+	DNSFilterListen       string        `json:"dns_filter_listen,omitempty"`
+	DNSFilterUpstream     string        `json:"dns_filter_upstream,omitempty"`
+	DNSFilterAllowedCIDRs []string      `json:"dns_filter_allowed_cidrs,omitempty"`
+	Ports                 []PortMapping `json:"ports,omitempty"`
 }
 
 type RuntimeSnapshot struct {
@@ -2728,6 +2734,25 @@ func validateConfig(c Config) error {
 	if len(c.Token) < 48 || len(c.Token) > 240 || strings.ContainsAny(c.Token, "\r\n") {
 		return errors.New("token must be 48–240 characters and contain no line breaks")
 	}
+	if c.DNSFilterEnabled {
+		if c.Role != "agent" && c.Role != "relay" {
+			return errors.New("DNS ad/tracker filtering can only be enabled on an Agent or Relay server")
+		}
+		if err := validateTCPAddress("DNS filter listen address", c.DNSFilterListen); err != nil {
+			return err
+		}
+		if err := validateTCPAddress("DNS upstream", c.DNSFilterUpstream); err != nil {
+			return err
+		}
+		if len(c.DNSFilterAllowedCIDRs) == 0 {
+			return errors.New("DNS filter requires at least one allowed source IP/CIDR; avoid creating an unrestricted public DNS resolver")
+		}
+		for _, cidr := range c.DNSFilterAllowedCIDRs {
+			if _, _, err := net.ParseCIDR(strings.TrimSpace(cidr)); err != nil {
+				return fmt.Errorf("invalid DNS filter allowed CIDR %q", cidr)
+			}
+		}
+	}
 	if len(c.Ports) == 0 {
 		return errors.New("at least one port mapping is required")
 	}
@@ -3312,6 +3337,25 @@ func generateCertificate(certPath, keyPath string) (string, error) {
 	sum := sha256.Sum256(der)
 	return hex.EncodeToString(sum[:]), nil
 }
+func wizardConfigureDNSFilter(c *Config) error {
+	if !wizardYesNo("Enable best-effort DNS ad/tracker filtering? (Y/n)", "n") {
+		return nil
+	}
+	c.DNSFilterEnabled = true
+	c.DNSFilterListen = wizardAsk("DNS filter bind address", "0.0.0.0:53")
+	c.DNSFilterUpstream = wizardAsk("Upstream DNS server (IP:PORT)", "1.1.1.1:53")
+	allowed := wizardAsk("Allowed client source IP/CIDR (required; use your VPN subnet, comma-separated)", "10.8.0.0/24")
+	for _, item := range strings.Split(allowed, ",") {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			c.DNSFilterAllowedCIDRs = append(c.DNSFilterAllowedCIDRs, item)
+		}
+	}
+	uiWarn("DNS filtering only affects clients that explicitly use this DNS listener and match the source CIDR allowlist.")
+	uiWarn("YouTube mid-roll ads cannot be reliably removed by DNS filtering; some ad/tracker domains will be blocked, and false positives are possible.")
+	return nil
+}
+
 func setup() error {
 	wizardStep = 0
 	uiHeader("SHAH TUNNEL // SPACE SETUP", "WIZARD   •   SECURE LINK   •   TRANSPORT ROUTING")
@@ -3405,6 +3449,9 @@ func setup() error {
 		if err != nil {
 			return err
 		}
+		if err = wizardConfigureDNSFilter(&c); err != nil {
+			return err
+		}
 		if transportModeAllowsHTTP2(c.Transport) {
 			uiInfo("HTTP/2 CONNECT uses TCP port " + nextPortLabel(c.HubAddr) + ". Open it in the Hub firewall if selected.")
 		}
@@ -3444,6 +3491,9 @@ func setup() error {
 	case "3", "relay", "front":
 		c.Role = "relay"
 		c.Token = "relay-mode-not-used-" + tok
+		if err = wizardConfigureDNSFilter(&c); err != nil {
+			return err
+		}
 		for i := 1; i <= 100; i++ {
 			defID := "front"
 			if i > 1 {
@@ -4442,6 +4492,10 @@ func main() {
 		cfg, err := loadConfig()
 		if err != nil {
 			log.Fatal(err)
+		}
+		if err = startDNSAdFilter(cfg); err != nil {
+			// DNS filtering is optional and must never prevent the tunnel itself from starting.
+			log.Printf("DNS ad filter could not start; continuing without DNS filtering: %v", err)
 		}
 		switch cfg.Role {
 		case "hub":

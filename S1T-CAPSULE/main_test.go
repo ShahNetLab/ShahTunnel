@@ -1281,3 +1281,82 @@ func TestAgentTLS13PinnedHandshake(t *testing.T) {
 		t.Fatal("server handshake did not complete")
 	}
 }
+
+func TestDNSAdFilterBlocksKnownAdDomain(t *testing.T) {
+	f, err := newDNSAdFilter(Config{
+		DNSFilterListen:       "127.0.0.1:5353",
+		DNSFilterUpstream:     "1.1.1.1:53",
+		DNSFilterAllowedCIDRs: []string{"127.0.0.1/32"},
+	})
+	if err != nil {
+		t.Fatalf("create DNS filter: %v", err)
+	}
+	q := makeDNSQueryForTest("ads.doubleclick.net")
+	name, _, err := dnsQuestionName(q)
+	if err != nil || name != "ads.doubleclick.net" {
+		t.Fatalf("parse DNS question: name=%q err=%v", name, err)
+	}
+	if !f.isBlocked(name) {
+		t.Fatal("expected subdomain of doubleclick.net to be blocked")
+	}
+	response, err := f.handleQuery(q, "udp")
+	if err != nil {
+		t.Fatalf("blocked response: %v", err)
+	}
+	if len(response) < 12 {
+		t.Fatalf("short DNS response: %d bytes", len(response))
+	}
+	flags := binary.BigEndian.Uint16(response[2:4])
+	if flags&0x8000 == 0 || flags&0x000f != 3 {
+		t.Fatalf("expected DNS NXDOMAIN response, flags=%#04x", flags)
+	}
+	if binary.BigEndian.Uint16(response[6:8]) != 0 {
+		t.Fatal("blocked DNS response must not contain answers")
+	}
+}
+
+func TestDNSAdFilterDoesNotBlockYouTubeMediaDomains(t *testing.T) {
+	f, err := newDNSAdFilter(Config{
+		DNSFilterListen:       "127.0.0.1:5353",
+		DNSFilterUpstream:     "1.1.1.1:53",
+		DNSFilterAllowedCIDRs: []string{"127.0.0.1/32"},
+	})
+	if err != nil {
+		t.Fatalf("create DNS filter: %v", err)
+	}
+	for _, domain := range []string{"youtube.com", "www.youtube.com", "googlevideo.com", "r2---sn.googlevideo.com"} {
+		if f.isBlocked(domain) {
+			t.Errorf("media/service domain %q should not be in the built-in blocklist", domain)
+		}
+	}
+}
+
+func TestDNSAdFilterAllowedSourceCIDR(t *testing.T) {
+	f, err := newDNSAdFilter(Config{
+		DNSFilterListen:       "127.0.0.1:5353",
+		DNSFilterUpstream:     "1.1.1.1:53",
+		DNSFilterAllowedCIDRs: []string{"10.8.0.0/24"},
+	})
+	if err != nil {
+		t.Fatalf("create DNS filter: %v", err)
+	}
+	if !f.allowedSource(&net.UDPAddr{IP: net.ParseIP("10.8.0.23"), Port: 42000}) {
+		t.Fatal("expected VPN subnet address to be allowed")
+	}
+	if f.allowedSource(&net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 42000}) {
+		t.Fatal("unexpectedly allowed source outside the CIDR allowlist")
+	}
+}
+
+func makeDNSQueryForTest(domain string) []byte {
+	q := make([]byte, 12)
+	binary.BigEndian.PutUint16(q[0:2], 0x1234)
+	binary.BigEndian.PutUint16(q[2:4], 0x0100) // recursion desired
+	binary.BigEndian.PutUint16(q[4:6], 1)
+	for _, label := range strings.Split(domain, ".") {
+		q = append(q, byte(len(label)))
+		q = append(q, []byte(label)...)
+	}
+	q = append(q, 0, 0, 1, 0, 1) // root, QTYPE A, QCLASS IN
+	return q
+}
