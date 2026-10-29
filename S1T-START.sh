@@ -358,6 +358,20 @@ official_go_sha256() {
   esac
 }
 
+resolve_module_dependencies() {
+  local source_dir="$1" go_root="$2" go_bin="$3"
+  # IMPORTANT: the installer is commonly started from /root via
+  # bash <(curl ...). Never assume the caller's current directory is the
+  # downloaded repository. Run `go mod tidy` from the verified source root.
+  (
+    cd -- "$source_dir"
+    env GOROOT="$go_root" GOTOOLCHAIN=local \
+      GOPROXY="https://proxy.golang.org|https://goproxy.cn|https://goproxy.io|direct" \
+      GOCACHE="${GO_CACHE_DIR}/build-cache-${GO_VERSION}-${TARGET_ARCH}" \
+      "$go_bin" mod tidy
+  )
+}
+
 build_project_binary() {
   local go_bin="$1" source_dir="$2" go_root="$3"
   (
@@ -525,10 +539,7 @@ build_from_official_go_toolchain() {
   fi
   echo "Resolving and checksum-verifying Go module dependencies..." >&2
   if ! run_with_spinner "Resolving dependencies" "$TMP/mod-tidy.log" \
-      env GOROOT="$go_root" GOTOOLCHAIN=local \
-      GOPROXY="https://proxy.golang.org|https://goproxy.cn|https://goproxy.io|direct" \
-      GOCACHE="${GO_CACHE_DIR}/build-cache-${GO_VERSION}-${TARGET_ARCH}" \
-      "$go_bin" mod tidy; then
+      resolve_module_dependencies "$source_dir" "$go_root" "$go_bin"; then
     echo "Go module resolution failed. Build output follows:" >&2
     [[ ! -s "$TMP/mod-tidy.log" ]] || cat "$TMP/mod-tidy.log" >&2
     return 1
