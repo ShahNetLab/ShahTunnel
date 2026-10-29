@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Local verification helper. It reuses an existing Go 1.27.3 toolchain and never downloads one.
+# Local verification helper. It reuses an existing Go 1.26.x or 1.27.x toolchain and never downloads one.
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-GO_VERSION="1.27.3"
+GO_VERSION="1.26.10" # installer download default; verifier accepts installed 1.26.x/1.27.x
 GO_HOME="$ROOT/.toolchains/go${GO_VERSION}"
 case "$(uname -m)" in
   x86_64|amd64) VERIFY_ARCH="amd64" ;;
@@ -16,27 +16,37 @@ GO_BIN=""
 fail() { printf '\n[FAIL] %s\n' "$*" >&2; exit 1; }
 pass() { printf '[ OK ] %s\n' "$*"; }
 
-version_is_pinned() {
+version_is_compatible() {
   local bin="$1" v
   [[ -x "$bin" ]] || return 1
   v="$(GOTOOLCHAIN=local "$bin" version 2>/dev/null || true)"
-  [[ "$v" == *"go${GO_VERSION}"* ]]
+  [[ "$v" =~ go[[:space:]]version[[:space:]]go1\.(26|27)\.[0-9]+[[:space:]]linux/${VERIFY_ARCH} ]]
 }
 
-# Reuse only an exact Go 1.27.3 binary. An older/newer system toolchain is not used.
-for candidate in "$GO_HOME/bin/go" "/usr/local/lib/shah-tunnel/toolchains/go${GO_VERSION}-${VERIFY_ARCH}/bin/go" "/usr/local/lib/shah-tunnel/go-${GO_VERSION}/bin/go" "$(command -v go 2>/dev/null || true)"; do
-  if [[ -n "$candidate" ]] && version_is_pinned "$candidate"; then
+# Prefer a compatible local toolchain; this helper never downloads Go.
+shopt -s nullglob
+local_candidates=(
+  "$GO_HOME/bin/go"
+  /usr/local/lib/shah-tunnel/toolchains/go1.26.*-"$VERIFY_ARCH"/bin/go
+  /usr/local/lib/shah-tunnel/toolchains/go1.27.*-"$VERIFY_ARCH"/bin/go
+  /usr/local/lib/shah-tunnel/go-*/bin/go
+  "$(command -v go 2>/dev/null || true)"
+)
+shopt -u nullglob
+for candidate in "${local_candidates[@]}"; do
+  if [[ -n "$candidate" ]] && version_is_compatible "$candidate"; then
     GO_BIN="$candidate"
     break
   fi
 done
 
 if [[ -z "$GO_BIN" ]]; then
-  fail "Go ${GO_VERSION} is not installed locally. This verification script will not download toolchains."
+  fail "Go 1.26.x or 1.27.x is not installed locally. This verification script will not download toolchains."
 fi
 
 version_out="$(GOTOOLCHAIN=local "$GO_BIN" version)"
-[[ "$version_out" == *"go${GO_VERSION}"* ]] || fail "Expected Go ${GO_VERSION}, got: $version_out"
+[[ "$version_out" =~ go[[:space:]]version[[:space:]]go1\.(26|27)\.[0-9]+[[:space:]]linux/${VERIFY_ARCH} ]] || fail "Expected Go 1.26.x/1.27.x, got: $version_out"
+GO_USED_VERSION="$(awk '{print $3}' <<<"$version_out")"
 export PATH="$(dirname "$GO_BIN"):$PATH"
 export GOTOOLCHAIN=local
 pass "Pinned toolchain: $version_out"
@@ -82,4 +92,4 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w 
 pass "Linux amd64 and arm64 binaries built; amd64 runtime version verified"
 
 echo
-echo "ALL CHECKS PASSED using Go ${GO_VERSION}."
+echo "ALL CHECKS PASSED using Go ${GO_USED_VERSION}."

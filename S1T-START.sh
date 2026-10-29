@@ -1,15 +1,27 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 # Shah Tunnel 1.7.1 installer.
-# Downloads the pinned Go toolchain, verifies its SHA-256, fetches the source,
-# and builds the binary on the target server. Go 1.27.3 is required by the pinned
-# github.com/xtls/reality dependency (minimum Go 1.27). No GitHub Release binary is used.
+# Prefer an already-installed Go 1.26.x/1.27.x toolchain. Otherwise download
+# Go 1.26.10 from an eligible mirror, verify its pinned SHA-256, then build locally.
+# REALITY is pinned to a Go-1.24-compatible revision so Go 1.26.x can build it.
+# No GitHub Release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
 VERSION="1.7.1"
-GO_VERSION="1.27.3"
-GO_BASE="https://dl.google.com/go"
-GO_FALLBACK_BASE="https://go.dev/dl"
+GO_VERSION="1.26.10"
+TOOLCHAIN_VERSION="$GO_VERSION"
+SKIP_GO_DOWNLOAD=0
+EXISTING_GO_BIN=""
+DETECTED_GO_VERSION=""
+MIRRORS=(
+  "https://go.dev/dl"
+  "https://dl.google.com/go"
+  "https://mirrors.aliyun.com/golang"
+  "https://mirrors.ustc.edu.cn/golang"
+  "https://mirrors.tuna.tsinghua.edu.cn/golang"
+  "https://mirrors.cloud.tencent.com/go"
+  "https://golang.google.cn/dl"
+)
 STATE_DIR="/usr/local/lib/shah-tunnel"
 GO_CACHE_DIR="/var/cache/shah-tunnel"
 PHASE_HAS_DOWNLOAD=0
@@ -27,6 +39,29 @@ command -v systemctl >/dev/null 2>&1 || { echo "systemd/systemctl is required." 
 for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod tar gzip mktemp rm sleep python3 wc sed tail sort xargs find; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "Required command missing: $cmd" >&2; exit 1; }
 done
+
+# First priority: use a compatible Go already exposed on PATH. Do not download
+# or extract another toolchain when Go 1.26.x/1.27.x is installed and matches
+# this server's architecture.
+if command -v go >/dev/null 2>&1; then
+  _go_path="$(type -P go 2>/dev/null || command -v go)"
+  _go_version_line="$(GOTOOLCHAIN=local "$_go_path" version 2>/dev/null || true)"
+  _go_version="$(awk '{print $3}' <<<"$_go_version_line")"
+  _go_platform="$(awk '{print $4}' <<<"$_go_version_line")"
+  case "$_go_version" in
+    go1.26.*|go1.27.*)
+      if [[ "$_go_platform" == "linux/${TARGET_ARCH}" ]]; then
+        EXISTING_GO_BIN="$_go_path"
+        DETECTED_GO_VERSION="$_go_version"
+        TOOLCHAIN_VERSION="${_go_version#go}"
+        SKIP_GO_DOWNLOAD=1
+        echo "Detected usable Go toolchain: ${DETECTED_GO_VERSION} (${_go_platform})" >&2
+        echo "Skipping Go download and extraction; using the existing toolchain." >&2
+      fi
+      ;;
+  esac
+fi
+
 TMP="$(mktemp -d /tmp/s1t-install.XXXXXX)"
 chmod 0700 "$TMP"
 cleanup() { rm -rf -- "$TMP"; }
@@ -352,11 +387,49 @@ verify_binary() {
     | grep -Fqx "Shah Tunnel ${VERSION} (linux/${TARGET_ARCH})"
 }
 official_go_sha256() {
+  [[ "$GO_VERSION" == "1.26.10" ]] || return 1
   case "$TARGET_ARCH" in
-    amd64) printf '%s' '65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40' ;;
-    arm64) printf '%s' 'a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49' ;;
+    amd64) printf '%s' 'ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5' ;;
+    arm64) printf '%s' '3f4227ce7b206a513e794f1393adb473a07b46e94d18bd15d1c684bbb7319797' ;;
     *) return 1 ;;
   esac
+}
+
+# Mirror preflight: a full archive download is attempted only after the final
+# HTTPS response is HTTP 200 and its Content-Length looks like a real Go archive.
+# HTTP 403/404 are rejected immediately so they do not waste a full download.
+mirror_head_preflight() {
+  local url="$1" mirror_name="$2" headers log status rc=0 content_length
+  headers="${TMP}/head-${mirror_name}-$$.headers"
+  log="${TMP}/head-${mirror_name}-$$.log"
+  rm -f "$headers" "$log"
+  status="$(curl --silent --show-error --location --head \
+    --proto '=https' --proto-redir '=https' \
+    --connect-timeout 4 --max-time 8 \
+    --dump-header "$headers" --output /dev/null --write-out '%{http_code}' \
+    "$url" 2>"$log")" || rc=$?
+  if [[ "$status" == "403" || "$status" == "404" ]]; then
+    echo "Skipping ${mirror_name}: HTTP ${status} (file unavailable)." >&2
+    rm -f "$headers" "$log"
+    return 1
+  fi
+  if (( rc != 0 )) || [[ "$status" != "200" ]]; then
+    echo "Skipping ${mirror_name}: HEAD preflight failed (HTTP ${status:-000})." >&2
+    rm -f "$headers" "$log"
+    return 1
+  fi
+  content_length="$(awk '
+    /^HTTP\// { length_value = "" }
+    tolower($1) == "content-length:" { gsub("\r", "", $2); length_value = $2 }
+    END { print length_value }
+  ' "$headers")"
+  rm -f "$headers" "$log"
+  if [[ ! "$content_length" =~ ^[0-9]+$ ]] || (( content_length < 30000000 || content_length > 200000000 )); then
+    echo "Skipping ${mirror_name}: missing or implausible Content-Length (${content_length:-none})." >&2
+    return 1
+  fi
+  echo "Mirror preflight passed: ${mirror_name} (HTTP 200, ${content_length} bytes)." >&2
+  return 0
 }
 
 resolve_module_dependencies() {
@@ -368,7 +441,7 @@ resolve_module_dependencies() {
     cd -- "$source_dir"
     env GOROOT="$go_root" GOTOOLCHAIN=local \
       GOPROXY="https://proxy.golang.org|https://goproxy.cn|https://goproxy.io|direct" \
-      GOCACHE="${GO_CACHE_DIR}/build-cache-${GO_VERSION}-${TARGET_ARCH}" \
+      GOCACHE="${GO_CACHE_DIR}/build-cache-${TOOLCHAIN_VERSION}-${TARGET_ARCH}" \
       "$go_bin" mod tidy
   )
 }
@@ -380,18 +453,19 @@ build_project_binary() {
     # Dependency resolution and checksum verification are completed before the
     # source fingerprint/cache lookup; compilation itself runs with GOPROXY off.
     env GOROOT="$go_root" GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off \
-      GOCACHE="${GO_CACHE_DIR}/build-cache-${GO_VERSION}-${TARGET_ARCH}" \
+      GOCACHE="${GO_CACHE_DIR}/build-cache-${TOOLCHAIN_VERSION}-${TARGET_ARCH}" \
       CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_ARCH" \
       "$go_bin" build -trimpath -ldflags='-s -w -buildid=' \
       -o "$TMP/S1T-CORE" ./S1T-CAPSULE
   )
 }
 build_from_official_go_toolchain() {
-  local go_archive go_sha source_url go_bin go_root source_dir expected_go url downloaded script_root
+  local go_archive go_sha source_url go_bin go_root source_dir expected_go script_root
+  local cache_archive toolchain_path toolchain_new downloaded=0 candidate candidate_line candidate_version candidate_platform
+  local url source_id base part_file bytes content_length i
   go_archive="go${GO_VERSION}.linux-${TARGET_ARCH}.tar.gz"
   go_sha="$(official_go_sha256)"
   source_url="https://codeload.github.com/${OWNER}/${REPO}/tar.gz/refs/heads/main"
-  expected_go="go version go${GO_VERSION} linux/${TARGET_ARCH}"
   script_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
   if [[ -s "$script_root/go.mod" && -s "$script_root/S1T-CAPSULE/main.go" ]]; then
     source_dir="$script_root"
@@ -400,121 +474,156 @@ build_from_official_go_toolchain() {
   fi
   go_bin=""
   go_root=""
+  expected_go=""
 
-  phase_start 1 "Download verified Go toolchain and source"
-  local cache_archive="$GO_CACHE_DIR/$go_archive"
-  local toolchain_path="${STATE_DIR}/toolchains/go${GO_VERSION}-${TARGET_ARCH}"
-  local toolchain_new="${toolchain_path}.new"
+  phase_start 1 "Select Go toolchain and fetch source"
+  cache_archive="$GO_CACHE_DIR/$go_archive"
+  toolchain_path="${STATE_DIR}/toolchains/go${GO_VERSION}-${TARGET_ARCH}"
+  toolchain_new="${toolchain_path}.new"
   install -d -o root -g root -m 0755 "$GO_CACHE_DIR" "${STATE_DIR}/toolchains"
-  downloaded=0
 
-  # A stable, previously verified toolchain avoids re-extracting Go on every
-  # run and keeps GOCACHE effective across installations.
-  if [[ -x "$toolchain_path/bin/go" ]] &&
-      [[ "$(GOROOT="$toolchain_path" GOTOOLCHAIN=local "$toolchain_path/bin/go" version 2>/dev/null || true)" == "$expected_go" ]]; then
-    go_root="$toolchain_path"
-    go_bin="$go_root/bin/go"
+  # PATH toolchain was checked before any download. If usable, skip all archive
+  # download/extraction steps exactly as requested.
+  if [[ "$SKIP_GO_DOWNLOAD" == "1" && -n "$EXISTING_GO_BIN" ]]; then
+    go_bin="$EXISTING_GO_BIN"
+    go_root="$(GOTOOLCHAIN=local "$go_bin" env GOROOT 2>/dev/null || true)"
+    expected_go="go version ${DETECTED_GO_VERSION} linux/${TARGET_ARCH}"
     downloaded=1
-    echo "Reusing installed, verified Go ${GO_VERSION} toolchain." >&2
+    echo "Using already-installed Go ${TOOLCHAIN_VERSION}; Go download/extraction skipped." >&2
   else
-    # Reuse only an archive whose checksum matches the pinned Go distribution.
-    if [[ -s "$cache_archive" ]] && printf '%s  %s\n' "$go_sha" "$cache_archive" | sha256sum -c - >/dev/null 2>&1; then
-      cp -f "$cache_archive" "$TMP/$go_archive"
-      echo "Using cached, SHA-256-verified Go ${GO_VERSION} archive." >&2
+    # Also reuse any installer-managed verified Go 1.26.x/1.27.x toolchain,
+    # including older managed versions left by prior installer runs.
+    shopt -s nullglob
+    local -a managed_candidates=(
+      "${STATE_DIR}"/toolchains/go1.26.*-"${TARGET_ARCH}"
+      "${STATE_DIR}"/toolchains/go1.27.*-"${TARGET_ARCH}"
+    )
+    shopt -u nullglob
+    for candidate in "${managed_candidates[@]}"; do
+      [[ -x "$candidate/bin/go" ]] || continue
+      candidate_line="$(GOROOT="$candidate" GOTOOLCHAIN=local "$candidate/bin/go" version 2>/dev/null || true)"
+      candidate_version="$(awk '{print $3}' <<<"$candidate_line")"
+      candidate_platform="$(awk '{print $4}' <<<"$candidate_line")"
+      case "$candidate_version" in go1.26.*|go1.27.*) ;; *) continue ;; esac
+      [[ "$candidate_platform" == "linux/${TARGET_ARCH}" ]] || continue
+      go_root="$candidate"
+      go_bin="$candidate/bin/go"
+      TOOLCHAIN_VERSION="${candidate_version#go}"
+      expected_go="go version ${candidate_version} linux/${TARGET_ARCH}"
       downloaded=1
-    else
-      rm -f "$cache_archive"
-      # Use parallel ranges first for mirrors that support them; if a mirror
-      # lacks byte-range support, fall back to the resumable single-stream path.
-      local -a download_sources=(
-        "aliyun|https://mirrors.aliyun.com/golang"
-        "nju|https://mirror.nju.edu.cn/golang"
-        "ustc|https://mirrors.ustc.edu.cn/golang"
-        "tsinghua|https://mirrors.tuna.tsinghua.edu.cn/golang"
-        "tencent|https://mirrors.cloud.tencent.com/go"
-        "163|https://mirrors.163.com/golang"
-        "google|https://dl.google.com/go"
-        "go-dev|https://go.dev/dl"
-        "google-storage|https://storage.googleapis.com/golang"
-        "google-cn|https://golang.google.cn/dl"
-      )
-      local source source_id base part_file bytes
-      echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) using parallel range requests where supported..." >&2
-      for source in "${download_sources[@]}"; do
-        source_id="${source%%|*}"
-        base="${source#*|}"
-        url="${base}/${go_archive}"
-        part_file="${GO_CACHE_DIR}/${go_archive}.${source_id}.part"
-        echo "Trying ${base}..." >&2
-
-        if [[ -s "$part_file" ]] && printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
-          cp -f "$part_file" "$TMP/$go_archive"
-          downloaded=1
-          echo "Using complete SHA-256-verified archive from ${source_id}." >&2
-          break
-        fi
-
-        RANGE_DOWNLOAD_ATTEMPTED=0
-        if curl_download_parallel_ranges "$url" "$part_file" "$go_sha"; then
-          cp -f "$part_file" "$TMP/$go_archive"
-          downloaded=1
-          echo "Parallel download from ${source_id} passed SHA-256 verification." >&2
-          break
-        fi
-        if [[ "$RANGE_DOWNLOAD_ATTEMPTED" == 1 ]]; then
-          echo "Parallel chunks were incomplete at ${source_id}; moving to the next mirror instead of restarting a slow full download." >&2
-          continue
-        fi
-        echo "${source_id} does not support a usable byte-range response; trying a time-limited single stream..." >&2
-        if curl_download_resumable "$url" "$part_file" 35 0 15; then
-          if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
-            cp -f "$part_file" "$TMP/$go_archive"
-            downloaded=1
-            echo "Resumable download from ${source_id} passed SHA-256 verification." >&2
-            break
-          fi
-          bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
-          echo "Checksum mismatch from ${source_id} (${bytes} bytes); discarding its single-stream partial." >&2
-          rm -f "$part_file"
-        else
-          bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
-          echo "Download failed from ${source_id} (${bytes} bytes retained for the same mirror)." >&2
-        fi
-      done
-      if [[ "$downloaded" -eq 1 ]]; then
-        # Cache only a fully downloaded and verified archive.
-        install -o root -g root -m 0644 "$TMP/$go_archive" "$cache_archive"
-      fi
-    fi
+      SKIP_GO_DOWNLOAD=1
+      echo "Reusing installed, verified Go ${TOOLCHAIN_VERSION} toolchain." >&2
+      break
+    done
 
     if [[ "$downloaded" -ne 1 ]]; then
-      echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the pinned SHA-256." >&2
-      return 1
+      # A cached archive is trusted only when it matches the official pinned
+      # digest. Otherwise preflight mirrors before transferring any large file.
+      if [[ -s "$cache_archive" ]] && printf '%s  %s\n' "$go_sha" "$cache_archive" | sha256sum -c - >/dev/null 2>&1; then
+        cp -f "$cache_archive" "$TMP/$go_archive"
+        downloaded=1
+        echo "Using cached, SHA-256-verified Go ${GO_VERSION} archive." >&2
+      else
+        rm -f "$cache_archive"
+        local -a mirror_names=(go-dev dl-google aliyun ustc tsinghua tencent google-cn)
+        echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}); preflighting mirrors before download..." >&2
+        for i in "${!MIRRORS[@]}"; do
+          base="${MIRRORS[$i]}"
+          source_id="${mirror_names[$i]}"
+          url="${base}/${go_archive}"
+          part_file="${GO_CACHE_DIR}/${go_archive}.${source_id}.part"
+          echo "Checking ${base}..." >&2
+
+          if ! mirror_head_preflight "$url" "$source_id"; then
+            # An HTTP 403/404 or invalid HEAD response must immediately move to
+            # the next mirror; do not spend time downloading an unavailable file.
+            continue
+          fi
+
+          if [[ -s "$part_file" ]] && printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
+            cp -f "$part_file" "$TMP/$go_archive"
+            downloaded=1
+            echo "Using complete SHA-256-verified archive from ${source_id}." >&2
+            break
+          fi
+
+          RANGE_DOWNLOAD_ATTEMPTED=0
+          if curl_download_parallel_ranges "$url" "$part_file" "$go_sha"; then
+            cp -f "$part_file" "$TMP/$go_archive"
+            downloaded=1
+            echo "Parallel download from ${source_id} passed SHA-256 verification." >&2
+            break
+          fi
+          if [[ "$RANGE_DOWNLOAD_ATTEMPTED" == "1" ]]; then
+            echo "Parallel chunks failed at ${source_id}; moving to the next preflighted mirror." >&2
+            continue
+          fi
+
+          echo "${source_id} has no usable byte-range response; trying a time-limited single stream." >&2
+          if curl_download_resumable "$url" "$part_file" 35 0 15; then
+            if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
+              cp -f "$part_file" "$TMP/$go_archive"
+              downloaded=1
+              echo "Resumable download from ${source_id} passed SHA-256 verification." >&2
+              break
+            fi
+            bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
+            echo "Checksum mismatch from ${source_id} (${bytes} bytes); discarding partial." >&2
+            rm -f "$part_file"
+          else
+            bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
+            echo "Download failed from ${source_id} (${bytes} bytes retained for same mirror)." >&2
+          fi
+        done
+        if [[ "$downloaded" -eq 1 ]]; then
+          install -o root -g root -m 0644 "$TMP/$go_archive" "$cache_archive"
+        fi
+      fi
+
+      if [[ "$downloaded" -ne 1 ]]; then
+        echo "ERROR: Could not download Go ${GO_VERSION} from any mirror." >&2
+        echo "Possible solutions:" >&2
+        echo "1. Install Go 1.26 or 1.27 manually and re-run the installer." >&2
+        echo "2. Check network / DNS / firewall restrictions." >&2
+        echo "3. Try running the installer again later." >&2
+        echo "Installation aborted. No binary was built." >&2
+        return 1
+      fi
+
+      echo "Go archive SHA-256 verified." >&2
+      rm -rf "$TMP/go-root" "$toolchain_new"
+      mkdir -p "$TMP/go-root"
+      if ! tar -xzf "$TMP/$go_archive" -C "$TMP/go-root"; then
+        echo "Downloaded Go archive could not be extracted." >&2
+        return 1
+      fi
+      go_root="$TMP/go-root/go"
+      go_bin="$go_root/bin/go"
+      expected_go="go version go${GO_VERSION} linux/${TARGET_ARCH}"
+      if [[ ! -x "$go_bin" ]]; then
+        echo "Go archive did not contain the expected bin/go executable." >&2
+        return 1
+      fi
+      if [[ "$(GOROOT="$go_root" GOTOOLCHAIN=local "$go_bin" version 2>/dev/null || true)" != "$expected_go" ]]; then
+        echo "Unexpected Go toolchain version or architecture; expected: $expected_go" >&2
+        return 1
+      fi
+      TOOLCHAIN_VERSION="$GO_VERSION"
+      mv "$go_root" "$toolchain_new"
+      rm -rf "$toolchain_path"
+      mv "$toolchain_new" "$toolchain_path"
+      go_root="$toolchain_path"
+      go_bin="$go_root/bin/go"
     fi
-    echo "Go archive SHA-256 verified." >&2
-    rm -rf "$TMP/go-root" "$toolchain_new"
-    mkdir -p "$TMP/go-root"
-    if ! tar -xzf "$TMP/$go_archive" -C "$TMP/go-root"; then
-      echo "Downloaded Go archive could not be extracted." >&2
-      return 1
-    fi
-    go_root="$TMP/go-root/go"
-    go_bin="$go_root/bin/go"
-    if [[ ! -x "$go_bin" ]]; then
-      echo "Go archive did not contain the expected bin/go executable." >&2
-      return 1
-    fi
-    if [[ "$(GOROOT="$go_root" GOTOOLCHAIN=local "$go_bin" version 2>/dev/null || true)" != "$expected_go" ]]; then
-      echo "Unexpected Go toolchain version or architecture; expected: $expected_go" >&2
-      return 1
-    fi
-    # Install the verified toolchain to a stable location. The build cache is
-    # keyed to this path and can be reused on future runs.
-    mv "$go_root" "$toolchain_new"
-    rm -rf "$toolchain_path"
-    mv "$toolchain_new" "$toolchain_path"
-    go_root="$toolchain_path"
-    go_bin="$go_root/bin/go"
+  fi
+
+  if [[ -z "$go_root" || ! -x "$go_bin" ]]; then
+    echo "Selected Go toolchain is invalid; refusing to continue." >&2
+    return 1
+  fi
+  if [[ "$(GOROOT="$go_root" GOTOOLCHAIN=local "$go_bin" version 2>/dev/null || true)" != "$expected_go" ]]; then
+    echo "Selected Go toolchain version/architecture validation failed; expected: $expected_go" >&2
+    return 1
   fi
 
   if [[ "$source_dir" == "$TMP/source" ]]; then
@@ -548,13 +657,13 @@ build_from_official_go_toolchain() {
   local source_fingerprint build_cache_dir cached_binary
   source_fingerprint="$(cd "$source_dir" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')"
   build_cache_dir="${STATE_DIR}/builds"
-  cached_binary="${build_cache_dir}/shah-tunnel-${VERSION}-${GO_VERSION}-${TARGET_ARCH}-${source_fingerprint}"
+  cached_binary="${build_cache_dir}/shah-tunnel-${VERSION}-${TOOLCHAIN_VERSION}-${TARGET_ARCH}-${source_fingerprint}"
   install -d -o root -g root -m 0755 "$build_cache_dir"
   if [[ -s "$cached_binary" ]] && timeout --kill-after=1s 5s "$cached_binary" version 2>/dev/null | grep -Fqx "Shah Tunnel ${VERSION} (linux/${TARGET_ARCH})"; then
     cp -f "$cached_binary" "$TMP/S1T-CORE"
     echo "Reusing cached ShahTunnel binary for this exact source revision." >&2
   else
-    echo "Building Shah Tunnel ${VERSION} with verified Go ${GO_VERSION}..." >&2
+    echo "Building Shah Tunnel ${VERSION} with Go ${TOOLCHAIN_VERSION}..." >&2
     if ! run_with_spinner "Building ShahTunnel" "$TMP/build.log" build_project_binary "$go_bin" "$source_dir" "$go_root"; then
       echo "Source build failed. Build output follows:" >&2
       [[ ! -s "$TMP/build.log" ]] || cat "$TMP/build.log" >&2
