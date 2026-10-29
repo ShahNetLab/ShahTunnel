@@ -1281,3 +1281,284 @@ func TestAgentTLS13PinnedHandshake(t *testing.T) {
 		t.Fatal("server handshake did not complete")
 	}
 }
+
+func TestAdaptiveCandidatesCanIncludeReality(t *testing.T) {
+	legacy := adaptiveTransportCandidates(transportTCP)
+	if len(legacy) != 4 {
+		t.Fatalf("legacy adaptive candidate count = %d; want 4", len(legacy))
+	}
+	for _, mode := range legacy {
+		if mode == transportReality {
+			t.Fatal("REALITY must not be included without explicit Agent configuration")
+		}
+	}
+	withReality := adaptiveTransportCandidates(transportReality, true)
+	if len(withReality) != 5 || withReality[0] != transportReality {
+		t.Fatalf("adaptive candidates with saved REALITY preference = %#v; want 5 and REALITY first", withReality)
+	}
+	found := false
+	for _, mode := range withReality {
+		if mode == transportReality {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("REALITY missing from configured Adaptive candidates")
+	}
+}
+
+func TestAdaptiveRealityDefaultPorts(t *testing.T) {
+	hub := Config{Role: "hub", Transport: transportAdaptive, ControlListen: "0.0.0.0:9443"}
+	got, err := realityHubListenAddress(hub)
+	if err != nil || got != "0.0.0.0:9446" {
+		t.Fatalf("adaptive REALITY listen address = %q, err=%v; want 0.0.0.0:9446", got, err)
+	}
+	agent := Config{Role: "agent", Transport: transportAdaptive, HubAddr: "203.0.113.8:9443"}
+	got, err = realityAgentAddress(agent)
+	if err != nil || got != "203.0.113.8:9446" {
+		t.Fatalf("adaptive REALITY agent address = %q, err=%v; want 203.0.113.8:9446", got, err)
+	}
+	if got, err = realityAgentAddress(Config{Role: "agent", Transport: transportReality, HubAddr: "203.0.113.8:9443", RealityAddr: "203.0.113.8:9555"}); err != nil || got != "203.0.113.8:9443" {
+		t.Fatalf("standalone REALITY address = %q, err=%v; want existing control address despite an Adaptive override", got, err)
+	}
+	if got, err = realityHubListenAddress(Config{Role: "hub", Transport: transportReality, ControlListen: "0.0.0.0:9443", RealityListen: "0.0.0.0:9555"}); err != nil || got != "0.0.0.0:9443" {
+		t.Fatalf("standalone REALITY listener = %q, err=%v; want existing control listener despite an Adaptive override", got, err)
+	}
+	if got, err = realityAgentAddress(Config{Role: "agent", Transport: transportAdaptive, HubAddr: "203.0.113.8:9443", RealityAddr: "203.0.113.8:9555"}); err != nil || got != "203.0.113.8:9555" {
+		t.Fatalf("custom Adaptive REALITY address = %q, err=%v; want configured override", got, err)
+	}
+	if got, err = realityHubListenAddress(Config{Role: "hub", Transport: transportAdaptive, ControlListen: "0.0.0.0:9443", RealityListen: "0.0.0.0:9555"}); err != nil || got != "0.0.0.0:9555" {
+		t.Fatalf("custom Adaptive REALITY listener = %q, err=%v; want configured override", got, err)
+	}
+}
+
+func TestUTLSAgentTLS13PinnedHandshakeProfiles(t *testing.T) {
+	for _, profile := range []string{"chrome", "firefox", "edge", "randomized"} {
+		t.Run(profile, func(t *testing.T) {
+			dir := t.TempDir()
+			certPath, keyPath := filepath.Join(dir, "hub.crt"), filepath.Join(dir, "hub.key")
+			fingerprint, err := generateCertificate(certPath, keyPath)
+			if err != nil {
+				t.Fatalf("generate test certificate: %v", err)
+			}
+			cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+			if err != nil {
+				t.Fatalf("load test certificate: %v", err)
+			}
+			pin, err := normalizeFingerprint(fingerprint)
+			if err != nil {
+				t.Fatalf("decode generated fingerprint: %v", err)
+			}
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			defer listener.Close()
+			tlsListener := tls.NewListener(listener, hubTLSConfig(cert))
+			defer tlsListener.Close()
+			serverResult := make(chan error, 1)
+			go func() {
+				conn, acceptErr := tlsListener.Accept()
+				if acceptErr != nil {
+					serverResult <- acceptErr
+					return
+				}
+				defer conn.Close()
+				tlsConn := conn.(*tls.Conn)
+				if handshakeErr := tlsConn.Handshake(); handshakeErr != nil {
+					serverResult <- handshakeErr
+					return
+				}
+				state := tlsConn.ConnectionState()
+				if state.Version != tls.VersionTLS13 {
+					serverResult <- fmt.Errorf("server negotiated TLS version %d; want TLS 1.3", state.Version)
+					return
+				}
+				if state.ServerName != "edge.example.net" {
+					serverResult <- fmt.Errorf("server received SNI %q; want edge.example.net", state.ServerName)
+					return
+				}
+				serverResult <- nil
+			}()
+			d := &net.Dialer{Timeout: 3 * time.Second}
+			raw, err := d.Dial("tcp", listener.Addr().String())
+			if err != nil {
+				t.Fatalf("dial local listener: %v", err)
+			}
+			client, err := dialUTLSConnWithPin(raw, pin, "edge.example.net", nil, profile)
+			if err != nil {
+				t.Fatalf("uTLS handshake with %s profile failed: %v", profile, err)
+			}
+			_ = client.Close()
+			select {
+			case serverErr := <-serverResult:
+				if serverErr != nil {
+					t.Fatalf("server handshake: %v", serverErr)
+				}
+			case <-time.After(4 * time.Second):
+				t.Fatal("server handshake did not complete")
+			}
+		})
+	}
+}
+
+func TestRealityProbeFallbackReturnsCoverSiteResponse(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "cover.crt"), filepath.Join(dir, "cover.key")
+	if _, err := generateCertificate(certPath, keyPath); err != nil {
+		t.Fatalf("generate cover certificate: %v", err)
+	}
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("load cover certificate: %v", err)
+	}
+	coverRaw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen cover site: %v", err)
+	}
+	coverServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "cover-site-ok")
+	})}
+	go func() {
+		_ = coverServer.Serve(tls.NewListener(coverRaw, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13}))
+	}()
+	defer coverServer.Close()
+
+	priv, pub, err := generateRealityKeyPair()
+	if err != nil {
+		t.Fatalf("generate REALITY key pair: %v", err)
+	}
+	realityCfg, err := makeRealityServerConfig(Config{
+		Transport: transportReality, RealityDest: coverRaw.Addr().String(), RealitySNI: "localhost",
+		RealityPrivateKey: priv, RealityPublicKey: pub, RealityShortID: "0102030405060708",
+	})
+	if err != nil {
+		t.Fatalf("prepare REALITY server: %v", err)
+	}
+	realityListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen REALITY test endpoint: %v", err)
+	}
+	defer realityListener.Close()
+	h := &hubServer{cfg: Config{Transport: transportReality, Token: strings.Repeat("a", 64)}, sessions: make(map[*hubSession]struct{}), pendingPublic: make(chan struct{}, 8)}
+	go func() {
+		for {
+			raw, acceptErr := realityListener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go h.serveRealityAgent(raw, realityCfg)
+		}
+	}()
+
+	d := &net.Dialer{Timeout: 3 * time.Second}
+	raw, err := d.Dial("tcp", realityListener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial probe endpoint: %v", err)
+	}
+	probe := tls.Client(raw, &tls.Config{ServerName: "localhost", InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+	_ = probe.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := probe.Handshake(); err != nil {
+		_ = probe.Close()
+		t.Fatalf("standard TLS probe did not receive cover-site handshake: %v", err)
+	}
+	if _, err := io.WriteString(probe, "GET /probe HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"); err != nil {
+		_ = probe.Close()
+		t.Fatalf("write cover-site request: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(probe), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		_ = probe.Close()
+		t.Fatalf("read cover-site response: %v", err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	_ = probe.Close()
+	if readErr != nil {
+		t.Fatalf("read cover-site body: %v", readErr)
+	}
+	if resp.StatusCode != http.StatusOK || string(body) != "cover-site-ok" {
+		t.Fatalf("probe response = status %d body %q; want 200 and cover-site-ok", resp.StatusCode, body)
+	}
+}
+
+func TestRealityShortIDNormalization(t *testing.T) {
+	got, err := normalizeRealityShortID("0102")
+	if err != nil {
+		t.Fatalf("normalize short ID: %v", err)
+	}
+	want := [8]byte{0x01, 0x02}
+	if got != want {
+		t.Fatalf("normalized short ID = %x; want %x", got, want)
+	}
+	full, err := normalizeRealityShortID("0011223344556677")
+	if err != nil {
+		t.Fatalf("normalize full short ID: %v", err)
+	}
+	if full != [8]byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77} {
+		t.Fatalf("unexpected full short ID bytes: %x", full)
+	}
+	for _, invalid := range []string{"", "0", "123", "zz", "001122334455667788"} {
+		if _, err := normalizeRealityShortID(invalid); err == nil {
+			t.Errorf("invalid short ID %q was accepted", invalid)
+		}
+	}
+}
+
+func TestRealityKeyPairEncoding(t *testing.T) {
+	privateKey, publicKey, err := generateRealityKeyPair()
+	if err != nil {
+		t.Fatalf("generate REALITY key pair: %v", err)
+	}
+	priv, err := decodeRealityKey(privateKey, 32)
+	if err != nil || len(priv) != 32 {
+		t.Fatalf("decode private key: len=%d err=%v", len(priv), err)
+	}
+	pub, err := decodeRealityKey(publicKey, 32)
+	if err != nil || len(pub) != 32 {
+		t.Fatalf("decode public key: len=%d err=%v", len(pub), err)
+	}
+	if err := validateRealityKeyPair(privateKey, publicKey); err != nil {
+		t.Fatalf("matching REALITY key pair rejected: %v", err)
+	}
+	_, otherPublic, err := generateRealityKeyPair()
+	if err != nil {
+		t.Fatalf("generate second X25519 key pair: %v", err)
+	}
+	if err := validateRealityKeyPair(privateKey, otherPublic); err == nil {
+		t.Fatal("mismatched REALITY key pair was accepted")
+	}
+	if _, err := decodeRealityKey("not-base64!", 32); err == nil {
+		t.Fatal("invalid REALITY key encoding was accepted")
+	}
+}
+
+func TestRealityClientHelloFingerprints(t *testing.T) {
+	for _, name := range []string{"", "chrome", "firefox", "edge", "randomized", "random"} {
+		if _, err := realityClientHelloID(name); err != nil {
+			t.Errorf("fingerprint %q rejected: %v", name, err)
+		}
+	}
+	if _, err := realityClientHelloID("unknown-browser"); err == nil {
+		t.Fatal("unknown ClientHello fingerprint was accepted")
+	}
+	if !validTransportMode(transportReality) {
+		t.Fatal("REALITY transport is not accepted by the config policy")
+	}
+	if got := normalizeConfig(Config{Role: "agent", Transport: transportReality}).RealityFingerprint; got != "chrome" {
+		t.Fatalf("default REALITY fingerprint = %q; want chrome", got)
+	}
+}
+
+func TestRealityHandledFallbackError(t *testing.T) {
+	if !realityHandledFallback(errors.New("REALITY: processed invalid connection")) {
+		t.Fatal("REALITY fallback sentinel was not recognized")
+	}
+	if realityHandledFallback(errors.New("REALITY: failed to dial dest")) {
+		t.Fatal("non-fallback REALITY error was treated as an active fallback")
+	}
+	if realityHandledFallback(nil) {
+		t.Fatal("nil error was treated as a fallback")
+	}
+}
