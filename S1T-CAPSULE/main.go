@@ -36,13 +36,10 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"github.com/xtls/reality"
-	h2transport "golang.org/x/net/http2"
 )
 
 const (
-	version                          = "1.7.1"
+	version                          = "1.6.2"
 	configPath                       = "/etc/ravanreverse/config.json"
 	maxFrame                         = 64 * 1024
 	defaultTunnelChannels            = 12
@@ -69,7 +66,6 @@ const (
 	transportHTTP2                   = "http2_connect"
 	transportHTTP1                   = "http1_connect"
 	transportHTTPConnectAuto         = "http_connect_auto"
-	transportReality                 = "reality"
 	http2TokenHeader                 = "X-S1T-Token"
 	webSocketPath                    = "/s1t-tunnel"
 	webSocketGUID                    = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -91,27 +87,18 @@ type PortMapping struct {
 }
 
 type Config struct {
-	Version            string `json:"version"`
-	Role               string `json:"role"`                // hub on Iran, agent on outside
-	Transport          string `json:"transport,omitempty"` // auto, adaptive, tcp_tls, websocket_tls, http2_connect, http1_connect, http_connect_auto, or reality
-	ControlListen      string `json:"control_listen,omitempty"`
-	PublicListen       string `json:"public_listen,omitempty"`
-	HubAddr            string `json:"hub_addr,omitempty"`
-	TLSServerName      string `json:"tls_server_name,omitempty"`
-	RealityDest        string `json:"reality_dest,omitempty"`
-	RealityListen      string `json:"reality_listen,omitempty"`  // Hub listener; adaptive defaults to ControlListen+3
-	RealityAddr        string `json:"reality_addr,omitempty"`    // Agent endpoint; adaptive defaults to HubAddr+3
-	TLSFingerprint     string `json:"tls_fingerprint,omitempty"` // uTLS ClientHello profile for legacy TLS transports
-	RealitySNI         string `json:"reality_sni,omitempty"`
-	RealityPrivateKey  string `json:"reality_private_key,omitempty"`
-	RealityPublicKey   string `json:"reality_public_key,omitempty"`
-	RealityShortID     string `json:"reality_short_id,omitempty"`
-	RealityFingerprint string `json:"reality_fingerprint,omitempty"`
-	Target             string `json:"target,omitempty"`
-	Token              string `json:"token"`
-	CertFile           string `json:"cert_file,omitempty"`
-	KeyFile            string `json:"key_file,omitempty"`
-	Fingerprint        string `json:"fingerprint,omitempty"`
+	Version       string `json:"version"`
+	Role          string `json:"role"`                // hub on Iran, agent on outside
+	Transport     string `json:"transport,omitempty"` // auto, adaptive, tcp_tls, websocket_tls, http2_connect, http1_connect, or http_connect_auto
+	ControlListen string `json:"control_listen,omitempty"`
+	PublicListen  string `json:"public_listen,omitempty"`
+	HubAddr       string `json:"hub_addr,omitempty"`
+	TLSServerName string `json:"tls_server_name,omitempty"`
+	Target        string `json:"target,omitempty"`
+	Token         string `json:"token"`
+	CertFile      string `json:"cert_file,omitempty"`
+	KeyFile       string `json:"key_file,omitempty"`
+	Fingerprint   string `json:"fingerprint,omitempty"`
 	// TunnelChannels controls the number of independent authenticated TCP/TLS lanes
 	// between Agent and Hub. Missing values on old configs are upgraded in memory to the current default.
 	TunnelChannels int           `json:"tunnel_channels,omitempty"`
@@ -505,7 +492,7 @@ func clientWebSocketUpgrade(conn net.Conn, host string) (net.Conn, error) {
 }
 
 func validTransportMode(mode string) bool {
-	return mode == transportAuto || mode == transportAdaptive || mode == transportTCP || mode == transportWebSocket || mode == transportHTTP2 || mode == transportHTTP1 || mode == transportHTTPConnectAuto || mode == transportReality
+	return mode == transportAuto || mode == transportAdaptive || mode == transportTCP || mode == transportWebSocket || mode == transportHTTP2 || mode == transportHTTP1 || mode == transportHTTPConnectAuto
 }
 func transportAllowed(configured, observed string) bool {
 	return configured == transportAuto || configured == transportAdaptive || configured == observed || (configured == transportHTTPConnectAuto && (observed == transportHTTP2 || observed == transportHTTP1))
@@ -1713,44 +1700,6 @@ func adjacentPortAddress(addr string) (string, error) { return offsetPortAddress
 // secondAdjacentPortAddress reserves TCP control port + 2 for HTTP/1.1 CONNECT.
 func secondAdjacentPortAddress(addr string) (string, error) { return offsetPortAddress(addr, 2) }
 
-// thirdAdjacentPortAddress reserves TCP control port + 3 for the independent REALITY listener in adaptive mode.
-func thirdAdjacentPortAddress(addr string) (string, error) { return offsetPortAddress(addr, 3) }
-
-func hubRealityAnyConfigured(c Config) bool {
-	return strings.TrimSpace(c.RealityDest) != "" || strings.TrimSpace(c.RealitySNI) != "" || strings.TrimSpace(c.RealityPrivateKey) != "" || strings.TrimSpace(c.RealityPublicKey) != "" || strings.TrimSpace(c.RealityShortID) != "" || strings.TrimSpace(c.RealityListen) != ""
-}
-func hubRealityConfigured(c Config) bool {
-	return strings.TrimSpace(c.RealityDest) != "" && strings.TrimSpace(c.RealitySNI) != "" && strings.TrimSpace(c.RealityPrivateKey) != "" && strings.TrimSpace(c.RealityPublicKey) != "" && strings.TrimSpace(c.RealityShortID) != ""
-}
-func agentRealityAnyConfigured(c Config) bool {
-	return strings.TrimSpace(c.RealitySNI) != "" || strings.TrimSpace(c.RealityPublicKey) != "" || strings.TrimSpace(c.RealityShortID) != "" || strings.TrimSpace(c.RealityAddr) != ""
-}
-func agentRealityConfigured(c Config) bool {
-	return strings.TrimSpace(c.RealitySNI) != "" && strings.TrimSpace(c.RealityPublicKey) != "" && strings.TrimSpace(c.RealityShortID) != ""
-}
-func realityHubListenAddress(c Config) (string, error) {
-	// Standalone REALITY intentionally reuses the legacy control endpoint.
-	// The override is only for a separate REALITY candidate in Adaptive mode.
-	if c.Transport == transportReality {
-		return c.ControlListen, nil
-	}
-	if strings.TrimSpace(c.RealityListen) != "" {
-		return strings.TrimSpace(c.RealityListen), nil
-	}
-	return thirdAdjacentPortAddress(c.ControlListen)
-}
-func realityAgentAddress(c Config) (string, error) {
-	// Standalone REALITY intentionally uses HubAddr; custom endpoints are for
-	// the optional additional Adaptive candidate only.
-	if c.Transport == transportReality {
-		return c.HubAddr, nil
-	}
-	if strings.TrimSpace(c.RealityAddr) != "" {
-		return strings.TrimSpace(c.RealityAddr), nil
-	}
-	return thirdAdjacentPortAddress(c.HubAddr)
-}
-
 func nextPortLabel(addr string) string {
 	out, err := adjacentPortAddress(addr)
 	if err != nil {
@@ -2039,6 +1988,8 @@ func dialHTTP2Connect(cfg Config) (net.Conn, error) {
 			sni = host
 		}
 	}
+	tlsCfg := agentTLSConfig(pin, sni)
+	tlsCfg.NextProtos = []string{"h2"}
 	ctx, cancel := context.WithCancel(context.Background())
 	pipeReader, pipeWriter := io.Pipe()
 	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "https://"+h2Addr, pipeReader)
@@ -2052,29 +2003,8 @@ func dialHTTP2Connect(cfg Config) (net.Conn, error) {
 	req.Header.Set(http2TokenHeader, cfg.Token)
 	req.Header.Set("User-Agent", "ShahTunnel/"+version)
 	req.ContentLength = -1
-	dialer := &net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
-	// Use x/net/http2.Transport explicitly: the standard net/http Transport
-	// versions supported here can otherwise fail to recognize a uTLS connection
-	// as an HTTP/2 TLS session. The adapter exposes ConnectionState and we verify
-	// the Hub certificate pin before any CONNECT headers (including the token)
-	// are sent.
-	tr := &h2transport.Transport{
-		DisableCompression: true,
-		ReadIdleTimeout:    30 * time.Second,
-		PingTimeout:        10 * time.Second,
-		DialTLSContext: func(ctx context.Context, network, addr string, tlsCfg *tls.Config) (net.Conn, error) {
-			raw, dialErr := dialer.DialContext(ctx, network, addr)
-			if dialErr != nil {
-				return nil, dialErr
-			}
-			return dialUTLSConnWithPin(raw, pin, sni, []string{"h2"}, cfg.TLSFingerprint)
-		},
-	}
-	// Match the former ResponseHeaderTimeout without placing a deadline on the
-	// long-lived CONNECT stream after its 200 response has arrived.
-	responseTimer := time.AfterFunc(12*time.Second, cancel)
+	tr := &http.Transport{TLSClientConfig: tlsCfg, ForceAttemptHTTP2: true, TLSHandshakeTimeout: 8 * time.Second, ResponseHeaderTimeout: 12 * time.Second, IdleConnTimeout: 60 * time.Second, MaxIdleConnsPerHost: 1, DisableCompression: true}
 	resp, err := tr.RoundTrip(req)
-	responseTimer.Stop()
 	if err == nil && resp == nil {
 		err = errors.New("HTTP/2 transport returned an empty response without an error")
 	}
@@ -2118,15 +2048,12 @@ func dialHTTP1Connect(cfg Config) (net.Conn, error) {
 			sni = host
 		}
 	}
+	tlsCfg := agentTLSConfig(pin, sni)
+	tlsCfg.NextProtos = []string{"http/1.1"}
 	d := net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
-	raw, err := d.Dial("tcp", h1Addr)
+	conn, err := tls.DialWithDialer(&d, "tcp", h1Addr, tlsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect HTTP/1.1 CONNECT endpoint %s: %w", h1Addr, err)
-	}
-	conn, err := dialUTLSConnWithPin(raw, pin, sni, []string{"http/1.1"}, cfg.TLSFingerprint)
-	if err != nil {
-		_ = raw.Close()
-		return nil, fmt.Errorf("TLS handshake for HTTP/1.1 CONNECT endpoint %s: %w", h1Addr, err)
 	}
 	_ = conn.SetDeadline(time.Now().Add(12 * time.Second))
 	// CONNECT uses the standard authority-form request target; after a 200
@@ -2296,22 +2223,9 @@ func acceptRetryDelay(attempt int) time.Duration {
 
 func runHub(cfg Config) error {
 	cfg = normalizeConfig(cfg)
-	var cert tls.Certificate
-	var tlsCfg *tls.Config
-	var realityCfg *reality.Config
-	var err error
-	if cfg.Transport == transportReality || (cfg.Transport == transportAdaptive && hubRealityConfigured(cfg)) {
-		realityCfg, err = makeRealityServerConfig(cfg)
-		if err != nil {
-			return fmt.Errorf("prepare REALITY server: %w", err)
-		}
-	}
-	if cfg.Transport != transportReality {
-		cert, err = tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
-		if err != nil {
-			return fmt.Errorf("load hub certificate/key: %w; run setup again", err)
-		}
-		tlsCfg = hubTLSConfig(cert)
+	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+	if err != nil {
+		return fmt.Errorf("load hub certificate/key: %w; run setup again", err)
 	}
 	control, err := net.Listen("tcp", cfg.ControlListen)
 	if err != nil {
@@ -2342,46 +2256,6 @@ func runHub(cfg Config) error {
 		cfg:           cfg,
 		sessions:      make(map[*hubSession]struct{}),
 		pendingPublic: make(chan struct{}, maxPendingPublicConnections),
-	}
-	controlSlots := make(chan struct{}, 16)
-	var realityListener net.Listener
-	if cfg.Transport == transportAdaptive && realityCfg != nil {
-		realityAddr, addrErr := realityHubListenAddress(cfg)
-		if addrErr != nil {
-			return fmt.Errorf("derive adaptive REALITY listener: %w", addrErr)
-		}
-		realityListener, err = net.Listen("tcp", realityAddr)
-		if err != nil {
-			return fmt.Errorf("listen adaptive REALITY on %s: %w (allow TCP on control port + 3)", realityAddr, err)
-		}
-		defer realityListener.Close()
-		realitySlots := make(chan struct{}, 16)
-		go func() {
-			acceptErrors := 0
-			for {
-				conn, acceptErr := realityListener.Accept()
-				if acceptErr != nil {
-					if errors.Is(acceptErr, net.ErrClosed) {
-						return
-					}
-					if isRetryableAcceptError(acceptErr) {
-						acceptErrors++
-						time.Sleep(acceptRetryDelay(acceptErrors - 1))
-						continue
-					}
-					log.Printf("adaptive REALITY listener stopped: %v", acceptErr)
-					return
-				}
-				acceptErrors = 0
-				select {
-				case realitySlots <- struct{}{}:
-					go func(c net.Conn) { defer func() { <-realitySlots }(); h.serveRealityAgent(c, realityCfg) }(conn)
-				default:
-					_ = conn.Close()
-				}
-			}
-		}()
-		log.Printf("adaptive REALITY listener enabled on TCP %s", realityAddr)
 	}
 	var h2Server *http.Server
 	if transportModeAllowsHTTP2(cfg.Transport) {
@@ -2438,9 +2312,11 @@ func runHub(cfg Config) error {
 	for _, p := range listeners {
 		go h.acceptPublic(p.listener, p.id)
 	}
-	log.Printf("HUB listening for agent on configured control port; transport=%s; public mappings=%d", cfg.Transport, len(listeners))
+	tlsCfg := hubTLSConfig(cert)
+	log.Printf("HUB listening for agent on configured control port; public mappings=%d", len(listeners))
 	// Bound concurrent unauthenticated control connections so a burst of
 	// slow handshakes cannot create an unbounded number of goroutines.
+	controlSlots := make(chan struct{}, 16)
 	acceptErrors := 0
 	for {
 		c, err := control.Accept()
@@ -2463,11 +2339,7 @@ func runHub(cfg Config) error {
 		case controlSlots <- struct{}{}:
 			go func(conn net.Conn) {
 				defer func() { <-controlSlots }()
-				if cfg.Transport == transportReality {
-					h.serveRealityAgent(conn, realityCfg)
-				} else {
-					h.serveAgent(conn, tlsCfg)
-				}
+				h.serveAgent(conn, tlsCfg)
 			}(c)
 		default:
 			_ = c.Close()
@@ -2587,13 +2459,9 @@ func validAuth(line, token string) bool { return authProtocol(line, token) != ""
 
 func runAgent(cfg Config) error {
 	cfg = normalizeConfig(cfg)
-	var pin []byte
-	if cfg.Transport != transportReality {
-		var err error
-		pin, err = normalizeFingerprint(cfg.Fingerprint)
-		if err != nil {
-			return err
-		}
+	pin, err := normalizeFingerprint(cfg.Fingerprint)
+	if err != nil {
+		return err
 	}
 	if cfg.TunnelChannels < 1 || cfg.TunnelChannels > maxTunnelChannels {
 		return fmt.Errorf("tunnel_channels must be between 1 and %d", maxTunnelChannels)
@@ -2619,7 +2487,6 @@ func runAgentWorker(cfg Config, pin []byte, channel int) {
 		if err := connectAndRunAgent(cfg, pin, channel); err != nil {
 			msg := err.Error()
 			msg = strings.ReplaceAll(msg, cfg.HubAddr, "[hub-address-redacted]")
-			msg = strings.ReplaceAll(msg, cfg.RealityAddr, "[reality-address-redacted]")
 			for _, p := range normalizeConfig(cfg).Ports {
 				msg = strings.ReplaceAll(msg, p.Target, "[target-redacted]")
 			}
@@ -2659,29 +2526,18 @@ func jitteredBackoff(base time.Duration) time.Duration {
 
 func isAdaptiveTransport(mode string) bool {
 	switch mode {
-	case transportTCP, transportWebSocket, transportHTTP2, transportHTTP1, transportReality:
+	case transportTCP, transportWebSocket, transportHTTP2, transportHTTP1:
 		return true
 	default:
 		return false
 	}
 }
 
-func adaptiveTransportCandidates(preferred string, includeReality ...bool) []string {
-	// Order implemented transports with the last successful path first. REALITY
-	// is included only when both endpoints have explicitly configured it.
+func adaptiveTransportCandidates(preferred string) []string {
+	// Order the implemented transports with the last successful path first.
 	all := []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1}
-	if len(includeReality) > 0 && includeReality[0] {
-		all = append(all, transportReality)
-	}
 	out := make([]string, 0, len(all))
-	preferredAllowed := false
-	for _, mode := range all {
-		if mode == preferred {
-			preferredAllowed = true
-			break
-		}
-	}
-	if preferredAllowed {
+	if isAdaptiveTransport(preferred) {
 		out = append(out, preferred)
 	}
 	for _, mode := range all {
@@ -2702,17 +2558,16 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 	}
 
 	preferred := transportTCP
-	includeReality := mode == transportAdaptive && agentRealityConfigured(cfg)
 	if mode == transportAdaptive {
 		if v, ok := agentPreferredTransport.Load(channel); ok {
-			if saved, ok := v.(string); ok && isAdaptiveTransport(saved) && (saved != transportReality || includeReality) {
+			if saved, ok := v.(string); ok && isAdaptiveTransport(saved) {
 				preferred = saved
 			}
 		}
 	}
 	candidates := []string{transportTCP, transportWebSocket}
 	if mode == transportAdaptive {
-		candidates = adaptiveTransportCandidates(preferred, includeReality)
+		candidates = adaptiveTransportCandidates(preferred)
 	}
 
 	// Every candidate is a real transport implementation in this build. A failed
@@ -2741,8 +2596,6 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 
 func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode string) error {
 	switch mode {
-	case transportReality:
-		return connectAndRunAgentReality(cfg, channel)
 	case transportHTTP2:
 		return connectAndRunAgentHTTP2(cfg, channel)
 	case transportHTTP1:
@@ -2757,17 +2610,12 @@ func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode s
 			sni = host
 		}
 	}
-	protos := []string(nil)
+	tlsCfg := agentTLSConfig(pin, sni)
 	if mode == transportWebSocket {
-		protos = []string{"http/1.1"}
+		tlsCfg.NextProtos = []string{"http/1.1"}
 	}
-	raw, err := d.Dial("tcp", cfg.HubAddr)
+	tlsConn, err := tls.DialWithDialer(&d, "tcp", cfg.HubAddr, tlsCfg)
 	if err != nil {
-		return err
-	}
-	tlsConn, err := dialUTLSConnWithPin(raw, pin, sni, protos, cfg.TLSFingerprint)
-	if err != nil {
-		_ = raw.Close()
 		return err
 	}
 	var c net.Conn = tlsConn
@@ -2820,22 +2668,8 @@ func normalizeConfig(c Config) Config {
 			c.Transport = transportAuto
 		}
 	}
-	c.RealitySNI = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(c.RealitySNI), "."))
-	c.RealityDest = strings.TrimSpace(c.RealityDest)
-	c.RealityShortID = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(c.RealityShortID), "0x")))
-	c.RealityFingerprint = strings.ToLower(strings.TrimSpace(c.RealityFingerprint))
-	c.TLSFingerprint = strings.ToLower(strings.TrimSpace(c.TLSFingerprint))
-	if c.Role == "agent" && c.TLSFingerprint == "" {
-		c.TLSFingerprint = "chrome"
-	}
 	// Upgrade existing Agent profiles to the current independent-lane performance profile.
 	// Each lane reconnects independently; no Hub-side config change is required.
-	if c.Role == "agent" && (c.Transport == transportReality || (c.Transport == transportAdaptive && agentRealityAnyConfigured(c))) && strings.TrimSpace(c.RealityFingerprint) == "" {
-		c.RealityFingerprint = c.TLSFingerprint
-		if c.RealityFingerprint == "" {
-			c.RealityFingerprint = "chrome"
-		}
-	}
 	if c.Role == "agent" && c.TunnelChannels < defaultTunnelChannels {
 		c.TunnelChannels = defaultTunnelChannels
 	}
@@ -2886,7 +2720,7 @@ func validateConfig(c Config) error {
 		return errors.New("role must be hub, agent, or relay")
 	}
 	if (c.Role == "hub" || c.Role == "agent") && !validTransportMode(c.Transport) {
-		return fmt.Errorf("unsupported transport %q (supported: auto, adaptive, tcp_tls, websocket_tls, http2_connect, http1_connect, http_connect_auto, reality)", c.Transport)
+		return fmt.Errorf("unsupported transport %q (supported: auto, adaptive, tcp_tls, websocket_tls, http2_connect, http1_connect, http_connect_auto)", c.Transport)
 	}
 	if c.Role == "agent" && (c.TunnelChannels < 1 || c.TunnelChannels > maxTunnelChannels) {
 		return fmt.Errorf("tunnel_channels must be between 1 and %d", maxTunnelChannels)
@@ -2902,42 +2736,8 @@ func validateConfig(c Config) error {
 		if err := validateTCPAddress("control listener", c.ControlListen); err != nil {
 			return err
 		}
-		if c.Transport != transportReality && (c.CertFile == "" || c.KeyFile == "") {
-			return errors.New("cert_file/key_file required for hub when REALITY transport is not selected")
-		}
-		realityRequested := c.Transport == transportReality || (c.Transport == transportAdaptive && hubRealityAnyConfigured(c))
-		if realityRequested {
-			if !hubRealityConfigured(c) {
-				return errors.New("REALITY in adaptive mode requires reality_dest, reality_sni, reality_private_key, reality_public_key and reality_short_id together")
-			}
-			if err := validateTCPAddress("REALITY dest", c.RealityDest); err != nil {
-				return err
-			}
-			if !validTLSServerName(c.RealitySNI) {
-				return errors.New("reality_sni must be a valid DNS hostname")
-			}
-			if err := validateRealityKeyPair(c.RealityPrivateKey, c.RealityPublicKey); err != nil {
-				return fmt.Errorf("invalid REALITY key pair: %w", err)
-			}
-			if _, err := normalizeRealityShortID(c.RealityShortID); err != nil {
-				return fmt.Errorf("invalid reality_short_id: %w", err)
-			}
-			if c.Transport == transportAdaptive {
-				addr, err := realityHubListenAddress(c)
-				if err != nil {
-					return err
-				}
-				if err := validateTCPAddress("REALITY listener", addr); err != nil {
-					return err
-				}
-				_, rportText, _ := net.SplitHostPort(addr)
-				rport, _ := strconv.Atoi(rportText)
-				_, ctrlText, _ := net.SplitHostPort(c.ControlListen)
-				ctrlPort, _ := strconv.Atoi(ctrlText)
-				if rport == ctrlPort {
-					return errors.New("adaptive REALITY listener must use a separate port (default: control port + 3)")
-				}
-			}
+		if c.CertFile == "" || c.KeyFile == "" {
+			return errors.New("cert_file/key_file required for hub")
 		}
 		if transportModeAllowsHTTP2(c.Transport) {
 			if _, err := adjacentPortAddress(c.ControlListen); err != nil {
@@ -2963,18 +2763,6 @@ func validateConfig(c Config) error {
 			_, pText, _ := net.SplitHostPort(h1Addr)
 			p, _ := strconv.Atoi(pText)
 			reservedPorts[p] = true
-		}
-		if c.Transport == transportAdaptive && hubRealityConfigured(c) {
-			realityAddr, err := realityHubListenAddress(c)
-			if err != nil {
-				return err
-			}
-			_, rpText, _ := net.SplitHostPort(realityAddr)
-			rp, _ := strconv.Atoi(rpText)
-			if reservedPorts[rp] {
-				return fmt.Errorf("REALITY listener %s collides with a reserved transport port", rpText)
-			}
-			reservedPorts[rp] = true
 		}
 		for _, p := range c.Ports {
 			if !validMappingID(p.ID) {
@@ -3004,41 +2792,6 @@ func validateConfig(c Config) error {
 		if c.TLSServerName != "" && !validTLSServerName(c.TLSServerName) {
 			return errors.New("tls_server_name must be a DNS hostname (no URL, port, IP, or whitespace)")
 		}
-		realityRequested := c.Transport == transportReality || (c.Transport == transportAdaptive && agentRealityAnyConfigured(c))
-		if c.Transport != transportReality {
-			if _, err := normalizeFingerprint(c.Fingerprint); err != nil {
-				return err
-			}
-			if _, err := clientHelloIDForLegacy(c.TLSFingerprint); err != nil {
-				return err
-			}
-		}
-		if realityRequested {
-			if !agentRealityConfigured(c) {
-				return errors.New("REALITY in adaptive mode requires reality_sni, reality_public_key and reality_short_id together")
-			}
-			if !validTLSServerName(c.RealitySNI) {
-				return errors.New("reality_sni must be a valid DNS hostname")
-			}
-			if _, err := decodeRealityKey(c.RealityPublicKey, 32); err != nil {
-				return fmt.Errorf("invalid reality_public_key: %w", err)
-			}
-			if _, err := normalizeRealityShortID(c.RealityShortID); err != nil {
-				return fmt.Errorf("invalid reality_short_id: %w", err)
-			}
-			if _, err := realityClientHelloID(c.RealityFingerprint); err != nil {
-				return err
-			}
-			if c.RealityAddr != "" {
-				if err := validateTCPAddress("REALITY Hub address", c.RealityAddr); err != nil {
-					return err
-				}
-			} else if c.Transport == transportAdaptive {
-				if _, err := offsetPortAddress(c.HubAddr, 3); err != nil {
-					return fmt.Errorf("derive REALITY address: %w", err)
-				}
-			}
-		}
 		for _, p := range c.Ports {
 			if !validMappingID(p.ID) {
 				return fmt.Errorf("invalid mapping id %q (use letters, numbers, - or _)", p.ID)
@@ -3050,6 +2803,9 @@ func validateConfig(c Config) error {
 			if err := validateTCPAddress("target for mapping "+p.ID, p.Target); err != nil {
 				return err
 			}
+		}
+		if _, err := normalizeFingerprint(c.Fingerprint); err != nil {
+			return err
 		}
 	} else {
 		for _, p := range c.Ports {
@@ -3299,8 +3055,8 @@ var shahTunnelRouteArt = func() []string {
 		"  ╭" + strings.Repeat("─", shahTunnelRouteWidth) + "╮",
 		line("NETWORK ROUTE  /  TCP FORWARDING"),
 		line("CLIENT ── TCP ──▶ HUB ═ TLS 1.3 + TOKEN AUTH ═▶ AGENT"),
-		line("PATHS: TCP/TLS | WS/TLS | H2 | H1 | REALITY"),
-		line("OPTION 7: ADAPTIVE FAILOVER ACROSS 5 PATHS"),
+		line("PATHS: TCP/TLS | WS/TLS | H2 CONNECT | H1 CONNECT"),
+		line("OPTION 7: ADAPTIVE FAILOVER ACROSS 4 PATHS"),
 		line("CERT PINNING • TOKEN AUTH • TLS 1.3"),
 		"  ╰" + strings.Repeat("─", shahTunnelRouteWidth) + "╯",
 	}
@@ -3443,37 +3199,6 @@ func wizardAsk(prompt, def string) string {
 	return readAnswer(def)
 }
 
-// wizardAskRealitySNI offers the supported cover hostnames as explicit choices.
-// ShahTunnel uses one REALITY SNI per Hub/Agent configuration; both sides must
-// select the same exact hostname. The Hub's fallback destination should serve
-// a valid TLS certificate for that hostname.
-func wizardAskRealitySNI(prompt string) string {
-	fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "REALITY SNI HOST OPTIONS"))
-	fmt.Printf("  %s\n", paint(ansiGreen, "1) www.microsoft.com"))
-	fmt.Printf("  %s\n", paint(ansiGreen, "2) www.apple.com"))
-	fmt.Printf("  %s\n", paint(ansiGreen, "3) www.amazon.com"))
-	fmt.Printf("  %s\n", paint(ansiGreen, "4) www.bing.com"))
-	fmt.Printf("  %s\n", paint(ansiGreen, "5) www.yahoo.com"))
-	fmt.Printf("  %s\n", paint(ansiYellow, "Select exactly the same number on Hub and Agent."))
-	for {
-		choice := strings.TrimSpace(wizardAsk(prompt+" (1-5)", "1"))
-		switch choice {
-		case "1":
-			return "www.microsoft.com"
-		case "2":
-			return "www.apple.com"
-		case "3":
-			return "www.amazon.com"
-		case "4":
-			return "www.bing.com"
-		case "5":
-			return "www.yahoo.com"
-		default:
-			uiWarn("Invalid SNI choice; enter a number from 1 to 5.")
-		}
-	}
-}
-
 func wizardAskTransport(prompt string) (string, error) {
 	fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "OUTER TUNNEL TRANSPORT"))
 	fmt.Printf("  %s\n", paint(ansiGreen, "1) TCP/TLS — implemented"))
@@ -3483,8 +3208,7 @@ func wizardAskTransport(prompt string) (string, error) {
 	fmt.Printf("  %s\n", paint(ansiGreen, "5) HTTP CONNECT fallback — HTTP/2, then HTTP/1.1"))
 	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
 	fmt.Printf("  %s\n", paint(ansiPinkGlow, "7) FULL ADAPTIVE FAILOVER — all 4 implemented transports"))
-	fmt.Printf("  %s\n", paint(ansiGreen, "8) REALITY — TLS 1.3 authenticated cover transport with real-site fallback"))
-	choice := wizardAsk(prompt+" (1-8)", "7")
+	choice := wizardAsk(prompt+" (1-7)", "7")
 	switch choice {
 	case "1":
 		return transportTCP, nil
@@ -3500,10 +3224,8 @@ func wizardAskTransport(prompt string) (string, error) {
 		return transportAuto, nil
 	case "7":
 		return transportAdaptive, nil
-	case "8":
-		return transportReality, nil
 	default:
-		return "", errors.New("invalid transport selection; enter a number from 1 to 8")
+		return "", errors.New("invalid transport selection; enter a number from 1 to 7")
 	}
 }
 
@@ -3619,34 +3341,8 @@ func setup() error {
 		if err != nil {
 			return err
 		}
-		uiInfo("Allow TCP on the control port, control+1 for HTTP/2 CONNECT, control+2 for HTTP/1.1 CONNECT, and control+3 for adaptive REALITY when enabled.")
-		wantReality := c.Transport == transportReality
-		if c.Transport == transportAdaptive {
-			wantReality = wizardYesNo("Enable REALITY as an Adaptive candidate? (Y/n)", "y")
-		}
-		if wantReality {
-			c.RealitySNI = wizardAskRealitySNI("Choose the Hub REALITY SNI host")
-			c.RealityDest = wizardAsk("REALITY fallback destination host:port (must serve the chosen SNI; default matches it)", c.RealitySNI+":443")
-			priv, pub, keyErr := generateRealityKeyPair()
-			if keyErr != nil {
-				return keyErr
-			}
-			c.RealityPrivateKey, c.RealityPublicKey = priv, pub
-			c.RealityShortID, err = randomHex(8)
-			if err != nil {
-				return err
-			}
-			if c.Transport == transportAdaptive {
-				defaultRealityListen, addrErr := thirdAdjacentPortAddress(c.ControlListen)
-				if addrErr != nil {
-					return addrErr
-				}
-				c.RealityListen = wizardAsk("Dedicated REALITY listener address (default control port + 3)", defaultRealityListen)
-			}
-		}
-		if c.Transport != transportReality {
-			c.CertFile, c.KeyFile = "/etc/ravanreverse/hub.crt", "/etc/ravanreverse/hub.key"
-		}
+		uiInfo("Allow TCP on the control port, control+1 for HTTP/2 CONNECT, and control+2 for HTTP/1.1 CONNECT as selected. Select the same transport policy on both endpoints.")
+		c.CertFile, c.KeyFile = "/etc/ravanreverse/hub.crt", "/etc/ravanreverse/hub.key"
 		for i := 1; i <= 100; i++ {
 			defID := "main"
 			if i > 1 {
@@ -3669,13 +3365,11 @@ func setup() error {
 		if err = validateConfig(c); err != nil {
 			return err
 		}
-		if c.Transport != transportReality {
-			fp, e := generateCertificate(c.CertFile, c.KeyFile)
-			if e != nil {
-				return e
-			}
-			c.Fingerprint = fp
+		fp, e := generateCertificate(c.CertFile, c.KeyFile)
+		if e != nil {
+			return e
 		}
+		c.Fingerprint = fp
 		if err = saveConfig(c); err != nil {
 			return err
 		}
@@ -3686,44 +3380,23 @@ func setup() error {
 		uiCard("🔐 AGENT TOKEN", []uiCardRow{
 			{Text: c.Token, Color: ansiYellow + ansiBold},
 		}, ansiYellow)
-		if c.Transport != transportReality {
-			uiCard("🛡️ LEGACY TLS CERTIFICATE PIN (SHA-256)", []uiCardRow{
-				{Text: c.Fingerprint, Color: ansiCyan + ansiBold},
-			}, ansiCyan)
-		}
-		if c.Transport == transportReality || (c.Transport == transportAdaptive && hubRealityConfigured(c)) {
-			uiCard("🛡️ REALITY CLIENT PARAMETERS", []uiCardRow{
-				{Text: "Public key: " + c.RealityPublicKey, Color: ansiCyan + ansiBold},
-				{Text: "Short ID: " + c.RealityShortID, Color: ansiYellow + ansiBold},
-				{Text: "SNI: " + c.RealitySNI, Color: ansiDim},
-				{Text: "Dest: " + c.RealityDest, Color: ansiDim},
-			}, ansiCyan)
-		}
-		controlRows := []uiCardRow{{Text: "Control listener: " + portOf(c.ControlListen) + "/TCP", Color: ansiPurple + ansiBold}}
-		if c.Transport == transportAdaptive && hubRealityConfigured(c) {
-			realityAddr, _ := realityHubListenAddress(c)
-			controlRows = append(controlRows, uiCardRow{Text: "Adaptive REALITY: " + portOf(realityAddr) + "/TCP (control + 3 by default)", Color: ansiGreen + ansiBold})
-		}
-		if transportModeAllowsHTTP2(c.Transport) {
-			controlRows = append(controlRows, uiCardRow{Text: "HTTP/2 CONNECT: " + nextPortLabel(c.ControlListen) + "/TCP", Color: ansiBlue + ansiBold})
-		}
-		if transportModeAllowsHTTP1(c.Transport) {
-			controlRows = append(controlRows, uiCardRow{Text: "HTTP/1.1 CONNECT: " + secondNextPortLabel(c.ControlListen) + "/TCP", Color: ansiBlue + ansiBold})
-		}
-		uiCard("🔌 CONTROL PORTS", controlRows, ansiPinkGlow)
+		uiCard("🛡️ CERTIFICATE SHA-256 FINGERPRINT", []uiCardRow{
+			{Text: c.Fingerprint, Color: ansiCyan + ansiBold},
+		}, ansiCyan)
+		uiCard("🔌 CONTROL PORTS", []uiCardRow{
+			{Text: "TCP/TLS + WebSocket/TLS: " + portOf(c.ControlListen), Color: ansiPurple + ansiBold},
+			{Text: "HTTP/2 CONNECT: " + nextPortLabel(c.ControlListen) + " (TCP)", Color: ansiBlue + ansiBold},
+			{Text: "HTTP/1.1 CONNECT: " + secondNextPortLabel(c.ControlListen) + " (TCP)", Color: ansiBlue + ansiBold},
+		}, ansiPinkGlow)
 		mappingRows := make([]uiCardRow, 0, len(c.Ports))
 		for _, p := range c.Ports {
 			mappingRows = append(mappingRows, uiCardRow{Text: fmt.Sprintf("ID=%s   LISTEN=%s", p.ID, p.Listen), Color: ansiCyan})
 		}
 		uiCard("🌐 PUBLIC PORT MAPPINGS", mappingRows, ansiBlue)
-		securityRows := []uiCardRow{{Text: "Keep the token secret; enter it only on the Agent.", Color: ansiYellow + ansiBold}}
-		if c.Transport != transportReality {
-			securityRows = append(securityRows, uiCardRow{Text: "Copy the exact legacy TLS certificate fingerprint into the Agent setup.", Color: ansiDim})
-		}
-		if c.Transport == transportReality || (c.Transport == transportAdaptive && hubRealityConfigured(c)) {
-			securityRows = append(securityRows, uiCardRow{Text: "Share only the REALITY public key and short ID with the Agent; never share the private key.", Color: ansiDim})
-		}
-		uiCard("⚠️ SECURITY REMINDER", securityRows, ansiYellow)
+		uiCard("⚠️ SECURITY REMINDER", []uiCardRow{
+			{Text: "Keep the token secret; enter it only on the Agent.", Color: ansiYellow + ansiBold},
+			{Text: "Copy the exact certificate fingerprint into the Agent setup.", Color: ansiDim},
+		}, ansiYellow)
 	case "2", "agent", "outside":
 		c.Role = "agent"
 		c.TunnelChannels = defaultTunnelChannels
@@ -3738,33 +3411,9 @@ func setup() error {
 		if transportModeAllowsHTTP1(c.Transport) {
 			uiInfo("HTTP/1.1 CONNECT uses TCP port " + secondNextPortLabel(c.HubAddr) + ". Open it in the Hub firewall if selected.")
 		}
-		wantReality := c.Transport == transportReality
-		if c.Transport == transportAdaptive {
-			wantReality = wizardYesNo("Include REALITY in Adaptive candidates? (Y/n)", "y")
-		}
-		if wantReality {
-			c.RealitySNI = wizardAskRealitySNI("Choose the SAME REALITY SNI host selected on Hub")
-			c.RealityPublicKey = wizardAsk("REALITY public key shown by the Hub", "")
-			c.RealityShortID = wizardAsk("REALITY short ID shown by the Hub", "")
-			c.RealityFingerprint = strings.ToLower(wizardAsk("REALITY ClientHello fingerprint (chrome/firefox/edge/randomized)", "chrome"))
-			if c.Transport == transportAdaptive {
-				defaultRealityAddr, addrErr := thirdAdjacentPortAddress(c.HubAddr)
-				if addrErr != nil {
-					return addrErr
-				}
-				c.RealityAddr = wizardAsk("Hub REALITY endpoint address (default control port + 3)", defaultRealityAddr)
-			}
-		}
-		if c.Transport != transportReality {
-			c.TLSServerName = wizardAsk("Optional legacy TLS SNI hostname on a domain you control (leave blank to derive from Hub hostname)", "")
-		}
+		c.TLSServerName = wizardAsk("Optional TLS SNI hostname on a domain you control (leave blank to derive from Hub hostname)", "")
 		c.Token = wizardAsk("Token shown on the Iran Hub", "")
-		if c.Transport != transportReality {
-			c.Fingerprint = wizardAsk("Hub certificate SHA-256 fingerprint", "")
-		}
-		if c.Transport != transportReality {
-			c.TLSFingerprint = strings.ToLower(wizardAsk("Legacy TLS ClientHello profile (chrome/firefox/edge/randomized)", "chrome"))
-		}
+		c.Fingerprint = wizardAsk("Hub certificate SHA-256 fingerprint", "")
 		for i := 1; i <= 100; i++ {
 			defID := "main"
 			if i > 1 {
@@ -3785,19 +3434,12 @@ func setup() error {
 			}
 		}
 		c = normalizeConfig(c)
-		if err = validateConfig(c); err != nil {
-			return err
-		}
 		if err = saveConfig(c); err != nil {
 			return err
 		}
 		_ = os.Remove("/etc/ravanreverse/hub.key")
 		_ = os.Remove("/etc/ravanreverse/hub.crt")
-		if c.Transport == transportReality || (c.Transport == transportAdaptive && agentRealityConfigured(c)) {
-			uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; REALITY SNI=%s; REALITY ClientHello=%s; legacy TLS ClientHello=%s.", c.TunnelChannels, c.RealitySNI, c.RealityFingerprint, c.TLSFingerprint))
-		} else {
-			uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s; legacy TLS ClientHello=%s.", c.TunnelChannels, c.Transport, c.TLSFingerprint))
-		}
+		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s. Option 7 covers TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT, and HTTP/1.1 CONNECT.", c.TunnelChannels, c.Transport))
 		uiSuccess("Agent configuration saved. Reconnection is automatic if a lane drops.")
 	case "3", "relay", "front":
 		c.Role = "relay"
@@ -3820,9 +3462,6 @@ func setup() error {
 			}
 		}
 		c = normalizeConfig(c)
-		if err = validateConfig(c); err != nil {
-			return err
-		}
 		if err = saveConfig(c); err != nil {
 			return err
 		}
