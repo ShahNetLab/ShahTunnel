@@ -641,8 +641,23 @@ build_from_official_go_toolchain() {
   else
     echo "Using ShahTunnel source from the local project directory: ${source_dir}" >&2
   fi
-  [[ -s "$source_dir/go.mod" && -s "$source_dir/S1T-CAPSULE/main.go" ]] \
+  [[ -s "$source_dir/go.mod" && -s "$source_dir/S1T-CAPSULE/main.go" && \
+     -s "$source_dir/S1T-CAPSULE/reality_transport.go" && \
+     -s "$source_dir/S1T-CAPSULE/main_test.go" ]] \
     || { echo "The selected directory does not contain the expected ShahTunnel source files." >&2; return 1; }
+
+  # Fail closed if an old GitHub main archive is used. The v1.7.1 REALITY EOF
+  # repair requires a pinned Chrome 133 ClientHello and explicit key-share checks.
+  if ! grep -Fq 'return utls.HelloChrome_133, nil' "$source_dir/S1T-CAPSULE/reality_transport.go" || \
+     ! grep -Fq 'if keyShares.MlkemEcdhe == nil' "$source_dir/S1T-CAPSULE/reality_transport.go" || \
+     ! grep -Fq 'if keyShares.Ecdhe == nil' "$source_dir/S1T-CAPSULE/reality_transport.go" || \
+     ! grep -Fq 'TestRealityChromeProfileOffersRequiredKeyShares' "$source_dir/S1T-CAPSULE/main_test.go"; then
+    echo "ERROR: refusing to install an unpatched REALITY source tree." >&2
+    echo "The current ShahTunnel source must pin HelloChrome_133 and validate both the hybrid and standalone X25519 key shares." >&2
+    echo "Upload the contents of the REALITY repair package to the GitHub repository root, or run fix_shah_reality.sh from the extracted package." >&2
+    return 1
+  fi
+
   if ! grep -Fq "module github.com/${OWNER}/${REPO}" "$source_dir/go.mod"; then
     echo "The source module path does not match github.com/${OWNER}/${REPO}; refusing to build." >&2
     return 1
