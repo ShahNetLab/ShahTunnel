@@ -2,11 +2,12 @@
 set -Eeuo pipefail
 # Shah Tunnel 1.7.1 installer.
 # Downloads the pinned Go toolchain, verifies its SHA-256, fetches the source,
-# and builds the binary on the target server. No GitHub Release binary is used.
+# and builds the binary on the target server. Go 1.27.3 is required by the pinned
+# github.com/xtls/reality dependency (minimum Go 1.27). No GitHub Release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
 VERSION="1.7.1"
-GO_VERSION="1.26.1"
+GO_VERSION="1.27.3"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
 STATE_DIR="/usr/local/lib/shah-tunnel"
@@ -352,8 +353,8 @@ verify_binary() {
 }
 official_go_sha256() {
   case "$TARGET_ARCH" in
-    amd64) printf '%s' '031f088e5d955bab8657ede27ad4e3bc5b7c1ba281f05f245bcc304f327c987a' ;;
-    arm64) printf '%s' 'a290581cfe4fe28ddd737dde3095f3dbeb7f2e4065cab4eae44dfc53b760c2f7' ;;
+    amd64) printf '%s' '65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40' ;;
+    arm64) printf '%s' 'a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49' ;;
     *) return 1 ;;
   esac
 }

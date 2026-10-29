@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# Local verification helper. It reuses an existing Go 1.26.1 toolchain and never downloads one.
+# Local verification helper. It reuses an existing Go 1.27.3 toolchain and never downloads one.
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-GO_VERSION="1.26.1"
+GO_VERSION="1.27.3"
 GO_HOME="$ROOT/.toolchains/go${GO_VERSION}"
+case "$(uname -m)" in
+  x86_64|amd64) VERIFY_ARCH="amd64" ;;
+  aarch64|arm64) VERIFY_ARCH="arm64" ;;
+  *) echo "Unsupported architecture for pinned Go verification: $(uname -m)" >&2; exit 1 ;;
+esac
 GO_BIN=""
 
 fail() { printf '\n[FAIL] %s\n' "$*" >&2; exit 1; }
@@ -18,8 +23,8 @@ version_is_pinned() {
   [[ "$v" == *"go${GO_VERSION}"* ]]
 }
 
-# Reuse only an exact Go 1.26.1 binary. An older/newer system toolchain is not used.
-for candidate in "$GO_HOME/bin/go" "/usr/local/lib/shah-tunnel/go-${GO_VERSION}/bin/go" "$(command -v go 2>/dev/null || true)"; do
+# Reuse only an exact Go 1.27.3 binary. An older/newer system toolchain is not used.
+for candidate in "$GO_HOME/bin/go" "/usr/local/lib/shah-tunnel/toolchains/go${GO_VERSION}-${VERIFY_ARCH}/bin/go" "/usr/local/lib/shah-tunnel/go-${GO_VERSION}/bin/go" "$(command -v go 2>/dev/null || true)"; do
   if [[ -n "$candidate" ]] && version_is_pinned "$candidate"; then
     GO_BIN="$candidate"
     break

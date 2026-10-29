@@ -1,6 +1,6 @@
 module github.com/ShahNetLab/ShahTunnel
 
-go 1.26.1
+go 1.27.0
 
 require (
 	github.com/refraction-networking/utls v1.8.2
