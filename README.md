@@ -45,6 +45,12 @@ If the Hub control port is `9443`:
 
 Open only the ports needed by the selected mode. REALITY uses TCP on the control port; the control+1 and control+2 ports are not needed for this mode. In Adaptive mode, optional REALITY listens on control port + 3 by default (for example, `9446/TCP` when control is `9443`). Override it with `reality_listen` on Hub and `reality_addr` on Agent. The standalone REALITY mode (option 8) continues to use the control address itself.
 
+## Choosing one REALITY SNI host
+
+The setup wizard offers these cover-host choices: `www.microsoft.com`, `www.apple.com`, `www.amazon.com`, `www.bing.com`, and `www.yahoo.com`. Select exactly one host and select the same host on both Hub and Agent. The Hub fallback destination defaults to the selected hostname on port 443 so that the TLS certificate can match the client SNI. Do not configure these five hostnames as simultaneous/random values: this version accepts one `reality_sni` per configuration.
+
+To change the SNI on an existing installation without rebuilding the binary, run `S1T-SNI-SELECT.sh` on each server and select the same number. On the Hub it verifies a valid TLS 1.3 connection to the selected host before changing the config. It backs up `/etc/ravanreverse/config.json` and restarts `ravanreverse`. This change can resolve a mismatch between SNI and the fallback destination, but it does not by itself prove that every REALITY `handshake EOF` issue is fixed; keys, short ID, ClientHello fingerprint, and implementation compatibility still matter.
+
 ## REALITY setup (option 8 or optional Adaptive path)
 
 Configure the Hub with option 8 first. It generates an X25519 private/public key pair; enter only the public key, Short ID, and SNI on the Agent. **The private key stays on the Hub.** The control port (default `9443/TCP`) must be reachable from the Agent.
