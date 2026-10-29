@@ -3,19 +3,19 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>v1.6.2 · Secure Reverse TCP Relay · Adaptive Transport Failover</strong></p>
+<p align="center"><strong>v1.7.1 · Secure Reverse TCP Relay · Adaptive REALITY + uTLS</strong></p>
 <p align="center">A reverse TCP relay with an authenticated TLS 1.3 Hub↔Agent channel, certificate pinning, independent lanes and automatic transport recovery.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
 ## Network flow
 
 <p align="center">
-  <img src="docs/img/ShahTunnel-Network-Flow-v1.6.2.png" alt="Shah Tunnel network flow: Client, Hub, private link, Agent and target with four implemented transport paths" width="100%" />
+  <img src="docs/img/ShahTunnel-Network-Flow-v1.7.1.png" alt="ShahTunnel v1.7.1 network flow, with TCP TLS, WebSocket, HTTP CONNECT and optional adaptive REALITY on a separate listener" width="100%" />
 </p>
 
 ## Features
 
-- **Four implemented transports:** TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT and HTTP/1.1 CONNECT/TLS.
+- **Four legacy transports plus REALITY:** TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT, HTTP/1.1 CONNECT/TLS, and an optional independent REALITY transport.
 - **Automatic recovery:** reconnect with jittered backoff and adaptive selection of the last successful transport per lane.
 - **Security:** TLS 1.3 for the private Hub↔Agent channel, token authentication and SHA-256 certificate pinning.
 - **Concurrency:** twelve independent lanes by default, bounded queues and load-aware session selection.
@@ -33,7 +33,7 @@ Choose the same transport or strategy on both Hub and Agent.
 | `4` | HTTP/1.1 CONNECT/TLS | CONNECT stream over TLS on control port + 2. |
 | `5` | HTTP CONNECT fallback | Tries HTTP/2 CONNECT, then HTTP/1.1 CONNECT if setup fails. |
 | `6` | Automatic fallback | TCP/TLS, then WebSocket/TLS. |
-| `7` | Full adaptive failover | Tries all four implemented transports and remembers the last successful authenticated transport per lane. |
+| `7` | Full adaptive failover | Tries the four legacy transports and, when configured on both endpoints, REALITY on a separate listener; remembers the last successful authenticated transport per lane. |
 
 ### Hub firewall ports
 
@@ -43,7 +43,17 @@ If the Hub control port is `9443`:
 - `9444/TCP`: HTTP/2 CONNECT (options 3, 5 and 7).
 - `9445/TCP`: HTTP/1.1 CONNECT (options 4, 5 and 7).
 
-Open only the ports needed by the selected mode. All four transports in this version use TCP.
+Open only the ports needed by the selected mode. REALITY uses TCP on the control port; the control+1 and control+2 ports are not needed for this mode. In Adaptive mode, optional REALITY listens on control port + 3 by default (for example, `9446/TCP` when control is `9443`). Override it with `reality_listen` on Hub and `reality_addr` on Agent. The standalone REALITY mode (option 8) continues to use the control address itself.
+
+## REALITY setup (option 8 or optional Adaptive path)
+
+Configure the Hub with option 8 first. It generates an X25519 private/public key pair; enter only the public key, Short ID, and SNI on the Agent. **The private key stays on the Hub.** The control port (default `9443/TCP`) must be reachable from the Agent.
+
+`reality_sni` is the TLS hostname; `reality_dest` is the target in `host:port` form. For example, use your real cover-site hostname as `reality_sni` and the origin IP that serves it as `reality_dest` (`host:port`); the destination may differ from the SNI hostname only when that origin actually serves the selected name and you are authorized to use it. The destination must be reachable from the Hub and compatible with the chosen SNI; an invalid destination can break fallback handshakes. Unauthenticated TLS attempts are intentionally forwarded to this single fixed destination so probes receive its real response; this consumes outbound bandwidth and behaves like a fixed-target TCP proxy, so choose the destination deliberately.
+
+The Agent uses uTLS with `chrome`, `firefox`, `edge`, or `randomized` ClientHello profiles. The REALITY public key and Short ID authenticate this mode; the SHA-256 certificate fingerprint used by legacy transports is not used here. ShahTunnel's token authentication remains required after a successful REALITY handshake.
+
+> Scope of this release: Adaptive selection now includes REALITY when its settings exist on both sides. Agent-side uTLS profiles are also used for legacy TLS transports while certificate SHA-256 pinning is retained. QUIC/HTTP3, true simultaneous multipath, and configurable traffic padding/morphing are not included. Adaptive failover is sequential per lane and does not migrate an already-open TCP stream to another transport; the lane reconnects through its next candidate.
 
 ## Responsible use and privacy
 
@@ -61,11 +71,11 @@ Run as root on Linux amd64 or arm64 with systemd and HTTPS access to the officia
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 ```
 
-The installer downloads the Go `1.26.1` toolchain, trying regional mirrors first and then official distribution hosts. If a transfer is interrupted, it retains a separate partial file per mirror and resumes only from that same mirror with HTTP Range where supported. This avoids mixing partial responses from different hosts. It verifies the pinned SHA-256 checksum before using the archive; unverified archives are never accepted. The installer then downloads the source archive from the `main` branch of this repository and compiles `S1T-CAPSULE` locally for the server architecture with CGO disabled. It does not use GitHub Release assets or install the Go toolchain permanently. The built binary's application version and target architecture are checked before installation. An existing binary is backed up before replacement, and an already-active service is not restarted during installation to avoid dropping live tunnel sessions.
+The installer downloads the Go `1.26.1` toolchain, trying regional mirrors first and then official distribution hosts. If a transfer is interrupted, it retains a separate partial file per mirror and resumes only from that same mirror with HTTP Range where supported. This avoids mixing partial responses from different hosts. It verifies the pinned SHA-256 checksum before using the archive; unverified archives are never accepted. When launched from an extracted or cloned project directory, the installer builds that local source; when launched remotely with `bash <(curl ...)`, it downloads the source archive from this repository's `main` branch. It then compiles `S1T-CAPSULE` locally for the server architecture with CGO disabled. It does not use GitHub Release assets or install the Go toolchain permanently. The built binary's application version and target architecture are checked before installation. An existing binary is backed up before replacement, and an already-active service is not restarted during installation to avoid dropping live tunnel sessions.
 
 ## Build and tests
 
-The verification helper requires Go 1.26.1 to already be installed locally; it will not download a toolchain. From the repository root:
+The module directive and installer are aligned on Go 1.26.1. The verification helper requires Go 1.26.1 to already be installed locally; it will not download a toolchain. From the repository root:
 
 ```bash
 ./VERIFY-ALL-TRANSPORTS.sh
@@ -74,7 +84,8 @@ The verification helper requires Go 1.26.1 to already be installed locally; it w
 Or run the main checks directly:
 
 ```bash
-gofmt -w S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go
+gofmt -w S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go S1T-CAPSULE/reality_transport.go
+go mod tidy
 go test -race -count=20 ./S1T-CAPSULE
 go vet ./S1T-CAPSULE
 mkdir -p dist

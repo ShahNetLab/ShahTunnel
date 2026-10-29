@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 1.6.2 installer.
+# Shah Tunnel 1.7.1 installer.
 # Downloads the pinned Go toolchain, verifies its SHA-256, fetches the source,
 # and builds the binary on the target server. No GitHub Release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="1.6.2"
+VERSION="1.7.1"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -362,6 +362,8 @@ build_project_binary() {
   local go_bin="$1" source_dir="$2" go_root="$3"
   (
     cd "$source_dir"
+    # Dependency resolution and checksum verification are completed before the
+    # source fingerprint/cache lookup; compilation itself runs with GOPROXY off.
     env GOROOT="$go_root" GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off \
       GOCACHE="${GO_CACHE_DIR}/build-cache-${GO_VERSION}-${TARGET_ARCH}" \
       CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_ARCH" \
@@ -370,12 +372,17 @@ build_project_binary() {
   )
 }
 build_from_official_go_toolchain() {
-  local go_archive go_sha source_url go_bin go_root source_dir expected_go url downloaded
+  local go_archive go_sha source_url go_bin go_root source_dir expected_go url downloaded script_root
   go_archive="go${GO_VERSION}.linux-${TARGET_ARCH}.tar.gz"
   go_sha="$(official_go_sha256)"
   source_url="https://codeload.github.com/${OWNER}/${REPO}/tar.gz/refs/heads/main"
   expected_go="go version go${GO_VERSION} linux/${TARGET_ARCH}"
-  source_dir="$TMP/source"
+  script_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -s "$script_root/go.mod" && -s "$script_root/S1T-CAPSULE/main.go" ]]; then
+    source_dir="$script_root"
+  else
+    source_dir="$TMP/source"
+  fi
   go_bin=""
   go_root=""
 
@@ -495,21 +502,35 @@ build_from_official_go_toolchain() {
     go_bin="$go_root/bin/go"
   fi
 
-  echo "Downloading ShahTunnel source from ${OWNER}/${REPO} (main branch)..." >&2
-  if ! curl_download "$source_url" "$TMP/shah-tunnel-source.tar.gz" \
-      --retry 2 --retry-delay 1 --connect-timeout 12 --max-time 180; then
-    echo "Could not download the source archive from ${source_url}." >&2
-    return 1
-  fi
-  mkdir -p "$source_dir"
-  if ! tar -xzf "$TMP/shah-tunnel-source.tar.gz" -C "$source_dir" --strip-components=1; then
-    echo "Could not extract the ShahTunnel source archive." >&2
-    return 1
+  if [[ "$source_dir" == "$TMP/source" ]]; then
+    echo "Downloading ShahTunnel source from ${OWNER}/${REPO} (main branch)..." >&2
+    if ! curl_download "$source_url" "$TMP/shah-tunnel-source.tar.gz" \
+        --retry 2 --retry-delay 1 --connect-timeout 12 --max-time 180; then
+      echo "Could not download the source archive from ${source_url}." >&2
+      return 1
+    fi
+    mkdir -p "$source_dir"
+    if ! tar -xzf "$TMP/shah-tunnel-source.tar.gz" -C "$source_dir" --strip-components=1; then
+      echo "Could not extract the ShahTunnel source archive." >&2
+      return 1
+    fi
+  else
+    echo "Using ShahTunnel source from the local project directory: ${source_dir}" >&2
   fi
   [[ -s "$source_dir/go.mod" && -s "$source_dir/S1T-CAPSULE/main.go" ]] \
-    || { echo "The downloaded repository does not contain the expected ShahTunnel source files." >&2; return 1; }
+    || { echo "The selected directory does not contain the expected ShahTunnel source files." >&2; return 1; }
   if ! grep -Fq "module github.com/${OWNER}/${REPO}" "$source_dir/go.mod"; then
     echo "The source module path does not match github.com/${OWNER}/${REPO}; refusing to build." >&2
+    return 1
+  fi
+  echo "Resolving and checksum-verifying Go module dependencies..." >&2
+  if ! run_with_spinner "Resolving dependencies" "$TMP/mod-tidy.log" \
+      env GOROOT="$go_root" GOTOOLCHAIN=local \
+      GOPROXY="https://proxy.golang.org|https://goproxy.cn|https://goproxy.io|direct" \
+      GOCACHE="${GO_CACHE_DIR}/build-cache-${GO_VERSION}-${TARGET_ARCH}" \
+      "$go_bin" mod tidy; then
+    echo "Go module resolution failed. Build output follows:" >&2
+    [[ ! -s "$TMP/mod-tidy.log" ]] || cat "$TMP/mod-tidy.log" >&2
     return 1
   fi
   local source_fingerprint build_cache_dir cached_binary

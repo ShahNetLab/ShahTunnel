@@ -42,7 +42,7 @@ printf '\n== 1/7: Resolve Go module metadata ==\n'
 pass "Module metadata resolved"
 
 printf '\n== 2/7: Formatting ==\n'
-unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go)"
+unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go S1T-CAPSULE/reality_transport.go)"
 [[ -z "$unformatted" ]] || fail "gofmt required for: $unformatted"
 pass "Go source formatting"
 
@@ -70,7 +70,7 @@ pass "go vet"
 printf '\n== 7/7: Linux binaries build ==\n'
 mkdir -p dist
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-amd64 ./S1T-CAPSULE
-[[ "$(dist/shah-tunnel-linux-amd64 version)" == "Shah Tunnel 1.6.2 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+[[ "$(dist/shah-tunnel-linux-amd64 version)" == "Shah Tunnel 1.7.1 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-arm64 ./S1T-CAPSULE
 (cd dist && sha256sum shah-tunnel-linux-amd64 > shah-tunnel-linux-amd64.sha256)
 (cd dist && sha256sum shah-tunnel-linux-arm64 > shah-tunnel-linux-arm64.sha256)
