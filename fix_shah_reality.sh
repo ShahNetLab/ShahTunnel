@@ -25,6 +25,10 @@ done
   echo "ERROR: run this script from the complete extracted ShahTunnel project." >&2
   exit 1
 }
+grep -Fq 'return utls.HelloChrome_133, nil' "$SCRIPT_DIR/S1T-CAPSULE/reality_transport.go" || {
+  echo "ERROR: source is missing the pinned Chrome 133 hybrid ClientHello profile; refusing to install." >&2
+  exit 1
+}
 grep -Fq 'func realityAuthKeyShare(plainX25519, hybridX25519 *ecdh.PrivateKey)' \
   "$SCRIPT_DIR/S1T-CAPSULE/reality_transport.go" || {
   echo "ERROR: source is missing the REALITY key-share fix; refusing to install." >&2
@@ -33,6 +37,11 @@ grep -Fq 'func realityAuthKeyShare(plainX25519, hybridX25519 *ecdh.PrivateKey)' 
 grep -Fq 'realityAuthKeyShare(keyShares.Ecdhe, keyShares.MlkemEcdhe)' \
   "$SCRIPT_DIR/S1T-CAPSULE/reality_transport.go" || {
   echo "ERROR: source does not select the standalone X25519 share first; refusing to install." >&2
+  exit 1
+}
+grep -Fq 'TestRealityChromeProfileOffersRequiredKeyShares' \
+  "$SCRIPT_DIR/S1T-CAPSULE/main_test.go" || {
+  echo "ERROR: source is missing the required hybrid-keyshare regression test; refusing to install." >&2
   exit 1
 }
 grep -Fq 'TestRealityAuthKeySharePrefersStandaloneX25519' \

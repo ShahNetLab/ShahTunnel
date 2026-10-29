@@ -7,6 +7,8 @@
 <p align="center">هدایت پورت‌های عمومی Hub به سرویس مقصد از طریق Agent، با ارتباط خصوصی TLS 1.3، احراز هویت توکن، تثبیت اثرانگشت گواهی و اتصال مجدد خودکار.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
+برای اتصال REALITY، fingerprint پیش‌فرض `chrome` به پروفایل ثابت Chrome 133 قفل شده است تا هر دو key share لازم (`X25519MLKEM768` و `X25519`) ارسال شوند؛ نسخه‌های جدید سرور REALITY اتصال بدون key share ترکیبی را رد می‌کنند. fingerprintهای دیگر اگر hybrid key share نداشته باشند، قبل از دست‌دهی با پیام روشن رد می‌شوند.
+
 ## مسیر شبکه | Network Flow
 
 <p align="center">
