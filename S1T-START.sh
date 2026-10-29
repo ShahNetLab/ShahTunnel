@@ -45,13 +45,7 @@ curl_download() {
   rm -f "$headers" "$log" "$dest"
   if [[ ! -t 2 ]]; then
     if ! curl -fsSL --proto '=https' --proto-redir '=https' --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log"; then
-      if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then
-        cat "$log" >&2
-      else
-        printf '  curl diagnostic for %s: ' "$url" >&2
-        if [[ -s "$log" ]]; then cat "$log" >&2; else printf 'no diagnostic output\n' >&2; fi
-        cp -f "$log" "$TMP/curl-last-error.log" 2>/dev/null || true
-      fi
+      if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
       rm -f "$headers" "$log" "$dest"
       return 1
     fi
@@ -74,13 +68,7 @@ curl_download() {
   wait "$pid" || rc=$?
   printf '\r\033[2K' >&2
   if (( rc != 0 )); then
-    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then
-      cat "$log" >&2
-    else
-      printf '  curl diagnostic for %s: ' "$url" >&2
-      if [[ -s "$log" ]]; then cat "$log" >&2; else printf 'no diagnostic output\n' >&2; fi
-      cp -f "$log" "$TMP/curl-last-error.log" 2>/dev/null || true
-    fi
+    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
     rm -f "$headers" "$log" "$dest"
     return "$rc"
   fi
@@ -252,44 +240,38 @@ build_from_official_go_toolchain() {
     downloaded=1
   else
     rm -f "$cache_archive"
-    # Try the official Google-hosted Go archive first. The previous order put
-    # a third-party mirror first with a 150-second timeout, then never tried
-    # dl.google.com directly; mirrors can serve stale/error pages with a bad
-    # checksum. Keep the pinned SHA-256 check mandatory for every source.
+    # Try official sources first, then mirrors. Preserve partial bytes between
+    # attempts and resume with HTTP Range rather than restarting a 64 MB download.
+    # The official SHA-256 remains mandatory; no unverified archive is accepted.
     local -a download_bases=(
       "$GO_BASE"
+      "$GO_FALLBACK_BASE"
       "https://storage.googleapis.com/golang"
       "https://golang.google.cn/dl"
-      "$GO_FALLBACK_BASE"
-      "https://mirrors.huaweicloud.com/golang"
+      "https://mirrors.aliyun.com/golang"
+      "https://mirror.nju.edu.cn/golang"
+      "https://mirrors.ustc.edu.cn/golang"
+      "https://mirrors.tuna.tsinghua.edu.cn/golang"
       "https://mirrors.cloud.tencent.com/go"
       "https://mirrors.163.com/golang"
-      "https://mirror.nju.edu.cn/golang"
-      "https://mirrors.tuna.tsinghua.edu.cn/golang"
-      "https://mirrors.aliyun.com/golang"
-      "https://mirrors.ustc.edu.cn/golang"
     )
-    local base max_time
-    echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}); progress indicator is active..." >&2
+    local base
+    echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) with resumable mirror downloads..." >&2
+    : > "$TMP/$go_archive"
     for base in "${download_bases[@]}"; do
       url="${base}/${go_archive}"
-      rm -f "$TMP/$go_archive"
-      # Bound each attempt so a blocked or slow endpoint cannot stall install.
-      case "$base" in
-        "$GO_BASE"|"https://storage.googleapis.com/golang"|"https://golang.google.cn/dl"|"$GO_FALLBACK_BASE") max_time=90 ;;
-        *) max_time=45 ;;
-      esac
-      if QUIET_CURL_ERRORS=1 curl_download "$url" "$TMP/$go_archive" \
-          --retry 0 --connect-timeout 6 --max-time "$max_time"; then
+      echo "Trying ${base} (partial downloads will be resumed where supported)..." >&2
+      if curl_download_resumable "$url" "$TMP/$go_archive"; then
         if printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null 2>&1; then
           downloaded=1
           break
         fi
-        echo "Checksum mismatch from ${base}; rejecting archive and trying the next source." >&2
+        # A successful HTTP response with a wrong checksum is not resumable.
+        echo "Checksum mismatch from ${base}; discarding archive and trying the next source." >&2
+        : > "$TMP/$go_archive"
       else
-        echo "Download failed from ${base}; trying the next source." >&2
+        echo "Download failed from ${base}; retaining any partial bytes for the next source." >&2
       fi
-      rm -f "$TMP/$go_archive"
     done
     if [[ "$downloaded" -eq 1 ]]; then
       # Cache only the completely downloaded and verified archive.
@@ -297,7 +279,7 @@ build_from_official_go_toolchain() {
     fi
   fi
   if [[ "$downloaded" -ne 1 ]]; then
-    echo "ERROR: Could not download a Go ${GO_VERSION} archive from any configured source." >&2
+    echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the pinned SHA-256." >&2
     return 1
   fi
   echo "Go archive SHA-256 verified." >&2

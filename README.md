@@ -61,11 +61,11 @@ Run as root on Linux amd64 or arm64 with systemd and HTTPS access to the officia
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 ```
 
-The installer downloads the Go `1.26.1` toolchain from official Go distribution hosts and checksum-verified mirrors, with bounded connection/download timeouts and verifies its pinned SHA-256 checksum before use. It then downloads the source archive from the `main` branch of this repository and compiles `S1T-CAPSULE` locally for the server architecture with CGO disabled. It does not use GitHub Release assets or install the Go toolchain permanently. The built binary's application version and target architecture are checked before installation. An existing binary is backed up before replacement, and an already-active service is not restarted during installation to avoid dropping live tunnel sessions.
+The installer downloads the Go `1.26.10` toolchain from the official Go distribution host `https://dl.google.com/go` (with `https://go.dev/dl` as a fallback) and verifies its pinned SHA-256 checksum before use. It then downloads the source archive from the `main` branch of this repository and compiles `S1T-CAPSULE` locally for the server architecture with CGO disabled. It does not use GitHub Release assets or install the Go toolchain permanently. The built binary's application version and target architecture are checked before installation. An existing binary is backed up before replacement, and an already-active service is not restarted during installation to avoid dropping live tunnel sessions.
 
 ## Build and tests
 
-The verification helper requires Go 1.26.1 to already be installed locally; it will not download a toolchain. From the repository root:
+The verification helper requires Go 1.26.10 to already be installed locally; it will not download a toolchain. From the repository root:
 
 ```bash
 ./VERIFY-ALL-TRANSPORTS.sh
