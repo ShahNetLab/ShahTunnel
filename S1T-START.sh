@@ -240,30 +240,39 @@ build_from_official_go_toolchain() {
     downloaded=1
   else
     rm -f "$cache_archive"
-    # Do not use HTTP Range/parallel chunks: some mirrors accept the probe but
-    # stall individual range requests. Download the full archive with strict
-    # time and low-speed limits, and fall back quickly if a mirror is unhealthy.
+    # Try the official Google-hosted Go archive first. The previous order put
+    # a third-party mirror first with a 150-second timeout, then never tried
+    # dl.google.com directly; mirrors can serve stale/error pages with a bad
+    # checksum. Keep the pinned SHA-256 check mandatory for every source.
     local -a download_bases=(
+      "$GO_BASE"
+      "$GO_FALLBACK_BASE"
       "https://mirror.nju.edu.cn/golang"
       "https://mirrors.aliyun.com/golang"
       "https://mirrors.ustc.edu.cn/golang"
-      "https://go.dev/dl"
     )
     local base max_time
     echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}); progress indicator is active..." >&2
     for base in "${download_bases[@]}"; do
       url="${base}/${go_archive}"
       rm -f "$TMP/$go_archive"
-      # Give the previously successful NJU mirror enough time for a 64 MB file;
-      # bound fallback mirrors more tightly and abort transfers that stall.
-      max_time=35
-      [[ "$base" == "https://mirror.nju.edu.cn/golang" ]] && max_time=150
+      # Bound each attempt so a blocked or slow endpoint cannot stall install.
+      case "$base" in
+        "$GO_BASE") max_time=55 ;;
+        "$GO_FALLBACK_BASE") max_time=25 ;;
+        "https://mirror.nju.edu.cn/golang") max_time=20 ;;
+        *) max_time=15 ;;
+      esac
       if QUIET_CURL_ERRORS=1 curl_download "$url" "$TMP/$go_archive" \
-          --retry 0 --connect-timeout 6 --max-time "$max_time" \
-          --speed-time 20 --speed-limit 32768 \
-          && printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null 2>&1; then
-        downloaded=1
-        break
+          --retry 0 --connect-timeout 5 --max-time "$max_time" \
+          --speed-time 15 --speed-limit 32768; then
+        if printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null 2>&1; then
+          downloaded=1
+          break
+        fi
+        echo "Checksum mismatch from ${base}; rejecting archive and trying the next source." >&2
+      else
+        echo "Download failed from ${base}; trying the next source." >&2
       fi
       rm -f "$TMP/$go_archive"
     done
