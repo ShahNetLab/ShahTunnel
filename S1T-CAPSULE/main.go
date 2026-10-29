@@ -101,14 +101,8 @@ type Config struct {
 	Fingerprint   string `json:"fingerprint,omitempty"`
 	// TunnelChannels controls the number of independent authenticated TCP/TLS lanes
 	// between Agent and Hub. Missing values on old configs are upgraded in memory to the current default.
-	TunnelChannels int `json:"tunnel_channels,omitempty"`
-	// DNSFilterEnabled starts an optional DNS sinkhole for common ad/tracker domains.
-	// Clients must explicitly use this resolver; it is not a packet-level VPN filter.
-	DNSFilterEnabled      bool          `json:"dns_filter_enabled,omitempty"`
-	DNSFilterListen       string        `json:"dns_filter_listen,omitempty"`
-	DNSFilterUpstream     string        `json:"dns_filter_upstream,omitempty"`
-	DNSFilterAllowedCIDRs []string      `json:"dns_filter_allowed_cidrs,omitempty"`
-	Ports                 []PortMapping `json:"ports,omitempty"`
+	TunnelChannels int           `json:"tunnel_channels,omitempty"`
+	Ports          []PortMapping `json:"ports,omitempty"`
 }
 
 type RuntimeSnapshot struct {
@@ -2734,59 +2728,6 @@ func validateConfig(c Config) error {
 	if len(c.Token) < 48 || len(c.Token) > 240 || strings.ContainsAny(c.Token, "\r\n") {
 		return errors.New("token must be 48–240 characters and contain no line breaks")
 	}
-	if c.DNSFilterEnabled {
-		// The filter can run on HUB, AGENT, or RELAY. In HUB mode it is a
-		// separate DNS listener: clients must explicitly point DNS at the Hub
-		// address and their observed source IP must match the allowlist. This
-		// TCP reverse tunnel is not itself a full-device VPN/IP router.
-		if err := validateTCPAddress("DNS filter listen address", c.DNSFilterListen); err != nil {
-			return err
-		}
-		if err := validateTCPAddress("DNS upstream", c.DNSFilterUpstream); err != nil {
-			return err
-		}
-		if len(c.DNSFilterAllowedCIDRs) == 0 {
-			return errors.New("DNS filter requires at least one allowed source IP/CIDR; avoid creating an unrestricted public DNS resolver")
-		}
-		for _, cidr := range c.DNSFilterAllowedCIDRs {
-			_, network, err := net.ParseCIDR(strings.TrimSpace(cidr))
-			if err != nil {
-				return fmt.Errorf("invalid DNS filter allowed CIDR %q", cidr)
-			}
-			ones, bits := network.Mask.Size()
-			if ones == 0 && bits > 0 {
-				return fmt.Errorf("DNS filter CIDR %q is unrestricted; use specific client IPs/subnets, not /0", cidr)
-			}
-		}
-		// The DNS filter binds both UDP and TCP on this port. Prevent collisions
-		// with this process's TCP listeners before saving the configuration.
-		_, dnsPortText, _ := net.SplitHostPort(c.DNSFilterListen)
-		dnsPort, _ := strconv.Atoi(dnsPortText)
-		if c.Role == "hub" {
-			check := []string{c.ControlListen}
-			if transportModeAllowsHTTP2(c.Transport) {
-				if a, err := adjacentPortAddress(c.ControlListen); err == nil {
-					check = append(check, a)
-				}
-			}
-			if transportModeAllowsHTTP1(c.Transport) {
-				if a, err := secondAdjacentPortAddress(c.ControlListen); err == nil {
-					check = append(check, a)
-				}
-			}
-			for _, m := range c.Ports {
-				check = append(check, m.Listen)
-			}
-			for _, addr := range check {
-				if _, portText, err := net.SplitHostPort(addr); err == nil {
-					port, _ := strconv.Atoi(portText)
-					if port == dnsPort {
-						return fmt.Errorf("DNS filter port %d conflicts with another HUB listener; choose another DNS port", dnsPort)
-					}
-				}
-			}
-		}
-	}
 	if len(c.Ports) == 0 {
 		return errors.New("at least one port mapping is required")
 	}
@@ -3371,77 +3312,6 @@ func generateCertificate(certPath, keyPath string) (string, error) {
 	sum := sha256.Sum256(der)
 	return hex.EncodeToString(sum[:]), nil
 }
-func wizardConfigureDNSFilter(c *Config) error {
-	if !wizardYesNo("Enable best-effort DNS ad/tracker filtering? (Y/n)", "n") {
-		return nil
-	}
-	return wizardAskDNSFilterSettings(c)
-}
-
-func wizardAskDNSFilterSettings(c *Config) error {
-	c.DNSFilterEnabled = true
-	c.DNSFilterListen = wizardAsk("DNS filter bind address (UDP and TCP)", "0.0.0.0:53")
-	c.DNSFilterUpstream = wizardAsk("Upstream DNS server (IP:PORT)", "1.1.1.1:53")
-	allowed := wizardAsk("Allowed client source IP/CIDR (required; comma-separated; use the real VPN subnet or client public IP/32)", "")
-	c.DNSFilterAllowedCIDRs = nil
-	for _, item := range strings.Split(allowed, ",") {
-		item = strings.TrimSpace(item)
-		if item == "" {
-			continue
-		}
-		_, network, err := net.ParseCIDR(item)
-		if err != nil {
-			return fmt.Errorf("invalid allowed client IP/CIDR %q", item)
-		}
-		ones, bits := network.Mask.Size()
-		if ones == 0 && bits > 0 {
-			return fmt.Errorf("refusing unrestricted DNS CIDR %q; do not expose an open DNS resolver", item)
-		}
-		c.DNSFilterAllowedCIDRs = append(c.DNSFilterAllowedCIDRs, item)
-	}
-	if len(c.DNSFilterAllowedCIDRs) == 0 {
-		return errors.New("DNS filtering was selected but no allowed source IP/CIDR was provided; setup stopped to avoid creating an open resolver")
-	}
-	uiInfo("DNS filter will listen on " + c.DNSFilterListen + " (UDP/TCP). Permit UDP and TCP on that port in the firewall only for the allowed client networks.")
-	uiWarn("Clients must explicitly use this DNS listener and their source IP must match the allowlist. ShahTunnel's TCP reverse tunnel does not assign VPN IPs or automatically route all phone DNS traffic.")
-	uiWarn("This blocks known ad/tracker domains, but YouTube in-stream ads may share media domains and cannot be reliably removed by DNS filtering.")
-	return nil
-}
-
-func manageDNSFilter() error {
-	cfg, err := loadConfig()
-	if err != nil {
-		return fmt.Errorf("load existing configuration: %w", err)
-	}
-	defaultChoice := "n"
-	if cfg.DNSFilterEnabled {
-		defaultChoice = "y"
-	}
-	if wizardYesNo("Enable DNS ad/tracker filtering? (y/N)", defaultChoice) {
-		if err = wizardAskDNSFilterSettings(&cfg); err != nil {
-			return err
-		}
-	} else {
-		cfg.DNSFilterEnabled = false
-		cfg.DNSFilterListen = ""
-		cfg.DNSFilterUpstream = ""
-		cfg.DNSFilterAllowedCIDRs = nil
-		uiInfo("DNS ad/tracker filtering will be disabled.")
-	}
-	cfg = normalizeConfig(cfg)
-	if err = validateConfig(cfg); err != nil {
-		return fmt.Errorf("DNS filter configuration invalid: %w", err)
-	}
-	if err = saveConfig(cfg); err != nil {
-		return fmt.Errorf("save DNS filter configuration: %w", err)
-	}
-	if err = ensureTunnelRunning(true); err != nil {
-		return fmt.Errorf("DNS filter settings saved but service restart failed: %w", err)
-	}
-	uiSuccess("DNS filter settings saved and service restarted. Existing Hub token and certificate were preserved.")
-	return nil
-}
-
 func setup() error {
 	wizardStep = 0
 	uiHeader("SHAH TUNNEL // SPACE SETUP", "WIZARD   •   SECURE LINK   •   TRANSPORT ROUTING")
@@ -3489,9 +3359,6 @@ func setup() error {
 				break
 			}
 		}
-		if err = wizardConfigureDNSFilter(&c); err != nil {
-			return err
-		}
 		c = normalizeConfig(c)
 		// Validate before rotating certificate/key files, so a typo cannot invalidate
 		// a previously working Hub configuration.
@@ -3530,24 +3397,12 @@ func setup() error {
 			{Text: "Keep the token secret; enter it only on the Agent.", Color: ansiYellow + ansiBold},
 			{Text: "Copy the exact certificate fingerprint into the Agent setup.", Color: ansiDim},
 		}, ansiYellow)
-		if c.DNSFilterEnabled {
-			dnsRows := []uiCardRow{
-				{Text: "DNS listener (UDP + TCP): " + c.DNSFilterListen, Color: ansiCyan + ansiBold},
-				{Text: "Upstream: " + c.DNSFilterUpstream, Color: ansiDim},
-				{Text: "Allowed source CIDRs: " + strings.Join(c.DNSFilterAllowedCIDRs, ", "), Color: ansiYellow},
-			}
-			uiCard("🧹 DNS AD/TRACKER FILTER ENABLED", dnsRows, ansiGreen+ansiBold)
-			uiWarn("Set client DNS to the Hub's reachable IP; ensure UDP and TCP port 53 are allowed only for the listed source networks. This does not automatically route phone DNS through the TCP tunnel.")
-		}
 	case "2", "agent", "outside":
 		c.Role = "agent"
 		c.TunnelChannels = defaultTunnelChannels
 		c.HubAddr = wizardAsk("Reachable Iran Hub address as IP:PORT or hostname:PORT (control port)", "")
 		c.Transport, err = wizardAskTransport("Agent transport mode (must be allowed by Hub)")
 		if err != nil {
-			return err
-		}
-		if err = wizardConfigureDNSFilter(&c); err != nil {
 			return err
 		}
 		if transportModeAllowsHTTP2(c.Transport) {
@@ -3589,9 +3444,6 @@ func setup() error {
 	case "3", "relay", "front":
 		c.Role = "relay"
 		c.Token = "relay-mode-not-used-" + tok
-		if err = wizardConfigureDNSFilter(&c); err != nil {
-			return err
-		}
 		for i := 1; i <= 100; i++ {
 			defID := "front"
 			if i > 1 {
@@ -4528,7 +4380,6 @@ func menu() {
 		menuItem("5", "📊 Status & Logs", "Service status and recent errors")
 		menuItem("6", "⏱️ Cron Job / Scheduled Restart", "Restart every selected interval")
 		menuItem("7", "🗑️ Complete Uninstall", "Only Shah Tunnel files and service")
-		menuItem("8", "🧹 DNS Ad/Tracker Filter", "Enable/disable DNS filtering without regenerating Hub credentials")
 		menuItem("0", "🚪 Exit", "Close the menu")
 		uiRule()
 		choice := ask("Select an operation", "0")
@@ -4557,8 +4408,6 @@ func menu() {
 			if errors.Is(err, errUninstallCancelled) {
 				err = nil
 			}
-		case "8":
-			err = manageDNSFilter()
 		case "0":
 			return
 		default:
@@ -4593,10 +4442,6 @@ func main() {
 		cfg, err := loadConfig()
 		if err != nil {
 			log.Fatal(err)
-		}
-		if err = startDNSAdFilter(cfg); err != nil {
-			// DNS filtering is optional and must never prevent the tunnel itself from starting.
-			log.Printf("DNS ad filter could not start; continuing without DNS filtering: %v", err)
 		}
 		switch cfg.Role {
 		case "hub":
