@@ -208,59 +208,6 @@ official_go_sha256() {
   esac
 }
 
-# Download one archive in parallel byte ranges when the mirror supports HTTP Range.
-# The final complete archive is still verified against the pinned SHA-256.
-download_go_ranges() {
-  local url="$1" dest="$2" chunks=8 total range_file range_code range_total
-  local probe="$TMP/go-range-probe" headers="$TMP/go-range-headers" parts="$TMP/go-range-parts"
-  local i start end expected pid failed=0
-  rm -rf "$parts"; mkdir -p "$parts"
-  rm -f "$probe" "$headers"
-  if ! curl -fsSL --proto '=https' --proto-redir '=https' --range 0-0 \
-      --connect-timeout 6 --max-time 12 -D "$headers" -o "$probe" "$url" >/dev/null 2>&1; then
-    rm -rf "$parts"; return 1
-  fi
-  range_code="$(awk '/^HTTP\// {code=$2} END {print code}' "$headers")"
-  range_total="$(sed -nE 's/^[Cc]ontent-[Rr]ange:[[:space:]]*bytes 0-0\/([0-9]+).*/\1/p' "$headers" | tail -n 1)"
-  [[ "$range_code" == "206" && "$range_total" =~ ^[0-9]+$ && "$(wc -c < "$probe")" -eq 1 ]] || {
-    rm -rf "$parts"; return 1;
-  }
-  total="$range_total"
-  (( total > chunks )) || { rm -rf "$parts"; return 1; }
-  local -a pids=()
-  for ((i=0; i<chunks; i++)); do
-    start=$((total * i / chunks))
-    end=$((total * (i + 1) / chunks - 1))
-    expected=$((end - start + 1))
-    (
-      local part="$parts/part.$(printf '%02d' "$i")"
-      if ! curl -fsSL --proto '=https' --proto-redir '=https' --range "$start-$end" \
-          --connect-timeout 8 --max-time 120 -o "$part" "$url" >/dev/null 2>&1; then
-        rm -f "$part"; exit 1
-      fi
-      [[ "$(wc -c < "$part")" -eq "$expected" ]]
-    ) &
-    pids+=("$!")
-  done
-  # Keep the existing animated progress display alive while all range jobs run.
-  local running frame=0
-  while :; do
-    running=0
-    for pid in "${pids[@]}"; do
-      if kill -0 "$pid" 2>/dev/null; then running=1; break; fi
-    done
-    (( running == 0 )) && break
-    if [[ -t 2 ]]; then draw_indeterminate_bar "$frame"; frame=$((frame + 1)); fi
-    sleep 0.12
-  done
-  if [[ -t 2 ]]; then printf '\r\033[2K' >&2; fi
-  for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
-  if (( failed != 0 )); then rm -rf "$parts"; return 1; fi
-  : > "$dest"
-  for ((i=0; i<chunks; i++)); do cat "$parts/part.$(printf '%02d' "$i")" >> "$dest" || { rm -rf "$parts"; return 1; }; done
-  rm -rf "$parts" "$probe" "$headers"
-  [[ "$(wc -c < "$dest")" -eq "$total" ]]
-}
 build_project_binary() {
   local go_bin="$1" source_dir="$2" go_root="$3"
   (
@@ -285,39 +232,35 @@ build_from_official_go_toolchain() {
   local cache_archive="$GO_CACHE_DIR/$go_archive"
   install -d -o root -g root -m 0755 "$GO_CACHE_DIR"
   downloaded=0
-  go_sha="$(official_go_sha256)"
 
-  # A cached archive is reused only after rechecking the pinned official SHA-256.
+  # Reuse only an archive whose checksum matches the pinned Go distribution.
   if [[ -s "$cache_archive" ]] && printf '%s  %s\n' "$go_sha" "$cache_archive" | sha256sum -c - >/dev/null 2>&1; then
     cp -f "$cache_archive" "$TMP/$go_archive"
     echo "Using cached, SHA-256-verified Go ${GO_VERSION} archive." >&2
     downloaded=1
   else
     rm -f "$cache_archive"
+    # Do not use HTTP Range/parallel chunks: some mirrors accept the probe but
+    # stall individual range requests. Download the full archive with strict
+    # time and low-speed limits, and fall back quickly if a mirror is unhealthy.
     local -a download_bases=(
       "https://mirror.nju.edu.cn/golang"
       "https://mirrors.aliyun.com/golang"
       "https://mirrors.ustc.edu.cn/golang"
-      "https://mirrors.tuna.tsinghua.edu.cn/golang"
       "https://go.dev/dl"
-      "https://dl.google.com/go"
-      "https://golang.google.cn/dl"
     )
-    local base
-    echo "Downloading Go ${GO_VERSION} with parallel chunks when supported..." >&2
+    local base max_time
+    echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}); progress indicator is active..." >&2
     for base in "${download_bases[@]}"; do
       url="${base}/${go_archive}"
       rm -f "$TMP/$go_archive"
-      # Parallel ranges can greatly reduce first-install time on slow mirrors.
-      if download_go_ranges "$url" "$TMP/$go_archive" 2>/dev/null \
-          && printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null 2>&1; then
-        downloaded=1
-        break
-      fi
-      rm -f "$TMP/$go_archive"
-      # Fallback for mirrors that don't support byte-range requests.
+      # Give the previously successful NJU mirror enough time for a 64 MB file;
+      # bound fallback mirrors more tightly and abort transfers that stall.
+      max_time=35
+      [[ "$base" == "https://mirror.nju.edu.cn/golang" ]] && max_time=150
       if QUIET_CURL_ERRORS=1 curl_download "$url" "$TMP/$go_archive" \
-          --retry 0 --connect-timeout 6 --max-time 90 2>/dev/null \
+          --retry 0 --connect-timeout 6 --max-time "$max_time" \
+          --speed-time 20 --speed-limit 32768 \
           && printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null 2>&1; then
         downloaded=1
         break
@@ -325,7 +268,7 @@ build_from_official_go_toolchain() {
       rm -f "$TMP/$go_archive"
     done
     if [[ "$downloaded" -eq 1 ]]; then
-      # Persist only a verified archive, so later reinstall/upgrade skips the 64 MB download.
+      # Cache only the completely downloaded and verified archive.
       install -o root -g root -m 0644 "$TMP/$go_archive" "$cache_archive"
     fi
   fi
