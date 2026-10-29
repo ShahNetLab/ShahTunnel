@@ -23,7 +23,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 1
 fi
 command -v systemctl >/dev/null 2>&1 || { echo "systemd/systemctl is required." >&2; exit 1; }
-for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod tar gzip mktemp rm sleep python3; do
+for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod tar gzip mktemp rm sleep python3 wc; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "Required command missing: $cmd" >&2; exit 1; }
 done
 TMP="$(mktemp -d /tmp/s1t-install.XXXXXX)"
@@ -91,7 +91,7 @@ curl_download_resumable() {
   if [[ ! -t 2 ]]; then
     if curl -fsSL --proto '=https' --proto-redir '=https' \
         --continue-at - \
-        --retry 2 --retry-all-errors --retry-delay 2 \
+        --retry 3 --retry-delay 2 --retry-connrefused \
         --connect-timeout 15 --max-time 0 \
         --speed-time 180 --speed-limit 1024 \
         --dump-header "$headers" "$url" -o "$dest" 2>"$log"; then
@@ -107,7 +107,7 @@ curl_download_resumable() {
 
   curl -fsSL --proto '=https' --proto-redir '=https' \
       --continue-at - \
-      --retry 2 --retry-all-errors --retry-delay 2 \
+      --retry 3 --retry-delay 2 --retry-connrefused \
       --connect-timeout 15 --max-time 0 \
       --speed-time 180 --speed-limit 1024 \
       --dump-header "$headers" "$url" -o "$dest" 2>"$log" &
@@ -293,37 +293,56 @@ build_from_official_go_toolchain() {
     downloaded=1
   else
     rm -f "$cache_archive"
-    # Try official sources first, then mirrors. Preserve partial bytes between
-    # attempts and resume with HTTP Range rather than restarting a 64 MB download.
-    # The official SHA-256 remains mandatory; no unverified archive is accepted.
-    local -a download_bases=(
-      "$GO_BASE"
-      "$GO_FALLBACK_BASE"
-      "https://storage.googleapis.com/golang"
-      "https://golang.google.cn/dl"
-      "https://mirrors.aliyun.com/golang"
-      "https://mirror.nju.edu.cn/golang"
-      "https://mirrors.ustc.edu.cn/golang"
-      "https://mirrors.tuna.tsinghua.edu.cn/golang"
-      "https://mirrors.cloud.tencent.com/go"
-      "https://mirrors.163.com/golang"
+    # Each mirror gets its own partial file. The official SHA-256 remains
+    # mandatory; no unverified archive is ever accepted.
+    # Keep a separate partial file for each host. Resuming a byte range from a
+    # different mirror is unsafe: some mirrors ignore Range requests or return
+    # a different response. A partial is reused only with the same exact URL.
+    # On networks that return 403/404 for Google hosts, try regional mirrors first.
+    local -a download_sources=(
+      "aliyun|https://mirrors.aliyun.com/golang"
+      "nju|https://mirror.nju.edu.cn/golang"
+      "ustc|https://mirrors.ustc.edu.cn/golang"
+      "tsinghua|https://mirrors.tuna.tsinghua.edu.cn/golang"
+      "tencent|https://mirrors.cloud.tencent.com/go"
+      "163|https://mirrors.163.com/golang"
+      "google|https://dl.google.com/go"
+      "go-dev|https://go.dev/dl"
+      "google-storage|https://storage.googleapis.com/golang"
+      "google-cn|https://golang.google.cn/dl"
     )
-    local base
-    echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) with resumable mirror downloads..." >&2
-    : > "$TMP/$go_archive"
-    for base in "${download_bases[@]}"; do
+    local source source_id base part_file bytes
+    echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}); each mirror has an independent resumable partial file..." >&2
+    for source in "${download_sources[@]}"; do
+      source_id="${source%%|*}"
+      base="${source#*|}"
       url="${base}/${go_archive}"
-      echo "Trying ${base} (partial downloads will be resumed where supported)..." >&2
-      if curl_download_resumable "$url" "$TMP/$go_archive"; then
-        if printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null 2>&1; then
+      part_file="${GO_CACHE_DIR}/${go_archive}.${source_id}.part"
+      echo "Trying ${base}..." >&2
+
+      # Accept a fully downloaded cache-part only if the pinned digest matches.
+      if [[ -s "$part_file" ]] && printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
+        cp -f "$part_file" "$TMP/$go_archive"
+        downloaded=1
+        echo "Using complete SHA-256-verified archive from ${source_id}." >&2
+        break
+      fi
+
+      # curl retries transient network/5xx errors but does not waste time
+      # retrying permanent HTTP 403/404 responses (no --retry-all-errors).
+      if curl_download_resumable "$url" "$part_file"; then
+        if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
+          cp -f "$part_file" "$TMP/$go_archive"
           downloaded=1
+          echo "Go archive from ${source_id} passed SHA-256 verification." >&2
           break
         fi
-        # A successful HTTP response with a wrong checksum is not resumable.
-        echo "Checksum mismatch from ${base}; discarding archive and trying the next source." >&2
-        : > "$TMP/$go_archive"
+        bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
+        echo "Checksum mismatch from ${source_id} (${bytes} bytes); discarding only that mirror's partial file." >&2
+        rm -f "$part_file"
       else
-        echo "Download failed from ${base}; retaining any partial bytes for the next source." >&2
+        bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
+        echo "Download failed from ${source_id} (${bytes} bytes retained for the same mirror's next attempt)." >&2
       fi
     done
     if [[ "$downloaded" -eq 1 ]]; then
