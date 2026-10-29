@@ -236,6 +236,15 @@ func hkdfSHA256(secret, salt, info []byte) []byte {
 	return expand.Sum(nil)
 }
 
+// realityAuthKeyShare follows the pinned XTLS/REALITY server's preference:
+// standalone X25519 first; the hybrid share's X25519 component is fallback.
+func realityAuthKeyShare(plainX25519, hybridX25519 *ecdh.PrivateKey) *ecdh.PrivateKey {
+	if plainX25519 != nil {
+		return plainX25519
+	}
+	return hybridX25519
+}
+
 func dialRealityClientConn(raw net.Conn, cfg Config) (net.Conn, error) {
 	publicBytes, err := decodeRealityKey(cfg.RealityPublicKey, 32)
 	if err != nil {
@@ -312,10 +321,15 @@ func dialRealityClientConn(raw net.Conn, cfg Config) (net.Conn, error) {
 	// In current uTLS releases State13 is a value (not a pointer), so it
 	// cannot be checked against nil. A missing TLS 1.3 key share is checked
 	// below through the ECDHE key-share fields instead.
-	ecdhe := uConn.HandshakeState.State13.KeyShareKeys.Ecdhe
-	if ecdhe == nil {
-		ecdhe = uConn.HandshakeState.State13.KeyShareKeys.MlkemEcdhe
-	}
+	// Match the pinned XTLS/REALITY server's actual selection logic. When the
+	// ClientHello offers both X25519MLKEM768 and standalone X25519, that server
+	// derives the REALITY authenticator from the standalone X25519 key share.
+	// Prefer Ecdhe first; the hybrid's X25519 component is only the fallback
+	// when no standalone X25519 key share was generated. Reversing this order
+	// makes the client and server derive different auth keys, so the Hub routes
+	// the connection to the cover-site fallback instead of accepting it.
+	keyShares := uConn.HandshakeState.State13.KeyShareKeys
+	ecdhe := realityAuthKeyShare(keyShares.Ecdhe, keyShares.MlkemEcdhe)
 	if ecdhe == nil {
 		_ = raw.Close()
 		return nil, errors.New("selected ClientHello fingerprint did not create a usable TLS 1.3 key share; choose chrome or edge")

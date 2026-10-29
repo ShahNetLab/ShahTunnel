@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/ecdh"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -1560,5 +1562,25 @@ func TestRealityHandledFallbackError(t *testing.T) {
 	}
 	if realityHandledFallback(nil) {
 		t.Fatal("nil error was treated as a fallback")
+	}
+}
+
+func TestRealityAuthKeySharePrefersStandaloneX25519(t *testing.T) {
+	plain, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate standalone X25519 key: %v", err)
+	}
+	hybrid, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate hybrid X25519 component key: %v", err)
+	}
+	if got := realityAuthKeyShare(plain, hybrid); got != plain {
+		t.Fatal("REALITY auth key selection must prefer standalone X25519 when both shares are offered")
+	}
+	if got := realityAuthKeyShare(nil, hybrid); got != hybrid {
+		t.Fatal("REALITY auth key selection must fall back to hybrid X25519 when standalone share is absent")
+	}
+	if got := realityAuthKeyShare(nil, nil); got != nil {
+		t.Fatal("REALITY auth key selection must return nil when no usable key share exists")
 	}
 }
