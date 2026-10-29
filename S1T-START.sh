@@ -76,6 +76,59 @@ curl_download() {
   PHASE_HAS_DOWNLOAD=1
   rm -f "$headers" "$log"
 }
+# Download a large file while retaining partial bytes between mirror attempts.
+# Unlike curl_download(), this helper must NEVER remove the destination file on
+# failure, because the next mirror may resume at the existing byte offset.
+curl_download_resumable() {
+  local url="$1" dest="$2"
+  local headers="${TMP}/curl-resume-headers.$$" log="${TMP}/curl-resume-log.$$"
+  local rc=0 pid=0 frame=0
+
+  [[ -f "$dest" ]] || : > "$dest"
+  rm -f "$headers" "$log"
+  : > "$log"
+
+  if [[ ! -t 2 ]]; then
+    if curl -fsSL --proto '=https' --proto-redir '=https' \
+        --continue-at - \
+        --retry 2 --retry-all-errors --retry-delay 2 \
+        --connect-timeout 15 --max-time 0 \
+        --speed-time 180 --speed-limit 1024 \
+        --dump-header "$headers" "$url" -o "$dest" 2>"$log"; then
+      rm -f "$headers" "$log"
+      return 0
+    else
+      rc=$?
+    fi
+    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
+    rm -f "$headers" "$log"
+    return "$rc"
+  fi
+
+  curl -fsSL --proto '=https' --proto-redir '=https' \
+      --continue-at - \
+      --retry 2 --retry-all-errors --retry-delay 2 \
+      --connect-timeout 15 --max-time 0 \
+      --speed-time 180 --speed-limit 1024 \
+      --dump-header "$headers" "$url" -o "$dest" 2>"$log" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    draw_indeterminate_bar "$frame"
+    frame=$((frame + 1))
+    sleep 0.12
+  done
+  wait "$pid" || rc=$?
+  printf '\r\033[2K' >&2
+  if (( rc != 0 )); then
+    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
+    rm -f "$headers" "$log"
+    return "$rc"
+  fi
+  PHASE_HAS_DOWNLOAD=1
+  rm -f "$headers" "$log"
+  return 0
+}
+
 # Use most of the available terminal width, then shorten each later phase
 # gradually. The first bar is deliberately much wider; all bars remain within
 # the terminal to avoid wrapping on mobile SSH clients.
