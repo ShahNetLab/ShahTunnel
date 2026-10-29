@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 func TestWebSocketUpgradeAndBidirectionalStream(t *testing.T) {
@@ -1545,11 +1547,35 @@ func TestRealityClientHelloFingerprints(t *testing.T) {
 	if _, err := realityClientHelloID("unknown-browser"); err == nil {
 		t.Fatal("unknown ClientHello fingerprint was accepted")
 	}
+	if got, _ := realityClientHelloID("chrome"); got != utls.HelloChrome_133 {
+		t.Fatalf("REALITY chrome profile = %#v; want explicitly pinned Chrome 133 hybrid profile", got)
+	}
 	if !validTransportMode(transportReality) {
 		t.Fatal("REALITY transport is not accepted by the config policy")
 	}
 	if got := normalizeConfig(Config{Role: "agent", Transport: transportReality}).RealityFingerprint; got != "chrome" {
 		t.Fatalf("default REALITY fingerprint = %q; want chrome", got)
+	}
+}
+
+func TestRealityChromeProfileOffersRequiredKeyShares(t *testing.T) {
+	raw, peer := net.Pipe()
+	defer raw.Close()
+	defer peer.Close()
+	id, err := realityClientHelloID("chrome")
+	if err != nil {
+		t.Fatalf("resolve chrome REALITY profile: %v", err)
+	}
+	conn := utls.UClient(raw, &utls.Config{ServerName: "www.cloudflare.com", MinVersion: utls.VersionTLS13}, id)
+	if err := conn.BuildHandshakeState(); err != nil {
+		t.Fatalf("build Chrome 133 ClientHello: %v", err)
+	}
+	shares := conn.HandshakeState.State13.KeyShareKeys
+	if shares.Ecdhe == nil {
+		t.Fatal("Chrome 133 ClientHello did not create the required standalone X25519 key share")
+	}
+	if shares.MlkemEcdhe == nil {
+		t.Fatal("Chrome 133 ClientHello did not create the required X25519MLKEM768 hybrid key share")
 	}
 }
 

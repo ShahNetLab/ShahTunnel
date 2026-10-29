@@ -126,7 +126,11 @@ func makeRealityServerConfig(cfg Config) (*reality.Config, error) {
 func realityClientHelloID(name string) (utls.ClientHelloID, error) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "", "chrome":
-		return utls.HelloChrome_Auto, nil
+		// Pin a profile that explicitly offers both X25519MLKEM768 and
+		// standalone X25519. The pinned XTLS/REALITY server rejects ClientHello
+		// messages that omit the hybrid share; Auto can move between profiles
+		// as uTLS changes, which made the wire behavior version-dependent.
+		return utls.HelloChrome_133, nil
 	case "firefox":
 		return utls.HelloFirefox_Auto, nil
 	case "edge":
@@ -321,18 +325,24 @@ func dialRealityClientConn(raw net.Conn, cfg Config) (net.Conn, error) {
 	// In current uTLS releases State13 is a value (not a pointer), so it
 	// cannot be checked against nil. A missing TLS 1.3 key share is checked
 	// below through the ECDHE key-share fields instead.
-	// Match the pinned XTLS/REALITY server's actual selection logic. When the
-	// ClientHello offers both X25519MLKEM768 and standalone X25519, that server
-	// derives the REALITY authenticator from the standalone X25519 key share.
-	// Prefer Ecdhe first; the hybrid's X25519 component is only the fallback
-	// when no standalone X25519 key share was generated. Reversing this order
-	// makes the client and server derive different auth keys, so the Hub routes
-	// the connection to the cover-site fallback instead of accepting it.
+	// The pinned XTLS/REALITY server requires an X25519MLKEM768 hybrid
+	// key share before it will even try REALITY authentication. It then uses
+	// the standalone X25519 share when both are present. Check this explicitly
+	// so an incompatible fingerprint fails locally with a useful message
+	// instead of silently falling through to the cover-site path and showing EOF.
 	keyShares := uConn.HandshakeState.State13.KeyShareKeys
+	if keyShares.MlkemEcdhe == nil {
+		_ = raw.Close()
+		return nil, errors.New("REALITY requires the X25519MLKEM768 hybrid key share; use the chrome fingerprint")
+	}
+	if keyShares.Ecdhe == nil {
+		_ = raw.Close()
+		return nil, errors.New("REALITY Chrome profile did not create the standalone X25519 key share")
+	}
 	ecdhe := realityAuthKeyShare(keyShares.Ecdhe, keyShares.MlkemEcdhe)
 	if ecdhe == nil {
 		_ = raw.Close()
-		return nil, errors.New("selected ClientHello fingerprint did not create a usable TLS 1.3 key share; choose chrome or edge")
+		return nil, errors.New("REALITY ClientHello did not create a usable TLS 1.3 key share")
 	}
 
 	// REALITY authenticates the ClientHello by encrypting the 16-byte metadata
