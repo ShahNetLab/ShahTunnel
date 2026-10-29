@@ -3443,6 +3443,37 @@ func wizardAsk(prompt, def string) string {
 	return readAnswer(def)
 }
 
+// wizardAskRealitySNI offers the supported cover hostnames as explicit choices.
+// ShahTunnel uses one REALITY SNI per Hub/Agent configuration; both sides must
+// select the same exact hostname. The Hub's fallback destination should serve
+// a valid TLS certificate for that hostname.
+func wizardAskRealitySNI(prompt string) string {
+	fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "REALITY SNI HOST OPTIONS"))
+	fmt.Printf("  %s\n", paint(ansiGreen, "1) www.microsoft.com"))
+	fmt.Printf("  %s\n", paint(ansiGreen, "2) www.apple.com"))
+	fmt.Printf("  %s\n", paint(ansiGreen, "3) www.amazon.com"))
+	fmt.Printf("  %s\n", paint(ansiGreen, "4) www.bing.com"))
+	fmt.Printf("  %s\n", paint(ansiGreen, "5) www.yahoo.com"))
+	fmt.Printf("  %s\n", paint(ansiYellow, "Select exactly the same number on Hub and Agent."))
+	for {
+		choice := strings.TrimSpace(wizardAsk(prompt+" (1-5)", "1"))
+		switch choice {
+		case "1":
+			return "www.microsoft.com"
+		case "2":
+			return "www.apple.com"
+		case "3":
+			return "www.amazon.com"
+		case "4":
+			return "www.bing.com"
+		case "5":
+			return "www.yahoo.com"
+		default:
+			uiWarn("Invalid SNI choice; enter a number from 1 to 5.")
+		}
+	}
+}
+
 func wizardAskTransport(prompt string) (string, error) {
 	fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "OUTER TUNNEL TRANSPORT"))
 	fmt.Printf("  %s\n", paint(ansiGreen, "1) TCP/TLS — implemented"))
@@ -3594,8 +3625,8 @@ func setup() error {
 			wantReality = wizardYesNo("Enable REALITY as an Adaptive candidate? (Y/n)", "y")
 		}
 		if wantReality {
-			c.RealitySNI = wizardAsk("REALITY SNI hostname (must be a real reachable site you are allowed to use as a cover)", "www.cloudflare.com")
-			c.RealityDest = wizardAsk("REALITY destination address as host:port (can differ from SNI)", c.RealitySNI+":443")
+			c.RealitySNI = wizardAskRealitySNI("Choose the Hub REALITY SNI host")
+			c.RealityDest = wizardAsk("REALITY fallback destination host:port (must serve the chosen SNI; default matches it)", c.RealitySNI+":443")
 			priv, pub, keyErr := generateRealityKeyPair()
 			if keyErr != nil {
 				return keyErr
@@ -3712,7 +3743,7 @@ func setup() error {
 			wantReality = wizardYesNo("Include REALITY in Adaptive candidates? (Y/n)", "y")
 		}
 		if wantReality {
-			c.RealitySNI = wizardAsk("REALITY SNI hostname (must match the Hub setting)", "www.cloudflare.com")
+			c.RealitySNI = wizardAskRealitySNI("Choose the SAME REALITY SNI host selected on Hub")
 			c.RealityPublicKey = wizardAsk("REALITY public key shown by the Hub", "")
 			c.RealityShortID = wizardAsk("REALITY short ID shown by the Hub", "")
 			c.RealityFingerprint = strings.ToLower(wizardAsk("REALITY ClientHello fingerprint (chrome/firefox/edge/randomized)", "chrome"))

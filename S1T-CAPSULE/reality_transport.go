@@ -434,33 +434,6 @@ func realityHandledFallback(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "processed invalid connection")
 }
 
-// realityFallbackReason extracts only the non-sensitive reason class from the
-// upstream REALITY error. The upstream error includes the remote address; we
-// intentionally omit that address from application logs.
-func realityFallbackReason(err error) string {
-	if err == nil {
-		return "unknown REALITY fallback reason"
-	}
-	message := err.Error()
-	if i := strings.Index(message, "server name mismatch:"); i >= 0 {
-		return "server name mismatch: " + strings.TrimSpace(message[i+len("server name mismatch:"):])
-	}
-	if i := strings.Index(message, "unsupported TLS version:"); i >= 0 {
-		return "unsupported TLS version: " + strings.TrimSpace(message[i+len("unsupported TLS version:"):])
-	}
-	for _, reason := range []string{
-		"failed to read client hello",
-		"authentication failed or validation criteria not met",
-		"target sent incorrect server hello or handshake incomplete",
-		"handshake did not complete successfully",
-	} {
-		if strings.Contains(message, reason) {
-			return reason
-		}
-	}
-	return "REALITY rejected ClientHello (unclassified reason)"
-}
-
 func (h *hubServer) serveRealityAgent(raw net.Conn, cfg *reality.Config) {
 	// The REALITY package's wrapper intentionally ignores SetDeadline on its
 	// MirrorConn. Set deadlines on the underlying TCP connection instead so a
@@ -472,7 +445,7 @@ func (h *hubServer) serveRealityAgent(raw net.Conn, cfg *reality.Config) {
 		// Do not close it here: its asynchronous copy loops must deliver the
 		// cover site's certificate and response to the connecting probe.
 		if realityHandledFallback(err) {
-			logAuthFailure("REALITY fallback reason: " + realityFallbackReason(err))
+			logAuthFailure("unauthenticated connection handed to REALITY cover-site fallback")
 			return
 		}
 		logAuthFailure("REALITY handshake failed (details suppressed)")
