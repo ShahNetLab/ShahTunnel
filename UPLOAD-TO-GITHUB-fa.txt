@@ -1,8 +1,0 @@
-برای اینکه نصب‌گر آنلاین نسخه اصلاح‌شده را بردارد، ZIP را به‌تنهایی به GitHub آپلود نکنید.
-محتویات پوشه ShahTunnel-1.7.1-REALITY-EOF-FIX را در ریشه مخزن ShahNetLab/ShahTunnel آپلود/جایگزین کنید.
-فایل‌های مهم: S1T-START.sh، S1T-CAPSULE/reality_transport.go و S1T-CAPSULE/main_test.go.
-پس از آپلود و ثبت Commit، در GitHub باز کنید:
-S1T-CAPSULE/reality_transport.go
-و بررسی کنید که خط `return utls.HelloChrome_133, nil` وجود دارد.
-نصب‌گر همراه این بسته اگر سورس قدیمی باشد، از نصب آن خودداری می‌کند.
-برای استفاده بدون تغییر مخزن، فایل `ShahTunnel-REALITY-EOF-FIXED.zip` را روی هر دو VPS منتقل کنید، در `/root/shah-fix` استخراج کنید و `bash fix_shah_reality.sh` را از پوشه پروژه اجرا کنید.
