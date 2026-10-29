@@ -45,7 +45,13 @@ curl_download() {
   rm -f "$headers" "$log" "$dest"
   if [[ ! -t 2 ]]; then
     if ! curl -fsSL --proto '=https' --proto-redir '=https' --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log"; then
-      if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
+      if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then
+        cat "$log" >&2
+      else
+        printf '  curl diagnostic for %s: ' "$url" >&2
+        if [[ -s "$log" ]]; then cat "$log" >&2; else printf 'no diagnostic output\n' >&2; fi
+        cp -f "$log" "$TMP/curl-last-error.log" 2>/dev/null || true
+      fi
       rm -f "$headers" "$log" "$dest"
       return 1
     fi
@@ -68,7 +74,13 @@ curl_download() {
   wait "$pid" || rc=$?
   printf '\r\033[2K' >&2
   if (( rc != 0 )); then
-    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
+    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then
+      cat "$log" >&2
+    else
+      printf '  curl diagnostic for %s: ' "$url" >&2
+      if [[ -s "$log" ]]; then cat "$log" >&2; else printf 'no diagnostic output\n' >&2; fi
+      cp -f "$log" "$TMP/curl-last-error.log" 2>/dev/null || true
+    fi
     rm -f "$headers" "$log" "$dest"
     return "$rc"
   fi
@@ -246,8 +258,14 @@ build_from_official_go_toolchain() {
     # checksum. Keep the pinned SHA-256 check mandatory for every source.
     local -a download_bases=(
       "$GO_BASE"
+      "https://storage.googleapis.com/golang"
+      "https://golang.google.cn/dl"
       "$GO_FALLBACK_BASE"
+      "https://mirrors.huaweicloud.com/golang"
+      "https://mirrors.cloud.tencent.com/go"
+      "https://mirrors.163.com/golang"
       "https://mirror.nju.edu.cn/golang"
+      "https://mirrors.tuna.tsinghua.edu.cn/golang"
       "https://mirrors.aliyun.com/golang"
       "https://mirrors.ustc.edu.cn/golang"
     )
@@ -258,14 +276,11 @@ build_from_official_go_toolchain() {
       rm -f "$TMP/$go_archive"
       # Bound each attempt so a blocked or slow endpoint cannot stall install.
       case "$base" in
-        "$GO_BASE") max_time=55 ;;
-        "$GO_FALLBACK_BASE") max_time=25 ;;
-        "https://mirror.nju.edu.cn/golang") max_time=20 ;;
-        *) max_time=15 ;;
+        "$GO_BASE"|"https://storage.googleapis.com/golang"|"https://golang.google.cn/dl"|"$GO_FALLBACK_BASE") max_time=90 ;;
+        *) max_time=45 ;;
       esac
       if QUIET_CURL_ERRORS=1 curl_download "$url" "$TMP/$go_archive" \
-          --retry 0 --connect-timeout 5 --max-time "$max_time" \
-          --speed-time 15 --speed-limit 32768; then
+          --retry 0 --connect-timeout 6 --max-time "$max_time"; then
         if printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null 2>&1; then
           downloaded=1
           break
@@ -282,7 +297,7 @@ build_from_official_go_toolchain() {
     fi
   fi
   if [[ "$downloaded" -ne 1 ]]; then
-    echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the pinned SHA-256." >&2
+    echo "ERROR: Could not download a Go ${GO_VERSION} archive from any configured source." >&2
     return 1
   fi
   echo "Go archive SHA-256 verified." >&2
