@@ -109,7 +109,7 @@ func makeRealityServerConfig(cfg Config) (*reality.Config, error) {
 		Type:        "tcp",
 		Dest:        cfg.RealityDest,
 		ServerNames: map[string]bool{cfg.RealitySNI: true},
-		PrivateKey:  priv,
+		PrivateKey:  priv.Bytes(),
 		MaxTimeDiff: 2 * time.Minute,
 		ShortIds:    map[[8]byte]bool{shortID: true},
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -309,10 +309,9 @@ func dialRealityClientConn(raw net.Conn, cfg Config) (net.Conn, error) {
 		_ = raw.Close()
 		return nil, errors.New("uTLS generated an incomplete TLS ClientHello")
 	}
-	if uConn.HandshakeState.State13 == nil {
-		_ = raw.Close()
-		return nil, errors.New("selected ClientHello fingerprint does not support TLS 1.3; choose chrome, edge, firefox, or randomized")
-	}
+	// In current uTLS releases State13 is a value (not a pointer), so it
+	// cannot be checked against nil. A missing TLS 1.3 key share is checked
+	// below through the ECDHE key-share fields instead.
 	ecdhe := uConn.HandshakeState.State13.KeyShareKeys.Ecdhe
 	if ecdhe == nil {
 		ecdhe = uConn.HandshakeState.State13.KeyShareKeys.MlkemEcdhe
