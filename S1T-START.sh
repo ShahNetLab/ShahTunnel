@@ -218,94 +218,63 @@ build_project_binary() {
       -o "$TMP/S1T-CORE" ./S1T-CAPSULE
   )
 }
-build_from_official_go_toolchain() {
-  local go_archive go_sha source_url go_bin go_root source_dir expected_go url downloaded
-  go_archive="go${GO_VERSION}.linux-${TARGET_ARCH}.tar.gz"
-  go_sha="$(official_go_sha256)"
-  source_url="https://codeload.github.com/${OWNER}/${REPO}/tar.gz/refs/heads/main"
-  expected_go="go version go${GO_VERSION} linux/${TARGET_ARCH}"
-  source_dir="$TMP/source"
-  go_bin=""
-  go_root=""
-
-  phase_start 1 "Download verified Go toolchain and source"
-  local cache_archive="$GO_CACHE_DIR/$go_archive"
-  install -d -o root -g root -m 0755 "$GO_CACHE_DIR"
-  downloaded=0
-
-  # Reuse only an archive whose checksum matches the pinned Go distribution.
-  if [[ -s "$cache_archive" ]] && printf '%s  %s\n' "$go_sha" "$cache_archive" | sha256sum -c - >/dev/null 2>&1; then
-    cp -f "$cache_archive" "$TMP/$go_archive"
-    echo "Using cached, SHA-256-verified Go ${GO_VERSION} archive." >&2
-    downloaded=1
+go_is_compatible() {
+  local candidate="$1" output major minor
+  [[ -x "$candidate" ]] || return 1
+  output="$(GOTOOLCHAIN=local "$candidate" version 2>/dev/null)" || return 1
+  [[ "$output" == *" linux/${TARGET_ARCH}" ]] || return 1
+  if [[ "$output" =~ go([0-9]+)\.([0-9]+)(\.[0-9]+)? ]]; then
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
   else
-    rm -f "$cache_archive"
-    # Try the official Google-hosted Go archive first. The previous order put
-    # a third-party mirror first with a 150-second timeout, then never tried
-    # dl.google.com directly; mirrors can serve stale/error pages with a bad
-    # checksum. Keep the pinned SHA-256 check mandatory for every source.
-    local -a download_bases=(
-      "$GO_BASE"
-      "$GO_FALLBACK_BASE"
-      "https://mirror.nju.edu.cn/golang"
-      "https://mirrors.aliyun.com/golang"
-      "https://mirrors.ustc.edu.cn/golang"
-    )
-    local base max_time
-    echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}); progress indicator is active..." >&2
-    for base in "${download_bases[@]}"; do
-      url="${base}/${go_archive}"
-      rm -f "$TMP/$go_archive"
-      # Bound each attempt so a blocked or slow endpoint cannot stall install.
-      case "$base" in
-        "$GO_BASE") max_time=55 ;;
-        "$GO_FALLBACK_BASE") max_time=25 ;;
-        "https://mirror.nju.edu.cn/golang") max_time=20 ;;
-        *) max_time=15 ;;
-      esac
-      if QUIET_CURL_ERRORS=1 curl_download "$url" "$TMP/$go_archive" \
-          --retry 0 --connect-timeout 5 --max-time "$max_time" \
-          --speed-time 15 --speed-limit 32768; then
-        if printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null 2>&1; then
-          downloaded=1
-          break
-        fi
-        echo "Checksum mismatch from ${base}; rejecting archive and trying the next source." >&2
-      else
-        echo "Download failed from ${base}; trying the next source." >&2
-      fi
-      rm -f "$TMP/$go_archive"
-    done
-    if [[ "$downloaded" -eq 1 ]]; then
-      # Cache only the completely downloaded and verified archive.
-      install -o root -g root -m 0644 "$TMP/$go_archive" "$cache_archive"
+    return 1
+  fi
+  # go.mod declares Go 1.23.0. The project builds and tests with Go 1.23.2,
+  # so a compatible preinstalled compiler avoids downloading a 64 MB toolchain.
+  if (( 10#$major > 1 )); then return 0; fi
+  if (( 10#$major < 1 )); then return 1; fi
+  (( 10#$minor >= 23 ))
+}
+
+find_compatible_go() {
+  local candidate discovered
+  local -a candidates=()
+  discovered="$(command -v go 2>/dev/null || true)"
+  [[ -z "$discovered" ]] || candidates+=("$discovered")
+  candidates+=(/usr/local/go/bin/go /usr/lib/go-*/bin/go "$STATE_DIR"/go-*/bin/go /usr/local/lib/shah-tunnel/go-*/bin/go)
+  for candidate in "${candidates[@]}"; do
+    if go_is_compatible "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+download_project_source() {
+  local source_dir="$1" source_url="https://codeload.github.com/${OWNER}/${REPO}/tar.gz/refs/heads/main"
+  # The program is self-contained (standard library only). Fetching these two
+  # small raw files first is faster and avoids the large repository archive.
+  if QUIET_CURL_ERRORS=1 curl_download "${RAW_BASE}/go.mod" "$TMP/go.mod" \
+      --retry 1 --connect-timeout 5 --max-time 12 \
+      && QUIET_CURL_ERRORS=1 curl_download "${RAW_BASE}/S1T-CAPSULE/main.go" "$TMP/main.go" \
+      --retry 1 --connect-timeout 5 --max-time 25; then
+    mkdir -p "$source_dir/S1T-CAPSULE"
+    install -m 0644 "$TMP/go.mod" "$source_dir/go.mod"
+    install -m 0644 "$TMP/main.go" "$source_dir/S1T-CAPSULE/main.go"
+    if [[ -s "$source_dir/go.mod" && -s "$source_dir/S1T-CAPSULE/main.go" ]] \
+        && grep -Fq "module github.com/${OWNER}/${REPO}" "$source_dir/go.mod"; then
+      echo "Downloaded minimal ShahTunnel source files from the repository." >&2
+      return 0
     fi
   fi
-  if [[ "$downloaded" -ne 1 ]]; then
-    echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the pinned SHA-256." >&2
-    return 1
-  fi
-  echo "Go archive SHA-256 verified." >&2
-  rm -rf "$TMP/go-root"
-  mkdir -p "$TMP/go-root"
-  if ! tar -xzf "$TMP/$go_archive" -C "$TMP/go-root"; then
-    echo "Downloaded Go archive could not be extracted." >&2
-    return 1
-  fi
-  go_root="$TMP/go-root/go"
-  go_bin="$go_root/bin/go"
-  if [[ ! -x "$go_bin" ]]; then
-    echo "Go archive did not contain the expected bin/go executable." >&2
-    return 1
-  fi
-  if [[ "$(GOROOT="$go_root" GOTOOLCHAIN=local "$go_bin" version 2>/dev/null || true)" != "$expected_go" ]]; then
-    echo "Unexpected Go toolchain version or architecture; expected: $expected_go" >&2
-    return 1
-  fi
-  echo "Downloading ShahTunnel source from ${OWNER}/${REPO} (main branch)..." >&2
-  if ! curl_download "$source_url" "$TMP/shah-tunnel-source.tar.gz" \
-      --retry 2 --retry-delay 1 --connect-timeout 12 --max-time 180; then
-    echo "Could not download the source archive from ${source_url}." >&2
+
+  echo "Small-file source fetch failed; trying the repository archive..." >&2
+  rm -rf "$source_dir"
+  if ! QUIET_CURL_ERRORS=1 curl_download "$source_url" "$TMP/shah-tunnel-source.tar.gz" \
+      --retry 1 --retry-delay 1 --connect-timeout 8 --max-time 90 \
+      --speed-time 12 --speed-limit 16384; then
+    echo "Could not download ShahTunnel source from raw GitHub or codeload." >&2
     return 1
   fi
   mkdir -p "$source_dir"
@@ -314,12 +283,111 @@ build_from_official_go_toolchain() {
     return 1
   fi
   [[ -s "$source_dir/go.mod" && -s "$source_dir/S1T-CAPSULE/main.go" ]] \
-    || { echo "The downloaded repository does not contain the expected ShahTunnel source files." >&2; return 1; }
-  if ! grep -Fq "module github.com/${OWNER}/${REPO}" "$source_dir/go.mod"; then
-    echo "The source module path does not match github.com/${OWNER}/${REPO}; refusing to build." >&2
+    || { echo "Downloaded source archive is missing go.mod or S1T-CAPSULE/main.go." >&2; return 1; }
+  grep -Fq "module github.com/${OWNER}/${REPO}" "$source_dir/go.mod" \
+    || { echo "The source module path does not match github.com/${OWNER}/${REPO}; refusing to build." >&2; return 1; }
+}
+
+build_from_official_go_toolchain() {
+  local go_archive go_sha go_bin go_root source_dir expected_go url downloaded
+  local go_version_out
+  go_archive="go${GO_VERSION}.linux-${TARGET_ARCH}.tar.gz"
+  go_sha="$(official_go_sha256)"
+  expected_go="go version go${GO_VERSION} linux/${TARGET_ARCH}"
+  source_dir="$TMP/source"
+  go_bin=""
+  go_root=""
+
+  phase_start 1 "Prepare Go toolchain and source"
+  # Fast path: use an already-installed compatible Go compiler. The module
+  # requires 1.23.0+, so downloading a newer pinned toolchain is unnecessary.
+  go_bin="$(find_compatible_go || true)"
+  if [[ -n "$go_bin" ]]; then
+    go_version_out="$(GOTOOLCHAIN=local "$go_bin" version)"
+    go_root="$(GOTOOLCHAIN=local "$go_bin" env GOROOT)"
+    echo "Using compatible installed toolchain: ${go_version_out}. Skipping Go download." >&2
+  else
+    local cache_archive="$GO_CACHE_DIR/$go_archive"
+    install -d -o root -g root -m 0755 "$GO_CACHE_DIR"
+    downloaded=0
+
+    # Reuse only an archive whose checksum matches the official distribution.
+    if [[ -s "$cache_archive" ]] && printf '%s  %s\n' "$go_sha" "$cache_archive" | sha256sum -c - >/dev/null 2>&1; then
+      cp -f "$cache_archive" "$TMP/$go_archive"
+      echo "Using cached, SHA-256-verified Go ${GO_VERSION} archive." >&2
+      downloaded=1
+    else
+      rm -f "$cache_archive"
+      # The hashes are pinned to the official Go download index. Keep SHA-256
+      # verification mandatory even when a mirror or CDN is used.
+      local -a download_bases=(
+        "$GO_BASE"
+        "https://storage.googleapis.com/golang"
+        "https://golang.google.cn/dl"
+        "$GO_FALLBACK_BASE"
+        "https://mirror.nju.edu.cn/golang"
+        "https://mirrors.aliyun.com/golang"
+        "https://mirrors.ustc.edu.cn/golang"
+      )
+      local base max_time
+      echo "No compatible Go >= 1.23.0 was found locally; downloading verified Go ${GO_VERSION} (${TARGET_ARCH})..." >&2
+      for base in "${download_bases[@]}"; do
+        url="${base}/${go_archive}"
+        rm -f "$TMP/$go_archive"
+        case "$base" in
+          "$GO_BASE") max_time=25 ;;
+          "https://storage.googleapis.com/golang") max_time=25 ;;
+          "https://golang.google.cn/dl") max_time=20 ;;
+          "$GO_FALLBACK_BASE") max_time=8 ;;
+          "https://mirror.nju.edu.cn/golang") max_time=10 ;;
+          *) max_time=10 ;;
+        esac
+        if QUIET_CURL_ERRORS=1 curl_download "$url" "$TMP/$go_archive" \
+            --retry 0 --connect-timeout 4 --max-time "$max_time" \
+            --speed-time 8 --speed-limit 32768; then
+          if printf '%s  %s\n' "$go_sha" "$TMP/$go_archive" | sha256sum -c - >/dev/null 2>&1; then
+            downloaded=1
+            break
+          fi
+          echo "Checksum mismatch from ${base}; rejecting archive and trying the next source." >&2
+        else
+          echo "Download unavailable from ${base}; trying the next source." >&2
+        fi
+        rm -f "$TMP/$go_archive"
+      done
+      if [[ "$downloaded" -eq 1 ]]; then
+        install -o root -g root -m 0644 "$TMP/$go_archive" "$cache_archive"
+      fi
+    fi
+    if [[ "$downloaded" -ne 1 ]]; then
+      echo "ERROR: No compatible Go compiler was found, and the verified Go ${GO_VERSION} download failed." >&2
+      echo "Check outbound HTTPS/DNS access, or install Go 1.23.0 or newer from your OS package source and rerun." >&2
+      return 1
+    fi
+    echo "Go archive SHA-256 verified." >&2
+    rm -rf "$TMP/go-root"
+    mkdir -p "$TMP/go-root"
+    if ! tar -xzf "$TMP/$go_archive" -C "$TMP/go-root"; then
+      echo "Downloaded Go archive could not be extracted." >&2
+      return 1
+    fi
+    go_root="$TMP/go-root/go"
+    go_bin="$go_root/bin/go"
+    if [[ ! -x "$go_bin" ]]; then
+      echo "Go archive did not contain the expected bin/go executable." >&2
+      return 1
+    fi
+    go_version_out="$(GOROOT="$go_root" GOTOOLCHAIN=local "$go_bin" version 2>/dev/null || true)"
+    if [[ "$go_version_out" != "$expected_go" ]]; then
+      echo "Unexpected Go toolchain version or architecture; expected: $expected_go" >&2
+      return 1
+    fi
+  fi
+
+  if ! download_project_source "$source_dir"; then
     return 1
   fi
-  echo "Building Shah Tunnel ${VERSION} with verified Go ${GO_VERSION}..." >&2
+  echo "Building Shah Tunnel ${VERSION} with ${go_version_out}..." >&2
   if ! run_with_spinner "Building ShahTunnel" "$TMP/build.log" build_project_binary "$go_bin" "$source_dir" "$go_root"; then
     echo "Source build failed. Build output follows:" >&2
     [[ ! -s "$TMP/build.log" ]] || cat "$TMP/build.log" >&2
@@ -336,7 +404,7 @@ build_from_official_go_toolchain() {
 
 if ! build_from_official_go_toolchain; then
   echo "Installation stopped: no verified ShahTunnel binary was built." >&2
-  echo "Go archives must match the pinned SHA-256; ShahTunnel is built locally without GitHub Release assets." >&2
+  echo "SHA-256 verification remains mandatory; ShahTunnel is built locally without GitHub Release assets." >&2
   exit 1
 fi
 phase_start 2 "Installing binary and configuring service"
