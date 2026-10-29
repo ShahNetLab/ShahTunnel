@@ -23,7 +23,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 1
 fi
 command -v systemctl >/dev/null 2>&1 || { echo "systemd/systemctl is required." >&2; exit 1; }
-for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod tar gzip mktemp rm sleep python3 wc; do
+for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod tar gzip mktemp rm sleep python3 wc sed tail sort xargs find; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "Required command missing: $cmd" >&2; exit 1; }
 done
 TMP="$(mktemp -d /tmp/s1t-install.XXXXXX)"
@@ -80,7 +80,7 @@ curl_download() {
 # Unlike curl_download(), this helper must NEVER remove the destination file on
 # failure, because the next mirror may resume at the existing byte offset.
 curl_download_resumable() {
-  local url="$1" dest="$2"
+  local url="$1" dest="$2" max_time="${3:-0}" retry_count="${4:-3}" speed_time="${5:-180}"
   local headers="${TMP}/curl-resume-headers.$$" log="${TMP}/curl-resume-log.$$"
   local rc=0 pid=0 frame=0
 
@@ -91,9 +91,9 @@ curl_download_resumable() {
   if [[ ! -t 2 ]]; then
     if curl -fsSL --proto '=https' --proto-redir '=https' \
         --continue-at - \
-        --retry 3 --retry-delay 2 --retry-connrefused \
-        --connect-timeout 15 --max-time 0 \
-        --speed-time 180 --speed-limit 1024 \
+        --retry "$retry_count" --retry-delay 1 --retry-connrefused \
+        --connect-timeout 8 --max-time "$max_time" \
+        --speed-time "$speed_time" --speed-limit 1024 \
         --dump-header "$headers" "$url" -o "$dest" 2>"$log"; then
       rm -f "$headers" "$log"
       return 0
@@ -107,9 +107,9 @@ curl_download_resumable() {
 
   curl -fsSL --proto '=https' --proto-redir '=https' \
       --continue-at - \
-      --retry 3 --retry-delay 2 --retry-connrefused \
-      --connect-timeout 15 --max-time 0 \
-      --speed-time 180 --speed-limit 1024 \
+      --retry "$retry_count" --retry-delay 1 --retry-connrefused \
+      --connect-timeout 8 --max-time "$max_time" \
+      --speed-time "$speed_time" --speed-limit 1024 \
       --dump-header "$headers" "$url" -o "$dest" 2>"$log" &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
@@ -126,6 +126,103 @@ curl_download_resumable() {
   fi
   PHASE_HAS_DOWNLOAD=1
   rm -f "$headers" "$log"
+  return 0
+}
+
+# Download a Go archive using concurrent byte ranges. This is especially
+# helpful on hosts where a single HTTPS stream is bandwidth-limited. A range
+# is accepted only when the server returns the exact number of bytes; the final
+# archive must match the pinned SHA-256 before it is used.
+curl_download_parallel_ranges() {
+  local url="$1" dest="$2" expected_sha="$3"
+  local workdir="${dest}.chunks" headers="${TMP}/range-headers.$$" probe="${TMP}/range-probe.$$"
+  local total chunk_count=8 chunk_size i start end expected_size part tmp_part
+  local pid rc failed=0 alive frame=0
+  local -a pids=()
+  RANGE_DOWNLOAD_ATTEMPTED=0
+
+  rm -f "$headers" "$probe"
+  # --max-filesize prevents a mirror that ignores Range from streaming the
+  # entire ~67 MB archive just to probe support.
+  if ! curl -fsSL --proto '=https' --proto-redir '=https' --range 0-0 \
+      --max-filesize 1024 --connect-timeout 8 --max-time 12 \
+      --dump-header "$headers" "$url" -o "$probe" 2>/dev/null; then
+    rm -f "$headers" "$probe"
+    return 1
+  fi
+  total="$(sed -nE 's/^[Cc]ontent-[Rr]ange:[[:space:]]*bytes[[:space:]]+0-0\/([0-9]+).*$/\1/p' "$headers" | tail -n 1)"
+  if [[ ! "$total" =~ ^[0-9]+$ ]] || [[ "$(wc -c < "$probe" 2>/dev/null || echo 0)" -ne 1 ]]; then
+    rm -f "$headers" "$probe"
+    return 1
+  fi
+  rm -f "$headers" "$probe"
+  RANGE_DOWNLOAD_ATTEMPTED=1
+
+  mkdir -p "$workdir"
+  chunk_size=$(((total + chunk_count - 1) / chunk_count))
+  pids=()
+  for ((i=0; i<chunk_count; i++)); do
+    start=$((i * chunk_size))
+    (( start < total )) || break
+    end=$((start + chunk_size - 1))
+    (( end < total )) || end=$((total - 1))
+    expected_size=$((end - start + 1))
+    part="${workdir}/chunk-$(printf '%02d' "$i").part"
+    # Completed chunks are reusable on the next invocation, but only if their
+    # byte count matches the expected range length.
+    if [[ -f "$part" ]] && [[ "$(wc -c < "$part")" -eq "$expected_size" ]]; then
+      continue
+    fi
+    tmp_part="${part}.tmp.$$"
+    rm -f "$tmp_part"
+    (
+      if curl -fsSL --proto '=https' --proto-redir '=https' \
+          --range "${start}-${end}" --retry 0 \
+          --connect-timeout 8 --max-time 35 \
+          "$url" -o "$tmp_part" 2>/dev/null &&
+          [[ "$(wc -c < "$tmp_part" 2>/dev/null || echo 0)" -eq "$expected_size" ]]; then
+        mv -f "$tmp_part" "$part"
+        exit 0
+      fi
+      rm -f "$tmp_part"
+      exit 1
+    ) &
+    pids+=("$!")
+  done
+
+  # Keep the existing compact animated indicator while chunks are in flight.
+  while :; do
+    alive=0
+    for pid in "${pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then alive=1; break; fi
+    done
+    (( alive == 1 )) || break
+    draw_indeterminate_bar "$frame"
+    frame=$((frame + 1))
+    sleep 0.12
+  done
+  printf '\r\033[2K' >&2
+  for pid in "${pids[@]}"; do
+    wait "$pid" || failed=1
+  done
+  if (( failed != 0 )); then
+    return 1
+  fi
+
+  local assembled="${TMP}/go-ranges-assembled.$$"
+  : > "$assembled"
+  for ((i=0; i<chunk_count; i++)); do
+    part="${workdir}/chunk-$(printf '%02d' "$i").part"
+    [[ -f "$part" ]] || { rm -f "$assembled"; return 1; }
+    cat "$part" >> "$assembled" || { rm -f "$assembled"; return 1; }
+  done
+  if [[ "$(wc -c < "$assembled")" -ne "$total" ]] ||
+      ! printf '%s  %s\n' "$expected_sha" "$assembled" | sha256sum -c - >/dev/null 2>&1; then
+    rm -f "$assembled"
+    rm -rf "$workdir"
+    return 1
+  fi
+  mv -f "$assembled" "$dest"
   return 0
 }
 
@@ -265,8 +362,9 @@ build_project_binary() {
   local go_bin="$1" source_dir="$2" go_root="$3"
   (
     cd "$source_dir"
-    env GOROOT="$go_root" GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off CGO_ENABLED=0 \
-      GOOS=linux GOARCH="$TARGET_ARCH" \
+    env GOROOT="$go_root" GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off \
+      GOCACHE="${GO_CACHE_DIR}/build-cache-${GO_VERSION}-${TARGET_ARCH}" \
+      CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_ARCH" \
       "$go_bin" build -trimpath -ldflags='-s -w -buildid=' \
       -o "$TMP/S1T-CORE" ./S1T-CAPSULE
   )
@@ -283,94 +381,120 @@ build_from_official_go_toolchain() {
 
   phase_start 1 "Download verified Go toolchain and source"
   local cache_archive="$GO_CACHE_DIR/$go_archive"
-  install -d -o root -g root -m 0755 "$GO_CACHE_DIR"
+  local toolchain_path="${STATE_DIR}/toolchains/go${GO_VERSION}-${TARGET_ARCH}"
+  local toolchain_new="${toolchain_path}.new"
+  install -d -o root -g root -m 0755 "$GO_CACHE_DIR" "${STATE_DIR}/toolchains"
   downloaded=0
 
-  # Reuse only an archive whose checksum matches the pinned Go distribution.
-  if [[ -s "$cache_archive" ]] && printf '%s  %s\n' "$go_sha" "$cache_archive" | sha256sum -c - >/dev/null 2>&1; then
-    cp -f "$cache_archive" "$TMP/$go_archive"
-    echo "Using cached, SHA-256-verified Go ${GO_VERSION} archive." >&2
+  # A stable, previously verified toolchain avoids re-extracting Go on every
+  # run and keeps GOCACHE effective across installations.
+  if [[ -x "$toolchain_path/bin/go" ]] &&
+      [[ "$(GOROOT="$toolchain_path" GOTOOLCHAIN=local "$toolchain_path/bin/go" version 2>/dev/null || true)" == "$expected_go" ]]; then
+    go_root="$toolchain_path"
+    go_bin="$go_root/bin/go"
     downloaded=1
+    echo "Reusing installed, verified Go ${GO_VERSION} toolchain." >&2
   else
-    rm -f "$cache_archive"
-    # Each mirror gets its own partial file. The official SHA-256 remains
-    # mandatory; no unverified archive is ever accepted.
-    # Keep a separate partial file for each host. Resuming a byte range from a
-    # different mirror is unsafe: some mirrors ignore Range requests or return
-    # a different response. A partial is reused only with the same exact URL.
-    # On networks that return 403/404 for Google hosts, try regional mirrors first.
-    local -a download_sources=(
-      "aliyun|https://mirrors.aliyun.com/golang"
-      "nju|https://mirror.nju.edu.cn/golang"
-      "ustc|https://mirrors.ustc.edu.cn/golang"
-      "tsinghua|https://mirrors.tuna.tsinghua.edu.cn/golang"
-      "tencent|https://mirrors.cloud.tencent.com/go"
-      "163|https://mirrors.163.com/golang"
-      "google|https://dl.google.com/go"
-      "go-dev|https://go.dev/dl"
-      "google-storage|https://storage.googleapis.com/golang"
-      "google-cn|https://golang.google.cn/dl"
-    )
-    local source source_id base part_file bytes
-    echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}); each mirror has an independent resumable partial file..." >&2
-    for source in "${download_sources[@]}"; do
-      source_id="${source%%|*}"
-      base="${source#*|}"
-      url="${base}/${go_archive}"
-      part_file="${GO_CACHE_DIR}/${go_archive}.${source_id}.part"
-      echo "Trying ${base}..." >&2
+    # Reuse only an archive whose checksum matches the pinned Go distribution.
+    if [[ -s "$cache_archive" ]] && printf '%s  %s\n' "$go_sha" "$cache_archive" | sha256sum -c - >/dev/null 2>&1; then
+      cp -f "$cache_archive" "$TMP/$go_archive"
+      echo "Using cached, SHA-256-verified Go ${GO_VERSION} archive." >&2
+      downloaded=1
+    else
+      rm -f "$cache_archive"
+      # Use parallel ranges first for mirrors that support them; if a mirror
+      # lacks byte-range support, fall back to the resumable single-stream path.
+      local -a download_sources=(
+        "aliyun|https://mirrors.aliyun.com/golang"
+        "nju|https://mirror.nju.edu.cn/golang"
+        "ustc|https://mirrors.ustc.edu.cn/golang"
+        "tsinghua|https://mirrors.tuna.tsinghua.edu.cn/golang"
+        "tencent|https://mirrors.cloud.tencent.com/go"
+        "163|https://mirrors.163.com/golang"
+        "google|https://dl.google.com/go"
+        "go-dev|https://go.dev/dl"
+        "google-storage|https://storage.googleapis.com/golang"
+        "google-cn|https://golang.google.cn/dl"
+      )
+      local source source_id base part_file bytes
+      echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) using parallel range requests where supported..." >&2
+      for source in "${download_sources[@]}"; do
+        source_id="${source%%|*}"
+        base="${source#*|}"
+        url="${base}/${go_archive}"
+        part_file="${GO_CACHE_DIR}/${go_archive}.${source_id}.part"
+        echo "Trying ${base}..." >&2
 
-      # Accept a fully downloaded cache-part only if the pinned digest matches.
-      if [[ -s "$part_file" ]] && printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
-        cp -f "$part_file" "$TMP/$go_archive"
-        downloaded=1
-        echo "Using complete SHA-256-verified archive from ${source_id}." >&2
-        break
-      fi
-
-      # curl retries transient network/5xx errors but does not waste time
-      # retrying permanent HTTP 403/404 responses (no --retry-all-errors).
-      if curl_download_resumable "$url" "$part_file"; then
-        if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
+        if [[ -s "$part_file" ]] && printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
           cp -f "$part_file" "$TMP/$go_archive"
           downloaded=1
-          echo "Go archive from ${source_id} passed SHA-256 verification." >&2
+          echo "Using complete SHA-256-verified archive from ${source_id}." >&2
           break
         fi
-        bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
-        echo "Checksum mismatch from ${source_id} (${bytes} bytes); discarding only that mirror's partial file." >&2
-        rm -f "$part_file"
-      else
-        bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
-        echo "Download failed from ${source_id} (${bytes} bytes retained for the same mirror's next attempt)." >&2
+
+        RANGE_DOWNLOAD_ATTEMPTED=0
+        if curl_download_parallel_ranges "$url" "$part_file" "$go_sha"; then
+          cp -f "$part_file" "$TMP/$go_archive"
+          downloaded=1
+          echo "Parallel download from ${source_id} passed SHA-256 verification." >&2
+          break
+        fi
+        if [[ "$RANGE_DOWNLOAD_ATTEMPTED" == 1 ]]; then
+          echo "Parallel chunks were incomplete at ${source_id}; moving to the next mirror instead of restarting a slow full download." >&2
+          continue
+        fi
+        echo "${source_id} does not support a usable byte-range response; trying a time-limited single stream..." >&2
+        if curl_download_resumable "$url" "$part_file" 35 0 15; then
+          if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
+            cp -f "$part_file" "$TMP/$go_archive"
+            downloaded=1
+            echo "Resumable download from ${source_id} passed SHA-256 verification." >&2
+            break
+          fi
+          bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
+          echo "Checksum mismatch from ${source_id} (${bytes} bytes); discarding its single-stream partial." >&2
+          rm -f "$part_file"
+        else
+          bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
+          echo "Download failed from ${source_id} (${bytes} bytes retained for the same mirror)." >&2
+        fi
+      done
+      if [[ "$downloaded" -eq 1 ]]; then
+        # Cache only a fully downloaded and verified archive.
+        install -o root -g root -m 0644 "$TMP/$go_archive" "$cache_archive"
       fi
-    done
-    if [[ "$downloaded" -eq 1 ]]; then
-      # Cache only the completely downloaded and verified archive.
-      install -o root -g root -m 0644 "$TMP/$go_archive" "$cache_archive"
     fi
+
+    if [[ "$downloaded" -ne 1 ]]; then
+      echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the pinned SHA-256." >&2
+      return 1
+    fi
+    echo "Go archive SHA-256 verified." >&2
+    rm -rf "$TMP/go-root" "$toolchain_new"
+    mkdir -p "$TMP/go-root"
+    if ! tar -xzf "$TMP/$go_archive" -C "$TMP/go-root"; then
+      echo "Downloaded Go archive could not be extracted." >&2
+      return 1
+    fi
+    go_root="$TMP/go-root/go"
+    go_bin="$go_root/bin/go"
+    if [[ ! -x "$go_bin" ]]; then
+      echo "Go archive did not contain the expected bin/go executable." >&2
+      return 1
+    fi
+    if [[ "$(GOROOT="$go_root" GOTOOLCHAIN=local "$go_bin" version 2>/dev/null || true)" != "$expected_go" ]]; then
+      echo "Unexpected Go toolchain version or architecture; expected: $expected_go" >&2
+      return 1
+    fi
+    # Install the verified toolchain to a stable location. The build cache is
+    # keyed to this path and can be reused on future runs.
+    mv "$go_root" "$toolchain_new"
+    rm -rf "$toolchain_path"
+    mv "$toolchain_new" "$toolchain_path"
+    go_root="$toolchain_path"
+    go_bin="$go_root/bin/go"
   fi
-  if [[ "$downloaded" -ne 1 ]]; then
-    echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the pinned SHA-256." >&2
-    return 1
-  fi
-  echo "Go archive SHA-256 verified." >&2
-  rm -rf "$TMP/go-root"
-  mkdir -p "$TMP/go-root"
-  if ! tar -xzf "$TMP/$go_archive" -C "$TMP/go-root"; then
-    echo "Downloaded Go archive could not be extracted." >&2
-    return 1
-  fi
-  go_root="$TMP/go-root/go"
-  go_bin="$go_root/bin/go"
-  if [[ ! -x "$go_bin" ]]; then
-    echo "Go archive did not contain the expected bin/go executable." >&2
-    return 1
-  fi
-  if [[ "$(GOROOT="$go_root" GOTOOLCHAIN=local "$go_bin" version 2>/dev/null || true)" != "$expected_go" ]]; then
-    echo "Unexpected Go toolchain version or architecture; expected: $expected_go" >&2
-    return 1
-  fi
+
   echo "Downloading ShahTunnel source from ${OWNER}/${REPO} (main branch)..." >&2
   if ! curl_download "$source_url" "$TMP/shah-tunnel-source.tar.gz" \
       --retry 2 --retry-delay 1 --connect-timeout 12 --max-time 180; then
@@ -388,11 +512,27 @@ build_from_official_go_toolchain() {
     echo "The source module path does not match github.com/${OWNER}/${REPO}; refusing to build." >&2
     return 1
   fi
-  echo "Building Shah Tunnel ${VERSION} with verified Go ${GO_VERSION}..." >&2
-  if ! run_with_spinner "Building ShahTunnel" "$TMP/build.log" build_project_binary "$go_bin" "$source_dir" "$go_root"; then
-    echo "Source build failed. Build output follows:" >&2
-    [[ ! -s "$TMP/build.log" ]] || cat "$TMP/build.log" >&2
-    return 1
+  local source_fingerprint build_cache_dir cached_binary
+  source_fingerprint="$(cd "$source_dir" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')"
+  build_cache_dir="${STATE_DIR}/builds"
+  cached_binary="${build_cache_dir}/shah-tunnel-${VERSION}-${GO_VERSION}-${TARGET_ARCH}-${source_fingerprint}"
+  install -d -o root -g root -m 0755 "$build_cache_dir"
+  if [[ -s "$cached_binary" ]] && timeout --kill-after=1s 5s "$cached_binary" version 2>/dev/null | grep -Fqx "Shah Tunnel ${VERSION} (linux/${TARGET_ARCH})"; then
+    cp -f "$cached_binary" "$TMP/S1T-CORE"
+    echo "Reusing cached ShahTunnel binary for this exact source revision." >&2
+  else
+    echo "Building Shah Tunnel ${VERSION} with verified Go ${GO_VERSION}..." >&2
+    if ! run_with_spinner "Building ShahTunnel" "$TMP/build.log" build_project_binary "$go_bin" "$source_dir" "$go_root"; then
+      echo "Source build failed. Build output follows:" >&2
+      [[ ! -s "$TMP/build.log" ]] || cat "$TMP/build.log" >&2
+      return 1
+    fi
+    if ! verify_binary; then
+      echo "Built binary version or architecture validation failed; refusing to cache it." >&2
+      return 1
+    fi
+    install -o root -g root -m 0750 "$TMP/S1T-CORE" "${cached_binary}.new"
+    mv -f "${cached_binary}.new" "$cached_binary"
   fi
 
   if ! verify_binary; then
