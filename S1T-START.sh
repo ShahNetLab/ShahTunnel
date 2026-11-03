@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 # Shah Tunnel 1.7.0 installer.
-# Builds only from the source bundled beside this installer; no moving branch is fetched.
-# All toolchain and Hysteria binaries are checksum-pinned before installation.
+# Local runs use the adjacent source tree; one-line remote runs bootstrap the matching source bundle.
+# Installer and application versions must match; toolchain and Hysteria binaries are SHA-256 pinned.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
 VERSION="1.7.0"
@@ -27,10 +27,67 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 1
 fi
 command -v systemctl >/dev/null 2>&1 || { echo "systemd/systemctl is required." >&2; exit 1; }
+for cmd in curl tar mktemp rm mkdir find sed head grep; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "Required bootstrap command missing: $cmd" >&2; exit 1; }
+done
+
+# One-line remote install support:
+# `bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)`
+# When this script is streamed from /dev/fd it has no adjacent source tree.
+# Fetch the complete main-branch source bundle, verify installer + Go versions,
+# and run the installer from that extracted bundle. No moving, mixed source files.
 if [[ ! -s "$SCRIPT_DIR/go.mod" || ! -s "$SCRIPT_DIR/S1T-CAPSULE/main.go" ]]; then
-  echo "This installer must run from the extracted ShahTunnel ${VERSION} release ZIP; the public main branch is not a version-pinned installer source." >&2
-  exit 1
+  echo "Fetching ShahTunnel ${VERSION} source bundle..." >&2
+  BOOTSTRAP_TMP="$(mktemp -d /tmp/shahtunnel-bootstrap.XXXXXX)"
+  trap 'rm -rf -- "$BOOTSTRAP_TMP"' EXIT
+  BOOTSTRAP_ARCHIVE="$BOOTSTRAP_TMP/source.tar.gz"
+  BOOTSTRAP_EXTRACT="$BOOTSTRAP_TMP/source"
+  mkdir -p "$BOOTSTRAP_EXTRACT"
+  BOOTSTRAP_OK=0
+  BOOTSTRAP_URLS=(
+    "https://codeload.github.com/${OWNER}/${REPO}/tar.gz/refs/heads/main"
+    "https://github.com/${OWNER}/${REPO}/archive/refs/heads/main.tar.gz"
+  )
+  for BOOTSTRAP_URL in "${BOOTSTRAP_URLS[@]}"; do
+    rm -f "$BOOTSTRAP_ARCHIVE"
+    if curl -fsSL --proto '=https' --proto-redir '=https' \
+        --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 600 \
+        "$BOOTSTRAP_URL" -o "$BOOTSTRAP_ARCHIVE" 2>/dev/null \
+        && tar -tzf "$BOOTSTRAP_ARCHIVE" >/dev/null 2>&1; then
+      if tar -xzf "$BOOTSTRAP_ARCHIVE" -C "$BOOTSTRAP_EXTRACT"; then
+        BOOTSTRAP_OK=1
+        break
+      fi
+    fi
+  done
+  if (( BOOTSTRAP_OK == 0 )); then
+    echo "ERROR: Could not download the ShahTunnel source bundle from GitHub." >&2
+    echo "Check HTTPS access to GitHub, then run the same command again." >&2
+    exit 1
+  fi
+  BOOTSTRAP_MAIN="$(find "$BOOTSTRAP_EXTRACT" -type f -path '*/S1T-CAPSULE/main.go' -print -quit)"
+  if [[ -z "$BOOTSTRAP_MAIN" ]]; then
+    echo "ERROR: The downloaded archive does not contain the ShahTunnel source tree." >&2
+    exit 1
+  fi
+  BOOTSTRAP_SOURCE_DIR="${BOOTSTRAP_MAIN%/S1T-CAPSULE/main.go}"
+  if [[ ! -s "$BOOTSTRAP_SOURCE_DIR/go.mod" || ! -s "$BOOTSTRAP_SOURCE_DIR/S1T-START.sh" || ! -s "$BOOTSTRAP_SOURCE_DIR/VERIFY-ALL-TRANSPORTS.sh" ]]; then
+    echo "ERROR: The downloaded source bundle is incomplete." >&2
+    exit 1
+  fi
+  BOOTSTRAP_SCRIPT_VERSION="$(sed -nE 's/^VERSION="([^"]+)"$/\1/p' "$BOOTSTRAP_SOURCE_DIR/S1T-START.sh" | head -n 1)"
+  BOOTSTRAP_APP_VERSION="$(sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]+)".*$/\1/p' "$BOOTSTRAP_SOURCE_DIR/S1T-CAPSULE/main.go" | head -n 1)"
+  if [[ "$BOOTSTRAP_SCRIPT_VERSION" != "$VERSION" || "$BOOTSTRAP_APP_VERSION" != "$VERSION" ]]; then
+    echo "ERROR: GitHub main is not a consistent ShahTunnel ${VERSION} release." >&2
+    echo "Installer version: ${BOOTSTRAP_SCRIPT_VERSION:-unknown}; application version: ${BOOTSTRAP_APP_VERSION:-unknown}." >&2
+    echo "Publish the complete matching release source to the main branch and retry." >&2
+    exit 1
+  fi
+  echo "Source bundle verified: ShahTunnel ${VERSION}. Starting installer..." >&2
+  (cd "$BOOTSTRAP_SOURCE_DIR" && bash ./S1T-START.sh "$@")
+  exit $?
 fi
+
 for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod tar gzip mktemp rm sleep python3 wc sed tail sort xargs find; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "Required command missing: $cmd" >&2; exit 1; }
 done

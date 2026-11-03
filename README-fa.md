@@ -9,7 +9,7 @@
 
 ## نصب سریع
 
-روی هر دو سرور با کاربر `root` این دستور را اجرا کنید:
+روی هر دو سرور با کاربر `root` این دستور را اجرا کنید. نصب‌کننده بستهٔ سورس را دریافت می‌کند و پیش از ساخت، یکسان‌بودن نسخهٔ نصب‌کننده و برنامه را بررسی می‌کند:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
@@ -17,12 +17,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S
 
 روی سرور ایران نقش `Hub` و روی سرور خارج نقش `Agent` را انتخاب کنید.
 
-> این دستور فایل نصب منتشرشده در شاخهٔ `main` مخزن را اجرا می‌کند. در بررسی ۴ نوامبر ۲۰۲۶، فایل آنلاین نسخهٔ `1.6.3` را اعلام می‌کند؛ برای نصب نسخهٔ `1.7.0` باید نصب‌کنندهٔ همین نسخه ابتدا در شاخهٔ `main` منتشر شود.
-
 ## نمودار جریان شبکه
 
 <p align="center">
-  <img src="docs/img/ShahTunnel-Network-Flow-v1.7.0-fa.png" alt="نمودار فارسی جریان شبکه شاه‌تونل با چهار مسیر TCP و مسیر مستقل Hysteria 2 روی QUIC/UDP" width="100%" />
+  <img src="docs/img/ShahTunnel-Network-Flow-v1.7.0-fa.jpg" alt="نمودار فارسی جریان شبکه شاه‌تونل با چهار مسیر TCP و مسیر مستقل Hysteria 2 روی QUIC/UDP" width="100%" />
 </p>
 
 ## سازوکار تونل

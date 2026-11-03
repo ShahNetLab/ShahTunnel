@@ -9,7 +9,7 @@
 
 ## Quick install
 
-Run this command as `root` on both servers:
+Run this command as `root` on both servers. The installer downloads the matching source bundle and checks that its installer and application versions agree before building:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
@@ -17,12 +17,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S
 
 Select `Hub` on the Iran server and `Agent` on the outside server.
 
-> This command runs the installer published on the repository's `main` branch. As checked on 4 November 2026, the online script identifies itself as version `1.6.3`; the `1.7.0` installer must be published to `main` before this command can install `1.7.0`.
-
 ## Network flow
 
 <p align="center">
-  <img src="docs/img/ShahTunnel-Network-Flow-v1.7.0-en.png" alt="ShahTunnel 1.7.0 network flow with four TCP transports and Hysteria 2 QUIC over UDP" width="100%" />
+  <img src="docs/img/ShahTunnel-Network-Flow-v1.7.0-en.jpg" alt="ShahTunnel 1.7.0 network flow with four TCP transports and Hysteria 2 QUIC over UDP" width="100%" />
 </p>
 
 ## Tunnel operation
