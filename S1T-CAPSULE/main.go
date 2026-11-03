@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -37,6 +38,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 const (
@@ -2483,9 +2485,9 @@ func compactFingerprint(value string) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(pin), nil
 }
 
-// osc52ClipboardSequence requests a clipboard copy only after the user
-// explicitly chooses a numbered copy action. Terminals without OSC 52 support
-// ignore it; each credential is also printed alone for long-press selection.
+// osc52ClipboardSequence requests a clipboard write containing only the value.
+// A value is copied when the terminal reports a pointer press on its credential
+// card; no numbered copy menu or extra explanatory text is rendered.
 func osc52ClipboardSequence(value string) string {
 	return "\033]52;c;" + base64.StdEncoding.EncodeToString([]byte(value)) + "\a"
 }
@@ -2496,48 +2498,263 @@ type displayedCredential struct {
 	color string
 }
 
+const credentialCardHeight = 4 // top border, title, value, bottom border
+
+func credentialIndexAtRow(endRow, count, clickedRow int) int {
+	if count <= 0 {
+		return -1
+	}
+	firstRow := endRow - count*credentialCardHeight
+	offset := clickedRow - firstRow
+	if offset < 0 || offset >= count*credentialCardHeight {
+		return -1
+	}
+	return offset / credentialCardHeight
+}
+
+func credentialValueAtRow(endRow, count, clickedRow int, credentials []displayedCredential) (string, bool) {
+	index := credentialIndexAtRow(endRow, count, clickedRow)
+	if index < 0 || index >= len(credentials) {
+		return "", false
+	}
+	return credentials[index].value, true
+}
+
+func parseSGRMouseReport(report string) (button, x, y int, pressed bool, err error) {
+	parts := strings.Split(report, ";")
+	if len(parts) != 3 {
+		return 0, 0, 0, false, errors.New("invalid SGR mouse report")
+	}
+	button, err = strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	x, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	y, err = strconv.Atoi(parts[2])
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	pressed = button&32 == 0 && button&3 != 3
+	return button, x, y, pressed, nil
+}
+
+func ioctlTermios(fd int, request uintptr, state *syscall.Termios) error {
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), request, uintptr(unsafe.Pointer(state)))
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+type terminalMouseSession struct {
+	fd       int
+	original syscall.Termios
+	closed   sync.Once
+}
+
+func startTerminalMouseSession() (*terminalMouseSession, error) {
+	if os.Getenv("TERM") == "" || os.Getenv("TERM") == "dumb" {
+		return nil, nil
+	}
+	fd := int(os.Stdin.Fd())
+	var original syscall.Termios
+	if err := ioctlTermios(fd, syscall.TCGETS, &original); err != nil {
+		return nil, nil // non-interactive input: keep the ordinary framed output
+	}
+	raw := original
+	raw.Lflag &^= syscall.ECHO | syscall.ICANON
+	raw.Cc[syscall.VMIN] = 1
+	raw.Cc[syscall.VTIME] = 0
+	if err := ioctlTermios(fd, syscall.TCSETS, &raw); err != nil {
+		return nil, err
+	}
+	session := &terminalMouseSession{fd: fd, original: original}
+	fmt.Fprint(os.Stdout, "\033[?1000h\033[?1006h") // xterm click reporting + SGR coordinates
+	return session, nil
+}
+
+func (s *terminalMouseSession) close() {
+	if s == nil {
+		return
+	}
+	s.closed.Do(func() {
+		fmt.Fprint(os.Stdout, "\033[?1006l\033[?1000l")
+		_ = ioctlTermios(s.fd, syscall.TCSETS, &s.original)
+	})
+}
+
+func readTTYByte(fd int, timeout time.Duration) (byte, error) {
+	if fd < 0 || fd >= 1024 {
+		return 0, errors.New("unsupported terminal file descriptor")
+	}
+	var set syscall.FdSet
+	set.Bits[fd/64] |= int64(1) << uint(fd%64)
+	tv := syscall.NsecToTimeval(timeout.Nanoseconds())
+	n, err := syscall.Select(fd+1, &set, nil, nil, &tv)
+	if err != nil {
+		return 0, err
+	}
+	if n == 0 {
+		return 0, errors.New("terminal response timeout")
+	}
+	var one [1]byte
+	nRead, err := syscall.Read(fd, one[:])
+	if err != nil {
+		return 0, err
+	}
+	if nRead != 1 {
+		return 0, io.EOF
+	}
+	return one[0], nil
+}
+
+func queryTerminalCursorRow(fd int) (int, error) {
+	fmt.Fprint(os.Stdout, "\033[6n")
+	deadline := time.Now().Add(900 * time.Millisecond)
+	var response strings.Builder
+	for response.Len() < 32 {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0, errors.New("terminal cursor query timed out")
+		}
+		b, err := readTTYByte(fd, remaining)
+		if err != nil {
+			return 0, err
+		}
+		response.WriteByte(b)
+		if b == 'R' {
+			value := response.String()
+			start := strings.LastIndex(value, "\033[")
+			if start < 0 {
+				return 0, errors.New("invalid terminal cursor response")
+			}
+			fields := strings.Split(strings.TrimSuffix(value[start+2:], "R"), ";")
+			if len(fields) != 2 {
+				return 0, errors.New("invalid terminal cursor coordinates")
+			}
+			row, parseErr := strconv.Atoi(fields[0])
+			if parseErr != nil || row < 1 {
+				return 0, errors.New("invalid terminal cursor row")
+			}
+			return row, nil
+		}
+	}
+	return 0, errors.New("terminal cursor response was too long")
+}
+
+// readCredentialTapOrEnter waits for a click on any row of a credential card
+// or Enter. A click is actionable only in SSH clients that forward xterm mouse
+// reports; clients that do not forward pointer events retain native text
+// selection/long-press behavior.
+func readCredentialTapOrEnter(fd, endRow, count int, credentials []displayedCredential) error {
+	for {
+		b, err := readTTYByte(fd, 24*time.Hour)
+		if err != nil {
+			return err
+		}
+		if b == '\r' || b == '\n' {
+			return nil
+		}
+		if b == 3 {
+			return errors.New("credential display interrupted")
+		}
+		if b != 0x1b {
+			continue
+		}
+		next, err := readTTYByte(fd, time.Second)
+		if err != nil || next != '[' {
+			continue
+		}
+		next, err = readTTYByte(fd, time.Second)
+		if err != nil {
+			continue
+		}
+		if next == 'M' { // legacy X10 mouse report: button, x, y are byte-offset encoded
+			buttonByte, err1 := readTTYByte(fd, time.Second)
+			xByte, err2 := readTTYByte(fd, time.Second)
+			yByte, err3 := readTTYByte(fd, time.Second)
+			if err1 == nil && err2 == nil && err3 == nil && xByte >= 33 {
+				button, y := int(buttonByte)-32, int(yByte)-32
+				pressed := button >= 0 && button&32 == 0 && button&3 != 3
+				if pressed {
+					if value, ok := credentialValueAtRow(endRow, count, y, credentials); ok {
+						fmt.Fprint(os.Stdout, osc52ClipboardSequence(value))
+					}
+				}
+			}
+			continue
+		}
+		if next != '<' { // ignore non-mouse CSI keys such as arrows
+			continue
+		}
+		var report strings.Builder
+		for report.Len() < 40 {
+			c, readErr := readTTYByte(fd, time.Second)
+			if readErr != nil {
+				break
+			}
+			if c == 'M' || c == 'm' {
+				_, _, y, pressed, parseErr := parseSGRMouseReport(report.String())
+				if parseErr == nil && pressed {
+					if value, ok := credentialValueAtRow(endRow, count, y, credentials); ok {
+						fmt.Fprint(os.Stdout, osc52ClipboardSequence(value))
+					}
+				}
+				break
+			}
+			report.WriteByte(c)
+		}
+	}
+}
+
 func printAgentCredentials(token, fingerprint, hysteriaAuth, salamander string) {
 	credentials := []displayedCredential{
-		{label: "AGENT TOKEN (256-bit)", value: token, color: ansiYellow + ansiBold},
-		{label: "HUB CERTIFICATE SHA-256 (Base64URL)", value: fingerprint, color: ansiCyan + ansiBold},
+		{label: "AGENT TOKEN • TAP TO COPY", value: token, color: ansiYellow + ansiBold},
+		{label: "CERTIFICATE SHA-256 • TAP TO COPY", value: fingerprint, color: ansiCyan + ansiBold},
 	}
 	if hysteriaAuth != "" || salamander != "" {
 		credentials = append(credentials,
-			displayedCredential{label: "HYSTERIA 2 PASSWORD (256-bit)", value: hysteriaAuth, color: ansiYellow + ansiBold},
-			displayedCredential{label: "SALAMANDER PASSWORD (256-bit)", value: salamander, color: ansiCyan + ansiBold},
+			displayedCredential{label: "HYSTERIA 2 PASSWORD • TAP TO COPY", value: hysteriaAuth, color: ansiYellow + ansiBold},
+			displayedCredential{label: "SALAMANDER PASSWORD • TAP TO COPY", value: salamander, color: ansiCyan + ansiBold},
 		)
 	}
 
-	fmt.Printf("\n  %s\n", paint(ansiYellow+ansiBold, "AGENT CREDENTIALS — COPY VALUES EXACTLY"))
-	for i, credential := range credentials {
-		fmt.Printf("  %s\n", paint(ansiDim, credential.label))
-		// Values are deliberately emitted as plain, unboxed, single lines.
-		fmt.Printf("  %s\n", paint(credential.color, credential.value))
-		if i != len(credentials)-1 {
-			fmt.Println()
-		}
+	// Keep the original framed terminal-card layout. Each credential has its
+	// own card so selecting/copying one never includes another label or value.
+	fmt.Print("\r\n")
+	for _, credential := range credentials {
+		uiCard(credential.label, []uiCardRow{{Text: credential.value, Color: credential.color}}, ansiPinkGlow)
 	}
-	fmt.Printf("\n  %s\n", paint(ansiDim, "Copy menu writes only the selected value to clipboard (OSC 52)."))
-	fmt.Printf("  %s\n", paint(ansiDim, "If your SSH app blocks OSC 52, long-press the value-only line."))
+	fmt.Printf("  %s\n", paint(ansiDim, "Tap a credential card to copy • Press Enter to continue"))
 
-	for {
-		prompt := "Copy [1] Agent token  [2] SHA-256  [Enter] Continue:"
-		if len(credentials) == 4 {
-			prompt = "Copy [1] Token  [2] SHA-256  [3] Hysteria  [4] Salamander  [Enter] Continue:"
-		}
-		choice := strings.TrimSpace(ask(prompt, ""))
-		if choice == "" {
-			return
-		}
-		index, err := strconv.Atoi(choice)
-		if err != nil || index < 1 || index > len(credentials) {
-			uiWarn("Choose a displayed number or press Enter to continue.")
-			continue
-		}
-		selected := credentials[index-1]
-		fmt.Print(osc52ClipboardSequence(selected.value))
-		uiSuccess(selected.label + " copy requested. If unsupported, long-press its value-only line.")
+	session, err := startTerminalMouseSession()
+	if err != nil || session == nil {
+		return
 	}
+	defer session.close()
+	endRow, err := queryTerminalCursorRow(session.fd)
+	if err != nil {
+		return
+	}
+
+	// The card block is the final credential output. Derive tap rows from the
+	// terminal's post-render cursor position, which also accounts for scrolling.
+	interrupted := make(chan os.Signal, 1)
+	finished := make(chan struct{})
+	signal.Notify(interrupted, os.Interrupt, syscall.SIGTERM)
+	defer func() { signal.Stop(interrupted); close(finished) }()
+	go func() {
+		select {
+		case <-interrupted:
+			session.close()
+			os.Exit(130)
+		case <-finished:
+		}
+	}()
+	_ = readCredentialTapOrEnter(session.fd, endRow, len(credentials), credentials)
 }
 
 func hysteriaFingerprint(s string) (string, error) {

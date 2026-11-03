@@ -26,10 +26,10 @@ import (
 	"time"
 )
 
-func TestCredentialCopyMenuCopiesOnlySelectedValue(t *testing.T) {
-	originalReader := stdinReader
-	stdinReader = bufio.NewReader(strings.NewReader("2\n\n"))
-	defer func() { stdinReader = originalReader }()
+func TestCredentialCardsRemainFramedWithoutCopyMenu(t *testing.T) {
+	originalTerm := os.Getenv("TERM")
+	_ = os.Setenv("TERM", "dumb")
+	defer func() { _ = os.Setenv("TERM", originalTerm) }()
 
 	readEnd, writeEnd, err := os.Pipe()
 	if err != nil {
@@ -45,13 +45,47 @@ func TestCredentialCopyMenuCopiesOnlySelectedValue(t *testing.T) {
 	if readErr != nil {
 		t.Fatalf("read credential output: %v", readErr)
 	}
-
-	encodedFingerprint := base64.StdEncoding.EncodeToString([]byte("FINGERPRINT_VALUE"))
-	if !strings.Contains(string(output), "\033]52;c;"+encodedFingerprint+"\a") {
-		t.Fatal("copy option 2 did not send only the SHA-256 fingerprint via OSC 52")
+	got := string(output)
+	for _, value := range []string{"TOKEN_VALUE", "FINGERPRINT_VALUE", "HYSTERIA_VALUE", "SALAMANDER_VALUE"} {
+		if !strings.Contains(got, value) {
+			t.Fatalf("credential card omitted %q", value)
+		}
 	}
-	if strings.Contains(string(output), "\033]52;c;"+base64.StdEncoding.EncodeToString([]byte("AGENT TOKEN"))+"\a") {
-		t.Fatal("copy menu placed a label in the clipboard sequence")
+	if strings.Count(got, "╭") != 4 || strings.Count(got, "╰") != 4 {
+		t.Fatalf("expected four separate framed credential cards; got output:\n%s", got)
+	}
+	for _, forbidden := range []string{"Copy menu writes", "If your SSH app blocks", "Copy [1]", "[4] Salamander"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("obsolete copy menu text %q is still present", forbidden)
+		}
+	}
+}
+
+func TestCredentialTapRowsSelectOnlyOneValue(t *testing.T) {
+	credentials := []displayedCredential{
+		{value: "TOKEN"}, {value: "FINGERPRINT"}, {value: "HYSTERIA"}, {value: "SALAMANDER"},
+	}
+	endRow := 40
+	for i, want := range []string{"TOKEN", "FINGERPRINT", "HYSTERIA", "SALAMANDER"} {
+		clickedRow := endRow - len(credentials)*credentialCardHeight + i*credentialCardHeight + 2
+		got, ok := credentialValueAtRow(endRow, len(credentials), clickedRow, credentials)
+		if !ok || got != want {
+			t.Fatalf("tap row for card %d selected %q, %v; want %q", i, got, ok, want)
+		}
+	}
+	if _, ok := credentialValueAtRow(endRow, len(credentials), endRow, credentials); ok {
+		t.Fatal("tap outside the displayed credential cards should not select a value")
+	}
+}
+
+func TestParseSGRMouseReport(t *testing.T) {
+	button, x, y, pressed, err := parseSGRMouseReport("0;18;27")
+	if err != nil || button != 0 || x != 18 || y != 27 || !pressed {
+		t.Fatalf("unexpected mouse report parse: button=%d x=%d y=%d pressed=%v err=%v", button, x, y, pressed, err)
+	}
+	_, _, _, pressed, err = parseSGRMouseReport("35;18;27")
+	if err != nil || pressed {
+		t.Fatalf("mouse-motion report should not trigger a copy; pressed=%v err=%v", pressed, err)
 	}
 }
 
