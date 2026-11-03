@@ -745,6 +745,64 @@ func TestAdaptiveTransportCandidatesPreferLastSuccessfulPath(t *testing.T) {
 	}
 }
 
+func TestAdaptiveTransportCandidatesSpreadFirstTimeLanes(t *testing.T) {
+	base := []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1}
+	for lane := 1; lane <= len(base); lane++ {
+		got := adaptiveTransportCandidatesForLane("", lane)
+		want := append(append([]string{}, base[lane-1:]...), base[:lane-1]...)
+		if !equalStrings(got, want) {
+			t.Fatalf("lane %d first candidates = %v; want %v", lane, got, want)
+		}
+	}
+	if got := adaptiveTransportCandidatesForLane("", len(base)+1); !equalStrings(got, base) {
+		t.Fatalf("lane %d rotation should wrap: got %v, want %v", len(base)+1, got, base)
+	}
+	if got := adaptiveTransportCandidatesForLane(transportHTTP2, 3); got[0] != transportHTTP2 {
+		t.Fatalf("previously authenticated path must remain first, got %v", got)
+	}
+}
+
+func TestWireObservePongRefreshesLivenessForLegacyEmptyPong(t *testing.T) {
+	local, peer := net.Pipe()
+	defer peer.Close()
+	w := newWire(local)
+	defer w.close()
+	before := w.lastPongAt.Load()
+	time.Sleep(time.Millisecond)
+	w.observePong(nil)
+	if got := w.lastPongAt.Load(); got <= before {
+		t.Fatalf("empty legacy PONG did not refresh liveness: before=%d after=%d", before, got)
+	}
+}
+
+func TestHeartbeatClosesBlackholedLane(t *testing.T) {
+	local, peer := net.Pipe()
+	w := newWire(local)
+	defer peer.Close()
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		var frame [17]byte // 9-byte frame header + 8-byte PING timestamp
+		for {
+			if _, err := io.ReadFull(peer, frame[:]); err != nil {
+				return
+			}
+		}
+	}()
+	stop := make(chan struct{})
+	go heartbeatWithTimings(w, stop, 5*time.Millisecond, 20*time.Millisecond)
+	select {
+	case <-w.done:
+	case <-time.After(250 * time.Millisecond):
+		close(stop)
+		w.close()
+		<-readerDone
+		t.Fatal("heartbeat did not close a lane that stopped returning PONGs")
+	}
+	close(stop)
+	<-readerDone
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -1105,8 +1163,8 @@ func TestShahTunnelRouteDiagram(t *testing.T) {
 		"NETWORK ROUTE  /  TCP FORWARDING",
 		"CLIENT ── TCP ──▶ HUB ═ TLS 1.3 + TOKEN AUTH ═▶ AGENT",
 		"PATHS: TCP/TLS | WS/TLS | H2 CONNECT | H1 CONNECT",
-		"OPTION 7: ADAPTIVE FAILOVER ACROSS 4 PATHS",
-		"CERT PINNING • TOKEN AUTH • TLS 1.3",
+		"OPTION 7: 4-PATH FAILOVER • LANES SPREAD BY PATH",
+		"5s HEARTBEAT • 20s DEAD-PATH DETECTION • TLS 1.3",
 	}
 	if len(shahTunnelRouteArt) != 7 {
 		t.Fatalf("route diagram has %d lines; want 7", len(shahTunnelRouteArt))

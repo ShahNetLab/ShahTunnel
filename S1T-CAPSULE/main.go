@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "1.6.2"
+	version                          = "1.6.3"
 	configPath                       = "/etc/ravanreverse/config.json"
 	maxFrame                         = 64 * 1024
 	defaultTunnelChannels            = 12
@@ -58,6 +58,9 @@ const (
 	streamWindowFrames               = 8
 	maxQueuedPayloadBytes            = int64(64 << 20)
 	wireWriteTimeout                 = 30 * time.Second
+	heartbeatInterval                = 5 * time.Second
+	heartbeatTimeout                 = 20 * time.Second
+	sessionReadTimeout               = 35 * time.Second
 	reverseStreamOpenTimeout         = 18 * time.Second
 	transportAuto                    = "auto"
 	transportAdaptive                = "adaptive"
@@ -518,7 +521,7 @@ type wire struct {
 	done       chan struct{}
 	once       sync.Once
 	rttNanos   atomic.Int64 // EWMA of authenticated PING/PONG round-trip time; zero until measured.
-	lastPongAt atomic.Int64 // Unix nanoseconds of the latest valid PONG, for diagnostics/future health checks.
+	lastPongAt atomic.Int64 // Unix nanoseconds of the latest PONG; used to evict a blackholed lane.
 }
 
 func newWire(c net.Conn) *wire {
@@ -531,6 +534,7 @@ func newWire(c net.Conn) *wire {
 		dataQ:    make(chan *wireRequest, 64),
 		done:     make(chan struct{}),
 	}
+	w.lastPongAt.Store(time.Now().UnixNano())
 	go w.writeLoop()
 	return w
 }
@@ -925,7 +929,17 @@ func acknowledge(ch chan struct{}) {
 }
 
 func heartbeat(w *wire, stop <-chan struct{}) {
-	t := time.NewTicker(15 * time.Second)
+	heartbeatWithTimings(w, stop, heartbeatInterval, heartbeatTimeout)
+}
+
+// heartbeatWithTimings sends a small authenticated liveness probe and closes
+// a lane after several missed replies. A single lost packet does not trigger
+// failover; the timeout requires sustained loss or a blackholed route.
+func heartbeatWithTimings(w *wire, stop <-chan struct{}, interval, timeout time.Duration) {
+	if interval <= 0 || timeout <= interval {
+		return
+	}
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		select {
@@ -934,8 +948,14 @@ func heartbeat(w *wire, stop <-chan struct{}) {
 		case <-w.done:
 			return
 		case <-t.C:
-			// The timestamp is echoed by compatible peers. Older peers ignore the
-			// payload and return an empty PONG, so this enhancement is wire-compatible.
+			last := w.lastPongAt.Load()
+			if last == 0 || time.Since(time.Unix(0, last)) > timeout {
+				log.Printf("tunnel lane health check expired; closing the unresponsive path")
+				w.close()
+				return
+			}
+			// The timestamp is echoed by current peers. Older peers return an
+			// empty PONG; both forms count as liveness acknowledgements.
 			var payload [8]byte
 			binary.BigEndian.PutUint64(payload[:], uint64(time.Now().UnixNano()))
 			if err := w.send(msgPing, 0, payload[:]); err != nil {
@@ -946,15 +966,16 @@ func heartbeat(w *wire, stop <-chan struct{}) {
 	}
 }
 
-// observePong records the round-trip time encoded by our own PING timestamp.
-// A wall-clock adjustment or malformed/stale payload is ignored instead of
-// poisoning lane selection. The 1/8 EWMA dampens transient scheduling spikes.
+// observePong refreshes path liveness for both timestamped and legacy empty
+// PONGs. A wall-clock adjustment or malformed timestamp does not affect the
+// health signal. The 1/8 EWMA dampens transient RTT scheduling spikes.
 func (w *wire) observePong(payload []byte) {
+	now := time.Now().UnixNano()
+	w.lastPongAt.Store(now)
 	if len(payload) != 8 {
 		return
 	}
 	sentAt := int64(binary.BigEndian.Uint64(payload))
-	now := time.Now().UnixNano()
 	elapsed := now - sentAt
 	if elapsed <= 0 || elapsed > int64(2*time.Minute) {
 		return
@@ -1154,7 +1175,7 @@ func (s *hubSession) run() {
 	defer close(stop)
 	go heartbeat(s.wire, stop)
 	for {
-		_ = s.wire.conn.SetReadDeadline(time.Now().Add(50 * time.Second))
+		_ = s.wire.conn.SetReadDeadline(time.Now().Add(sessionReadTimeout))
 		f, err := s.wire.receive()
 		if err != nil {
 			log.Printf("reverse agent session ended (connection closed or timed out)")
@@ -1455,7 +1476,7 @@ func (s *agentSession) run() {
 	defer close(stop)
 	go heartbeat(s.wire, stop)
 	for {
-		_ = s.wire.conn.SetReadDeadline(time.Now().Add(50 * time.Second))
+		_ = s.wire.conn.SetReadDeadline(time.Now().Add(sessionReadTimeout))
 		f, err := s.wire.receive()
 		if err != nil {
 			return
@@ -2548,6 +2569,24 @@ func adaptiveTransportCandidates(preferred string) []string {
 	return out
 }
 
+// adaptiveTransportCandidatesForLane spreads first-time lanes across all
+// enabled transports. Once a lane has authenticated successfully, its known
+// good path remains first. This keeps several transport paths warm at once.
+func adaptiveTransportCandidatesForLane(preferred string, channel int) []string {
+	out := adaptiveTransportCandidates(preferred)
+	if isAdaptiveTransport(preferred) || len(out) < 2 {
+		return out
+	}
+	start := 0
+	if channel > 0 {
+		start = (channel - 1) % len(out)
+	}
+	rotated := make([]string, 0, len(out))
+	rotated = append(rotated, out[start:]...)
+	rotated = append(rotated, out[:start]...)
+	return rotated
+}
+
 func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 	mode := cfg.Transport
 	if mode == "" {
@@ -2557,7 +2596,7 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 		return connectAndRunAgentWithTransport(cfg, pin, channel, mode)
 	}
 
-	preferred := transportTCP
+	preferred := ""
 	if mode == transportAdaptive {
 		if v, ok := agentPreferredTransport.Load(channel); ok {
 			if saved, ok := v.(string); ok && isAdaptiveTransport(saved) {
@@ -2567,7 +2606,7 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 	}
 	candidates := []string{transportTCP, transportWebSocket}
 	if mode == transportAdaptive {
-		candidates = adaptiveTransportCandidates(preferred)
+		candidates = adaptiveTransportCandidatesForLane(preferred, channel)
 	}
 
 	// Every candidate is a real transport implementation in this build. A failed
@@ -3056,8 +3095,8 @@ var shahTunnelRouteArt = func() []string {
 		line("NETWORK ROUTE  /  TCP FORWARDING"),
 		line("CLIENT ── TCP ──▶ HUB ═ TLS 1.3 + TOKEN AUTH ═▶ AGENT"),
 		line("PATHS: TCP/TLS | WS/TLS | H2 CONNECT | H1 CONNECT"),
-		line("OPTION 7: ADAPTIVE FAILOVER ACROSS 4 PATHS"),
-		line("CERT PINNING • TOKEN AUTH • TLS 1.3"),
+		line("OPTION 7: 4-PATH FAILOVER • LANES SPREAD BY PATH"),
+		line("5s HEARTBEAT • 20s DEAD-PATH DETECTION • TLS 1.3"),
 		"  ╰" + strings.Repeat("─", shahTunnelRouteWidth) + "╯",
 	}
 }()
@@ -3207,7 +3246,7 @@ func wizardAskTransport(prompt string) (string, error) {
 	fmt.Printf("  %s\n", paint(ansiGreen, "4) HTTP/1.1 CONNECT/TLS — implemented on control port + 2"))
 	fmt.Printf("  %s\n", paint(ansiGreen, "5) HTTP CONNECT fallback — HTTP/2, then HTTP/1.1"))
 	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
-	fmt.Printf("  %s\n", paint(ansiPinkGlow, "7) FULL ADAPTIVE FAILOVER — all 4 implemented transports"))
+	fmt.Printf("  %s\n", paint(ansiPinkGlow, "7) FULL ADAPTIVE FAILOVER — all 4 TCP transports; lanes are distributed"))
 	choice := wizardAsk(prompt+" (1-7)", "7")
 	switch choice {
 	case "1":
@@ -3341,7 +3380,7 @@ func setup() error {
 		if err != nil {
 			return err
 		}
-		uiInfo("Allow TCP on the control port, control+1 for HTTP/2 CONNECT, and control+2 for HTTP/1.1 CONNECT as selected. Select the same transport policy on both endpoints.")
+		uiInfo("Allow TCP on the control port, control+1 for HTTP/2 CONNECT, and control+2 for HTTP/1.1 CONNECT as selected. Option 7 distributes lanes across these four TCP transports; keep the same policy on both endpoints.")
 		c.CertFile, c.KeyFile = "/etc/ravanreverse/hub.crt", "/etc/ravanreverse/hub.key"
 		for i := 1; i <= 100; i++ {
 			defID := "main"
@@ -3440,7 +3479,7 @@ func setup() error {
 		_ = os.Remove("/etc/ravanreverse/hub.key")
 		_ = os.Remove("/etc/ravanreverse/hub.crt")
 		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s. Option 7 covers TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT, and HTTP/1.1 CONNECT.", c.TunnelChannels, c.Transport))
-		uiSuccess("Agent configuration saved. Reconnection is automatic if a lane drops.")
+		uiSuccess("Agent configuration saved. Option 7 spreads lanes across four TCP transports; a blackholed lane is retried after missed heartbeat checks.")
 	case "3", "relay", "front":
 		c.Role = "relay"
 		c.Token = "relay-mode-not-used-" + tok
