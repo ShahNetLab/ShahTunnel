@@ -93,7 +93,7 @@ For a Hub control port of `9443`:
 
 After Hub setup, the Agent token and certificate fingerprint are shown as compact single-line values for mobile terminals. New Agent tokens still contain 256 bits of randomness and use unpadded Base32. SHA-256 fingerprints are displayed as 43-character unpadded Base64URL; the Agent accepts this representation and continues to accept legacy 64-character hexadecimal fingerprints. New Hysteria and Salamander passwords also contain 256 random bits and use 52-character Base32; existing hexadecimal profile values remain supported.
 
-Use the numbered copy menu to send only the selected value to the device clipboard with OSC 52. This depends on the SSH terminal app allowing OSC 52 clipboard writes. If the app blocks OSC 52, long-press the value-only line and select that line. Plain terminal output does not expose a general tap event to a Bash program, so direct tap-to-copy cannot be guaranteed across all SSH apps.
+Each credential is displayed in its own original-style framed card. On SSH terminal apps that forward xterm mouse events and permit OSC 52 clipboard writes, tapping anywhere inside a credential card copies only that card's value. No numbered copy menu is shown. If the SSH app does not forward pointer events or blocks OSC 52, use the terminal's native text-selection/long-press behavior; generic SSH terminals do not provide a universal tap-to-copy API.
 
 ## UDP path security
 
