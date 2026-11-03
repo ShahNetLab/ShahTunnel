@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -762,6 +763,163 @@ func TestAdaptiveTransportCandidatesSpreadFirstTimeLanes(t *testing.T) {
 	}
 }
 
+func TestAdaptiveAllCandidatesIncludeIndependentUDPPath(t *testing.T) {
+	want := []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1, transportHysteria}
+	got := adaptiveAllTransportCandidates("")
+	if !equalStrings(got, want) {
+		t.Fatalf("adaptive-all candidates = %v; want %v", got, want)
+	}
+	for _, preferred := range want {
+		candidates := adaptiveAllTransportCandidates(preferred)
+		if len(candidates) != len(want) || candidates[0] != preferred {
+			t.Fatalf("preferred %q gives candidates %v", preferred, candidates)
+		}
+		seen := map[string]bool{}
+		for _, candidate := range candidates {
+			if seen[candidate] {
+				t.Fatalf("duplicate candidate %q in %v", candidate, candidates)
+			}
+			seen[candidate] = true
+		}
+	}
+	for lane := 1; lane <= len(want); lane++ {
+		candidates := adaptiveAllTransportCandidatesForLane("", lane)
+		if candidates[0] != want[lane-1] {
+			t.Fatalf("lane %d starts with %q; want %q", lane, candidates[0], want[lane-1])
+		}
+	}
+	if !validTransportMode(transportHysteria) || !validTransportMode(transportAdaptiveAll) {
+		t.Fatal("new Hysteria or adaptive-all mode is not accepted")
+	}
+}
+
+func TestHysteriaOnlyControlIsLoopbackRestricted(t *testing.T) {
+	loopback := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 45678}
+	public := &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 45678}
+	if !transportAllowedPeer(transportHysteria, transportTCP, loopback) {
+		t.Fatal("Hysteria sidecar loopback connection should be allowed")
+	}
+	if transportAllowedPeer(transportHysteria, transportTCP, public) {
+		t.Fatal("public raw TCP connection must not be allowed in Hysteria-only mode")
+	}
+	if transportAllowedPeer(transportHysteria, transportWebSocket, loopback) {
+		t.Fatal("WebSocket must not be enabled in Hysteria-only mode")
+	}
+	if !transportAllowed(transportAdaptiveAll, transportTCP) || !transportAllowed(transportAdaptiveAll, transportHTTP2) {
+		t.Fatal("adaptive-all must retain the TCP fallback transports")
+	}
+}
+
+func TestHysteriaConfigContentsArePinnedAndDefaultDeny(t *testing.T) {
+	auth := strings.Repeat("a", 64)
+	obfs := strings.Repeat("b", 64)
+	cfg := Config{
+		Role: "hub", Transport: transportHysteria, ControlListen: "0.0.0.0:9443",
+		CertFile: "/etc/ravanreverse/hub.crt", KeyFile: "/etc/ravanreverse/hub.key",
+		HysteriaAuth: auth, HysteriaObfs: obfs,
+	}
+	server, err := hysteriaServerConfigContent(cfg)
+	if err != nil {
+		t.Fatalf("server config: %v", err)
+	}
+	for _, fragment := range []string{
+		`listen: "0.0.0.0:9446"`, `type: salamander`, `direct(127.0.0.1, tcp/9443)`, `reject(all)`,
+		`cert: "/etc/ravanreverse/hub.crt"`, auth, obfs,
+	} {
+		if !strings.Contains(string(server), fragment) {
+			t.Errorf("server config missing %q:\n%s", fragment, server)
+		}
+	}
+	cfg.Role, cfg.HubAddr, cfg.TLSServerName = "agent", "hub.example.net:9443", "hub.example.net"
+	cfg.Fingerprint = strings.Repeat("ab", 32)
+	client, err := hysteriaClientConfigContent(cfg)
+	if err != nil {
+		t.Fatalf("client config: %v", err)
+	}
+	for _, fragment := range []string{
+		`server: "hub.example.net:9446"`, `pinSHA256: "AB:AB:AB:AB`, `disableUDP: true`,
+		`listen: "127.0.0.1:11080"`, `type: salamander`, auth, obfs,
+	} {
+		if !strings.Contains(string(client), fragment) {
+			t.Errorf("client config missing %q:\n%s", fragment, client)
+		}
+	}
+	if !validHysteriaSecret(auth) || validHysteriaSecret("short") || validHysteriaSecret(strings.Repeat("z", 64)) {
+		t.Fatal("Hysteria credentials must be 32 random bytes encoded as 64 hexadecimal characters")
+	}
+}
+
+func TestDialSOCKS5TCPConnect(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		var greeting [3]byte
+		if _, err = io.ReadFull(conn, greeting[:]); err != nil {
+			serverErr <- err
+			return
+		}
+		if !bytes.Equal(greeting[:], []byte{0x05, 0x01, 0x00}) {
+			serverErr <- fmt.Errorf("unexpected greeting %v", greeting)
+			return
+		}
+		if err = writeFull(conn, []byte{0x05, 0x00}); err != nil {
+			serverErr <- err
+			return
+		}
+		var header [4]byte
+		if _, err = io.ReadFull(conn, header[:]); err != nil {
+			serverErr <- err
+			return
+		}
+		if header != [4]byte{0x05, 0x01, 0x00, 0x01} {
+			serverErr <- fmt.Errorf("unexpected CONNECT header %v", header)
+			return
+		}
+		var target [6]byte
+		if _, err = io.ReadFull(conn, target[:]); err != nil {
+			serverErr <- err
+			return
+		}
+		if !bytes.Equal(target[:4], []byte{127, 0, 0, 1}) || binary.BigEndian.Uint16(target[4:]) != 9443 {
+			serverErr <- fmt.Errorf("unexpected target %v", target)
+			return
+		}
+		if err = writeFull(conn, []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x12, 0x34}); err != nil {
+			serverErr <- err
+			return
+		}
+		_, err = io.WriteString(conn, "tunnel-ready")
+		serverErr <- err
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := dialSOCKS5(ctx, ln.Addr().String(), "127.0.0.1:9443")
+	if err != nil {
+		t.Fatalf("dial SOCKS5: %v", err)
+	}
+	defer client.Close()
+	got := make([]byte, len("tunnel-ready"))
+	if _, err := io.ReadFull(client, got); err != nil {
+		t.Fatalf("read tunneled payload: %v", err)
+	}
+	if string(got) != "tunnel-ready" {
+		t.Fatalf("payload = %q", got)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("SOCKS server: %v", err)
+	}
+}
+
 func TestWireObservePongRefreshesLivenessForLegacyEmptyPong(t *testing.T) {
 	local, peer := net.Pipe()
 	defer peer.Close()
@@ -1162,8 +1320,8 @@ func TestShahTunnelRouteDiagram(t *testing.T) {
 	wantContains := []string{
 		"NETWORK ROUTE  /  TCP FORWARDING",
 		"CLIENT ── TCP ──▶ HUB ═ TLS 1.3 + TOKEN AUTH ═▶ AGENT",
-		"PATHS: TCP/TLS | WS/TLS | H2 CONNECT | H1 CONNECT",
-		"OPTION 7: 4-PATH FAILOVER • LANES SPREAD BY PATH",
+		"PATHS: TCP/TLS | WS/TLS | H2 | H1 | HYSTERIA 2 QUIC/UDP",
+		"OPTION 8: 5-PATH ADAPTIVE • OPTION 7: QUIC/UDP ONLY",
 		"5s HEARTBEAT • 20s DEAD-PATH DETECTION • TLS 1.3",
 	}
 	if len(shahTunnelRouteArt) != 7 {

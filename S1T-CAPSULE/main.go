@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "1.6.3"
+	version                          = "1.7.0"
 	configPath                       = "/etc/ravanreverse/config.json"
 	maxFrame                         = 64 * 1024
 	defaultTunnelChannels            = 12
@@ -63,7 +63,13 @@ const (
 	sessionReadTimeout               = 35 * time.Second
 	reverseStreamOpenTimeout         = 18 * time.Second
 	transportAuto                    = "auto"
-	transportAdaptive                = "adaptive"
+	transportAdaptive                = "adaptive" // legacy adaptive mode: the four original TCP transports
+	transportAdaptiveAll             = "adaptive_all"
+	transportHysteria                = "hysteria2_quic"
+	hysteriaBinary                   = "/usr/local/bin/hysteria"
+	hysteriaServerConfigPath         = "/etc/ravanreverse/hysteria-server.yaml"
+	hysteriaClientConfigPath         = "/etc/ravanreverse/hysteria-client.yaml"
+	hysteriaSOCKSListen              = "127.0.0.1:11080"
 	transportTCP                     = "tcp_tls"
 	transportWebSocket               = "websocket_tls"
 	transportHTTP2                   = "http2_connect"
@@ -102,6 +108,8 @@ type Config struct {
 	CertFile      string `json:"cert_file,omitempty"`
 	KeyFile       string `json:"key_file,omitempty"`
 	Fingerprint   string `json:"fingerprint,omitempty"`
+	HysteriaAuth  string `json:"hysteria_auth,omitempty"`
+	HysteriaObfs  string `json:"hysteria_obfs_password,omitempty"`
 	// TunnelChannels controls the number of independent authenticated TCP/TLS lanes
 	// between Agent and Hub. Missing values on old configs are upgraded in memory to the current default.
 	TunnelChannels int           `json:"tunnel_channels,omitempty"`
@@ -495,10 +503,30 @@ func clientWebSocketUpgrade(conn net.Conn, host string) (net.Conn, error) {
 }
 
 func validTransportMode(mode string) bool {
-	return mode == transportAuto || mode == transportAdaptive || mode == transportTCP || mode == transportWebSocket || mode == transportHTTP2 || mode == transportHTTP1 || mode == transportHTTPConnectAuto
+	return mode == transportAuto || mode == transportAdaptive || mode == transportAdaptiveAll || mode == transportHysteria || mode == transportTCP || mode == transportWebSocket || mode == transportHTTP2 || mode == transportHTTP1 || mode == transportHTTPConnectAuto
 }
 func transportAllowed(configured, observed string) bool {
-	return configured == transportAuto || configured == transportAdaptive || configured == observed || (configured == transportHTTPConnectAuto && (observed == transportHTTP2 || observed == transportHTTP1))
+	if configured == transportAuto || configured == transportAdaptive || configured == transportAdaptiveAll || configured == observed {
+		return true
+	}
+	return configured == transportHTTPConnectAuto && (observed == transportHTTP2 || observed == transportHTTP1)
+}
+
+// Hysteria-only mode deliberately keeps the inner TCP control listener on
+// loopback. Only the local Hysteria sidecar may reach it; the public path is UDP.
+func transportAllowedPeer(configured, observed string, remote net.Addr) bool {
+	if configured != transportHysteria {
+		return transportAllowed(configured, observed)
+	}
+	if observed != transportTCP || remote == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(remote.String())
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 type frame struct {
@@ -1721,6 +1749,9 @@ func adjacentPortAddress(addr string) (string, error) { return offsetPortAddress
 // secondAdjacentPortAddress reserves TCP control port + 2 for HTTP/1.1 CONNECT.
 func secondAdjacentPortAddress(addr string) (string, error) { return offsetPortAddress(addr, 2) }
 
+// hysteriaUDPAddress reserves UDP control port + 3 for the QUIC sidecar.
+func hysteriaUDPAddress(addr string) (string, error) { return offsetPortAddress(addr, 3) }
+
 func nextPortLabel(addr string) string {
 	out, err := adjacentPortAddress(addr)
 	if err != nil {
@@ -1738,11 +1769,11 @@ func secondNextPortLabel(addr string) string {
 }
 
 func transportModeAllowsHTTP2(mode string) bool {
-	return mode == transportAdaptive || mode == transportHTTP2 || mode == transportHTTPConnectAuto
+	return mode == transportAdaptive || mode == transportAdaptiveAll || mode == transportHTTP2 || mode == transportHTTPConnectAuto
 }
 
 func transportModeAllowsHTTP1(mode string) bool {
-	return mode == transportAdaptive || mode == transportHTTP1 || mode == transportHTTPConnectAuto
+	return mode == transportAdaptive || mode == transportAdaptiveAll || mode == transportHTTP1 || mode == transportHTTPConnectAuto
 }
 
 // tunnelStreamConn adapts a bidirectional HTTP/2 CONNECT stream to net.Conn.
@@ -1981,7 +2012,7 @@ func runAgentOverStream(conn net.Conn, cfg Config, channel int, displayTransport
 	adjustAgentChannels(1)
 	defer adjustAgentChannels(-1)
 	defer conn.Close()
-	if cfg.Transport == transportAdaptive {
+	if cfg.Transport == transportAdaptive || cfg.Transport == transportAdaptiveAll {
 		agentPreferredTransport.Store(channel, displayTransport)
 	}
 	log.Printf("tunnel lane %d/%d connected via %s; forwarding through %d configured port mapping(s)", channel, cfg.TunnelChannels, displayTransport, len(normalizeConfig(cfg).Ports))
@@ -2120,7 +2151,7 @@ func (h *hubServer) serveAgent(raw net.Conn, tlsCfg *tls.Config) {
 	var authReader *bufio.Reader
 	if bytes.Equal(prefix, []byte("GET ")) {
 		observed = transportWebSocket
-		if !transportAllowed(h.cfg.Transport, observed) {
+		if !transportAllowedPeer(h.cfg.Transport, observed, raw.RemoteAddr()) {
 			_ = writeFull(tc, []byte("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"))
 			logAuthFailure("WebSocket transport not enabled by Hub policy")
 			return
@@ -2132,7 +2163,7 @@ func (h *hubServer) serveAgent(raw net.Conn, tlsCfg *tls.Config) {
 		c = &websocketConn{Conn: tc, r: r, clientSide: false}
 		authReader = bufio.NewReaderSize(c, 256)
 	} else {
-		if !transportAllowed(h.cfg.Transport, observed) {
+		if !transportAllowedPeer(h.cfg.Transport, observed, raw.RemoteAddr()) {
 			_ = writeFull(tc, []byte("NO\n"))
 			logAuthFailure("TCP/TLS transport not enabled by Hub policy")
 			return
@@ -2242,17 +2273,356 @@ func acceptRetryDelay(attempt int) time.Duration {
 	return delay
 }
 
+const hysteriaRelease = "v2.13.0"
+
+func usesHysteria(mode string) bool {
+	return mode == transportHysteria || mode == transportAdaptiveAll
+}
+
+func validHysteriaSecret(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+func hysteriaFingerprint(s string) (string, error) {
+	pin, err := normalizeFingerprint(s)
+	if err != nil {
+		return "", err
+	}
+	parts := make([]string, len(pin))
+	for i, b := range pin {
+		parts[i] = fmt.Sprintf("%02X", b)
+	}
+	return strings.Join(parts, ":"), nil
+}
+
+func writePrivateConfig(path string, content []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".hysteria-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err = tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err = tmp.Write(content); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+func hysteriaServerConfigContent(cfg Config) ([]byte, error) {
+	if !validHysteriaSecret(cfg.HysteriaAuth) || !validHysteriaSecret(cfg.HysteriaObfs) {
+		return nil, errors.New("invalid Hysteria credentials")
+	}
+	udpAddr, err := hysteriaUDPAddress(cfg.ControlListen)
+	if err != nil {
+		return nil, err
+	}
+	_, controlPort, err := net.SplitHostPort(cfg.ControlListen)
+	if err != nil {
+		return nil, err
+	}
+	// ACL is intentionally default-deny: the authenticated Hysteria SOCKS
+	// client can reach only the loopback ShahTunnel control TCP port.
+	content := fmt.Sprintf(`listen: %s
+tls:
+  cert: %s
+  key: %s
+  sniGuard: disable
+auth:
+  type: password
+  password: %s
+obfs:
+  type: salamander
+  salamander:
+    password: %s
+acl:
+  inline:
+    - direct(127.0.0.1, tcp/%s)
+    - reject(all)
+`, strconv.Quote(udpAddr), strconv.Quote(cfg.CertFile), strconv.Quote(cfg.KeyFile), strconv.Quote(cfg.HysteriaAuth), strconv.Quote(cfg.HysteriaObfs), controlPort)
+	return []byte(content), nil
+}
+
+func writeHysteriaServerConfig(cfg Config) error {
+	content, err := hysteriaServerConfigContent(cfg)
+	if err != nil {
+		return err
+	}
+	return writePrivateConfig(hysteriaServerConfigPath, content)
+}
+
+func hysteriaClientConfigContent(cfg Config) ([]byte, error) {
+	if !validHysteriaSecret(cfg.HysteriaAuth) || !validHysteriaSecret(cfg.HysteriaObfs) {
+		return nil, errors.New("invalid Hysteria credentials")
+	}
+	serverAddr, err := hysteriaUDPAddress(cfg.HubAddr)
+	if err != nil {
+		return nil, err
+	}
+	fingerprint, err := hysteriaFingerprint(cfg.Fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "server: %s\nauth: %s\n", strconv.Quote(serverAddr), strconv.Quote(cfg.HysteriaAuth))
+	b.WriteString("tls:\n")
+	if sni := strings.TrimSpace(cfg.TLSServerName); sni != "" {
+		fmt.Fprintf(&b, "  sni: %s\n", strconv.Quote(sni))
+	}
+	// Hysteria uses the existing pinned Hub certificate as the trust anchor.
+	// The inner ShahTunnel TLS handshake independently verifies the same pin.
+	fmt.Fprintf(&b, "  insecure: true\n  pinSHA256: %s\n", strconv.Quote(fingerprint))
+	fmt.Fprintf(&b, "obfs:\n  type: salamander\n  salamander:\n    password: %s\n", strconv.Quote(cfg.HysteriaObfs))
+	fmt.Fprintf(&b, "socks5:\n  listen: %s\n  disableUDP: true\n", strconv.Quote(hysteriaSOCKSListen))
+	return []byte(b.String()), nil
+}
+
+func writeHysteriaClientConfig(cfg Config) error {
+	content, err := hysteriaClientConfigContent(cfg)
+	if err != nil {
+		return err
+	}
+	return writePrivateConfig(hysteriaClientConfigPath, content)
+}
+
+func startHysteriaSidecar(mode, configFile string) (context.CancelFunc, error) {
+	if mode != "server" && mode != "client" {
+		return nil, fmt.Errorf("unsupported Hysteria sidecar mode %q", mode)
+	}
+	if _, err := os.Stat(configFile); err != nil {
+		return nil, fmt.Errorf("Hysteria config %s: %w", configFile, err)
+	}
+	binary, err := exec.LookPath(hysteriaBinary)
+	if err != nil {
+		return nil, fmt.Errorf("Hysteria 2 binary not found at %s; rerun the ShahTunnel installer", hysteriaBinary)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	launch := func() (<-chan error, error) {
+		cmd := exec.CommandContext(ctx, binary, mode, "-c", configFile)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		return done, nil
+	}
+	done, err := launch()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("launch Hysteria %s: %w", mode, err)
+	}
+	select {
+	case err := <-done:
+		cancel()
+		if err == nil {
+			err = errors.New("process exited during startup")
+		}
+		return nil, fmt.Errorf("Hysteria %s exited during startup: %w", mode, err)
+	case <-time.After(350 * time.Millisecond):
+	case <-ctx.Done():
+		cancel()
+		return nil, ctx.Err()
+	}
+	// Restart the companion process if it exits later. ShahTunnel's systemd
+	// unit owns this child, so stopping the main service also stops the sidecar.
+	go func(current <-chan error) {
+		backoff := time.Second
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case processErr := <-current:
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("Hysteria %s process stopped (%v); restarting in %s", mode, processErr, backoff)
+			}
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(jitteredBackoff(backoff)):
+				}
+				next, startErr := launch()
+				if startErr != nil {
+					log.Printf("Hysteria %s restart failed: %v", mode, startErr)
+					if backoff < 30*time.Second {
+						backoff *= 2
+						if backoff > 30*time.Second {
+							backoff = 30 * time.Second
+						}
+					}
+					continue
+				}
+				current = next
+				if backoff > time.Second {
+					backoff /= 2
+				}
+				break
+			}
+		}
+	}(done)
+	log.Printf("Hysteria 2 %s sidecar started (%s)", mode, hysteriaRelease)
+	return cancel, nil
+}
+
+func waitForTCPListener(address string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", address, 150*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false
+}
+
+// dialSOCKS5 connects to a local Hysteria SOCKS5 listener and returns an
+// established TCP CONNECT stream. It supports IPv4, IPv6, and DNS targets.
+func dialSOCKS5(ctx context.Context, proxyAddr, targetAddr string) (net.Conn, error) {
+	d := net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", proxyAddr)
+	if err != nil {
+		return nil, fmt.Errorf("connect local SOCKS5 listener %s: %w", proxyAddr, err)
+	}
+	fail := func(e error) (net.Conn, error) { _ = conn.Close(); return nil, e }
+	deadline := time.Now().Add(8 * time.Second)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+	if err := writeFull(conn, []byte{0x05, 0x01, 0x00}); err != nil {
+		return fail(fmt.Errorf("SOCKS5 greeting: %w", err))
+	}
+	var method [2]byte
+	if _, err := io.ReadFull(conn, method[:]); err != nil {
+		return fail(fmt.Errorf("SOCKS5 method response: %w", err))
+	}
+	if method[0] != 0x05 || method[1] != 0x00 {
+		return fail(errors.New("SOCKS5 proxy does not accept no-auth mode"))
+	}
+	host, portText, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		return fail(fmt.Errorf("invalid SOCKS5 target %q: %w", targetAddr, err))
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return fail(errors.New("invalid SOCKS5 target port"))
+	}
+	request := []byte{0x05, 0x01, 0x00}
+	if ip := net.ParseIP(host); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			request = append(request, 0x01)
+			request = append(request, v4...)
+		} else {
+			request = append(request, 0x04)
+			request = append(request, ip.To16()...)
+		}
+	} else {
+		if len(host) == 0 || len(host) > 255 {
+			return fail(errors.New("SOCKS5 target hostname length is invalid"))
+		}
+		request = append(request, 0x03, byte(len(host)))
+		request = append(request, host...)
+	}
+	request = append(request, byte(port>>8), byte(port))
+	if err := writeFull(conn, request); err != nil {
+		return fail(fmt.Errorf("SOCKS5 CONNECT request: %w", err))
+	}
+	var reply [4]byte
+	if _, err := io.ReadFull(conn, reply[:]); err != nil {
+		return fail(fmt.Errorf("SOCKS5 CONNECT response: %w", err))
+	}
+	if reply[0] != 0x05 || reply[2] != 0x00 {
+		return fail(errors.New("invalid SOCKS5 response header"))
+	}
+	if reply[1] != 0x00 {
+		return fail(fmt.Errorf("SOCKS5 CONNECT rejected with reply code 0x%02x", reply[1]))
+	}
+	var boundLen int
+	switch reply[3] {
+	case 0x01:
+		boundLen = 4
+	case 0x04:
+		boundLen = 16
+	case 0x03:
+		var n [1]byte
+		if _, err := io.ReadFull(conn, n[:]); err != nil {
+			return fail(err)
+		}
+		boundLen = int(n[0])
+	default:
+		return fail(errors.New("invalid SOCKS5 bound address type"))
+	}
+	if _, err := io.CopyN(io.Discard, conn, int64(boundLen+2)); err != nil {
+		return fail(fmt.Errorf("read SOCKS5 bound address: %w", err))
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return conn, nil
+}
+
 func runHub(cfg Config) error {
 	cfg = normalizeConfig(cfg)
 	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
 	if err != nil {
 		return fmt.Errorf("load hub certificate/key: %w; run setup again", err)
 	}
-	control, err := net.Listen("tcp", cfg.ControlListen)
+	controlListen := cfg.ControlListen
+	if cfg.Transport == transportHysteria {
+		_, controlPort, splitErr := net.SplitHostPort(cfg.ControlListen)
+		if splitErr != nil {
+			return fmt.Errorf("parse Hysteria-only control port: %w", splitErr)
+		}
+		controlListen = net.JoinHostPort("127.0.0.1", controlPort)
+	}
+	control, err := net.Listen("tcp", controlListen)
 	if err != nil {
-		return fmt.Errorf("listen control %s: %w", cfg.ControlListen, err)
+		return fmt.Errorf("listen control %s: %w", controlListen, err)
 	}
 	defer control.Close()
+	var sidecarCancel context.CancelFunc
+	if usesHysteria(cfg.Transport) {
+		if configErr := writeHysteriaServerConfig(cfg); configErr != nil {
+			if cfg.Transport == transportHysteria {
+				return fmt.Errorf("write Hysteria server config: %w", configErr)
+			}
+			log.Printf("WARNING: Hysteria config unavailable; adaptive mode will retain the four TCP paths: %v", configErr)
+		} else {
+			sidecarCancel, err = startHysteriaSidecar("server", hysteriaServerConfigPath)
+			if err != nil {
+				if cfg.Transport == transportHysteria {
+					return fmt.Errorf("start Hysteria QUIC/UDP server: %w", err)
+				}
+				log.Printf("WARNING: Hysteria QUIC/UDP is unavailable; adaptive mode will retain the four TCP paths: %v", err)
+			} else {
+				defer sidecarCancel()
+				udpAddr, _ := hysteriaUDPAddress(cfg.ControlListen)
+				log.Printf("Hysteria 2 QUIC/UDP listener enabled on %s; SOCKS ACL is restricted to the local ShahTunnel control port", udpAddr)
+			}
+		}
+	}
 	type listenerMap struct {
 		listener net.Listener
 		id       string
@@ -2487,6 +2857,30 @@ func runAgent(cfg Config) error {
 	if cfg.TunnelChannels < 1 || cfg.TunnelChannels > maxTunnelChannels {
 		return fmt.Errorf("tunnel_channels must be between 1 and %d", maxTunnelChannels)
 	}
+	if usesHysteria(cfg.Transport) {
+		if configErr := writeHysteriaClientConfig(cfg); configErr != nil {
+			if cfg.Transport == transportHysteria {
+				return fmt.Errorf("write Hysteria client config: %w", configErr)
+			}
+			log.Printf("WARNING: Hysteria client config unavailable; adaptive mode will retain the four TCP paths: %v", configErr)
+		} else {
+			sidecarCancel, startErr := startHysteriaSidecar("client", hysteriaClientConfigPath)
+			if startErr != nil {
+				if cfg.Transport == transportHysteria {
+					return fmt.Errorf("start Hysteria QUIC/UDP client: %w", startErr)
+				}
+				log.Printf("WARNING: Hysteria QUIC/UDP is unavailable; adaptive mode will retain the four TCP paths: %v", startErr)
+			} else {
+				defer sidecarCancel()
+				if !waitForTCPListener(hysteriaSOCKSListen, 3*time.Second) {
+					if cfg.Transport == transportHysteria {
+						return errors.New("Hysteria local SOCKS listener did not become ready")
+					}
+					log.Printf("WARNING: Hysteria local SOCKS listener did not become ready; adaptive mode will continue trying the TCP transports")
+				}
+			}
+		}
+	}
 	startMetricsReporter("agent")
 	log.Printf("starting %d independent authenticated tunnel lanes", cfg.TunnelChannels)
 	var workers sync.WaitGroup
@@ -2554,8 +2948,12 @@ func isAdaptiveTransport(mode string) bool {
 	}
 }
 
+func isAdaptiveAllTransport(mode string) bool {
+	return isAdaptiveTransport(mode) || mode == transportHysteria
+}
+
 func adaptiveTransportCandidates(preferred string) []string {
-	// Order the implemented transports with the last successful path first.
+	// Legacy adaptive mode intentionally retains the exact original four TCP paths.
 	all := []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1}
 	out := make([]string, 0, len(all))
 	if isAdaptiveTransport(preferred) {
@@ -2569,21 +2967,47 @@ func adaptiveTransportCandidates(preferred string) []string {
 	return out
 }
 
-// adaptiveTransportCandidatesForLane spreads first-time lanes across all
-// enabled transports. Once a lane has authenticated successfully, its known
-// good path remains first. This keeps several transport paths warm at once.
 func adaptiveTransportCandidatesForLane(preferred string, channel int) []string {
 	out := adaptiveTransportCandidates(preferred)
 	if isAdaptiveTransport(preferred) || len(out) < 2 {
 		return out
 	}
+	return rotateCandidates(out, channel)
+}
+
+func adaptiveAllTransportCandidates(preferred string) []string {
+	all := []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1, transportHysteria}
+	out := make([]string, 0, len(all))
+	if isAdaptiveAllTransport(preferred) {
+		out = append(out, preferred)
+	}
+	for _, mode := range all {
+		if mode != preferred {
+			out = append(out, mode)
+		}
+	}
+	return out
+}
+
+func adaptiveAllTransportCandidatesForLane(preferred string, channel int) []string {
+	out := adaptiveAllTransportCandidates(preferred)
+	if isAdaptiveAllTransport(preferred) || len(out) < 2 {
+		return out
+	}
+	return rotateCandidates(out, channel)
+}
+
+func rotateCandidates(candidates []string, channel int) []string {
+	if len(candidates) < 2 {
+		return candidates
+	}
 	start := 0
 	if channel > 0 {
-		start = (channel - 1) % len(out)
+		start = (channel - 1) % len(candidates)
 	}
-	rotated := make([]string, 0, len(out))
-	rotated = append(rotated, out[start:]...)
-	rotated = append(rotated, out[:start]...)
+	rotated := make([]string, 0, len(candidates))
+	rotated = append(rotated, candidates[start:]...)
+	rotated = append(rotated, candidates[:start]...)
 	return rotated
 }
 
@@ -2592,26 +3016,27 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 	if mode == "" {
 		mode = transportAuto
 	}
-	if mode != transportAuto && mode != transportAdaptive {
+	if mode != transportAuto && mode != transportAdaptive && mode != transportAdaptiveAll {
 		return connectAndRunAgentWithTransport(cfg, pin, channel, mode)
 	}
 
 	preferred := ""
-	if mode == transportAdaptive {
+	if mode == transportAdaptive || mode == transportAdaptiveAll {
 		if v, ok := agentPreferredTransport.Load(channel); ok {
-			if saved, ok := v.(string); ok && isAdaptiveTransport(saved) {
-				preferred = saved
+			if saved, ok := v.(string); ok {
+				if (mode == transportAdaptive && isAdaptiveTransport(saved)) || (mode == transportAdaptiveAll && isAdaptiveAllTransport(saved)) {
+					preferred = saved
+				}
 			}
 		}
 	}
 	candidates := []string{transportTCP, transportWebSocket}
 	if mode == transportAdaptive {
 		candidates = adaptiveTransportCandidatesForLane(preferred, channel)
+	} else if mode == transportAdaptiveAll {
+		candidates = adaptiveAllTransportCandidatesForLane(preferred, channel)
 	}
 
-	// Every candidate is a real transport implementation in this build. A failed
-	// connect, handshake, or ended lane moves to the next candidate immediately.
-	// The outer worker's jittered backoff still applies after every candidate fails.
 	var lastErr error
 	for i, candidate := range candidates {
 		err := connectAndRunAgentWithTransport(cfg, pin, channel, candidate)
@@ -2620,11 +3045,7 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 		}
 		lastErr = err
 		if i < len(candidates)-1 {
-			if mode == transportAdaptive {
-				log.Printf("tunnel lane %d: adaptive transport %s failed or closed; trying %s", channel, candidate, candidates[i+1])
-			} else {
-				log.Printf("tunnel lane %d: TCP/TLS attempt failed or closed; trying WebSocket/TLS fallback", channel)
-			}
+			log.Printf("tunnel lane %d: %s failed or closed; trying %s", channel, candidate, candidates[i+1])
 		}
 	}
 	if lastErr == nil {
@@ -2653,9 +3074,37 @@ func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode s
 	if mode == transportWebSocket {
 		tlsCfg.NextProtos = []string{"http/1.1"}
 	}
-	tlsConn, err := tls.DialWithDialer(&d, "tcp", cfg.HubAddr, tlsCfg)
-	if err != nil {
-		return err
+	var rawConn net.Conn
+	var err error
+	if mode == transportHysteria {
+		_, hubPort, splitErr := net.SplitHostPort(cfg.HubAddr)
+		if splitErr != nil {
+			return fmt.Errorf("parse Hub control port for Hysteria SOCKS route: %w", splitErr)
+		}
+		target := net.JoinHostPort("127.0.0.1", hubPort)
+		ctx, cancel := context.WithTimeout(context.Background(), 9*time.Second)
+		defer cancel()
+		rawConn, err = dialSOCKS5(ctx, hysteriaSOCKSListen, target)
+		if err != nil {
+			return fmt.Errorf("Hysteria QUIC/UDP SOCKS path: %w", err)
+		}
+		tlsConn := tls.Client(rawConn, tlsCfg)
+		if err = tlsConn.HandshakeContext(ctx); err != nil {
+			_ = rawConn.Close()
+			return fmt.Errorf("TLS inside Hysteria path: %w", err)
+		}
+		rawConn = tlsConn
+	} else {
+		tlsConn, dialErr := tls.DialWithDialer(&d, "tcp", cfg.HubAddr, tlsCfg)
+		if dialErr != nil {
+			return dialErr
+		}
+		rawConn = tlsConn
+	}
+	tlsConn, ok := rawConn.(*tls.Conn)
+	if !ok {
+		_ = rawConn.Close()
+		return errors.New("internal TLS transport setup failed")
 	}
 	var c net.Conn = tlsConn
 	if mode == transportWebSocket {
@@ -2687,7 +3136,7 @@ func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode s
 	_ = c.SetDeadline(time.Time{})
 	adjustAgentChannels(1)
 	defer adjustAgentChannels(-1)
-	if cfg.Transport == transportAdaptive {
+	if cfg.Transport == transportAdaptive || cfg.Transport == transportAdaptiveAll {
 		agentPreferredTransport.Store(channel, mode)
 	}
 	log.Printf("tunnel lane %d/%d connected via %s; forwarding through %d configured port mapping(s)", channel, cfg.TunnelChannels, mode, len(normalizeConfig(cfg).Ports))
@@ -2759,7 +3208,7 @@ func validateConfig(c Config) error {
 		return errors.New("role must be hub, agent, or relay")
 	}
 	if (c.Role == "hub" || c.Role == "agent") && !validTransportMode(c.Transport) {
-		return fmt.Errorf("unsupported transport %q (supported: auto, adaptive, tcp_tls, websocket_tls, http2_connect, http1_connect, http_connect_auto)", c.Transport)
+		return fmt.Errorf("unsupported transport %q (supported: auto, adaptive, adaptive_all, hysteria2_quic, tcp_tls, websocket_tls, http2_connect, http1_connect, http_connect_auto)", c.Transport)
 	}
 	if c.Role == "agent" && (c.TunnelChannels < 1 || c.TunnelChannels > maxTunnelChannels) {
 		return fmt.Errorf("tunnel_channels must be between 1 and %d", maxTunnelChannels)
@@ -2777,6 +3226,14 @@ func validateConfig(c Config) error {
 		}
 		if c.CertFile == "" || c.KeyFile == "" {
 			return errors.New("cert_file/key_file required for hub")
+		}
+		if usesHysteria(c.Transport) {
+			if _, err := hysteriaUDPAddress(c.ControlListen); err != nil {
+				return fmt.Errorf("Hysteria QUIC/UDP port: %w", err)
+			}
+			if !validHysteriaSecret(c.HysteriaAuth) || !validHysteriaSecret(c.HysteriaObfs) {
+				return errors.New("Hysteria password and Salamander obfuscation password must each be 64 hexadecimal characters; rerun setup")
+			}
 		}
 		if transportModeAllowsHTTP2(c.Transport) {
 			if _, err := adjacentPortAddress(c.ControlListen); err != nil {
@@ -2845,6 +3302,14 @@ func validateConfig(c Config) error {
 		}
 		if _, err := normalizeFingerprint(c.Fingerprint); err != nil {
 			return err
+		}
+		if usesHysteria(c.Transport) {
+			if _, err := hysteriaUDPAddress(c.HubAddr); err != nil {
+				return fmt.Errorf("Hysteria QUIC/UDP endpoint: %w", err)
+			}
+			if !validHysteriaSecret(c.HysteriaAuth) || !validHysteriaSecret(c.HysteriaObfs) {
+				return errors.New("Hysteria password and Salamander obfuscation password must each be 64 hexadecimal characters; use the credentials displayed by the Hub")
+			}
 		}
 	} else {
 		for _, p := range c.Ports {
@@ -3094,8 +3559,8 @@ var shahTunnelRouteArt = func() []string {
 		"  ╭" + strings.Repeat("─", shahTunnelRouteWidth) + "╮",
 		line("NETWORK ROUTE  /  TCP FORWARDING"),
 		line("CLIENT ── TCP ──▶ HUB ═ TLS 1.3 + TOKEN AUTH ═▶ AGENT"),
-		line("PATHS: TCP/TLS | WS/TLS | H2 CONNECT | H1 CONNECT"),
-		line("OPTION 7: 4-PATH FAILOVER • LANES SPREAD BY PATH"),
+		line("PATHS: TCP/TLS | WS/TLS | H2 | H1 | HYSTERIA 2 QUIC/UDP"),
+		line("OPTION 8: 5-PATH ADAPTIVE • OPTION 7: QUIC/UDP ONLY"),
 		line("5s HEARTBEAT • 20s DEAD-PATH DETECTION • TLS 1.3"),
 		"  ╰" + strings.Repeat("─", shahTunnelRouteWidth) + "╯",
 	}
@@ -3246,8 +3711,9 @@ func wizardAskTransport(prompt string) (string, error) {
 	fmt.Printf("  %s\n", paint(ansiGreen, "4) HTTP/1.1 CONNECT/TLS — implemented on control port + 2"))
 	fmt.Printf("  %s\n", paint(ansiGreen, "5) HTTP CONNECT fallback — HTTP/2, then HTTP/1.1"))
 	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
-	fmt.Printf("  %s\n", paint(ansiPinkGlow, "7) FULL ADAPTIVE FAILOVER — all 4 TCP transports; lanes are distributed"))
-	choice := wizardAsk(prompt+" (1-7)", "7")
+	fmt.Printf("  %s\n", paint(ansiGreen, "7) Hysteria 2 / QUIC / UDP + Salamander — independent UDP path"))
+	fmt.Printf("  %s\n", paint(ansiPinkGlow, "8) FULL ADAPTIVE FAILOVER — all 4 TCP transports + Hysteria UDP"))
+	choice := wizardAsk(prompt+" (1-8)", "8")
 	switch choice {
 	case "1":
 		return transportTCP, nil
@@ -3262,9 +3728,11 @@ func wizardAskTransport(prompt string) (string, error) {
 	case "6":
 		return transportAuto, nil
 	case "7":
-		return transportAdaptive, nil
+		return transportHysteria, nil
+	case "8":
+		return transportAdaptiveAll, nil
 	default:
-		return "", errors.New("invalid transport selection; enter a number from 1 to 7")
+		return "", errors.New("invalid transport selection; enter a number from 1 to 8")
 	}
 }
 
@@ -3380,7 +3848,23 @@ func setup() error {
 		if err != nil {
 			return err
 		}
-		uiInfo("Allow TCP on the control port, control+1 for HTTP/2 CONNECT, and control+2 for HTTP/1.1 CONNECT as selected. Option 7 distributes lanes across these four TCP transports; keep the same policy on both endpoints.")
+		if usesHysteria(c.Transport) {
+			c.HysteriaAuth, err = randomHex(32)
+			if err != nil {
+				return err
+			}
+			c.HysteriaObfs, err = randomHex(32)
+			if err != nil {
+				return err
+			}
+		}
+		if c.Transport == transportHysteria {
+			uiInfo("Hysteria-only mode: expose UDP control+3. The inner TCP control listener is bound to 127.0.0.1 and is not exposed publicly.")
+		} else if c.Transport == transportAdaptiveAll {
+			uiInfo("Adaptive-all needs TCP control, TCP control+1, TCP control+2, and UDP control+3. Keep the same policy and Hysteria credentials on both endpoints.")
+		} else {
+			uiInfo("Open the TCP control port and only the extra TCP ports required by the selected transport.")
+		}
 		c.CertFile, c.KeyFile = "/etc/ravanreverse/hub.crt", "/etc/ravanreverse/hub.key"
 		for i := 1; i <= 100; i++ {
 			defID := "main"
@@ -3422,11 +3906,28 @@ func setup() error {
 		uiCard("🛡️ CERTIFICATE SHA-256 FINGERPRINT", []uiCardRow{
 			{Text: c.Fingerprint, Color: ansiCyan + ansiBold},
 		}, ansiCyan)
-		uiCard("🔌 CONTROL PORTS", []uiCardRow{
-			{Text: "TCP/TLS + WebSocket/TLS: " + portOf(c.ControlListen), Color: ansiPurple + ansiBold},
-			{Text: "HTTP/2 CONNECT: " + nextPortLabel(c.ControlListen) + " (TCP)", Color: ansiBlue + ansiBold},
-			{Text: "HTTP/1.1 CONNECT: " + secondNextPortLabel(c.ControlListen) + " (TCP)", Color: ansiBlue + ansiBold},
-		}, ansiPinkGlow)
+		controlRows := []uiCardRow{}
+		if c.Transport == transportHysteria {
+			controlRows = append(controlRows, uiCardRow{Text: "Local-only TCP control: 127.0.0.1:" + portOf(c.ControlListen), Color: ansiDim})
+		} else {
+			controlRows = append(controlRows,
+				uiCardRow{Text: "TCP/TLS + WebSocket/TLS: " + portOf(c.ControlListen) + " (TCP)", Color: ansiPurple + ansiBold},
+				uiCardRow{Text: "HTTP/2 CONNECT: " + nextPortLabel(c.ControlListen) + " (TCP)", Color: ansiBlue + ansiBold},
+				uiCardRow{Text: "HTTP/1.1 CONNECT: " + secondNextPortLabel(c.ControlListen) + " (TCP)", Color: ansiBlue + ansiBold},
+			)
+		}
+		if usesHysteria(c.Transport) {
+			udpAddr, _ := hysteriaUDPAddress(c.ControlListen)
+			controlRows = append(controlRows, uiCardRow{Text: "Hysteria 2 QUIC: " + portOf(udpAddr) + " (UDP)", Color: ansiGreen + ansiBold})
+		}
+		uiCard("🔌 CONTROL PORTS", controlRows, ansiPinkGlow)
+		if usesHysteria(c.Transport) {
+			uiCard("HYSTERIA 2 / AGENT CREDENTIALS", []uiCardRow{
+				{Text: "Hysteria password: " + c.HysteriaAuth, Color: ansiYellow + ansiBold},
+				{Text: "Salamander password: " + c.HysteriaObfs, Color: ansiCyan + ansiBold},
+				{Text: "Copy both values exactly into Agent setup.", Color: ansiDim},
+			}, ansiYellow)
+		}
 		mappingRows := make([]uiCardRow, 0, len(c.Ports))
 		for _, p := range c.Ports {
 			mappingRows = append(mappingRows, uiCardRow{Text: fmt.Sprintf("ID=%s   LISTEN=%s", p.ID, p.Listen), Color: ansiCyan})
@@ -3453,6 +3954,12 @@ func setup() error {
 		c.TLSServerName = wizardAsk("Optional TLS SNI hostname on a domain you control (leave blank to derive from Hub hostname)", "")
 		c.Token = wizardAsk("Token shown on the Iran Hub", "")
 		c.Fingerprint = wizardAsk("Hub certificate SHA-256 fingerprint", "")
+		if usesHysteria(c.Transport) {
+			c.HysteriaAuth = wizardAsk("Hysteria password shown on the Hub", "")
+			c.HysteriaObfs = wizardAsk("Hysteria Salamander password shown on the Hub", "")
+			udpAddr, _ := hysteriaUDPAddress(c.HubAddr)
+			uiInfo("Hysteria 2 uses QUIC over UDP port " + portOf(udpAddr) + "; allow that UDP port on the Hub firewall.")
+		}
 		for i := 1; i <= 100; i++ {
 			defID := "main"
 			if i > 1 {
@@ -3478,8 +3985,8 @@ func setup() error {
 		}
 		_ = os.Remove("/etc/ravanreverse/hub.key")
 		_ = os.Remove("/etc/ravanreverse/hub.crt")
-		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s. Option 7 covers TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT, and HTTP/1.1 CONNECT.", c.TunnelChannels, c.Transport))
-		uiSuccess("Agent configuration saved. Option 7 spreads lanes across four TCP transports; a blackholed lane is retried after missed heartbeat checks.")
+		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s.", c.TunnelChannels, c.Transport))
+		uiSuccess("Agent configuration saved. Adaptive-all spreads lanes across the enabled TCP and QUIC/UDP paths; failed lanes reconnect and try the remaining transports.")
 	case "3", "relay", "front":
 		c.Role = "relay"
 		c.Token = "relay-mode-not-used-" + tok
