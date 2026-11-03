@@ -7,6 +7,8 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base32"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -23,6 +25,35 @@ import (
 	"testing"
 	"time"
 )
+
+func TestCredentialCopyMenuCopiesOnlySelectedValue(t *testing.T) {
+	originalReader := stdinReader
+	stdinReader = bufio.NewReader(strings.NewReader("2\n\n"))
+	defer func() { stdinReader = originalReader }()
+
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stdout pipe: %v", err)
+	}
+	originalStdout := os.Stdout
+	os.Stdout = writeEnd
+	printAgentCredentials("TOKEN_VALUE", "FINGERPRINT_VALUE", "HYSTERIA_VALUE", "SALAMANDER_VALUE")
+	_ = writeEnd.Close()
+	os.Stdout = originalStdout
+	output, readErr := io.ReadAll(readEnd)
+	_ = readEnd.Close()
+	if readErr != nil {
+		t.Fatalf("read credential output: %v", readErr)
+	}
+
+	encodedFingerprint := base64.StdEncoding.EncodeToString([]byte("FINGERPRINT_VALUE"))
+	if !strings.Contains(string(output), "\033]52;c;"+encodedFingerprint+"\a") {
+		t.Fatal("copy option 2 did not send only the SHA-256 fingerprint via OSC 52")
+	}
+	if strings.Contains(string(output), "\033]52;c;"+base64.StdEncoding.EncodeToString([]byte("AGENT TOKEN"))+"\a") {
+		t.Fatal("copy menu placed a label in the clipboard sequence")
+	}
+}
 
 func TestWebSocketUpgradeAndBidirectionalStream(t *testing.T) {
 	serverRaw, clientRaw := net.Pipe()
@@ -847,8 +878,41 @@ func TestHysteriaConfigContentsArePinnedAndDefaultDeny(t *testing.T) {
 			t.Errorf("client config missing %q:\n%s", fragment, client)
 		}
 	}
+	compact, err := randomHysteriaSecret()
+	if err != nil {
+		t.Fatalf("generate compact Hysteria secret: %v", err)
+	}
+	decoded, decodeErr := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(compact)
+	if len(compact) != 52 || decodeErr != nil || len(decoded) != 32 || !validHysteriaSecret(compact) {
+		t.Fatalf("new Hysteria secret must be 52-character Base32 encoding of 32 bytes; got %q (%d bytes, %v)", compact, len(decoded), decodeErr)
+	}
 	if !validHysteriaSecret(auth) || validHysteriaSecret("short") || validHysteriaSecret(strings.Repeat("z", 64)) {
-		t.Fatal("Hysteria credentials must be 32 random bytes encoded as 64 hexadecimal characters")
+		t.Fatal("Hysteria credentials must accept legacy 32-byte hex and new 32-byte Base32 formats only")
+	}
+	if seq := osc52ClipboardSequence(compact); !strings.Contains(seq, base64.StdEncoding.EncodeToString([]byte(compact))) {
+		t.Fatal("OSC 52 clipboard sequence does not contain the exact credential")
+	}
+
+	token, err := randomAgentToken()
+	if err != nil {
+		t.Fatalf("generate compact Agent token: %v", err)
+	}
+	tokenBytes, tokenErr := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(token)
+	if len(token) != 52 || tokenErr != nil || len(tokenBytes) != 32 {
+		t.Fatalf("Agent token must be 52-character Base32 for 256-bit entropy; got %q (%d bytes, %v)", token, len(tokenBytes), tokenErr)
+	}
+
+	hexFingerprint := strings.Repeat("ab", 32)
+	shortFingerprint, err := compactFingerprint(hexFingerprint)
+	if err != nil {
+		t.Fatalf("compact fingerprint: %v", err)
+	}
+	if len(shortFingerprint) != 43 {
+		t.Fatalf("compact fingerprint must be 43 Base64URL characters; got %d", len(shortFingerprint))
+	}
+	decodedFingerprint, err := normalizeFingerprint(shortFingerprint)
+	if err != nil || fmt.Sprintf("%x", decodedFingerprint) != hexFingerprint {
+		t.Fatalf("compact fingerprint did not round-trip: %x (%v)", decodedFingerprint, err)
 	}
 }
 

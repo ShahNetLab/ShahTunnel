@@ -13,6 +13,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -2439,11 +2440,104 @@ func usesHysteria(mode string) bool {
 }
 
 func validHysteriaSecret(s string) bool {
-	if len(s) != 64 {
-		return false
+	// Keep accepting the original 32-byte hex format for existing profiles.
+	if len(s) == 64 {
+		decoded, err := hex.DecodeString(s)
+		return err == nil && len(decoded) == 32
 	}
-	_, err := hex.DecodeString(s)
-	return err == nil
+	// New credentials use unpadded Base32: 32 random bytes remain 256-bit,
+	// but the 52-character value fits on a narrow mobile terminal line.
+	if len(s) == 52 {
+		decoded, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(s)
+		return err == nil && len(decoded) == 32
+	}
+	return false
+}
+
+func randomHysteriaSecret() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b), nil
+}
+
+// New Agent tokens use unpadded Base32 so all 256 random bits fit on a
+// narrow mobile terminal line. Existing hexadecimal tokens remain valid.
+func randomAgentToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b), nil
+}
+
+// compactFingerprint converts the canonical 32-byte SHA-256 fingerprint to
+// unpadded Base64URL (43 chars) for a single-line mobile display. The Agent
+// accepts this representation and stores/uses the same fingerprint bytes.
+func compactFingerprint(value string) (string, error) {
+	pin, err := normalizeFingerprint(value)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(pin), nil
+}
+
+// osc52ClipboardSequence requests a clipboard copy only after the user
+// explicitly chooses a numbered copy action. Terminals without OSC 52 support
+// ignore it; each credential is also printed alone for long-press selection.
+func osc52ClipboardSequence(value string) string {
+	return "\033]52;c;" + base64.StdEncoding.EncodeToString([]byte(value)) + "\a"
+}
+
+type displayedCredential struct {
+	label string
+	value string
+	color string
+}
+
+func printAgentCredentials(token, fingerprint, hysteriaAuth, salamander string) {
+	credentials := []displayedCredential{
+		{label: "AGENT TOKEN (256-bit)", value: token, color: ansiYellow + ansiBold},
+		{label: "HUB CERTIFICATE SHA-256 (Base64URL)", value: fingerprint, color: ansiCyan + ansiBold},
+	}
+	if hysteriaAuth != "" || salamander != "" {
+		credentials = append(credentials,
+			displayedCredential{label: "HYSTERIA 2 PASSWORD (256-bit)", value: hysteriaAuth, color: ansiYellow + ansiBold},
+			displayedCredential{label: "SALAMANDER PASSWORD (256-bit)", value: salamander, color: ansiCyan + ansiBold},
+		)
+	}
+
+	fmt.Printf("\n  %s\n", paint(ansiYellow+ansiBold, "AGENT CREDENTIALS — COPY VALUES EXACTLY"))
+	for i, credential := range credentials {
+		fmt.Printf("  %s\n", paint(ansiDim, credential.label))
+		// Values are deliberately emitted as plain, unboxed, single lines.
+		fmt.Printf("  %s\n", paint(credential.color, credential.value))
+		if i != len(credentials)-1 {
+			fmt.Println()
+		}
+	}
+	fmt.Printf("\n  %s\n", paint(ansiDim, "Copy menu writes only the selected value to clipboard (OSC 52)."))
+	fmt.Printf("  %s\n", paint(ansiDim, "If your SSH app blocks OSC 52, long-press the value-only line."))
+
+	for {
+		prompt := "Copy [1] Agent token  [2] SHA-256  [Enter] Continue:"
+		if len(credentials) == 4 {
+			prompt = "Copy [1] Token  [2] SHA-256  [3] Hysteria  [4] Salamander  [Enter] Continue:"
+		}
+		choice := strings.TrimSpace(ask(prompt, ""))
+		if choice == "" {
+			return
+		}
+		index, err := strconv.Atoi(choice)
+		if err != nil || index < 1 || index > len(credentials) {
+			uiWarn("Choose a displayed number or press Enter to continue.")
+			continue
+		}
+		selected := credentials[index-1]
+		fmt.Print(osc52ClipboardSequence(selected.value))
+		uiSuccess(selected.label + " copy requested. If unsupported, long-press its value-only line.")
+	}
 }
 
 func hysteriaFingerprint(s string) (string, error) {
@@ -3441,7 +3535,7 @@ func validateConfig(c Config) error {
 				return fmt.Errorf("Hysteria QUIC/UDP port: %w", err)
 			}
 			if !validHysteriaSecret(c.HysteriaAuth) || !validHysteriaSecret(c.HysteriaObfs) {
-				return errors.New("Hysteria password and Salamander obfuscation password must each be 64 hexadecimal characters; rerun setup")
+				return errors.New("Hysteria and Salamander passwords must each be a valid 32-byte Base32 or legacy hexadecimal value; rerun setup")
 			}
 		}
 		if transportModeAllowsHTTP2(c.Transport) {
@@ -3528,7 +3622,7 @@ func validateConfig(c Config) error {
 				return fmt.Errorf("Hysteria QUIC/UDP endpoint: %w", err)
 			}
 			if !validHysteriaSecret(c.HysteriaAuth) || !validHysteriaSecret(c.HysteriaObfs) {
-				return errors.New("Hysteria password and Salamander obfuscation password must each be 64 hexadecimal characters; use the credentials displayed by the Hub")
+				return errors.New("Hysteria and Salamander passwords must each be valid 32-byte Base32 or legacy hexadecimal values; use the credentials displayed by the Hub")
 			}
 		}
 	} else {
@@ -3584,11 +3678,15 @@ func validMappingID(s string) bool {
 func normalizeFingerprint(s string) ([]byte, error) {
 	s = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "sha256:"))
 	s = strings.ReplaceAll(s, ":", "")
-	b, err := hex.DecodeString(s)
-	if err != nil || len(b) != sha256.Size {
-		return nil, errors.New("fingerprint must be SHA-256 hex (64 hex chars, colons optional)")
+	if b, err := hex.DecodeString(s); err == nil && len(b) == sha256.Size {
+		return b, nil
 	}
-	return b, nil
+	// New setup screens show a 43-character unpadded Base64URL value so it
+	// fits on mobile screens. Accept it alongside legacy SHA-256 hex pins.
+	if b, err := base64.RawURLEncoding.DecodeString(s); err == nil && len(b) == sha256.Size {
+		return b, nil
+	}
+	return nil, errors.New("fingerprint must be SHA-256 hex (64 chars) or unpadded Base64URL (43 chars)")
 }
 func loadConfig() (Config, error) {
 	b, err := os.ReadFile(configPath)
@@ -4176,7 +4274,7 @@ func setup() error {
 	fmt.Printf("  %s %s\n", paint(ansiGreen+ansiBold, "2"), "🔗 AGENT   | OUTSIDE — connects securely to Iran and forwards traffic to local services")
 	fmt.Printf("  %s %s\n", paint(ansiGreen+ansiBold, "3"), "🌐 RELAY   | THIRD SERVER — public entry point that forwards TCP traffic")
 	role := wizardAsk("Select role (1/2/3)", "")
-	tok, err := randomHex(32)
+	tok, err := randomAgentToken()
 	if err != nil {
 		return err
 	}
@@ -4190,11 +4288,11 @@ func setup() error {
 			return err
 		}
 		if usesHysteria(c.Transport) {
-			c.HysteriaAuth, err = randomHex(32)
+			c.HysteriaAuth, err = randomHysteriaSecret()
 			if err != nil {
 				return err
 			}
-			c.HysteriaObfs, err = randomHex(32)
+			c.HysteriaObfs, err = randomHysteriaSecret()
 			if err != nil {
 				return err
 			}
@@ -4244,12 +4342,11 @@ func setup() error {
 		uiCard("✅ HUB CONFIGURED", []uiCardRow{
 			{Text: "Configuration saved successfully.", Color: ansiGreen},
 		}, ansiGreen+ansiBold)
-		uiCard("🔐 AGENT TOKEN", []uiCardRow{
-			{Text: c.Token, Color: ansiYellow + ansiBold},
-		}, ansiYellow)
-		uiCard("🛡️ CERTIFICATE SHA-256 FINGERPRINT", []uiCardRow{
-			{Text: c.Fingerprint, Color: ansiCyan + ansiBold},
-		}, ansiCyan)
+		fingerprintDisplay, fpErr := compactFingerprint(c.Fingerprint)
+		if fpErr != nil {
+			return fmt.Errorf("prepare Agent fingerprint display: %w", fpErr)
+		}
+		printAgentCredentials(c.Token, fingerprintDisplay, c.HysteriaAuth, c.HysteriaObfs)
 		controlRows := []uiCardRow{}
 		if c.Transport == transportHysteria {
 			controlRows = append(controlRows, uiCardRow{Text: "Local-only TCP control: 127.0.0.1:" + portOf(c.ControlListen), Color: ansiDim})
@@ -4265,13 +4362,6 @@ func setup() error {
 			controlRows = append(controlRows, uiCardRow{Text: "Hysteria 2 QUIC: " + portOf(udpAddr) + " (UDP)", Color: ansiGreen + ansiBold})
 		}
 		uiCard("🔌 CONTROL PORTS", controlRows, ansiPinkGlow)
-		if usesHysteria(c.Transport) {
-			uiCard("HYSTERIA 2 / AGENT CREDENTIALS", []uiCardRow{
-				{Text: "Hysteria password: " + c.HysteriaAuth, Color: ansiYellow + ansiBold},
-				{Text: "Salamander password: " + c.HysteriaObfs, Color: ansiCyan + ansiBold},
-				{Text: "Copy both values exactly into Agent setup.", Color: ansiDim},
-			}, ansiYellow)
-		}
 		mappingRows := make([]uiCardRow, 0, len(c.Ports))
 		for _, p := range c.Ports {
 			mappingRows = append(mappingRows, uiCardRow{Text: fmt.Sprintf("ID=%s   LISTEN=%s", p.ID, p.Listen), Color: ansiCyan})
