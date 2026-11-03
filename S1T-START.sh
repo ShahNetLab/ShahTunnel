@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 1.7.0 installer.
+# Shah Tunnel 1.8.0 installer.
 # Local runs use the adjacent source tree; one-line remote runs bootstrap the matching source bundle.
 # Installer and application versions must match; toolchain and Hysteria binaries are SHA-256 pinned.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="1.7.0"
+VERSION="1.8.0"
 GO_VERSION="1.27.3"
 HYSTERIA_VERSION="v2.13.0"
 HYSTERIA_HASHES_SHA256="e1d2c80994cf57fcef494ea799eedf80088e11fd7243b5b3b23f1288fe1266b5"
@@ -730,6 +730,55 @@ UNIT
     echo "systemd daemon-reload timed out. The binary is installed, but service metadata may need: systemctl daemon-reload" >&2
     exit 1
   fi
+fi
+# Template unit gives each named tunnel its own process and configuration tree.
+# The legacy ravanreverse.service remains untouched for the existing default profile.
+if [[ ! -f /etc/systemd/system/ravanreverse@.service ]]; then
+  cat > "$TMP/ravanreverse@.service" <<'UNIT'
+[Unit]
+Description=Shah Tunnel profile %i
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+[Service]
+Type=simple
+UMask=0077
+Environment="S1T_INSTANCE=%i"
+ExecStart=/usr/local/bin/ravanreverse run
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+LimitNOFILE=262144
+TasksMax=4096
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+ReadWritePaths=/etc/ravanreverse
+[Install]
+WantedBy=multi-user.target
+UNIT
+  install -o root -g root -m 0644 "$TMP/ravanreverse@.service" /etc/systemd/system/ravanreverse@.service
+fi
+if ! timeout --kill-after=3s 15s systemctl daemon-reload; then
+  echo "systemctl daemon-reload timed out. The binary is installed, but service metadata may need: systemctl daemon-reload" >&2
+  exit 1
 fi
 if [[ -f /etc/ravanreverse/config.json ]]; then
   if ! timeout --kill-after=2s 10s systemctl enable ravanreverse >/dev/null; then
