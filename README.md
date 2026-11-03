@@ -89,6 +89,12 @@ For a Hub control port of `9443`:
 - **Option 8:** expose `9443/TCP`, `9444/TCP`, `9445/TCP` and `9446/UDP`. Open only what your chosen mode actually uses, plus the public service-mapping ports.
 - The UDP tunnel port is always the control port + 3. Ensure it does not overlap with another UDP listener on the Hub.
 
+## Agent credential display and copy
+
+After Hub setup, the Agent token and certificate fingerprint are shown as compact single-line values for mobile terminals. New Agent tokens still contain 256 bits of randomness and use unpadded Base32. SHA-256 fingerprints are displayed as 43-character unpadded Base64URL; the Agent accepts this representation and continues to accept legacy 64-character hexadecimal fingerprints. New Hysteria and Salamander passwords also contain 256 random bits and use 52-character Base32; existing hexadecimal profile values remain supported.
+
+Use the numbered copy menu to send only the selected value to the device clipboard with OSC 52. This depends on the SSH terminal app allowing OSC 52 clipboard writes. If the app blocks OSC 52, long-press the value-only line and select that line. Plain terminal output does not expose a general tap event to a Bash program, so direct tap-to-copy cannot be guaranteed across all SSH apps.
+
 ## UDP path security
 
 - Hysteria 2 v2.13.0 carries the inner ShahTunnel TLS 1.3 control stream over QUIC/UDP.
