@@ -1,67 +1,98 @@
 <p align="center">
-  <img src="docs/img/shah-tunnel-logo.png" alt="Shah Tunnel logo" width="220" />
+  <img src="docs/img/shah-tunnel-logo.png" alt="ShahTunnel logo" width="220" />
 </p>
 
-<h1 align="center">SHAH TUNNEL | شاه تونل</h1>
-<p align="center"><strong>v1.6.3 · Reverse TCP Tunnel · Adaptive Lane Recovery</strong></p>
-<p align="center">An authenticated reverse TCP relay from public Hub listeners to services reachable by the remote Agent.</p>
-<p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
+<h1 align="center">SHAH TUNNEL</h1>
+<p align="center"><strong>v1.7.0 · Authenticated reverse TCP tunnel · TCP + QUIC/UDP adaptive transport</strong></p>
+<p align="center">An authenticated Hub↔Agent reverse tunnel with four TCP transport choices and an independent Hysteria 2 / QUIC / UDP path.</p>
+<p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a> · <a href="https://github.com/ShahNetLab/ShahTunnel">Project page</a></p>
+
+## Quick installation
+
+Download and extract the **v1.7.0 ZIP** on each Linux server (Hub and Agent), then run this single command from the extracted project directory as root:
+
+```bash
+sudo bash ./S1T-START.sh
+```
+
+Installer: [Run the easy installer from `S1T-START.sh`](./S1T-START.sh) · [Project page](https://github.com/ShahNetLab/ShahTunnel)
+
+The installer uses the source files in this ZIP when run locally, builds ShahTunnel for the server architecture, and installs the pinned Hysteria 2 sidecar after SHA-256 verification. It supports Linux `amd64` and `arm64`, with systemd. It downloads Go 1.27.3 from verified Go mirrors and Hysteria 2 v2.13.0 from GitHub Releases, falling back to the SourceForge mirror; both artifacts are checked against pinned SHA-256 values. A fresh install still needs access to at least one download source; this is not a fully offline installer. The one-line command above is intentionally local: the public repository's current branch is not this unpublished ZIP revision, so a raw GitHub install command would not reliably install this exact source.
 
 ## Network flow
 
 <p align="center">
-  <img src="docs/img/ShahTunnel-Network-Flow-v1.6.3.png" alt="Shah Tunnel v1.6.3 network flow, four TCP transport paths, adaptive lanes and security" width="100%" />
+  <img src="docs/img/ShahTunnel-Network-Flow-v1.7.0-en.png" alt="ShahTunnel 1.7.0 network flow with four TCP transports and Hysteria 2 QUIC over UDP" width="100%" />
 </p>
 
 ## Tunnel operation
 
-1. **Hub** listens for incoming public TCP sessions and maintains the configured public-port-to-mapping-ID table.
-2. **Agent** initiates outbound authenticated connections to the Hub. It opens connections to the configured local targets and forwards streams for matching mapping IDs.
-3. The Hub and Agent exchange framed tunnel messages over independent lanes. Each lane carries multiple multiplexed streams, subject to bounded stream and queue limits.
-4. The default is **12 independent lanes** (configurable up to 16). In option 7, first-time lanes are distributed across the four implemented transports. Each lane remembers its own last successfully authenticated transport and tries it first after reconnecting.
+1. **Hub** accepts public TCP connections and maps each public listener to a configured mapping ID.
+2. **Agent** initiates authenticated outbound tunnel lanes to the Hub and forwards each matching mapping ID to its configured local target.
+3. Each lane carries framed, multiplexed TCP streams. The default is **12 independent lanes** (configurable up to 16); streams are bounded by per-lane and queue limits.
+4. The inner ShahTunnel channel remains protected by TLS 1.3, the setup token and SHA-256 certificate pinning, regardless of the selected outer transport.
+5. In option **8**, first-time lanes are spread over five candidates. Every lane remembers its last successfully authenticated transport and tries it first after reconnecting.
 
 ## Transport menu
 
-Select the same policy on both Hub and Agent:
+Choose the same policy on the Hub and Agent:
 
-| Option | Transport | Tunnel path |
+| Option | Transport | Path |
 |---|---|---|
-| `1` | TCP/TLS | TLS-protected stream on the control port. |
+| `1` | TCP/TLS | Native TLS-protected stream on the control port. |
 | `2` | WebSocket/TLS | Binary WebSocket frames over TLS on the control port. |
-| `3` | HTTP/2 CONNECT | Full-duplex CONNECT stream on control port + 1. |
-| `4` | HTTP/1.1 CONNECT/TLS | CONNECT stream on control port + 2. |
-| `5` | HTTP CONNECT fallback | HTTP/2 CONNECT, then HTTP/1.1 CONNECT if setup fails. |
-| `6` | Automatic fallback | TCP/TLS, then WebSocket/TLS. |
-| `7` | Full adaptive failover | Uses all four transports, distributes first-time lanes, and remembers each lane's last good path. |
+| `3` | HTTP/2 CONNECT | Full-duplex CONNECT on control port + 1. |
+| `4` | HTTP/1.1 CONNECT/TLS | CONNECT on control port + 2. |
+| `5` | HTTP CONNECT fallback | HTTP/2 CONNECT, then HTTP/1.1 CONNECT. |
+| `6` | Automatic TCP fallback | TCP/TLS, then WebSocket/TLS. |
+| `7` | Hysteria 2 / QUIC / UDP | Independent UDP transport with Salamander packet obfuscation. No TCP fallback in this single-transport mode. |
+| `8` | Full adaptive failover | All four TCP paths plus Hysteria 2 / QUIC / UDP. This is the default recommended configuration when both networks allow the required ports. |
 
-**Option 7 health and recovery:** an authenticated heartbeat is sent every 5 seconds. A lane is closed after 20 seconds without a PONG, allowing its worker to reconnect and try the next transport. A single missed heartbeat does not trigger failover. Reconnect attempts use jittered backoff. The Hub and Agent must use matching policies and have all required transport ports reachable.
+### Option 8 health and recovery
 
-## Hub ports
+- Each active ShahTunnel lane sends an authenticated heartbeat every 5 seconds.
+- A lane is closed after 20 seconds without a PONG. Its worker then reconnects and tries the next path. A single lost heartbeat does not trigger failover.
+- Hysteria 2 runs as a managed child process of ShahTunnel. If it exits, ShahTunnel restarts it with jittered backoff.
+- In adaptive mode, a Hysteria start/configuration failure is non-fatal: the four TCP alternatives continue to run. In option 7 (Hysteria-only), failure to start the UDP sidecar is fatal by design.
+- **Failover is per lane, not seamless migration of an in-flight TCP stream.** If its lane dies, an existing public TCP stream on that lane closes; the lane reconnects for new streams. Silent blackholes can take about 20–25 seconds to be detected, plus the next dial/handshake time.
 
-With control port `9443`:
+## Hub firewall ports
 
-- `9443/TCP`: TCP/TLS and WebSocket/TLS.
-- `9444/TCP`: HTTP/2 CONNECT.
-- `9445/TCP`: HTTP/1.1 CONNECT.
+For a Hub control port of `9443`:
 
-Open the control port and the additional ports required by the selected policy. **All four transports in v1.6.3 use TCP.** This release does not include QUIC/UDP, Hysteria2, REALITY, IP spoofing, or an alternate Internet uplink. It therefore cannot bypass a complete TCP block, a block of every Hub address, or a total international upstream outage. A separate reachable UDP path and an independently routed upstream would be required for those failure cases.
+| Port | Protocol | Purpose |
+|---|---|---|
+| `9443` | TCP | Native TCP/TLS, WebSocket/TLS and inner loopback control. |
+| `9444` | TCP | HTTP/2 CONNECT. |
+| `9445` | TCP | HTTP/1.1 CONNECT. |
+| `9446` | UDP | Hysteria 2 / QUIC. |
 
-## Security
+- **Option 7:** expose `9446/UDP` only for the tunnel control path. The inner control listener is bound to `127.0.0.1`; it is not exposed publicly. Keep the configured public service-mapping ports open separately.
+- **Option 8:** expose `9443/TCP`, `9444/TCP`, `9445/TCP` and `9446/UDP`. Open only what your chosen mode actually uses, plus the public service-mapping ports.
+- The UDP tunnel port is always the control port + 3. Ensure it does not overlap with another UDP listener on the Hub.
 
-- TLS 1.3 protects the private Hub-Agent control and data lanes.
-- The Agent verifies the Hub certificate using its configured SHA-256 certificate fingerprint.
-- The Hub verifies the 256-bit random setup token using constant-time comparison.
-- Authentication failures are rate-limited in logs; stream queues, pending public connections and concurrent streams are bounded.
-- Keep the token, private key and certificate fingerprint configuration confidential. Restrict file permissions and expose only the Hub ports required by the selected transport policy.
+## Hysteria 2 / QUIC security
+
+- Hysteria 2 v2.13.0 carries the inner ShahTunnel TLS 1.3 control stream over QUIC/UDP.
+- Salamander obfuscation uses a separate random 256-bit password that must match on Hub and Agent. Hysteria authentication has its own random 256-bit password.
+- The Agent uses Hysteria's `pinSHA256` against the Hub certificate. The inner ShahTunnel TLS session independently validates the same certificate fingerprint and authenticates the ShahTunnel token.
+- The Hub's Hysteria ACL is default-deny: it permits only `127.0.0.1:<control-port>` over TCP and rejects every other destination. The local SOCKS5 endpoint listens only on `127.0.0.1` on the Agent.
+- The Hysteria binary and Go toolchain are downloaded as pinned versions and checksum-verified by the installer. Keep `/etc/ravanreverse` restricted to root; it contains credentials and private keys.
+
+## Limits you should plan for
+
+QUIC/UDP provides a genuinely separate transport family from TCP. Salamander can help when a network filters QUIC/HTTP/3 patterns but still carries UDP. It **cannot** make UDP work when UDP is blocked or unusable. If all Hub IP addresses are blocked, the Hub has no reachable uplink, or international connectivity is completely cut, no protocol on that same server can guarantee a working path. A second independently routed server/uplink is required for that failure domain. IP source spoofing is not included: it does not create a usable return path for a TCP/UDP session.
+
+Hysteria's optional Linux “Mimic / Fake TCP” mode is not enabled. It requires a separate executable and kernel XDP/eBPF support; it is not equivalent to changing UDP packet source addresses and should not be presented as a software-only fallback.
 
 ## Compatibility and verification
 
-The v1.6.3 configuration remains compatible with existing v1.6.x configurations; missing lane-count values continue to use the 12-lane default. No new config key is required. An in-flight public TCP stream is not migrated transparently if its specific lane dies; that stream closes, while the lane reconnects for new streams.
+Legacy v1.6.x configuration files remain readable. Options `1`–`6` retain their earlier behavior. The old `adaptive` setting still means the four legacy TCP paths; the new option 8 uses `adaptive_all` and requires matching Hysteria credentials on both ends. Run Hub setup first, then copy the token, certificate fingerprint, Hysteria password and Salamander password into Agent setup.
 
-Build and test from the repository root with the Go version pinned by the installer (Go 1.26.1):
+Run local checks with Go 1.27.3 already installed:
 
 ```bash
 ./VERIFY-ALL-TRANSPORTS.sh
 ```
 
-The installer builds locally for Linux amd64 or arm64. Existing service configuration and public-port mappings should be backed up before replacing a running deployment.
+The verification script tests the ShahTunnel code and builds Linux `amd64` / `arm64` binaries. It does not simulate filtering on a real ISP; test the selected UDP/TCP ports from both actual server networks before relying on the tunnel.
