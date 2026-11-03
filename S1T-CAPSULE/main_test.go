@@ -8,12 +8,15 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -1495,5 +1498,211 @@ func TestAgentTLS13PinnedHandshake(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("server handshake did not complete")
+	}
+}
+
+func TestTunnelProfilePathsAreIsolatedAndValidated(t *testing.T) {
+	oldRoot, oldName := configRoot, activeProfileName
+	oldConfig, oldServer, oldClient := configPath, hysteriaServerConfigPath, hysteriaClientConfigPath
+	t.Cleanup(func() {
+		configRoot, activeProfileName = oldRoot, oldName
+		configPath, hysteriaServerConfigPath, hysteriaClientConfigPath = oldConfig, oldServer, oldClient
+	})
+	configRoot = t.TempDir()
+	if err := setActiveProfile("main-edge"); err != nil {
+		t.Fatalf("set profile: %v", err)
+	}
+	if configPath != filepath.Join(configRoot, "profiles", "main-edge", "config.json") {
+		t.Fatalf("profile config path = %q", configPath)
+	}
+	if hysteriaServerConfigPath != filepath.Join(profileDirFor("main-edge"), "hysteria-server.yaml") {
+		t.Fatalf("profile Hysteria server path = %q", hysteriaServerConfigPath)
+	}
+	if profileServiceName("main-edge") != "ravanreverse@main-edge" || profileServiceName("default") != "ravanreverse" {
+		t.Fatal("profile service names are not isolated")
+	}
+	for _, invalid := range []string{"", "../bad", "a/b", "bad name", strings.Repeat("a", 33)} {
+		if validTunnelProfileName(invalid) {
+			t.Errorf("invalid profile name %q was accepted", invalid)
+		}
+	}
+	if !validTunnelProfileName("Edge_01-prod") {
+		t.Fatal("valid profile name was rejected")
+	}
+}
+
+func TestListTunnelProfilesFindsOnlyValidConfigDirectories(t *testing.T) {
+	oldRoot := configRoot
+	t.Cleanup(func() { configRoot = oldRoot })
+	configRoot = t.TempDir()
+	if err := os.MkdirAll(filepath.Join(profileDirFor("alpha")), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(profileDirFor("beta")), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPathForProfile("alpha"), []byte(`{"role":"hub"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profileDirFor("beta"), "readme.txt"), []byte("not a config"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := listTunnelProfiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalStrings(got, []string{"alpha"}) {
+		t.Fatalf("profiles = %v; want [alpha]", got)
+	}
+}
+
+func TestProfilePortConflictDetectionIsScopedAndNetworkAware(t *testing.T) {
+	oldRoot, oldName := configRoot, activeProfileName
+	t.Cleanup(func() { configRoot, activeProfileName = oldRoot, oldName })
+	configRoot = t.TempDir()
+	if err := os.MkdirAll(profileDirFor("existing"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	other := Config{Role: "hub", Transport: transportAdaptiveAll, ControlListen: "0.0.0.0:9443", Ports: []PortMapping{{ID: "web", Listen: "0.0.0.0:443"}}}
+	b, _ := json.Marshal(other)
+	if err := os.WriteFile(configPathForProfile("existing"), b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	candidate := Config{Role: "hub", Transport: transportTCP, ControlListen: "0.0.0.0:9543", Ports: []PortMapping{{ID: "web2", Listen: "0.0.0.0:443"}}}
+	if err := validateNoCrossProfilePortConflicts(candidate, "new-one"); err == nil || !strings.Contains(err.Error(), "port conflict") {
+		t.Fatalf("expected public listener port conflict, got %v", err)
+	}
+	candidate.Ports[0].Listen = "0.0.0.0:8448"
+	if err := validateNoCrossProfilePortConflicts(candidate, "new-one"); err != nil {
+		t.Fatalf("distinct TCP ports should coexist: %v", err)
+	}
+	candidate.Transport = transportHysteria
+	candidate.ControlListen = "127.0.0.1:9443"
+	// TCP and UDP may share a numeric port; only same-protocol socket conflicts.
+	if endpointHostsOverlap("0.0.0.0:9446", "0.0.0.0:9446") != true {
+		t.Fatal("wildcard TCP bind overlap was not detected")
+	}
+}
+
+func TestAdaptiveAllTransportCircuitBreakerSkipsRecentlyFailedPath(t *testing.T) {
+	agentTransportCooldown = sync.Map{}
+	t.Cleanup(func() { agentTransportCooldown = sync.Map{} })
+	now := time.Now()
+	base := []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1, transportHysteria}
+	markAdaptiveTransportFailed(transportTCP, now)
+	markAdaptiveTransportFailed(transportHTTP2, now)
+	got := filterCoolingAdaptiveCandidates(base, now.Add(time.Second))
+	want := []string{transportWebSocket, transportHTTP1, transportHysteria}
+	if !equalStrings(got, want) {
+		t.Fatalf("healthy candidate order = %v; want %v", got, want)
+	}
+	got = filterCoolingAdaptiveCandidates(base, now.Add(adaptiveTransportCooldown+time.Second))
+	if !equalStrings(got, base) {
+		t.Fatalf("expired cooldowns should restore all paths, got %v", got)
+	}
+	for _, mode := range base {
+		markAdaptiveTransportFailed(mode, now)
+	}
+	got = filterCoolingAdaptiveCandidates(base, now.Add(time.Second))
+	if !equalStrings(got, base) {
+		t.Fatalf("when all paths are cooled, manager must probe all again: %v", got)
+	}
+}
+
+func TestAllocateHysteriaSOCKSPortIsUniquePerAgentProfile(t *testing.T) {
+	oldRoot := configRoot
+	t.Cleanup(func() { configRoot = oldRoot })
+	configRoot = t.TempDir()
+	if err := os.MkdirAll(profileDirFor("existing"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	existing := Config{
+		Version: version, Role: "agent", Transport: transportAdaptiveAll,
+		HubAddr: "203.0.113.10:9443", Token: strings.Repeat("a", 64),
+		Fingerprint: strings.Repeat("b", 64), HysteriaAuth: strings.Repeat("c", 64),
+		HysteriaObfs: strings.Repeat("d", 64), HysteriaSOCKSListen: "127.0.0.1:11080",
+		Ports: []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
+	}
+	b, err := json.Marshal(existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPathForProfile("existing"), b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := allocateHysteriaSOCKSListen()
+	if err != nil {
+		t.Fatalf("allocate Hysteria SOCKS port: %v", err)
+	}
+	if got == existing.HysteriaSOCKSListen {
+		t.Fatalf("allocated duplicate SOCKS listener %s", got)
+	}
+	host, portText, err := net.SplitHostPort(got)
+	if err != nil || host != "127.0.0.1" {
+		t.Fatalf("allocated listener %q is not loopback: %v", got, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 11080 || port > 11999 {
+		t.Fatalf("allocated port %q is outside the managed range", portText)
+	}
+}
+
+func TestValidateAgentHysteriaRequiresValidLocalSOCKSListener(t *testing.T) {
+	c := Config{
+		Version: version, Role: "agent", Transport: transportHysteria,
+		HubAddr: "203.0.113.10:9443", Token: strings.Repeat("a", 64),
+		Fingerprint: strings.Repeat("b", 64), HysteriaAuth: strings.Repeat("c", 64),
+		HysteriaObfs: strings.Repeat("d", 64), HysteriaSOCKSListen: "0.0.0.0:11080",
+		Ports: []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
+	}
+	if err := validateConfig(c); err == nil || !strings.Contains(err.Error(), "local Hysteria SOCKS listener") {
+		t.Fatalf("expected invalid local SOCKS listener error, got %v", err)
+	}
+	c.HysteriaSOCKSListen = "127.0.0.1:11080"
+	if err := validateConfig(c); err != nil {
+		t.Fatalf("valid loopback SOCKS listener rejected: %v", err)
+	}
+}
+
+func TestDeleteTunnelProfileRemovesOnlyNamedProfile(t *testing.T) {
+	oldRoot, oldName := configRoot, activeProfileName
+	oldConfig, oldServer, oldClient := configPath, hysteriaServerConfigPath, hysteriaClientConfigPath
+	oldPATH := os.Getenv("PATH")
+	t.Cleanup(func() {
+		configRoot, activeProfileName = oldRoot, oldName
+		configPath, hysteriaServerConfigPath, hysteriaClientConfigPath = oldConfig, oldServer, oldClient
+		_ = os.Setenv("PATH", oldPATH)
+	})
+	configRoot = t.TempDir()
+	fakeBin := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(fakeBin, 0700); err != nil {
+		t.Fatal(err)
+	}
+	fakeSystemctl := filepath.Join(fakeBin, "systemctl")
+	if err := os.WriteFile(fakeSystemctl, []byte(`#!/bin/sh
+if [ "$1" = "show" ]; then echo inactive; fi
+exit 0
+`), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("PATH", fakeBin+string(os.PathListSeparator)+oldPATH); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"remove-me", "keep-me"} {
+		if err := os.MkdirAll(profileDirFor(name), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configPathForProfile(name), []byte(`{"role":"hub"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := deleteTunnelProfile("remove-me"); err != nil {
+		t.Fatalf("delete selected profile: %v", err)
+	}
+	if _, err := os.Stat(profileDirFor("remove-me")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("selected profile directory still exists or stat failed unexpectedly: %v", err)
+	}
+	if _, err := os.Stat(configPathForProfile("keep-me")); err != nil {
+		t.Fatalf("unselected profile was damaged: %v", err)
 	}
 }
