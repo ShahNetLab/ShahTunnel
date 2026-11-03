@@ -5,19 +5,19 @@
 <h1 align="center">SHAH TUNNEL</h1>
 <p align="center"><strong>v1.7.0 · Authenticated reverse TCP tunnel · TCP + QUIC/UDP adaptive transport</strong></p>
 <p align="center">An authenticated Hub↔Agent reverse tunnel with four TCP transport choices and an independent Hysteria 2 / QUIC / UDP path.</p>
-<p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a> · <a href="https://github.com/ShahNetLab/ShahTunnel">Project page</a></p>
+<p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
-## Quick installation
+## Quick install
 
-Download and extract the **v1.7.0 ZIP** on each Linux server (Hub and Agent), then run this single command from the extracted project directory as root:
+Run this command as `root` on both servers:
 
 ```bash
-sudo bash ./S1T-START.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 ```
 
-Installer: [Run the easy installer from `S1T-START.sh`](./S1T-START.sh) · [Project page](https://github.com/ShahNetLab/ShahTunnel)
+Select `Hub` on the Iran server and `Agent` on the outside server.
 
-The installer uses the source files in this ZIP when run locally, builds ShahTunnel for the server architecture, and installs the pinned Hysteria 2 sidecar after SHA-256 verification. It supports Linux `amd64` and `arm64`, with systemd. It downloads Go 1.27.3 from verified Go mirrors and Hysteria 2 v2.13.0 from GitHub Releases, falling back to the SourceForge mirror; both artifacts are checked against pinned SHA-256 values. A fresh install still needs access to at least one download source; this is not a fully offline installer. The one-line command above is intentionally local: the public repository's current branch is not this unpublished ZIP revision, so a raw GitHub install command would not reliably install this exact source.
+> This command runs the installer published on the repository's `main` branch. As checked on 4 November 2026, the online script identifies itself as version `1.6.3`; the `1.7.0` installer must be published to `main` before this command can install `1.7.0`.
 
 ## Network flow
 
@@ -71,7 +71,7 @@ For a Hub control port of `9443`:
 - **Option 8:** expose `9443/TCP`, `9444/TCP`, `9445/TCP` and `9446/UDP`. Open only what your chosen mode actually uses, plus the public service-mapping ports.
 - The UDP tunnel port is always the control port + 3. Ensure it does not overlap with another UDP listener on the Hub.
 
-## Hysteria 2 / QUIC security
+## UDP path security
 
 - Hysteria 2 v2.13.0 carries the inner ShahTunnel TLS 1.3 control stream over QUIC/UDP.
 - Salamander obfuscation uses a separate random 256-bit password that must match on Hub and Agent. Hysteria authentication has its own random 256-bit password.
