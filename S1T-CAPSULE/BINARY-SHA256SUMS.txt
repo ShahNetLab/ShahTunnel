@@ -1,0 +1,2 @@
+d9397790a5aaf9af4e61ae7bd2a1ccc233b5fba3a9fa330513f5d5a9a09c0f47  shah-tunnel-linux-amd64
+9d06bdc2dc412c6a615a740165ff06d22b73b551db7ed394c89b9843f44e427e  shah-tunnel-linux-arm64
