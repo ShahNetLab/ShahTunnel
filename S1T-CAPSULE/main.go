@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -519,19 +518,17 @@ type wireRequest struct {
 }
 
 type wire struct {
-	conn         net.Conn
-	controlQ     chan *wireRequest
-	dataQ        chan *wireRequest
-	done         chan struct{}
-	once         sync.Once
-	rttNanos     atomic.Int64  // EWMA of authenticated PING/PONG round-trip time; zero until measured.
-	lastPongAt   atomic.Int64  // Unix nanoseconds of the latest valid PONG, for diagnostics/future health checks.
-	payloadBytes atomic.Uint64 // Total application payload bytes observed on this lane, in both directions.
+	conn       net.Conn
+	controlQ   chan *wireRequest
+	dataQ      chan *wireRequest
+	done       chan struct{}
+	once       sync.Once
+	rttNanos   atomic.Int64 // EWMA of authenticated PING/PONG round-trip time; zero until measured.
+	lastPongAt atomic.Int64 // Unix nanoseconds of the latest valid PONG, for diagnostics/future health checks.
 }
 
 func newWire(c net.Conn) *wire {
 	tuneTCPConn(c)
-	tuneTunnelSendQueue(c)
 	w := &wire{
 		conn: c,
 		// Control traffic (OPEN/ACK/CLOSE/PING) must not queue behind
@@ -570,41 +567,6 @@ func tuneTCPConn(c net.Conn) {
 	_ = tcp.SetNoDelay(true)
 	_ = tcp.SetKeepAlive(true)
 	_ = tcp.SetKeepAlivePeriod(30 * time.Second)
-}
-
-// tuneTunnelSendQueue limits only the unsent kernel queue on each outer tunnel
-// TCP socket. It does not change global sysctls or fixed socket buffers, and it
-// leaves TCP autotuning intact. Keeping this queue short lets the wire scheduler
-// interleave control frames and other streams instead of sitting behind a large
-// userspace-to-kernel upload backlog. Older kernels/transports simply ignore it.
-func tuneTunnelSendQueue(c net.Conn) {
-	if c == nil || runtime.GOOS != "linux" {
-		return
-	}
-	raw := c
-	switch wrapped := c.(type) {
-	case *tls.Conn:
-		raw = wrapped.NetConn()
-	case *websocketConn:
-		raw = wrapped.Conn
-	case *bufferedConn:
-		raw = wrapped.Conn
-	}
-	if tc, ok := raw.(*tls.Conn); ok {
-		raw = tc.NetConn()
-	}
-	tcp, ok := raw.(*net.TCPConn)
-	if !ok {
-		return // HTTP CONNECT stream transports do not expose their parent socket.
-	}
-	rawConn, err := tcp.SyscallConn()
-	if err != nil {
-		return
-	}
-	_ = rawConn.Control(func(fd uintptr) {
-		// Linux TCP_NOTSENT_LOWAT (25): cap unsent queued bytes at 128 KiB.
-		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, 25, 128*1024)
-	})
 }
 
 func adjustAgentChannels(delta int64) {
@@ -654,9 +616,6 @@ func (w *wire) writeRequest(req *wireRequest) error {
 	binary.BigEndian.PutUint32(buf[5:9], uint32(len(req.data)))
 	copy(buf[9:], req.data)
 	err := writeFull(w.conn, buf)
-	if err == nil && req.typ == msgData && len(req.data) > 0 {
-		w.payloadBytes.Add(uint64(len(req.data)))
-	}
 	wireFramePool.Put(buf[:0])
 	_ = w.conn.SetWriteDeadline(time.Time{})
 	return err
@@ -723,9 +682,6 @@ func (w *wire) receive() (frame, error) {
 		f.data = make([]byte, int(n))
 		if _, err := io.ReadFull(w.conn, f.data); err != nil {
 			return frame{}, err
-		}
-		if f.typ == msgData {
-			w.payloadBytes.Add(uint64(n))
 		}
 	}
 	return f, nil
@@ -1054,16 +1010,12 @@ func (s *hubStream) close() {
 }
 
 type hubSession struct {
-	id              uint64
-	wire            *wire
-	mu              sync.RWMutex
-	streams         map[uint32]*hubStream
-	next            atomic.Uint32
-	stopOnce        sync.Once
-	loadMu          sync.Mutex
-	loadSampleAt    time.Time
-	loadSampleBytes uint64
-	loadRateBPS     float64 // Smoothed payload throughput used to avoid already-busy lanes.
+	id       uint64
+	wire     *wire
+	mu       sync.RWMutex
+	streams  map[uint32]*hubStream
+	next     atomic.Uint32
+	stopOnce sync.Once
 }
 
 func newHubSession(c net.Conn) *hubSession {
@@ -1075,38 +1027,6 @@ func (s *hubSession) activeStreams() int {
 	n := len(s.streams)
 	s.mu.RUnlock()
 	return n
-}
-
-// estimatedPayloadRate returns a two-second EWMA of the actual payload rate on
-// this lane. Active stream count alone cannot distinguish an idle TCP stream
-// from a video upload that is already occupying most of the lane capacity.
-func (s *hubSession) estimatedPayloadRate() float64 {
-	if s == nil || s.wire == nil {
-		return 0
-	}
-	now := time.Now()
-	total := s.wire.payloadBytes.Load()
-	s.loadMu.Lock()
-	defer s.loadMu.Unlock()
-	if s.loadSampleAt.IsZero() {
-		s.loadSampleAt = now
-		s.loadSampleBytes = total
-		return s.loadRateBPS
-	}
-	elapsed := now.Sub(s.loadSampleAt).Seconds()
-	if elapsed <= 0 {
-		return s.loadRateBPS
-	}
-	delta := uint64(0)
-	if total >= s.loadSampleBytes {
-		delta = total - s.loadSampleBytes
-	}
-	instantaneous := float64(delta) / elapsed
-	alpha := 1 - math.Exp(-elapsed/2.0)
-	s.loadRateBPS = s.loadRateBPS*(1-alpha) + instantaneous*alpha
-	s.loadSampleAt = now
-	s.loadSampleBytes = total
-	return s.loadRateBPS
 }
 func (s *hubSession) get(id uint32) *hubStream {
 	s.mu.RLock()
@@ -1627,10 +1547,10 @@ func (h *hubServer) sessionCount() int {
 	return n
 }
 
-// current chooses a healthy lane using both active streams and measured payload
-// throughput. New connections avoid lanes that are already carrying a large
-// upload/download, while RTT is the final tie-breaker;
-// the rotating cursor keeps otherwise-equal lanes balanced.
+// current chooses the least-loaded healthy lane. When several lanes have the
+// same load and all have measured RTT, the lowest-RTT lane wins; a rotating
+// tie-breaker prevents pinning every new flow to one connection. RTT is only a
+// tie-breaker, not a promise that the lowest-latency lane has the highest capacity.
 func (h *hubServer) current() *hubSession {
 	h.mu.RLock()
 	candidates := make([]*hubSession, 0, len(h.sessions))
@@ -1648,70 +1568,46 @@ func (h *hubServer) current() *hubSession {
 		ordered = append(ordered, candidates[(start+i)%len(candidates)])
 	}
 
-	// Build one load score from both connection count and real payload rate.
-	// This lets an idle lane win over a lane carrying a single saturated upload,
-	// even when the saturated lane has fewer total streams.
-	type laneLoad struct {
-		session *hubSession
-		streams int
-		rate    float64
-		score   float64
-	}
-	loads := make([]laneLoad, 0, len(ordered))
-	var totalRate float64
+	bestLoad := maxStreams + 1
+	var leastLoaded []*hubSession
 	for _, candidate := range ordered {
-		streams := candidate.activeStreams()
-		if streams >= maxStreams {
+		load := candidate.activeStreams()
+		if load >= maxStreams {
 			continue
 		}
-		rate := candidate.estimatedPayloadRate()
-		loads = append(loads, laneLoad{session: candidate, streams: streams, rate: rate})
-		totalRate += rate
+		if load < bestLoad {
+			bestLoad = load
+			leastLoaded = leastLoaded[:0]
+		}
+		if load == bestLoad {
+			leastLoaded = append(leastLoaded, candidate)
+		}
 	}
-	if len(loads) == 0 {
+	if len(leastLoaded) == 0 {
 		return nil
 	}
-	averageRate := totalRate / float64(len(loads))
-	rateScale := math.Max(averageRate, 64*1024) // Keep idle/low-rate lanes numerically stable.
-	bestScore := math.Inf(1)
-	for i := range loads {
-		// One sustained lane-rate equal to the current fleet average adds 1.5
-		// stream-equivalents to the score. Connection count still dominates when
-		// traffic is idle, while a bulk-transfer lane is avoided under load.
-		loads[i].score = float64(loads[i].streams) + 1.5*(loads[i].rate/rateScale)
-		if loads[i].score < bestScore {
-			bestScore = loads[i].score
-		}
-	}
-	rateCandidates := make([]*hubSession, 0, len(loads))
-	for _, load := range loads {
-		if load.score <= bestScore+0.05 {
-			rateCandidates = append(rateCandidates, load.session)
-		}
-	}
-
-	if len(rateCandidates) == 1 {
-		return rateCandidates[0]
+	if len(leastLoaded) == 1 {
+		return leastLoaded[0]
 	}
 
 	// Do not prefer an unmeasured lane over a measured one (or vice versa):
-	// keep round-robin behaviour until every equally-loaded candidate has RTT.
+	// keep round-robin behaviour until every equally loaded candidate has RTT.
 	bestRTT := time.Duration(0)
-	for _, candidate := range rateCandidates {
+	for _, candidate := range leastLoaded {
 		rtt := candidate.wire.roundTripTime()
 		if rtt <= 0 {
-			return rateCandidates[0]
+			return leastLoaded[0]
 		}
 		if bestRTT == 0 || rtt < bestRTT {
 			bestRTT = rtt
 		}
 	}
-	for _, candidate := range rateCandidates {
+	for _, candidate := range leastLoaded {
 		if candidate.wire.roundTripTime() == bestRTT {
 			return candidate
 		}
 	}
-	return rateCandidates[0]
+	return leastLoaded[0]
 }
 func (h *hubServer) acceptPublic(ln net.Listener, portID string) {
 	pending := h.pendingPublic
