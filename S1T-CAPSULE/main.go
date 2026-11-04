@@ -3447,11 +3447,11 @@ func uiRouteDiagram() {
 		color := ansiDim
 		switch i {
 		case 1:
-			color = ansiPurple + ansiBold
+			color = ansiPinkGlow + ansiBold
 		case 2, 3:
 			color = ansiCyan + ansiBold
 		case 4, 5:
-			color = ansiDim
+			color = ansiGreen + ansiBold
 		}
 		fmt.Println(paintNeonRouteLine(i, line, color))
 	}
@@ -3523,16 +3523,12 @@ func uiHeader(_, _ string) {
 		}
 		color := ansiDim
 		switch i {
-		case 0, 3, 9:
-			color = ansiCyan + ansiBold
+		case 0, 3, 9, 10, 13:
+			color = ansiPinkGlow + ansiBold
 		case 1, 4, 6, 11:
 			color = ansiCyan + ansiBold
-		case 10, 13:
-			color = ansiPurple + ansiBold
-		case 12:
+		case 2, 5, 7, 8, 12:
 			color = ansiGreen + ansiBold
-		case 2, 5, 7, 8:
-			color = ansiDim
 		}
 		fmt.Println(paintNeonHeaderLine(i, line, color))
 	}
@@ -4772,25 +4768,12 @@ func geoDisplay(g ServerGeo) (string, string) {
 	}
 	return g.IP, country
 }
+
+// uiCommandDeckHeader renders the complete branded header stack used by the
+// main menu: Shah Tunnel identity, network route diagram, and Command Deck.
+// Keeping this as the menu entry point ensures the main screen matches setup.
 func uiCommandDeckHeader() {
-	width := 66
-	inner := width - 2
-	lines := []string{
-		"╔" + strings.Repeat("═", inner) + "╗",
-		"║" + centerUI("COMMAND DECK", inner) + "║",
-		"║" + centerUI("NEBULA ROUTING   •   TLS 1.3   •   ZERO TRUST", inner) + "║",
-		"╚" + strings.Repeat("═", inner) + "╝",
-	}
-	for i, line := range lines {
-		if i == 1 {
-			fmt.Println(paint(ansiPurple+ansiBold, line))
-		} else if i == 2 {
-			fmt.Println(paint(ansiGreen+ansiBold, line))
-		} else {
-			fmt.Println(paint(ansiPinkGlow, line))
-		}
-	}
-	fmt.Println()
+	uiHeader("", "")
 }
 
 func menu() {
