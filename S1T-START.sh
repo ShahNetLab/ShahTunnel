@@ -7,8 +7,10 @@ OWNER="ShahNetLab"
 REPO="ShahTunnel"
 VERSION="1.6.3"
 STATE_DIR="/usr/local/lib/shah-tunnel"
+DOWNLOAD_CACHE="/var/cache/shah-tunnel/downloads"
 PHASE_HAS_DOWNLOAD=0
 RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/main"
+CDN_BASE="https://cdn.jsdelivr.net/gh/${OWNER}/${REPO}@main"
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64) TARGET_ARCH="amd64" ;;
   Linux:aarch64|Linux:arm64) TARGET_ARCH="arm64" ;;
@@ -33,45 +35,57 @@ PINK=$'\033[38;5;213m'
 PINK_DARK=$'\033[38;5;97m'
 RESET=$'\033[0m'
 
-curl_download() {
-  local url="$1" dest="$2"
-  shift 2
-  local headers="${TMP}/curl-headers.$$" log="${TMP}/curl-log.$$"
-  local pid=0 rc=0
-  rm -f "$headers" "$log" "$dest"
-  if [[ ! -t 2 ]]; then
-    if ! curl -fsSL --proto '=https' --proto-redir '=https' --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log"; then
-      if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
-      rm -f "$headers" "$log" "$dest"
-      return 1
-    fi
-    # No progress bar is visible without a TTY, so let phase_done emit the
-    # single final bar rather than suppressing all progress output.
-    PHASE_HAS_DOWNLOAD=0
-    rm -f "$headers" "$log"
+# Download from a mirror with resumable, bounded retries. Partial files live
+# outside TMP so rerunning the installer continues an interrupted download.
+download_from_mirror() {
+  local url="$1" part="$2" expected_sha="$3" label="$4"
+  local rc=0
+  mkdir -p "$DOWNLOAD_CACHE"
+  chmod 0700 "$DOWNLOAD_CACHE"
+
+  if [[ -s "$part" ]] && printf '%s  %s\n' "$expected_sha" "$part" | sha256sum -c - >/dev/null 2>&1; then
+    mv -f "$part" "$TMP/S1T-CORE"
+    echo "Using previously completed, SHA-256-verified download from ${label}." >&2
     return 0
   fi
-  curl -fsSL --proto '=https' --proto-redir '=https' --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log" &
-  pid=$!
-  # Show a single animated indicator while downloading; hide failed mirror
-  # errors when QUIET_CURL_ERRORS=1 so normal fallback does not look broken.
-  local frame=0
-  while kill -0 "$pid" 2>/dev/null; do
-    draw_indeterminate_bar "$frame"
-    frame=$((frame + 1))
-    sleep 0.12
-  done
-  wait "$pid" || rc=$?
-  printf '\r\033[2K' >&2
-  if (( rc != 0 )); then
-    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
-    rm -f "$headers" "$log" "$dest"
-    return "$rc"
+  [[ -f "$part" ]] || : > "$part"
+
+  echo "Source: ${label}" >&2
+  echo "A real download percentage, transfer speed and ETA are shown below." >&2
+  echo "Interrupted downloads are saved; rerun the same install command to resume." >&2
+
+  if [[ -t 2 ]]; then
+    curl --fail --location --show-error --progress-bar \
+      --proto '=https' --proto-redir '=https' \
+      --continue-at - --retry 4 --retry-delay 2 --retry-connrefused \
+      --connect-timeout 15 --max-time 600 \
+      --speed-time 75 --speed-limit 1024 \
+      --output "$part" "$url" || rc=$?
+  else
+    curl --fail --location --silent --show-error \
+      --proto '=https' --proto-redir '=https' \
+      --continue-at - --retry 4 --retry-delay 2 --retry-connrefused \
+      --connect-timeout 15 --max-time 600 \
+      --speed-time 75 --speed-limit 1024 \
+      --output "$part" "$url" || rc=$?
   fi
-  # Hold all success progress output until the four-line completion display.
-  PHASE_HAS_DOWNLOAD=1
-  rm -f "$headers" "$log"
+
+  if (( rc != 0 )); then
+    echo "${label} download did not finish (curl exit ${rc}); partial bytes are retained." >&2
+    return 1
+  fi
+
+  if ! printf '%s  %s\n' "$expected_sha" "$part" | sha256sum -c - >/dev/null 2>&1; then
+    echo "${label} returned an incomplete or unexpected file; its cached copy was discarded." >&2
+    rm -f "$part"
+    return 1
+  fi
+
+  mv -f "$part" "$TMP/S1T-CORE"
+  echo "${label}: SHA-256 verified." >&2
+  return 0
 }
+
 # Use most of the available terminal width, then shorten each later phase
 # gradually. The first bar is deliberately much wider; all bars remain within
 # the terminal to avoid wrapping on mobile SSH clients.
@@ -176,25 +190,27 @@ prebuilt_binary_sha256() {
   esac
 }
 download_prebuilt_binary() {
-  local binary_name expected_sha binary_url
+  local binary_name expected_sha cdn_url raw_url
   binary_name="shah-tunnel-linux-${TARGET_ARCH}"
   expected_sha="$(prebuilt_binary_sha256)"
-  binary_url="${RAW_BASE}/S1T-CAPSULE/${binary_name}"
+  cdn_url="${CDN_BASE}/S1T-CAPSULE/${binary_name}"
+  raw_url="${RAW_BASE}/S1T-CAPSULE/${binary_name}"
 
   phase_start 1 "Download prebuilt Shah Tunnel binary"
-  echo "Downloading Shah Tunnel ${VERSION} (${TARGET_ARCH}) from the S1T-CAPSULE folder..." >&2
-  if ! curl_download "$binary_url" "$TMP/S1T-CORE" \
-      --retry 3 --retry-delay 1 --connect-timeout 12 --max-time 300; then
-    echo "Could not download ${binary_name} from ${binary_url}." >&2
-    echo "Check that the binary exists in S1T-CAPSULE on the main branch." >&2
-    return 1
+  echo "Downloading Shah Tunnel ${VERSION} (${TARGET_ARCH}); no Go download or local compilation is used." >&2
+
+  # Try jsDelivr first because it is a GitHub-backed global CDN. Verify the
+  # exact pinned digest and fall back to GitHub Raw if the CDN is unavailable
+  # or has a stale cached copy. No unverified bytes are ever installed.
+  if ! download_from_mirror "$cdn_url" "${DOWNLOAD_CACHE}/${binary_name}.cdn.part" "$expected_sha" "jsDelivr CDN"; then
+    echo "Trying the GitHub Raw source..." >&2
+    if ! download_from_mirror "$raw_url" "${DOWNLOAD_CACHE}/${binary_name}.raw.part" "$expected_sha" "GitHub Raw"; then
+      echo "Could not obtain a verified ${binary_name}." >&2
+      echo "Check that the binary and BINARY-SHA256SUMS.txt are committed in S1T-CAPSULE on the main branch." >&2
+      return 1
+    fi
   fi
 
-  if ! printf '%s  %s\n' "$expected_sha" "$TMP/S1T-CORE" | sha256sum -c - >/dev/null 2>&1; then
-    echo "Binary SHA-256 verification failed; refusing to install it." >&2
-    rm -f "$TMP/S1T-CORE"
-    return 1
-  fi
   if ! verify_binary; then
     echo "Downloaded binary version or architecture is incorrect; refusing to install it." >&2
     rm -f "$TMP/S1T-CORE"
