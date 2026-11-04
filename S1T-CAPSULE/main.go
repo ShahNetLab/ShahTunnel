@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "1.6.3"
+	version                          = "1.6.2"
 	configPath                       = "/etc/ravanreverse/config.json"
 	maxFrame                         = 64 * 1024
 	defaultTunnelChannels            = 12
