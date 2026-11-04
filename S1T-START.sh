@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 1.6.2 installer.
+# Shah Tunnel 1.6.3 installer.
 # Downloads a prebuilt, SHA-256-verified binary from S1T-CAPSULE in this repository.
 # No Go toolchain download or compilation is required on the target server.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="1.6.2"
+VERSION="1.6.3"
 STATE_DIR="/usr/local/lib/shah-tunnel"
 PHASE_HAS_DOWNLOAD=0
 RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/main"
@@ -170,8 +170,8 @@ verify_binary() {
 }
 prebuilt_binary_sha256() {
   case "$TARGET_ARCH" in
-    amd64) printf '%s' 'd9397790a5aaf9af4e61ae7bd2a1ccc233b5fba3a9fa330513f5d5a9a09c0f47' ;;
-    arm64) printf '%s' '9d06bdc2dc412c6a615a740165ff06d22b73b551db7ed394c89b9843f44e427e' ;;
+    amd64) printf '%s' 'd1438086451078bd77acc8121934ed6a8d901a6a3ec024fb431efa5f8dd1e8e5' ;;
+    arm64) printf '%s' '928cc5c9792c8bf3a9cdff2ac6ea7cb9820b2f503ce6e24ad50120e448d5c024' ;;
     *) return 1 ;;
   esac
 }
