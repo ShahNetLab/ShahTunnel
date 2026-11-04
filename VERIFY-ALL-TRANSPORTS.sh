@@ -1,40 +1,40 @@
 #!/usr/bin/env bash
-# Local verification helper. It reuses an existing Go 1.26.1 toolchain and never downloads one.
+# Local verification helper. It reuses an installed Go toolchain compatible with go.mod.
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-GO_VERSION="1.26.1"
-GO_HOME="$ROOT/.toolchains/go${GO_VERSION}"
+MIN_GO_VERSION="1.23.0"
 GO_BIN=""
 
 fail() { printf '\n[FAIL] %s\n' "$*" >&2; exit 1; }
 pass() { printf '[ OK ] %s\n' "$*"; }
 
-version_is_pinned() {
-  local bin="$1" v
+version_is_compatible() {
+  local bin="$1" output found
   [[ -x "$bin" ]] || return 1
-  v="$(GOTOOLCHAIN=local "$bin" version 2>/dev/null || true)"
-  [[ "$v" == *"go${GO_VERSION}"* ]]
+  output="$(GOTOOLCHAIN=local "$bin" version 2>/dev/null || true)"
+  found="$(printf '%s\n' "$output" | sed -nE 's/^go version go([0-9]+\.[0-9]+(\.[0-9]+)?)([[:space:]].*)?$/\1/p')"
+  [[ -n "$found" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$MIN_GO_VERSION" "$found" | sort -V | head -n 1)" == "$MIN_GO_VERSION" ]]
 }
 
-# Reuse only an exact Go 1.26.1 binary. An older/newer system toolchain is not used.
-for candidate in "$GO_HOME/bin/go" "/usr/local/lib/shah-tunnel/go-${GO_VERSION}/bin/go" "$(command -v go 2>/dev/null || true)"; do
-  if [[ -n "$candidate" ]] && version_is_pinned "$candidate"; then
+# Reuse a local toolchain meeting the go.mod minimum; no network download here.
+for candidate in "$(command -v go 2>/dev/null || true)" "/usr/local/lib/shah-tunnel/toolchains/go1.27.3-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')/bin/go"; do
+  if [[ -n "$candidate" ]] && version_is_compatible "$candidate"; then
     GO_BIN="$candidate"
     break
   fi
 done
 
 if [[ -z "$GO_BIN" ]]; then
-  fail "Go ${GO_VERSION} is not installed locally. This verification script will not download toolchains."
+  fail "Go ${MIN_GO_VERSION} or newer is not installed locally. This verification script will not download toolchains."
 fi
 
 version_out="$(GOTOOLCHAIN=local "$GO_BIN" version)"
-[[ "$version_out" == *"go${GO_VERSION}"* ]] || fail "Expected Go ${GO_VERSION}, got: $version_out"
 export PATH="$(dirname "$GO_BIN"):$PATH"
 export GOTOOLCHAIN=local
-pass "Pinned toolchain: $version_out"
+pass "Compatible toolchain: $version_out"
 
 printf '\n== 1/7: Resolve Go module metadata ==\n'
 "$GO_BIN" mod tidy || fail "Could not validate Go module metadata."
@@ -70,11 +70,11 @@ pass "go vet"
 printf '\n== 7/7: Linux binaries build ==\n'
 mkdir -p dist
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-amd64 ./S1T-CAPSULE
-[[ "$(dist/shah-tunnel-linux-amd64 version)" == "Shah Tunnel 1.6.2 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+[[ "$(dist/shah-tunnel-linux-amd64 version)" == "Shah Tunnel 1.6.3 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-arm64 ./S1T-CAPSULE
 (cd dist && sha256sum shah-tunnel-linux-amd64 > shah-tunnel-linux-amd64.sha256)
 (cd dist && sha256sum shah-tunnel-linux-arm64 > shah-tunnel-linux-arm64.sha256)
 pass "Linux amd64 and arm64 binaries built; amd64 runtime version verified"
 
 echo
-echo "ALL CHECKS PASSED using Go ${GO_VERSION}."
+echo "ALL CHECKS PASSED using ${version_out}."
