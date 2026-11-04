@@ -2994,11 +2994,25 @@ func tunnelConfigPath(name string) string {
 }
 
 func runtimeStatsPath() string {
-	if filepath.Clean(configPath) == filepath.Clean(legacyConfigPath) {
+	cleanConfigPath := filepath.Clean(configPath)
+	if cleanConfigPath == filepath.Clean(legacyConfigPath) {
 		return "/etc/ravanreverse/runtime.json"
 	}
-	base := strings.TrimSuffix(filepath.Base(configPath), filepath.Ext(configPath))
-	return filepath.Join(filepath.Dir(configPath), base+".runtime.json")
+
+	// Named tunnel runtime metrics must not live beside *.json profile files:
+	// listTunnelProfiles scans that directory for configuration profiles.
+	// Keep metrics in a dedicated directory under /etc/ravanreverse (already
+	// writable by the systemd service sandbox) so one tunnel cannot appear as
+	// a second profile such as "name.runtime".
+	if filepath.Clean(filepath.Dir(cleanConfigPath)) == filepath.Clean(tunnelConfigDir) {
+		base := strings.TrimSuffix(filepath.Base(cleanConfigPath), filepath.Ext(cleanConfigPath))
+		return filepath.Join("/etc/ravanreverse", "runtime", base+".json")
+	}
+
+	// Preserve the previous behavior for custom --config paths outside the
+	// managed tunnel directory.
+	base := strings.TrimSuffix(filepath.Base(cleanConfigPath), filepath.Ext(cleanConfigPath))
+	return filepath.Join(filepath.Dir(cleanConfigPath), base+".runtime.json")
 }
 
 func currentServiceName() string {
@@ -3007,6 +3021,18 @@ func currentServiceName() string {
 	}
 	id := strings.TrimSuffix(filepath.Base(configPath), filepath.Ext(configPath))
 	return "ravanreverse@" + id
+}
+
+func parseTunnelProfileConfig(data []byte) (Config, bool) {
+	var c Config
+	if err := json.Unmarshal(data, &c); err != nil {
+		return Config{}, false
+	}
+	c = normalizeConfig(c)
+	if err := validateConfig(c); err != nil {
+		return Config{}, false
+	}
+	return c, true
 }
 
 func listTunnelProfiles() ([]TunnelProfile, error) {
@@ -3036,8 +3062,12 @@ func listTunnelProfiles() ([]TunnelProfile, error) {
 		if readErr != nil {
 			continue
 		}
-		var c Config
-		if json.Unmarshal(data, &c) != nil {
+		// Runtime snapshots and unrelated JSON files can share fields with
+		// Config (for example, both contain a "role"). Only show complete,
+		// valid tunnel configurations in the profile manager. This also hides
+		// stale *.runtime.json files created by previous Shah Tunnel versions.
+		c, ok := parseTunnelProfileConfig(data)
+		if !ok {
 			continue
 		}
 		id := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
