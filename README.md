@@ -58,10 +58,10 @@ For upgrade compatibility, the installed systemd unit and configuration director
 Run as root on Linux amd64 or arm64 with systemd and HTTPS access to the official Go download hosts and the source repository:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/release-1.6.3/S1T-START.sh)
 ```
 
-The installer first reuses a compatible system Go compiler (Go `1.23.0` or newer). If none is available, it downloads the pinned Go `1.27.3` toolchain from regional mirrors and official distribution hosts, with separate resumable partial files per mirror. The downloaded archive must match the official SHA-256 checksum for the server architecture before extraction or use. When run from an extracted repository, the installer uses its local source tree; when invoked remotely, it downloads this repository's `main` source archive. It then compiles `S1T-CAPSULE` locally with CGO disabled. No GitHub Release binary is used. A downloaded Go toolchain is stored in ShahTunnel's managed state directory for reuse. The built binary's application version and target architecture are checked before installation. An existing binary is backed up before replacement, and an already-active service is not restarted during installation to avoid dropping live tunnel sessions.
+This ZIP intentionally contains source code and the installer only; it does not bundle compiled executables. Create a branch named `release-1.6.3`, upload the ZIP contents to that branch, and allow the included GitHub Actions workflow to build the Linux `amd64` and `arm64` binaries and publish them under `dist/` with SHA-256 sidecar files. After the workflow succeeds, run the one-line command above on the VPS. The installer downloads only the binary matching the VPS architecture, verifies the published SHA-256 and embedded version/architecture, then installs it; Go is not required on the VPS. If no published binary is available, the installer can use compatible system Go `1.23.0` or newer, or a cached verified Go toolchain. Go mirror downloads remain disabled by default; explicitly set `SHAHTUNNEL_ALLOW_GO_DOWNLOAD=1` to enable the legacy fallback. An existing binary is backed up before replacement, and an already-active service is not restarted during installation.
 
 ## Build and tests
 
@@ -78,8 +78,8 @@ gofmt -w S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go
 go test -race -count=20 ./S1T-CAPSULE
 go vet ./S1T-CAPSULE
 mkdir -p dist
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-amd64 ./S1T-CAPSULE
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-arm64 ./S1T-CAPSULE
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-amd64 ./S1T-CAPSULE
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-arm64 ./S1T-CAPSULE
 (cd dist && sha256sum shah-tunnel-linux-amd64 > shah-tunnel-linux-amd64.sha256)
 (cd dist && sha256sum shah-tunnel-linux-arm64 > shah-tunnel-linux-arm64.sha256)
 ```

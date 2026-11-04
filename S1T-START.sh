@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 # Shah Tunnel 1.6.3 installer.
-# Reuses compatible system Go or downloads a pinned, SHA-256-verified toolchain,
-# fetches the source, and builds locally. No GitHub Release binary is used.
+# Downloads the matching release-branch binary and verifies its SHA-256.
+# A local/source build is only a fallback; VPS installs need no Go compiler.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
 VERSION="1.6.3"
@@ -13,7 +13,8 @@ GO_FALLBACK_BASE="https://go.dev/dl"
 STATE_DIR="/usr/local/lib/shah-tunnel"
 GO_CACHE_DIR="/var/cache/shah-tunnel"
 PHASE_HAS_DOWNLOAD=0
-RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/main"
+RELEASE_BRANCH="release-1.6.3"
+RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/${RELEASE_BRANCH}"
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64) TARGET_ARCH="amd64" ;;
   Linux:aarch64|Linux:arm64) TARGET_ARCH="arm64" ;;
@@ -366,6 +367,49 @@ official_go_sha256() {
   esac
 }
 
+try_prebuilt_binary() {
+  local binary_name binary_sha binary_url checksum_url
+  binary_name="shah-tunnel-linux-${TARGET_ARCH}"
+  binary_url="${RAW_BASE}/dist/${binary_name}"
+  checksum_url="${binary_url}.sha256"
+
+  # The source ZIP deliberately contains no executable binaries. GitHub
+  # Actions builds them in the release branch; the VPS fetches only its target.
+  echo "Downloading published SHA-256 file for linux/${TARGET_ARCH}..." >&2
+  if ! QUIET_CURL_ERRORS=1 curl_download "$checksum_url" "$TMP/S1T-CHECKSUM" \
+      --retry 2 --retry-delay 1 --connect-timeout 12 --max-time 30; then
+    echo "Published binary checksum is not available at ${checksum_url}." >&2
+    echo "Check that the release-1.6.3 GitHub Actions build completed successfully." >&2
+    return 1
+  fi
+
+  binary_sha="$(awk 'NR==1 {print $1}' "$TMP/S1T-CHECKSUM")"
+  if [[ ! "$binary_sha" =~ ^[[:xdigit:]]{64}$ ]]; then
+    echo "The published SHA-256 file is malformed; refusing to install." >&2
+    return 1
+  fi
+
+  echo "Downloading ShahTunnel ${VERSION} for linux/${TARGET_ARCH}..." >&2
+  if ! QUIET_CURL_ERRORS=1 curl_download "$binary_url" "$TMP/S1T-CORE" \
+      --retry 2 --retry-delay 1 --connect-timeout 15 --max-time 180; then
+    echo "Published ShahTunnel binary is not available at ${binary_url}." >&2
+    return 1
+  fi
+
+  if ! printf '%s  %s\n' "$binary_sha" "$TMP/S1T-CORE" | sha256sum -c - >/dev/null 2>&1; then
+    echo "Downloaded binary failed its published SHA-256 check; refusing to run it." >&2
+    rm -f "$TMP/S1T-CORE"
+    return 1
+  fi
+  if ! verify_binary; then
+    echo "Downloaded binary version/architecture check failed; refusing to install it." >&2
+    rm -f "$TMP/S1T-CORE"
+    return 1
+  fi
+  echo "ShahTunnel ${VERSION} verified (SHA-256 + runtime version); Go is not required." >&2
+  return 0
+}
+
 build_project_binary() {
   local go_bin="$1" source_dir="$2" go_root="$3" go_version_actual="$4"
   (
@@ -373,16 +417,25 @@ build_project_binary() {
     env GOROOT="$go_root" GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off \
       GOCACHE="${GO_CACHE_DIR}/build-cache-${go_version_actual}-${TARGET_ARCH}" \
       CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_ARCH" \
-      "$go_bin" build -trimpath -ldflags='-s -w -buildid=' \
+      "$go_bin" build -buildvcs=false -trimpath -ldflags='-s -w -buildid=' \
       -o "$TMP/S1T-CORE" ./S1T-CAPSULE
   )
 }
 build_from_official_go_toolchain() {
+  # Normal remote installations use a repository-hosted, SHA-256-pinned binary.
+  # This branch intentionally runs before any Go detection/download so a VPS
+  # with blocked Go mirrors can still install when raw.githubusercontent.com works.
+  phase_start 1 "Fetch and verify prebuilt binary"
+  if try_prebuilt_binary; then
+    phase_done "Prebuilt binary verified"
+    return 0
+  fi
+
   local go_archive go_sha source_url go_bin go_root source_dir expected_go url downloaded
   local go_version_actual system_go system_go_output system_go_version local_repo_dir
   go_archive="go${GO_VERSION}.linux-${TARGET_ARCH}.tar.gz"
   go_sha="$(official_go_sha256)"
-  source_url="https://codeload.github.com/${OWNER}/${REPO}/tar.gz/refs/heads/main"
+  source_url="https://codeload.github.com/${OWNER}/${REPO}/tar.gz/refs/heads/${RELEASE_BRANCH}"
   expected_go="go version go${GO_VERSION} linux/${TARGET_ARCH}"
   source_dir="$TMP/source"
   go_bin=""
@@ -431,6 +484,12 @@ build_from_official_go_toolchain() {
       echo "Using cached, SHA-256-verified Go ${GO_VERSION} archive." >&2
       downloaded=1
     else
+      if [[ "${SHAHTUNNEL_ALLOW_GO_DOWNLOAD:-0}" != "1" ]]; then
+        echo "No verified prebuilt binary, compatible system Go, or cached Go toolchain is available." >&2
+        echo "Normal installation does not download a compiler. Wait for the ${RELEASE_BRANCH} GitHub Actions build to publish dist/shah-tunnel-linux-${TARGET_ARCH}, or install Go ${MIN_GO_VERSION}+ locally." >&2
+        echo "To explicitly allow the legacy Go mirror fallback, run with SHAHTUNNEL_ALLOW_GO_DOWNLOAD=1." >&2
+        return 1
+      fi
       rm -f "$cache_archive"
       # Use parallel ranges first for mirrors that support them; if a mirror
       # lacks byte-range support, fall back to the resumable single-stream path.
@@ -541,7 +600,7 @@ build_from_official_go_toolchain() {
     echo "Using ShahTunnel source from the local repository directory." >&2
     cp -a "$local_repo_dir/." "$source_dir/"
   else
-    echo "Downloading ShahTunnel source from ${OWNER}/${REPO} (main branch)..." >&2
+    echo "Downloading ShahTunnel source from ${OWNER}/${REPO} (${RELEASE_BRANCH} branch)..." >&2
     if ! curl_download "$source_url" "$TMP/shah-tunnel-source.tar.gz" \
         --retry 2 --retry-delay 1 --connect-timeout 12 --max-time 180; then
       echo "Could not download the source archive from ${source_url}." >&2
