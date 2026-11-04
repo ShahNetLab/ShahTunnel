@@ -55,13 +55,13 @@ For upgrade compatibility, the installed systemd unit and configuration director
 
 ## Install
 
-Run as root on Linux amd64 or arm64 with systemd and HTTPS access to the official Go download hosts and the source repository:
+Run as root on Linux amd64 or arm64 with systemd and HTTPS access to GitHub:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 ```
 
-The installer downloads the Go `1.26.1` toolchain, trying regional mirrors first and then official distribution hosts. If a transfer is interrupted, it retains a separate partial file per mirror and resumes only from that same mirror with HTTP Range where supported. This avoids mixing partial responses from different hosts. It verifies the pinned SHA-256 checksum before using the archive; unverified archives are never accepted. The installer then downloads the source archive from the `main` branch of this repository and compiles `S1T-CAPSULE` locally for the server architecture with CGO disabled. It does not use GitHub Release assets or install the Go toolchain permanently. The built binary's application version and target architecture are checked before installation. An existing binary is backed up before replacement, and an already-active service is not restarted during installation to avoid dropping live tunnel sessions.
+The installer downloads the prebuilt binary for the server architecture directly from this repository's `S1T-CAPSULE` folder: `shah-tunnel-linux-amd64` or `shah-tunnel-linux-arm64`. The binaries are stored in the repository itself, not in GitHub Releases. The installer verifies the pinned SHA-256 checksum, then checks the binary's application version and architecture before installation. No Go toolchain, source archive, or local compilation is needed on the target server. When publishing an update, replace both architecture binaries and the installer in the repository. An existing binary is backed up before replacement, and an already-active service is not restarted during installation to avoid dropping live tunnel sessions.
 
 ## Build and tests
 
