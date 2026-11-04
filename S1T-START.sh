@@ -1,93 +1,28 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 1.8.2 installer.
-# Local runs use the adjacent source tree; one-line remote runs bootstrap the matching source bundle.
-# Installer and application versions must match; toolchain and Hysteria binaries are SHA-256 pinned.
+# Shah Tunnel 1.6.2 installer.
+# Downloads the pinned Go toolchain, verifies its SHA-256, fetches the source,
+# and builds the binary on the target server. No GitHub Release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="1.8.2"
-GO_VERSION="1.27.3"
-HYSTERIA_VERSION="v2.13.0"
-HYSTERIA_HASHES_SHA256="e1d2c80994cf57fcef494ea799eedf80088e11fd7243b5b3b23f1288fe1266b5"
-HYSTERIA_RELEASE_BASE="https://github.com/HyNetworks/hysteria/releases/download/app%2F${HYSTERIA_VERSION}"
-HYSTERIA_MIRROR_BASE="https://sourceforge.net/projects/hysteria.mirror/files/app_v2.13.0"
+VERSION="1.6.2"
+GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || pwd)"
 STATE_DIR="/usr/local/lib/shah-tunnel"
 GO_CACHE_DIR="/var/cache/shah-tunnel"
 PHASE_HAS_DOWNLOAD=0
+RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/main"
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64) TARGET_ARCH="amd64" ;;
   Linux:aarch64|Linux:arm64) TARGET_ARCH="arm64" ;;
   *) echo "Shah Tunnel ${VERSION} supports Linux amd64 and arm64 only." >&2; exit 1 ;;
 esac
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-  echo "Run from the extracted release folder as root: sudo bash ./S1T-START.sh" >&2
+  echo "Run as root: bash <(curl -fsSL ${RAW_BASE}/S1T-START.sh)" >&2
   exit 1
 fi
 command -v systemctl >/dev/null 2>&1 || { echo "systemd/systemctl is required." >&2; exit 1; }
-for cmd in curl tar mktemp rm mkdir find sed head grep; do
-  command -v "$cmd" >/dev/null 2>&1 || { echo "Required bootstrap command missing: $cmd" >&2; exit 1; }
-done
-
-# One-line remote install support:
-# `bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)`
-# When this script is streamed from /dev/fd it has no adjacent source tree.
-# Fetch the complete main-branch source bundle, verify installer + Go versions,
-# and run the installer from that extracted bundle. No moving, mixed source files.
-if [[ ! -s "$SCRIPT_DIR/go.mod" || ! -s "$SCRIPT_DIR/S1T-CAPSULE/main.go" ]]; then
-  echo "Fetching ShahTunnel ${VERSION} source bundle..." >&2
-  BOOTSTRAP_TMP="$(mktemp -d /tmp/shahtunnel-bootstrap.XXXXXX)"
-  trap 'rm -rf -- "$BOOTSTRAP_TMP"' EXIT
-  BOOTSTRAP_ARCHIVE="$BOOTSTRAP_TMP/source.tar.gz"
-  BOOTSTRAP_EXTRACT="$BOOTSTRAP_TMP/source"
-  mkdir -p "$BOOTSTRAP_EXTRACT"
-  BOOTSTRAP_OK=0
-  BOOTSTRAP_URLS=(
-    "https://codeload.github.com/${OWNER}/${REPO}/tar.gz/refs/heads/main"
-    "https://github.com/${OWNER}/${REPO}/archive/refs/heads/main.tar.gz"
-  )
-  for BOOTSTRAP_URL in "${BOOTSTRAP_URLS[@]}"; do
-    rm -f "$BOOTSTRAP_ARCHIVE"
-    if curl -fsSL --proto '=https' --proto-redir '=https' \
-        --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 600 \
-        "$BOOTSTRAP_URL" -o "$BOOTSTRAP_ARCHIVE" 2>/dev/null \
-        && tar -tzf "$BOOTSTRAP_ARCHIVE" >/dev/null 2>&1; then
-      if tar -xzf "$BOOTSTRAP_ARCHIVE" -C "$BOOTSTRAP_EXTRACT"; then
-        BOOTSTRAP_OK=1
-        break
-      fi
-    fi
-  done
-  if (( BOOTSTRAP_OK == 0 )); then
-    echo "ERROR: Could not download the ShahTunnel source bundle from GitHub." >&2
-    echo "Check HTTPS access to GitHub, then run the same command again." >&2
-    exit 1
-  fi
-  BOOTSTRAP_MAIN="$(find "$BOOTSTRAP_EXTRACT" -type f -path '*/S1T-CAPSULE/main.go' -print -quit)"
-  if [[ -z "$BOOTSTRAP_MAIN" ]]; then
-    echo "ERROR: The downloaded archive does not contain the ShahTunnel source tree." >&2
-    exit 1
-  fi
-  BOOTSTRAP_SOURCE_DIR="${BOOTSTRAP_MAIN%/S1T-CAPSULE/main.go}"
-  if [[ ! -s "$BOOTSTRAP_SOURCE_DIR/go.mod" || ! -s "$BOOTSTRAP_SOURCE_DIR/S1T-START.sh" || ! -s "$BOOTSTRAP_SOURCE_DIR/VERIFY-ALL-TRANSPORTS.sh" ]]; then
-    echo "ERROR: The downloaded source bundle is incomplete." >&2
-    exit 1
-  fi
-  BOOTSTRAP_SCRIPT_VERSION="$(sed -nE 's/^VERSION="([^"]+)"$/\1/p' "$BOOTSTRAP_SOURCE_DIR/S1T-START.sh" | head -n 1)"
-  BOOTSTRAP_APP_VERSION="$(sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]+)".*$/\1/p' "$BOOTSTRAP_SOURCE_DIR/S1T-CAPSULE/main.go" | head -n 1)"
-  if [[ "$BOOTSTRAP_SCRIPT_VERSION" != "$VERSION" || "$BOOTSTRAP_APP_VERSION" != "$VERSION" ]]; then
-    echo "ERROR: GitHub main is not a consistent ShahTunnel ${VERSION} release." >&2
-    echo "Installer version: ${BOOTSTRAP_SCRIPT_VERSION:-unknown}; application version: ${BOOTSTRAP_APP_VERSION:-unknown}." >&2
-    echo "Publish the complete matching release source to the main branch and retry." >&2
-    exit 1
-  fi
-  echo "Source bundle verified: ShahTunnel ${VERSION}. Starting installer..." >&2
-  (cd "$BOOTSTRAP_SOURCE_DIR" && bash ./S1T-START.sh "$@")
-  exit $?
-fi
-
 for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod tar gzip mktemp rm sleep python3 wc sed tail sort xargs find; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "Required command missing: $cmd" >&2; exit 1; }
 done
@@ -417,8 +352,8 @@ verify_binary() {
 }
 official_go_sha256() {
   case "$TARGET_ARCH" in
-    amd64) printf '%s' '65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40' ;;
-    arm64) printf '%s' 'a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49' ;;
+    amd64) printf '%s' '031f088e5d955bab8657ede27ad4e3bc5b7c1ba281f05f245bcc304f327c987a' ;;
+    arm64) printf '%s' 'a290581cfe4fe28ddd737dde3095f3dbeb7f2e4065cab4eae44dfc53b760c2f7' ;;
     *) return 1 ;;
   esac
 }
@@ -435,11 +370,12 @@ build_project_binary() {
   )
 }
 build_from_official_go_toolchain() {
-  local go_archive go_sha go_bin go_root source_dir expected_go url downloaded
+  local go_archive go_sha source_url go_bin go_root source_dir expected_go url downloaded
   go_archive="go${GO_VERSION}.linux-${TARGET_ARCH}.tar.gz"
   go_sha="$(official_go_sha256)"
+  source_url="https://codeload.github.com/${OWNER}/${REPO}/tar.gz/refs/heads/main"
   expected_go="go version go${GO_VERSION} linux/${TARGET_ARCH}"
-  source_dir="$SCRIPT_DIR"
+  source_dir="$TMP/source"
   go_bin=""
   go_root=""
 
@@ -559,9 +495,19 @@ build_from_official_go_toolchain() {
     go_bin="$go_root/bin/go"
   fi
 
-  echo "Building from the exact local ShahTunnel release bundle: ${source_dir}" >&2
+  echo "Downloading ShahTunnel source from ${OWNER}/${REPO} (main branch)..." >&2
+  if ! curl_download "$source_url" "$TMP/shah-tunnel-source.tar.gz" \
+      --retry 2 --retry-delay 1 --connect-timeout 12 --max-time 180; then
+    echo "Could not download the source archive from ${source_url}." >&2
+    return 1
+  fi
+  mkdir -p "$source_dir"
+  if ! tar -xzf "$TMP/shah-tunnel-source.tar.gz" -C "$source_dir" --strip-components=1; then
+    echo "Could not extract the ShahTunnel source archive." >&2
+    return 1
+  fi
   [[ -s "$source_dir/go.mod" && -s "$source_dir/S1T-CAPSULE/main.go" ]] \
-    || { echo "The extracted release bundle does not contain the expected ShahTunnel source files." >&2; return 1; }
+    || { echo "The downloaded repository does not contain the expected ShahTunnel source files." >&2; return 1; }
   if ! grep -Fq "module github.com/${OWNER}/${REPO}" "$source_dir/go.mod"; then
     echo "The source module path does not match github.com/${OWNER}/${REPO}; refusing to build." >&2
     return 1
@@ -602,77 +548,7 @@ if ! build_from_official_go_toolchain; then
   echo "Go archives must match the pinned SHA-256; ShahTunnel is built locally without GitHub Release assets." >&2
   exit 1
 fi
-install_hysteria_binary() {
-  local asset="hysteria-linux-${TARGET_ARCH}"
-  local hashes="$TMP/hysteria-hashes.txt"
-  local binary="$TMP/${asset}"
-  local expected_sha installed_version existing_sha i
-
-  # Always authenticate the release manifest first. A matching version string
-  # alone is not sufficient evidence that an existing executable is trusted.
-  echo "Downloading checksum manifest for Hysteria ${HYSTERIA_VERSION}..." >&2
-  if ! curl_download "${HYSTERIA_RELEASE_BASE}/hashes.txt" "$hashes" \
-      --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 60; then
-    echo "GitHub unavailable; trying the Hysteria SourceForge mirror for the checksum manifest..." >&2
-    if ! curl_download "${HYSTERIA_MIRROR_BASE}/hashes.txt/download" "$hashes" \
-        --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 60; then
-      echo "Could not download the pinned Hysteria checksum manifest from either source." >&2
-      return 1
-    fi
-  fi
-  if ! printf '%s  %s\n' "$HYSTERIA_HASHES_SHA256" "$hashes" | sha256sum -c - >/dev/null 2>&1; then
-    echo "Hysteria checksum manifest did not match the pinned release digest." >&2
-    return 1
-  fi
-  expected_sha="$(awk -v asset="$asset" '{
-    name=$NF; sub(/^\*/, "", name); sub(/^.*\//, "", name)
-    hash=""
-    for (i=1; i<=NF; i++) if (length($i)==64 && $i ~ /^[[:xdigit:]]+$/) { hash=tolower($i); break }
-    if (name==asset && hash!="") { print hash; exit }
-  }' "$hashes")"
-  if [[ ! "$expected_sha" =~ ^[[:xdigit:]]{64}$ ]]; then
-    echo "The pinned Hysteria manifest does not contain a valid checksum for ${asset}." >&2
-    return 1
-  fi
-  if [[ -x /usr/local/bin/hysteria ]]; then
-    existing_sha="$(sha256sum /usr/local/bin/hysteria | awk '{print tolower($1)}')"
-    installed_version="$(/usr/local/bin/hysteria version 2>/dev/null | head -n 1 || true)"
-    if [[ "$existing_sha" == "$expected_sha" && "$installed_version" == *"${HYSTERIA_VERSION}"* ]]; then
-      echo "Reusing SHA-256-verified Hysteria ${HYSTERIA_VERSION}." >&2
-      return 0
-    fi
-  fi
-
-  echo "Downloading Hysteria ${HYSTERIA_VERSION} (${asset})..." >&2
-  if ! curl_download "${HYSTERIA_RELEASE_BASE}/${asset}" "$binary" \
-      --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 240; then
-    echo "GitHub unavailable; trying the Hysteria SourceForge mirror for ${asset}..." >&2
-    if ! curl_download "${HYSTERIA_MIRROR_BASE}/${asset}/download" "$binary" \
-        --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 240; then
-      echo "Could not download the Hysteria executable from either source." >&2
-      return 1
-    fi
-  fi
-  if ! printf '%s  %s\n' "$expected_sha" "$binary" | sha256sum -c - >/dev/null 2>&1; then
-    echo "Hysteria executable checksum verification failed." >&2
-    return 1
-  fi
-  chmod 0755 "$binary"
-  local version_output
-  if ! version_output="$(timeout --kill-after=1s 5s "$binary" version 2>&1)" || [[ "$version_output" != *"${HYSTERIA_VERSION}"* ]]; then
-    echo "Downloaded Hysteria executable did not report the pinned version ${HYSTERIA_VERSION}." >&2
-    return 1
-  fi
-  install -o root -g root -m 0755 "$binary" /usr/local/bin/hysteria.new
-  mv -f /usr/local/bin/hysteria.new /usr/local/bin/hysteria
-  echo "Hysteria ${HYSTERIA_VERSION} installed and SHA-256 verified." >&2
-}
-
-phase_start 2 "Installing tunnel and QUIC transport"
-if ! install_hysteria_binary; then
-  echo "Installation stopped before replacing ShahTunnel: Hysteria could not be verified." >&2
-  exit 1
-fi
+phase_start 2 "Installing binary and configuring service"
 install -d -o root -g root -m 0700 /etc/ravanreverse
 install -d -o root -g root -m 0755 /usr/local/bin
 install -d -o root -g root -m 0755 "$STATE_DIR"
@@ -730,55 +606,6 @@ UNIT
     echo "systemd daemon-reload timed out. The binary is installed, but service metadata may need: systemctl daemon-reload" >&2
     exit 1
   fi
-fi
-# Template unit gives each named tunnel its own process and configuration tree.
-# The legacy ravanreverse.service remains untouched for the existing default profile.
-if [[ ! -f /etc/systemd/system/ravanreverse@.service ]]; then
-  cat > "$TMP/ravanreverse@.service" <<'UNIT'
-[Unit]
-Description=Shah Tunnel profile %i
-Wants=network-online.target
-After=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=10
-[Service]
-Type=simple
-UMask=0077
-Environment="S1T_INSTANCE=%i"
-ExecStart=/usr/local/bin/ravanreverse run
-Restart=always
-RestartSec=2
-TimeoutStopSec=20
-LimitNOFILE=262144
-TasksMax=4096
-NoNewPrivileges=true
-PrivateTmp=true
-PrivateDevices=true
-ProtectSystem=strict
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-ProtectHostname=true
-ProtectClock=true
-ProtectProc=invisible
-ProcSubset=pid
-RestrictNamespaces=true
-RestrictRealtime=true
-RestrictSUIDSGID=true
-LockPersonality=true
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-SystemCallArchitectures=native
-ReadWritePaths=/etc/ravanreverse
-[Install]
-WantedBy=multi-user.target
-UNIT
-  install -o root -g root -m 0644 "$TMP/ravanreverse@.service" /etc/systemd/system/ravanreverse@.service
-fi
-if ! timeout --kill-after=3s 15s systemctl daemon-reload; then
-  echo "systemctl daemon-reload timed out. The binary is installed, but service metadata may need: systemctl daemon-reload" >&2
-  exit 1
 fi
 if [[ -f /etc/ravanreverse/config.json ]]; then
   if ! timeout --kill-after=2s 10s systemctl enable ravanreverse >/dev/null; then
