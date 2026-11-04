@@ -21,7 +21,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 1
 fi
 command -v systemctl >/dev/null 2>&1 || { echo "systemd/systemctl is required." >&2; exit 1; }
-for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod mktemp rm sleep; do
+for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod mktemp rm sleep tar; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "Required command missing: $cmd" >&2; exit 1; }
 done
 TMP="$(mktemp -d /tmp/s1t-install.XXXXXX)"
@@ -182,42 +182,52 @@ verify_binary() {
   timeout --kill-after=1s 5s "$TMP/S1T-CORE" version 2>/dev/null \
     | grep -Fqx "Shah Tunnel ${VERSION} (linux/${TARGET_ARCH})"
 }
-prebuilt_binary_sha256() {
-  case "$TARGET_ARCH" in
-    amd64) printf '%s' 'd1438086451078bd77acc8121934ed6a8d901a6a3ec024fb431efa5f8dd1e8e5' ;;
-    arm64) printf '%s' '928cc5c9792c8bf3a9cdff2ac6ea7cb9820b2f503ce6e24ad50120e448d5c024' ;;
-    *) return 1 ;;
-  esac
+prebuilt_bundle_sha256() {
+  printf '%s' '6a6a2c4fa1f99a391b238ea419fc23b3ef3e7785c09ac926184bf45700a50c66'
 }
 download_prebuilt_binary() {
-  local binary_name expected_sha cdn_url raw_url
-  binary_name="shah-tunnel-linux-${TARGET_ARCH}"
-  expected_sha="$(prebuilt_binary_sha256)"
-  cdn_url="${CDN_BASE}/S1T-CAPSULE/${binary_name}"
-  raw_url="${RAW_BASE}/S1T-CAPSULE/${binary_name}"
+  local bundle_name expected_sha cdn_url raw_url extracted candidate
+  bundle_name="shah-tunnel.tar.gz.tar"
+  expected_sha="$(prebuilt_bundle_sha256)"
+  cdn_url="${CDN_BASE}/S1T-CAPSULE/${bundle_name}"
+  raw_url="${RAW_BASE}/S1T-CAPSULE/${bundle_name}"
 
-  phase_start 1 "Download prebuilt Shah Tunnel binary"
-  echo "Downloading Shah Tunnel ${VERSION} (${TARGET_ARCH}); no Go download or local compilation is used." >&2
+  phase_start 1 "Download universal Shah Tunnel package"
+  echo "Downloading one package for Linux ${TARGET_ARCH}; no Go download or local compilation is used." >&2
 
-  # Try jsDelivr first because it is a GitHub-backed global CDN. Verify the
-  # exact pinned digest and fall back to GitHub Raw if the CDN is unavailable
-  # or has a stale cached copy. No unverified bytes are ever installed.
-  if ! download_from_mirror "$cdn_url" "${DOWNLOAD_CACHE}/${binary_name}.cdn.part" "$expected_sha" "jsDelivr CDN"; then
+  # One archive contains both prebuilt architectures. Verify the complete
+  # package before extracting any executable from it.
+  if ! download_from_mirror "$cdn_url" "${DOWNLOAD_CACHE}/${bundle_name}.cdn.part" "$expected_sha" "jsDelivr CDN"; then
     echo "Trying the GitHub Raw source..." >&2
-    if ! download_from_mirror "$raw_url" "${DOWNLOAD_CACHE}/${binary_name}.raw.part" "$expected_sha" "GitHub Raw"; then
-      echo "Could not obtain a verified ${binary_name}." >&2
-      echo "Check that the binary and BINARY-SHA256SUMS.txt are committed in S1T-CAPSULE on the main branch." >&2
+    if ! download_from_mirror "$raw_url" "${DOWNLOAD_CACHE}/${bundle_name}.raw.part" "$expected_sha" "GitHub Raw"; then
+      echo "Could not obtain the verified universal package: ${bundle_name}." >&2
+      echo "Check that this archive exists in S1T-CAPSULE on the main branch." >&2
       return 1
     fi
   fi
 
+  extracted="${TMP}/universal-package"
+  mkdir -p "$extracted"
+  if ! tar -xzf "$TMP/S1T-CORE" -C "$extracted"; then
+    echo "The downloaded universal package is not a valid gzip archive." >&2
+    return 1
+  fi
+  candidate="${extracted}/shah-tunnel-universal/bin/linux-${TARGET_ARCH}/ravanreverse"
+  if [[ ! -s "$candidate" ]]; then
+    echo "The universal package does not contain the Linux ${TARGET_ARCH} binary." >&2
+    return 1
+  fi
+  # Replace the archive in the temporary path with the selected executable.
+  mv -f "$candidate" "$TMP/S1T-CORE"
+  chmod 0750 "$TMP/S1T-CORE"
+
   if ! verify_binary; then
-    echo "Downloaded binary version or architecture is incorrect; refusing to install it." >&2
+    echo "The extracted binary version or architecture is incorrect; refusing to install it." >&2
     rm -f "$TMP/S1T-CORE"
     return 1
   fi
 
-  phase_done "Prebuilt binary verified"
+  phase_done "Universal package and selected binary verified"
   return 0
 }
 
