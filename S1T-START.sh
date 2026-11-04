@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 # Shah Tunnel 1.6.2 installer.
-# Downloads the pinned Go toolchain, verifies its SHA-256, fetches the source,
-# and builds the binary on the target server. No GitHub Release binary is used.
+# Downloads Go from the official Go distribution server at runtime, verifies SHA-256,
+# fetches the source, and builds locally. No prebuilt ShahTunnel binary is embedded.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
 VERSION="1.6.2"
 GO_VERSION="1.26.1"
-GO_BASE="https://dl.google.com/go"
-GO_FALLBACK_BASE="https://go.dev/dl"
+GO_BASE="https://dl.google.com/go"   # Official Go distribution host only.
 STATE_DIR="/usr/local/lib/shah-tunnel"
 GO_CACHE_DIR="/var/cache/shah-tunnel"
 PHASE_HAS_DOWNLOAD=0
@@ -44,7 +43,7 @@ curl_download() {
   local pid=0 rc=0
   rm -f "$headers" "$log" "$dest"
   if [[ ! -t 2 ]]; then
-    if ! curl -fsSL --proto '=https' --proto-redir '=https' --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log"; then
+    if ! curl -4 -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 25 --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log"; then
       if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
       rm -f "$headers" "$log" "$dest"
       return 1
@@ -55,7 +54,7 @@ curl_download() {
     rm -f "$headers" "$log"
     return 0
   fi
-  curl -fsSL --proto '=https' --proto-redir '=https' --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log" &
+  curl -4 -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 25 --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log" &
   pid=$!
   # Show a single animated indicator while downloading; hide failed mirror
   # errors when QUIET_CURL_ERRORS=1 so normal fallback does not look broken.
@@ -76,23 +75,28 @@ curl_download() {
   PHASE_HAS_DOWNLOAD=1
   rm -f "$headers" "$log"
 }
-# Download a large file while retaining partial bytes between mirror attempts.
-# Unlike curl_download(), this helper must NEVER remove the destination file on
-# failure, because the next mirror may resume at the existing byte offset.
+# Download a large official archive while retaining partial bytes between retries.
+# Unlike curl_download(), this helper never removes the destination on failure.
 curl_download_resumable() {
-  local url="$1" dest="$2" max_time="${3:-0}" retry_count="${4:-3}" speed_time="${5:-180}"
+  local url="$1" dest="$2" max_time="${3:-900}" retry_count="${4:-3}" speed_time="${5:-90}" resolve_ip="${6:-}"
   local headers="${TMP}/curl-resume-headers.$$" log="${TMP}/curl-resume-log.$$"
-  local rc=0 pid=0 frame=0
+  local rc=0 pid=0 frame=0 url_host
+  local -a resolve_args=()
 
   [[ -f "$dest" ]] || : > "$dest"
   rm -f "$headers" "$log"
   : > "$log"
+  if [[ -n "$resolve_ip" ]]; then
+    url_host="${url#https://}"
+    url_host="${url_host%%/*}"
+    resolve_args=(--resolve "${url_host}:443:${resolve_ip}")
+  fi
 
   if [[ ! -t 2 ]]; then
-    if curl -fsSL --proto '=https' --proto-redir '=https' \
-        --continue-at - \
-        --retry "$retry_count" --retry-delay 1 --retry-connrefused \
-        --connect-timeout 8 --max-time "$max_time" \
+    if curl -4 -fsSL --proto '=https' --proto-redir '=https' \
+        "${resolve_args[@]}" --continue-at - \
+        --retry "$retry_count" --retry-delay 2 --retry-connrefused \
+        --connect-timeout 25 --max-time "$max_time" \
         --speed-time "$speed_time" --speed-limit 1024 \
         --dump-header "$headers" "$url" -o "$dest" 2>"$log"; then
       rm -f "$headers" "$log"
@@ -105,10 +109,10 @@ curl_download_resumable() {
     return "$rc"
   fi
 
-  curl -fsSL --proto '=https' --proto-redir '=https' \
-      --continue-at - \
-      --retry "$retry_count" --retry-delay 1 --retry-connrefused \
-      --connect-timeout 8 --max-time "$max_time" \
+  curl -4 -fsSL --proto '=https' --proto-redir '=https' \
+      "${resolve_args[@]}" --continue-at - \
+      --retry "$retry_count" --retry-delay 2 --retry-connrefused \
+      --connect-timeout 25 --max-time "$max_time" \
       --speed-time "$speed_time" --speed-limit 1024 \
       --dump-header "$headers" "$url" -o "$dest" 2>"$log" &
   pid=$!
@@ -129,101 +133,44 @@ curl_download_resumable() {
   return 0
 }
 
-# Download a Go archive using concurrent byte ranges. This is especially
-# helpful on hosts where a single HTTPS stream is bandwidth-limited. A range
-# is accepted only when the server returns the exact number of bytes; the final
-# archive must match the pinned SHA-256 before it is used.
-curl_download_parallel_ranges() {
-  local url="$1" dest="$2" expected_sha="$3"
-  local workdir="${dest}.chunks" headers="${TMP}/range-headers.$$" probe="${TMP}/range-probe.$$"
-  local total chunk_count=8 chunk_size i start end expected_size part tmp_part
-  local pid rc failed=0 alive frame=0
-  local -a pids=()
-  RANGE_DOWNLOAD_ATTEMPTED=0
-
-  rm -f "$headers" "$probe"
-  # --max-filesize prevents a mirror that ignores Range from streaming the
-  # entire ~67 MB archive just to probe support.
-  if ! curl -fsSL --proto '=https' --proto-redir '=https' --range 0-0 \
-      --max-filesize 1024 --connect-timeout 8 --max-time 12 \
-      --dump-header "$headers" "$url" -o "$probe" 2>/dev/null; then
-    rm -f "$headers" "$probe"
-    return 1
-  fi
-  total="$(sed -nE 's/^[Cc]ontent-[Rr]ange:[[:space:]]*bytes[[:space:]]+0-0\/([0-9]+).*$/\1/p' "$headers" | tail -n 1)"
-  if [[ ! "$total" =~ ^[0-9]+$ ]] || [[ "$(wc -c < "$probe" 2>/dev/null || echo 0)" -ne 1 ]]; then
-    rm -f "$headers" "$probe"
-    return 1
-  fi
-  rm -f "$headers" "$probe"
-  RANGE_DOWNLOAD_ATTEMPTED=1
-
-  mkdir -p "$workdir"
-  chunk_size=$(((total + chunk_count - 1) / chunk_count))
-  pids=()
-  for ((i=0; i<chunk_count; i++)); do
-    start=$((i * chunk_size))
-    (( start < total )) || break
-    end=$((start + chunk_size - 1))
-    (( end < total )) || end=$((total - 1))
-    expected_size=$((end - start + 1))
-    part="${workdir}/chunk-$(printf '%02d' "$i").part"
-    # Completed chunks are reusable on the next invocation, but only if their
-    # byte count matches the expected range length.
-    if [[ -f "$part" ]] && [[ "$(wc -c < "$part")" -eq "$expected_size" ]]; then
-      continue
+# Resolve a host through authenticated DNS-over-HTTPS when the VPS resolver is
+# broken. The archive itself is still fetched from the official HTTPS hostname;
+# curl --resolve pins only the IP and keeps TLS hostname verification enabled.
+resolve_ipv4_via_doh() {
+  local host="$1" response
+  local -a doh_hosts=(
+    'cloudflare-dns.com|1.1.1.1|/dns-query'
+    'dns.google|8.8.8.8|/resolve'
+  )
+  local entry doh_host doh_ip doh_path
+  for entry in "${doh_hosts[@]}"; do
+    doh_host="${entry%%|*}"
+    entry="${entry#*|}"
+    doh_ip="${entry%%|*}"
+    doh_path="${entry#*|}"
+    response="$(curl -4 -fsS --proto '=https' --connect-timeout 8 --max-time 15 \
+      --resolve "${doh_host}:443:${doh_ip}" \
+      -H 'accept: application/dns-json' \
+      "https://${doh_host}${doh_path}?name=${host}&type=A" 2>/dev/null || true)"
+    if [[ -n "$response" ]]; then
+      printf '%s' "$response" | python3 -c '
+import ipaddress, json, sys
+try:
+    data = json.load(sys.stdin)
+    if data.get("Status") == 0:
+        for answer in data.get("Answer", []):
+            if answer.get("type") == 1:
+                try:
+                    ip = ipaddress.ip_address(answer.get("data", ""))
+                    if ip.version == 4:
+                        print(ip)
+                except ValueError:
+                    pass
+except Exception:
+    pass
+' 2>/dev/null
     fi
-    tmp_part="${part}.tmp.$$"
-    rm -f "$tmp_part"
-    (
-      if curl -fsSL --proto '=https' --proto-redir '=https' \
-          --range "${start}-${end}" --retry 0 \
-          --connect-timeout 8 --max-time 35 \
-          "$url" -o "$tmp_part" 2>/dev/null &&
-          [[ "$(wc -c < "$tmp_part" 2>/dev/null || echo 0)" -eq "$expected_size" ]]; then
-        mv -f "$tmp_part" "$part"
-        exit 0
-      fi
-      rm -f "$tmp_part"
-      exit 1
-    ) &
-    pids+=("$!")
   done
-
-  # Keep the existing compact animated indicator while chunks are in flight.
-  while :; do
-    alive=0
-    for pid in "${pids[@]}"; do
-      if kill -0 "$pid" 2>/dev/null; then alive=1; break; fi
-    done
-    (( alive == 1 )) || break
-    draw_indeterminate_bar "$frame"
-    frame=$((frame + 1))
-    sleep 0.12
-  done
-  printf '\r\033[2K' >&2
-  for pid in "${pids[@]}"; do
-    wait "$pid" || failed=1
-  done
-  if (( failed != 0 )); then
-    return 1
-  fi
-
-  local assembled="${TMP}/go-ranges-assembled.$$"
-  : > "$assembled"
-  for ((i=0; i<chunk_count; i++)); do
-    part="${workdir}/chunk-$(printf '%02d' "$i").part"
-    [[ -f "$part" ]] || { rm -f "$assembled"; return 1; }
-    cat "$part" >> "$assembled" || { rm -f "$assembled"; return 1; }
-  done
-  if [[ "$(wc -c < "$assembled")" -ne "$total" ]] ||
-      ! printf '%s  %s\n' "$expected_sha" "$assembled" | sha256sum -c - >/dev/null 2>&1; then
-    rm -f "$assembled"
-    rm -rf "$workdir"
-    return 1
-  fi
-  mv -f "$assembled" "$dest"
-  return 0
 }
 
 # Use most of the available terminal width, then shorten each later phase
@@ -402,66 +349,52 @@ build_from_official_go_toolchain() {
       downloaded=1
     else
       rm -f "$cache_archive"
-      # Use parallel ranges first for mirrors that support them; if a mirror
-      # lacks byte-range support, fall back to the resumable single-stream path.
-      local -a download_sources=(
-        "aliyun|https://mirrors.aliyun.com/golang"
-        "nju|https://mirror.nju.edu.cn/golang"
-        "ustc|https://mirrors.ustc.edu.cn/golang"
-        "tsinghua|https://mirrors.tuna.tsinghua.edu.cn/golang"
-        "tencent|https://mirrors.cloud.tencent.com/go"
-        "163|https://mirrors.163.com/golang"
-        "google|https://dl.google.com/go"
-        "go-dev|https://go.dev/dl"
-        "google-storage|https://storage.googleapis.com/golang"
-        "google-cn|https://golang.google.cn/dl"
-      )
-      local source source_id base part_file bytes
-      echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) using parallel range requests where supported..." >&2
-      for source in "${download_sources[@]}"; do
-        source_id="${source%%|*}"
-        base="${source#*|}"
-        url="${base}/${go_archive}"
-        part_file="${GO_CACHE_DIR}/${go_archive}.${source_id}.part"
-        echo "Trying ${base}..." >&2
+      local part_file="${GO_CACHE_DIR}/${go_archive}.official.part"
+      local official_url="${GO_BASE}/${go_archive}"
+      local -a official_ips=()
+      echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) directly from the official Go server: ${GO_BASE}" >&2
 
-        if [[ -s "$part_file" ]] && printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
+      # First try the normal system resolver.
+      if curl_download_resumable "$official_url" "$part_file" 900 3 90; then
+        if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
           cp -f "$part_file" "$TMP/$go_archive"
           downloaded=1
-          echo "Using complete SHA-256-verified archive from ${source_id}." >&2
-          break
-        fi
-
-        RANGE_DOWNLOAD_ATTEMPTED=0
-        if curl_download_parallel_ranges "$url" "$part_file" "$go_sha"; then
-          cp -f "$part_file" "$TMP/$go_archive"
-          downloaded=1
-          echo "Parallel download from ${source_id} passed SHA-256 verification." >&2
-          break
-        fi
-        if [[ "$RANGE_DOWNLOAD_ATTEMPTED" == 1 ]]; then
-          echo "Parallel chunks were incomplete at ${source_id}; moving to the next mirror instead of restarting a slow full download." >&2
-          continue
-        fi
-        echo "${source_id} does not support a usable byte-range response; trying a time-limited single stream..." >&2
-        if curl_download_resumable "$url" "$part_file" 35 0 15; then
-          if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
-            cp -f "$part_file" "$TMP/$go_archive"
-            downloaded=1
-            echo "Resumable download from ${source_id} passed SHA-256 verification." >&2
-            break
-          fi
-          bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
-          echo "Checksum mismatch from ${source_id} (${bytes} bytes); discarding its single-stream partial." >&2
-          rm -f "$part_file"
+          echo "Official Go archive downloaded and SHA-256 verified." >&2
         else
-          bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
-          echo "Download failed from ${source_id} (${bytes} bytes retained for the same mirror)." >&2
+          echo "Official server download completed but SHA-256 did not match; discarding it." >&2
+          rm -f "$part_file"
         fi
-      done
+      fi
+
+      # If local DNS is the problem, resolve dl.google.com through DoH and retry
+      # the exact same official HTTPS URL with TLS hostname validation intact.
+      if [[ "$downloaded" -ne 1 ]]; then
+        echo "Normal DNS/download failed. Trying DNS-over-HTTPS resolution for the official host..." >&2
+        mapfile -t official_ips < <(resolve_ipv4_via_doh "dl.google.com")
+        if [[ "${#official_ips[@]}" -eq 0 ]]; then
+          echo "DNS-over-HTTPS could not resolve the official host. Check outbound HTTPS access and the VPS network/DNS settings." >&2
+        else
+          local official_ip
+          for official_ip in "${official_ips[@]}"; do
+            [[ "$official_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+            echo "Retrying official Go download using resolved address ${official_ip}..." >&2
+            if curl_download_resumable "$official_url" "$part_file" 900 3 90 "$official_ip"; then
+              if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
+                cp -f "$part_file" "$TMP/$go_archive"
+                downloaded=1
+                echo "Official Go archive downloaded through DNS fallback and SHA-256 verified." >&2
+                break
+              fi
+              echo "SHA-256 mismatch from the official download endpoint; discarding partial data." >&2
+              rm -f "$part_file"
+            fi
+          done
+        fi
+      fi
       if [[ "$downloaded" -eq 1 ]]; then
         # Cache only a fully downloaded and verified archive.
         install -o root -g root -m 0644 "$TMP/$go_archive" "$cache_archive"
+        rm -f "$part_file"
       fi
     fi
 
@@ -497,9 +430,22 @@ build_from_official_go_toolchain() {
 
   echo "Downloading ShahTunnel source from ${OWNER}/${REPO} (main branch)..." >&2
   if ! curl_download "$source_url" "$TMP/shah-tunnel-source.tar.gz" \
-      --retry 2 --retry-delay 1 --connect-timeout 12 --max-time 180; then
-    echo "Could not download the source archive from ${source_url}." >&2
-    return 1
+      --retry 3 --retry-delay 2 --retry-connrefused --connect-timeout 25 --max-time 300; then
+    echo "Normal DNS failed for the source host; trying DNS-over-HTTPS..." >&2
+    local source_ip source_ok=0
+    while IFS= read -r source_ip; do
+      [[ "$source_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+      if curl_download "$source_url" "$TMP/shah-tunnel-source.tar.gz" \
+          --resolve "codeload.github.com:443:${source_ip}" \
+          --retry 2 --retry-delay 2 --retry-connrefused --connect-timeout 25 --max-time 300; then
+        source_ok=1
+        break
+      fi
+    done < <(resolve_ipv4_via_doh "codeload.github.com")
+    if [[ "$source_ok" -ne 1 ]]; then
+      echo "Could not download the source archive from ${source_url}; check outbound HTTPS/DNS access." >&2
+      return 1
+    fi
   fi
   mkdir -p "$source_dir"
   if ! tar -xzf "$TMP/shah-tunnel-source.tar.gz" -C "$source_dir" --strip-components=1; then
