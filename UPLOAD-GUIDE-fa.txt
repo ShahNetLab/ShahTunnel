@@ -1,0 +1,16 @@
+بسته باینری آماده Shah Tunnel 1.6.3
+
+۱) در مخزن ShahNetLab/ShahTunnel یک GitHub Release با تگ دقیق v1.6.3 بسازید.
+۲) این چهار فایل را جداگانه در بخش Assets همان Release آپلود کنید:
+   - shah-tunnel-linux-amd64
+   - shah-tunnel-linux-amd64.sha256
+   - shah-tunnel-linux-arm64
+   - shah-tunnel-linux-arm64.sha256
+   فایل ZIP را به‌عنوان Asset آپلود نکنید؛ چهار فایل بالا باید جداگانه وجود داشته باشند.
+۳) فایل main-branch/S1T-START.sh را در شاخه main مخزن، در ریشه و با نام S1T-START.sh جایگزین نسخه فعلی کنید. این نسخه به ShahNetLab/ShahTunnel اشاره می‌کند و باینری را از Release v1.6.3 می‌گیرد.
+۴) پس از انتشار، دستور نصب ثابت می‌ماند:
+   bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
+
+نصب‌کننده Go را دانلود یا کامپایل نمی‌کند. بر اساس معماری سرور فقط باینری amd64 یا arm64 را می‌گیرد و SHA-256، نسخه و معماری را بررسی می‌کند.
+
+جزئیات ساخت: سورس Shah Tunnel 1.6.3؛ Go 1.23.2؛ Linux amd64 و arm64؛ CGO_ENABLED=0؛ باینری‌ها استاتیک هستند. go test -count=20 و go vet موفق شدند. نسخه و معماری باینری amd64 در زمان اجرا بررسی شد؛ باینری arm64 از نظر فرمت ELF و معماری بررسی شد.
