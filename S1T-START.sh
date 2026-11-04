@@ -1,94 +1,27 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 1.8.2 installer.
-# Local runs use the adjacent source tree; one-line remote runs bootstrap the matching source bundle.
-# Installer and application versions must match; toolchain and Hysteria binaries are SHA-256 pinned.
+# Shah Tunnel 1.6.3 installer.
+# Downloads a prebuilt, SHA-256-verified binary from S1T-CAPSULE in this repository.
+# No Go toolchain download or compilation is required on the target server.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="1.8.2"
-GO_VERSION="1.27.3"
-HYSTERIA_VERSION="v2.13.0"
-HYSTERIA_HASHES_SHA256="e1d2c80994cf57fcef494ea799eedf80088e11fd7243b5b3b23f1288fe1266b5"
-HYSTERIA_RELEASE_BASE="https://github.com/HyNetworks/hysteria/releases/download/app%2F${HYSTERIA_VERSION}"
-HYSTERIA_MIRROR_BASE="https://sourceforge.net/projects/hysteria.mirror/files/app_v2.13.0"
-GO_BASE="https://dl.google.com/go"
-GO_FALLBACK_BASE="https://go.dev/dl"
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || pwd)"
+VERSION="1.6.3"
 STATE_DIR="/usr/local/lib/shah-tunnel"
-GO_CACHE_DIR="/var/cache/shah-tunnel"
+DOWNLOAD_CACHE="/var/cache/shah-tunnel/downloads"
 PHASE_HAS_DOWNLOAD=0
+RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/main"
+CDN_BASE="https://cdn.jsdelivr.net/gh/${OWNER}/${REPO}@main"
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64) TARGET_ARCH="amd64" ;;
   Linux:aarch64|Linux:arm64) TARGET_ARCH="arm64" ;;
   *) echo "Shah Tunnel ${VERSION} supports Linux amd64 and arm64 only." >&2; exit 1 ;;
 esac
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-  echo "Run from the extracted release folder as root: sudo bash ./S1T-START.sh" >&2
+  echo "Run as root: bash <(curl -fsSL ${RAW_BASE}/S1T-START.sh)" >&2
   exit 1
 fi
 command -v systemctl >/dev/null 2>&1 || { echo "systemd/systemctl is required." >&2; exit 1; }
-for cmd in curl tar mktemp rm mkdir find sed head grep; do
-  command -v "$cmd" >/dev/null 2>&1 || { echo "Required bootstrap command missing: $cmd" >&2; exit 1; }
-done
-
-# One-line remote install support:
-# `bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)`
-# When this script is streamed from /dev/fd it has no adjacent source tree.
-# Fetch the complete main-branch source bundle, verify installer + Go versions,
-# and run the installer from that extracted bundle. No moving, mixed source files.
-if [[ ! -s "$SCRIPT_DIR/go.mod" || ! -s "$SCRIPT_DIR/S1T-CAPSULE/main.go" ]]; then
-  echo "Fetching ShahTunnel ${VERSION} source bundle..." >&2
-  BOOTSTRAP_TMP="$(mktemp -d /tmp/shahtunnel-bootstrap.XXXXXX)"
-  trap 'rm -rf -- "$BOOTSTRAP_TMP"' EXIT
-  BOOTSTRAP_ARCHIVE="$BOOTSTRAP_TMP/source.tar.gz"
-  BOOTSTRAP_EXTRACT="$BOOTSTRAP_TMP/source"
-  mkdir -p "$BOOTSTRAP_EXTRACT"
-  BOOTSTRAP_OK=0
-  BOOTSTRAP_URLS=(
-    "https://codeload.github.com/${OWNER}/${REPO}/tar.gz/refs/heads/main"
-    "https://github.com/${OWNER}/${REPO}/archive/refs/heads/main.tar.gz"
-  )
-  for BOOTSTRAP_URL in "${BOOTSTRAP_URLS[@]}"; do
-    rm -f "$BOOTSTRAP_ARCHIVE"
-    if curl -fsSL --proto '=https' --proto-redir '=https' \
-        --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 600 \
-        "$BOOTSTRAP_URL" -o "$BOOTSTRAP_ARCHIVE" 2>/dev/null \
-        && tar -tzf "$BOOTSTRAP_ARCHIVE" >/dev/null 2>&1; then
-      if tar -xzf "$BOOTSTRAP_ARCHIVE" -C "$BOOTSTRAP_EXTRACT"; then
-        BOOTSTRAP_OK=1
-        break
-      fi
-    fi
-  done
-  if (( BOOTSTRAP_OK == 0 )); then
-    echo "ERROR: Could not download the ShahTunnel source bundle from GitHub." >&2
-    echo "Check HTTPS access to GitHub, then run the same command again." >&2
-    exit 1
-  fi
-  BOOTSTRAP_MAIN="$(find "$BOOTSTRAP_EXTRACT" -type f -path '*/S1T-CAPSULE/main.go' -print -quit)"
-  if [[ -z "$BOOTSTRAP_MAIN" ]]; then
-    echo "ERROR: The downloaded archive does not contain the ShahTunnel source tree." >&2
-    exit 1
-  fi
-  BOOTSTRAP_SOURCE_DIR="${BOOTSTRAP_MAIN%/S1T-CAPSULE/main.go}"
-  if [[ ! -s "$BOOTSTRAP_SOURCE_DIR/go.mod" || ! -s "$BOOTSTRAP_SOURCE_DIR/S1T-START.sh" || ! -s "$BOOTSTRAP_SOURCE_DIR/VERIFY-ALL-TRANSPORTS.sh" ]]; then
-    echo "ERROR: The downloaded source bundle is incomplete." >&2
-    exit 1
-  fi
-  BOOTSTRAP_SCRIPT_VERSION="$(sed -nE 's/^VERSION="([^"]+)"$/\1/p' "$BOOTSTRAP_SOURCE_DIR/S1T-START.sh" | head -n 1)"
-  BOOTSTRAP_APP_VERSION="$(sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]+)".*$/\1/p' "$BOOTSTRAP_SOURCE_DIR/S1T-CAPSULE/main.go" | head -n 1)"
-  if [[ "$BOOTSTRAP_SCRIPT_VERSION" != "$VERSION" || "$BOOTSTRAP_APP_VERSION" != "$VERSION" ]]; then
-    echo "ERROR: GitHub main is not a consistent ShahTunnel ${VERSION} release." >&2
-    echo "Installer version: ${BOOTSTRAP_SCRIPT_VERSION:-unknown}; application version: ${BOOTSTRAP_APP_VERSION:-unknown}." >&2
-    echo "Publish the complete matching release source to the main branch and retry." >&2
-    exit 1
-  fi
-  echo "Source bundle verified: ShahTunnel ${VERSION}. Starting installer..." >&2
-  (cd "$BOOTSTRAP_SOURCE_DIR" && bash ./S1T-START.sh "$@")
-  exit $?
-fi
-
-for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod tar gzip mktemp rm sleep python3 wc sed tail sort xargs find; do
+for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod mktemp rm sleep tar; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "Required command missing: $cmd" >&2; exit 1; }
 done
 TMP="$(mktemp -d /tmp/s1t-install.XXXXXX)"
@@ -102,192 +35,54 @@ PINK=$'\033[38;5;213m'
 PINK_DARK=$'\033[38;5;97m'
 RESET=$'\033[0m'
 
-curl_download() {
-  local url="$1" dest="$2"
-  shift 2
-  local headers="${TMP}/curl-headers.$$" log="${TMP}/curl-log.$$"
-  local pid=0 rc=0
-  rm -f "$headers" "$log" "$dest"
-  if [[ ! -t 2 ]]; then
-    if ! curl -fsSL --proto '=https' --proto-redir '=https' --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log"; then
-      if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
-      rm -f "$headers" "$log" "$dest"
-      return 1
-    fi
-    # No progress bar is visible without a TTY, so let phase_done emit the
-    # single final bar rather than suppressing all progress output.
-    PHASE_HAS_DOWNLOAD=0
-    rm -f "$headers" "$log"
+# Download from a mirror with resumable, bounded retries. Partial files live
+# outside TMP so rerunning the installer continues an interrupted download.
+download_from_mirror() {
+  local url="$1" part="$2" expected_sha="$3" label="$4"
+  local rc=0
+  mkdir -p "$DOWNLOAD_CACHE"
+  chmod 0700 "$DOWNLOAD_CACHE"
+
+  if [[ -s "$part" ]] && printf '%s  %s\n' "$expected_sha" "$part" | sha256sum -c - >/dev/null 2>&1; then
+    mv -f "$part" "$TMP/S1T-CORE"
+    echo "Using previously completed, SHA-256-verified download from ${label}." >&2
     return 0
   fi
-  curl -fsSL --proto '=https' --proto-redir '=https' --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log" &
-  pid=$!
-  # Show a single animated indicator while downloading; hide failed mirror
-  # errors when QUIET_CURL_ERRORS=1 so normal fallback does not look broken.
-  local frame=0
-  while kill -0 "$pid" 2>/dev/null; do
-    draw_indeterminate_bar "$frame"
-    frame=$((frame + 1))
-    sleep 0.12
-  done
-  wait "$pid" || rc=$?
-  printf '\r\033[2K' >&2
+  [[ -f "$part" ]] || : > "$part"
+
+  echo "Source: ${label}" >&2
+  echo "A real download percentage, transfer speed and ETA are shown below." >&2
+  echo "Interrupted downloads are saved; rerun the same install command to resume." >&2
+
+  if [[ -t 2 ]]; then
+    curl --fail --location --show-error --progress-bar \
+      --proto '=https' --proto-redir '=https' \
+      --continue-at - --retry 4 --retry-delay 2 --retry-connrefused \
+      --connect-timeout 15 --max-time 600 \
+      --speed-time 75 --speed-limit 1024 \
+      --output "$part" "$url" || rc=$?
+  else
+    curl --fail --location --silent --show-error \
+      --proto '=https' --proto-redir '=https' \
+      --continue-at - --retry 4 --retry-delay 2 --retry-connrefused \
+      --connect-timeout 15 --max-time 600 \
+      --speed-time 75 --speed-limit 1024 \
+      --output "$part" "$url" || rc=$?
+  fi
+
   if (( rc != 0 )); then
-    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
-    rm -f "$headers" "$log" "$dest"
-    return "$rc"
-  fi
-  # Hold all success progress output until the four-line completion display.
-  PHASE_HAS_DOWNLOAD=1
-  rm -f "$headers" "$log"
-}
-# Download a large file while retaining partial bytes between mirror attempts.
-# Unlike curl_download(), this helper must NEVER remove the destination file on
-# failure, because the next mirror may resume at the existing byte offset.
-curl_download_resumable() {
-  local url="$1" dest="$2" max_time="${3:-0}" retry_count="${4:-3}" speed_time="${5:-180}"
-  local headers="${TMP}/curl-resume-headers.$$" log="${TMP}/curl-resume-log.$$"
-  local rc=0 pid=0 frame=0
-
-  [[ -f "$dest" ]] || : > "$dest"
-  rm -f "$headers" "$log"
-  : > "$log"
-
-  if [[ ! -t 2 ]]; then
-    if curl -fsSL --proto '=https' --proto-redir '=https' \
-        --continue-at - \
-        --retry "$retry_count" --retry-delay 1 --retry-connrefused \
-        --connect-timeout 8 --max-time "$max_time" \
-        --speed-time "$speed_time" --speed-limit 1024 \
-        --dump-header "$headers" "$url" -o "$dest" 2>"$log"; then
-      rm -f "$headers" "$log"
-      return 0
-    else
-      rc=$?
-    fi
-    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
-    rm -f "$headers" "$log"
-    return "$rc"
-  fi
-
-  curl -fsSL --proto '=https' --proto-redir '=https' \
-      --continue-at - \
-      --retry "$retry_count" --retry-delay 1 --retry-connrefused \
-      --connect-timeout 8 --max-time "$max_time" \
-      --speed-time "$speed_time" --speed-limit 1024 \
-      --dump-header "$headers" "$url" -o "$dest" 2>"$log" &
-  pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
-    draw_indeterminate_bar "$frame"
-    frame=$((frame + 1))
-    sleep 0.12
-  done
-  wait "$pid" || rc=$?
-  printf '\r\033[2K' >&2
-  if (( rc != 0 )); then
-    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
-    rm -f "$headers" "$log"
-    return "$rc"
-  fi
-  PHASE_HAS_DOWNLOAD=1
-  rm -f "$headers" "$log"
-  return 0
-}
-
-# Download a Go archive using concurrent byte ranges. This is especially
-# helpful on hosts where a single HTTPS stream is bandwidth-limited. A range
-# is accepted only when the server returns the exact number of bytes; the final
-# archive must match the pinned SHA-256 before it is used.
-curl_download_parallel_ranges() {
-  local url="$1" dest="$2" expected_sha="$3"
-  local workdir="${dest}.chunks" headers="${TMP}/range-headers.$$" probe="${TMP}/range-probe.$$"
-  local total chunk_count=8 chunk_size i start end expected_size part tmp_part
-  local pid rc failed=0 alive frame=0
-  local -a pids=()
-  RANGE_DOWNLOAD_ATTEMPTED=0
-
-  rm -f "$headers" "$probe"
-  # --max-filesize prevents a mirror that ignores Range from streaming the
-  # entire ~67 MB archive just to probe support.
-  if ! curl -fsSL --proto '=https' --proto-redir '=https' --range 0-0 \
-      --max-filesize 1024 --connect-timeout 8 --max-time 12 \
-      --dump-header "$headers" "$url" -o "$probe" 2>/dev/null; then
-    rm -f "$headers" "$probe"
-    return 1
-  fi
-  total="$(sed -nE 's/^[Cc]ontent-[Rr]ange:[[:space:]]*bytes[[:space:]]+0-0\/([0-9]+).*$/\1/p' "$headers" | tail -n 1)"
-  if [[ ! "$total" =~ ^[0-9]+$ ]] || [[ "$(wc -c < "$probe" 2>/dev/null || echo 0)" -ne 1 ]]; then
-    rm -f "$headers" "$probe"
-    return 1
-  fi
-  rm -f "$headers" "$probe"
-  RANGE_DOWNLOAD_ATTEMPTED=1
-
-  mkdir -p "$workdir"
-  chunk_size=$(((total + chunk_count - 1) / chunk_count))
-  pids=()
-  for ((i=0; i<chunk_count; i++)); do
-    start=$((i * chunk_size))
-    (( start < total )) || break
-    end=$((start + chunk_size - 1))
-    (( end < total )) || end=$((total - 1))
-    expected_size=$((end - start + 1))
-    part="${workdir}/chunk-$(printf '%02d' "$i").part"
-    # Completed chunks are reusable on the next invocation, but only if their
-    # byte count matches the expected range length.
-    if [[ -f "$part" ]] && [[ "$(wc -c < "$part")" -eq "$expected_size" ]]; then
-      continue
-    fi
-    tmp_part="${part}.tmp.$$"
-    rm -f "$tmp_part"
-    (
-      if curl -fsSL --proto '=https' --proto-redir '=https' \
-          --range "${start}-${end}" --retry 0 \
-          --connect-timeout 8 --max-time 35 \
-          "$url" -o "$tmp_part" 2>/dev/null &&
-          [[ "$(wc -c < "$tmp_part" 2>/dev/null || echo 0)" -eq "$expected_size" ]]; then
-        mv -f "$tmp_part" "$part"
-        exit 0
-      fi
-      rm -f "$tmp_part"
-      exit 1
-    ) &
-    pids+=("$!")
-  done
-
-  # Keep the existing compact animated indicator while chunks are in flight.
-  while :; do
-    alive=0
-    for pid in "${pids[@]}"; do
-      if kill -0 "$pid" 2>/dev/null; then alive=1; break; fi
-    done
-    (( alive == 1 )) || break
-    draw_indeterminate_bar "$frame"
-    frame=$((frame + 1))
-    sleep 0.12
-  done
-  printf '\r\033[2K' >&2
-  for pid in "${pids[@]}"; do
-    wait "$pid" || failed=1
-  done
-  if (( failed != 0 )); then
+    echo "${label} download did not finish (curl exit ${rc}); partial bytes are retained." >&2
     return 1
   fi
 
-  local assembled="${TMP}/go-ranges-assembled.$$"
-  : > "$assembled"
-  for ((i=0; i<chunk_count; i++)); do
-    part="${workdir}/chunk-$(printf '%02d' "$i").part"
-    [[ -f "$part" ]] || { rm -f "$assembled"; return 1; }
-    cat "$part" >> "$assembled" || { rm -f "$assembled"; return 1; }
-  done
-  if [[ "$(wc -c < "$assembled")" -ne "$total" ]] ||
-      ! printf '%s  %s\n' "$expected_sha" "$assembled" | sha256sum -c - >/dev/null 2>&1; then
-    rm -f "$assembled"
-    rm -rf "$workdir"
+  if ! printf '%s  %s\n' "$expected_sha" "$part" | sha256sum -c - >/dev/null 2>&1; then
+    echo "${label} returned an incomplete or unexpected file; its cached copy was discarded." >&2
+    rm -f "$part"
     return 1
   fi
-  mv -f "$assembled" "$dest"
+
+  mv -f "$part" "$TMP/S1T-CORE"
+  echo "${label}: SHA-256 verified." >&2
   return 0
 }
 
@@ -381,298 +176,66 @@ phase_done() {
   fi
   PHASE_HAS_DOWNLOAD=0
 }
-run_with_spinner() {
-  local label="$1" logfile="$2" rc=0 pid frame=0
-  shift 2
-  : > "$logfile"
-  if [[ ! -t 2 ]]; then
-    "$@" >"$logfile" 2>&1 || rc=$?
-    if [[ "$rc" -ne 0 ]]; then
-      cat "$logfile" >&2
-      return "$rc"
-    fi
-    return 0
-  fi
-  "$@" >"$logfile" 2>&1 &
-  pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
-    draw_indeterminate_bar "$frame"
-    frame=$((frame + 1))
-    sleep 0.12
-  done
-  wait "$pid" || rc=$?
-  printf '\r\033[2K' >&2
-  if [[ "$rc" -ne 0 ]]; then
-    printf 'ERROR: background command failed (exit %s).\n' "$rc" >&2
-    cat "$logfile" >&2
-    return "$rc"
-  fi
-  # Keep successful command output hidden; only the animated pink bar is shown.
-}
 verify_binary() {
   [[ -s "$TMP/S1T-CORE" ]] || return 1
   chmod 0750 "$TMP/S1T-CORE"
   timeout --kill-after=1s 5s "$TMP/S1T-CORE" version 2>/dev/null \
     | grep -Fqx "Shah Tunnel ${VERSION} (linux/${TARGET_ARCH})"
 }
-official_go_sha256() {
-  case "$TARGET_ARCH" in
-    amd64) printf '%s' '65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40' ;;
-    arm64) printf '%s' 'a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49' ;;
-    *) return 1 ;;
-  esac
+prebuilt_bundle_sha256() {
+  printf '%s' '6a6a2c4fa1f99a391b238ea419fc23b3ef3e7785c09ac926184bf45700a50c66'
 }
+download_prebuilt_binary() {
+  local bundle_name expected_sha cdn_url raw_url extracted candidate
+  bundle_name="shah-tunnel.tar.gz.tar"
+  expected_sha="$(prebuilt_bundle_sha256)"
+  cdn_url="${CDN_BASE}/S1T-CAPSULE/${bundle_name}"
+  raw_url="${RAW_BASE}/S1T-CAPSULE/${bundle_name}"
 
-build_project_binary() {
-  local go_bin="$1" source_dir="$2" go_root="$3"
-  (
-    cd "$source_dir"
-    env GOROOT="$go_root" GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off \
-      GOCACHE="${GO_CACHE_DIR}/build-cache-${GO_VERSION}-${TARGET_ARCH}" \
-      CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_ARCH" \
-      "$go_bin" build -trimpath -ldflags='-s -w -buildid=' \
-      -o "$TMP/S1T-CORE" ./S1T-CAPSULE
-  )
-}
-build_from_official_go_toolchain() {
-  local go_archive go_sha go_bin go_root source_dir expected_go url downloaded
-  go_archive="go${GO_VERSION}.linux-${TARGET_ARCH}.tar.gz"
-  go_sha="$(official_go_sha256)"
-  expected_go="go version go${GO_VERSION} linux/${TARGET_ARCH}"
-  source_dir="$SCRIPT_DIR"
-  go_bin=""
-  go_root=""
+  phase_start 1 "Download universal Shah Tunnel package"
+  echo "Downloading one package for Linux ${TARGET_ARCH}; no Go download or local compilation is used." >&2
 
-  phase_start 1 "Download verified Go toolchain and source"
-  local cache_archive="$GO_CACHE_DIR/$go_archive"
-  local toolchain_path="${STATE_DIR}/toolchains/go${GO_VERSION}-${TARGET_ARCH}"
-  local toolchain_new="${toolchain_path}.new"
-  install -d -o root -g root -m 0755 "$GO_CACHE_DIR" "${STATE_DIR}/toolchains"
-  downloaded=0
-
-  # A stable, previously verified toolchain avoids re-extracting Go on every
-  # run and keeps GOCACHE effective across installations.
-  if [[ -x "$toolchain_path/bin/go" ]] &&
-      [[ "$(GOROOT="$toolchain_path" GOTOOLCHAIN=local "$toolchain_path/bin/go" version 2>/dev/null || true)" == "$expected_go" ]]; then
-    go_root="$toolchain_path"
-    go_bin="$go_root/bin/go"
-    downloaded=1
-    echo "Reusing installed, verified Go ${GO_VERSION} toolchain." >&2
-  else
-    # Reuse only an archive whose checksum matches the pinned Go distribution.
-    if [[ -s "$cache_archive" ]] && printf '%s  %s\n' "$go_sha" "$cache_archive" | sha256sum -c - >/dev/null 2>&1; then
-      cp -f "$cache_archive" "$TMP/$go_archive"
-      echo "Using cached, SHA-256-verified Go ${GO_VERSION} archive." >&2
-      downloaded=1
-    else
-      rm -f "$cache_archive"
-      # Use parallel ranges first for mirrors that support them; if a mirror
-      # lacks byte-range support, fall back to the resumable single-stream path.
-      local -a download_sources=(
-        "aliyun|https://mirrors.aliyun.com/golang"
-        "nju|https://mirror.nju.edu.cn/golang"
-        "ustc|https://mirrors.ustc.edu.cn/golang"
-        "tsinghua|https://mirrors.tuna.tsinghua.edu.cn/golang"
-        "tencent|https://mirrors.cloud.tencent.com/go"
-        "163|https://mirrors.163.com/golang"
-        "google|https://dl.google.com/go"
-        "go-dev|https://go.dev/dl"
-        "google-storage|https://storage.googleapis.com/golang"
-        "google-cn|https://golang.google.cn/dl"
-      )
-      local source source_id base part_file bytes
-      echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) using parallel range requests where supported..." >&2
-      for source in "${download_sources[@]}"; do
-        source_id="${source%%|*}"
-        base="${source#*|}"
-        url="${base}/${go_archive}"
-        part_file="${GO_CACHE_DIR}/${go_archive}.${source_id}.part"
-        echo "Trying ${base}..." >&2
-
-        if [[ -s "$part_file" ]] && printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
-          cp -f "$part_file" "$TMP/$go_archive"
-          downloaded=1
-          echo "Using complete SHA-256-verified archive from ${source_id}." >&2
-          break
-        fi
-
-        RANGE_DOWNLOAD_ATTEMPTED=0
-        if curl_download_parallel_ranges "$url" "$part_file" "$go_sha"; then
-          cp -f "$part_file" "$TMP/$go_archive"
-          downloaded=1
-          echo "Parallel download from ${source_id} passed SHA-256 verification." >&2
-          break
-        fi
-        if [[ "$RANGE_DOWNLOAD_ATTEMPTED" == 1 ]]; then
-          echo "Parallel chunks were incomplete at ${source_id}; moving to the next mirror instead of restarting a slow full download." >&2
-          continue
-        fi
-        echo "${source_id} does not support a usable byte-range response; trying a time-limited single stream..." >&2
-        if curl_download_resumable "$url" "$part_file" 35 0 15; then
-          if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
-            cp -f "$part_file" "$TMP/$go_archive"
-            downloaded=1
-            echo "Resumable download from ${source_id} passed SHA-256 verification." >&2
-            break
-          fi
-          bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
-          echo "Checksum mismatch from ${source_id} (${bytes} bytes); discarding its single-stream partial." >&2
-          rm -f "$part_file"
-        else
-          bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
-          echo "Download failed from ${source_id} (${bytes} bytes retained for the same mirror)." >&2
-        fi
-      done
-      if [[ "$downloaded" -eq 1 ]]; then
-        # Cache only a fully downloaded and verified archive.
-        install -o root -g root -m 0644 "$TMP/$go_archive" "$cache_archive"
-      fi
-    fi
-
-    if [[ "$downloaded" -ne 1 ]]; then
-      echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the pinned SHA-256." >&2
+  # One archive contains both prebuilt architectures. Verify the complete
+  # package before extracting any executable from it.
+  if ! download_from_mirror "$cdn_url" "${DOWNLOAD_CACHE}/${bundle_name}.cdn.part" "$expected_sha" "jsDelivr CDN"; then
+    echo "Trying the GitHub Raw source..." >&2
+    if ! download_from_mirror "$raw_url" "${DOWNLOAD_CACHE}/${bundle_name}.raw.part" "$expected_sha" "GitHub Raw"; then
+      echo "Could not obtain the verified universal package: ${bundle_name}." >&2
+      echo "Check that this archive exists in S1T-CAPSULE on the main branch." >&2
       return 1
     fi
-    echo "Go archive SHA-256 verified." >&2
-    rm -rf "$TMP/go-root" "$toolchain_new"
-    mkdir -p "$TMP/go-root"
-    if ! tar -xzf "$TMP/$go_archive" -C "$TMP/go-root"; then
-      echo "Downloaded Go archive could not be extracted." >&2
-      return 1
-    fi
-    go_root="$TMP/go-root/go"
-    go_bin="$go_root/bin/go"
-    if [[ ! -x "$go_bin" ]]; then
-      echo "Go archive did not contain the expected bin/go executable." >&2
-      return 1
-    fi
-    if [[ "$(GOROOT="$go_root" GOTOOLCHAIN=local "$go_bin" version 2>/dev/null || true)" != "$expected_go" ]]; then
-      echo "Unexpected Go toolchain version or architecture; expected: $expected_go" >&2
-      return 1
-    fi
-    # Install the verified toolchain to a stable location. The build cache is
-    # keyed to this path and can be reused on future runs.
-    mv "$go_root" "$toolchain_new"
-    rm -rf "$toolchain_path"
-    mv "$toolchain_new" "$toolchain_path"
-    go_root="$toolchain_path"
-    go_bin="$go_root/bin/go"
   fi
 
-  echo "Building from the exact local ShahTunnel release bundle: ${source_dir}" >&2
-  [[ -s "$source_dir/go.mod" && -s "$source_dir/S1T-CAPSULE/main.go" ]] \
-    || { echo "The extracted release bundle does not contain the expected ShahTunnel source files." >&2; return 1; }
-  if ! grep -Fq "module github.com/${OWNER}/${REPO}" "$source_dir/go.mod"; then
-    echo "The source module path does not match github.com/${OWNER}/${REPO}; refusing to build." >&2
+  extracted="${TMP}/universal-package"
+  mkdir -p "$extracted"
+  if ! tar -xzf "$TMP/S1T-CORE" -C "$extracted"; then
+    echo "The downloaded universal package is not a valid gzip archive." >&2
     return 1
   fi
-  local source_fingerprint build_cache_dir cached_binary
-  source_fingerprint="$(cd "$source_dir" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')"
-  build_cache_dir="${STATE_DIR}/builds"
-  cached_binary="${build_cache_dir}/shah-tunnel-${VERSION}-${GO_VERSION}-${TARGET_ARCH}-${source_fingerprint}"
-  install -d -o root -g root -m 0755 "$build_cache_dir"
-  if [[ -s "$cached_binary" ]] && timeout --kill-after=1s 5s "$cached_binary" version 2>/dev/null | grep -Fqx "Shah Tunnel ${VERSION} (linux/${TARGET_ARCH})"; then
-    cp -f "$cached_binary" "$TMP/S1T-CORE"
-    echo "Reusing cached ShahTunnel binary for this exact source revision." >&2
-  else
-    echo "Building Shah Tunnel ${VERSION} with verified Go ${GO_VERSION}..." >&2
-    if ! run_with_spinner "Building ShahTunnel" "$TMP/build.log" build_project_binary "$go_bin" "$source_dir" "$go_root"; then
-      echo "Source build failed. Build output follows:" >&2
-      [[ ! -s "$TMP/build.log" ]] || cat "$TMP/build.log" >&2
-      return 1
-    fi
-    if ! verify_binary; then
-      echo "Built binary version or architecture validation failed; refusing to cache it." >&2
-      return 1
-    fi
-    install -o root -g root -m 0750 "$TMP/S1T-CORE" "${cached_binary}.new"
-    mv -f "${cached_binary}.new" "$cached_binary"
+  candidate="${extracted}/shah-tunnel-universal/bin/linux-${TARGET_ARCH}/ravanreverse"
+  if [[ ! -s "$candidate" ]]; then
+    echo "The universal package does not contain the Linux ${TARGET_ARCH} binary." >&2
+    return 1
   fi
+  # Replace the archive in the temporary path with the selected executable.
+  mv -f "$candidate" "$TMP/S1T-CORE"
+  chmod 0750 "$TMP/S1T-CORE"
 
   if ! verify_binary; then
-    echo "Built binary version or architecture validation failed; refusing to install it." >&2
+    echo "The extracted binary version or architecture is incorrect; refusing to install it." >&2
+    rm -f "$TMP/S1T-CORE"
     return 1
   fi
-  phase_done "Source-built binary verified"
+
+  phase_done "Universal package and selected binary verified"
   return 0
 }
 
-if ! build_from_official_go_toolchain; then
-  echo "Installation stopped: no verified ShahTunnel binary was built." >&2
-  echo "Go archives must match the pinned SHA-256; ShahTunnel is built locally without GitHub Release assets." >&2
+if ! download_prebuilt_binary; then
+  echo "Installation stopped: no verified ShahTunnel binary was downloaded." >&2
   exit 1
 fi
-install_hysteria_binary() {
-  local asset="hysteria-linux-${TARGET_ARCH}"
-  local hashes="$TMP/hysteria-hashes.txt"
-  local binary="$TMP/${asset}"
-  local expected_sha installed_version existing_sha i
-
-  # Always authenticate the release manifest first. A matching version string
-  # alone is not sufficient evidence that an existing executable is trusted.
-  echo "Downloading checksum manifest for Hysteria ${HYSTERIA_VERSION}..." >&2
-  if ! curl_download "${HYSTERIA_RELEASE_BASE}/hashes.txt" "$hashes" \
-      --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 60; then
-    echo "GitHub unavailable; trying the Hysteria SourceForge mirror for the checksum manifest..." >&2
-    if ! curl_download "${HYSTERIA_MIRROR_BASE}/hashes.txt/download" "$hashes" \
-        --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 60; then
-      echo "Could not download the pinned Hysteria checksum manifest from either source." >&2
-      return 1
-    fi
-  fi
-  if ! printf '%s  %s\n' "$HYSTERIA_HASHES_SHA256" "$hashes" | sha256sum -c - >/dev/null 2>&1; then
-    echo "Hysteria checksum manifest did not match the pinned release digest." >&2
-    return 1
-  fi
-  expected_sha="$(awk -v asset="$asset" '{
-    name=$NF; sub(/^\*/, "", name); sub(/^.*\//, "", name)
-    hash=""
-    for (i=1; i<=NF; i++) if (length($i)==64 && $i ~ /^[[:xdigit:]]+$/) { hash=tolower($i); break }
-    if (name==asset && hash!="") { print hash; exit }
-  }' "$hashes")"
-  if [[ ! "$expected_sha" =~ ^[[:xdigit:]]{64}$ ]]; then
-    echo "The pinned Hysteria manifest does not contain a valid checksum for ${asset}." >&2
-    return 1
-  fi
-  if [[ -x /usr/local/bin/hysteria ]]; then
-    existing_sha="$(sha256sum /usr/local/bin/hysteria | awk '{print tolower($1)}')"
-    installed_version="$(/usr/local/bin/hysteria version 2>/dev/null | head -n 1 || true)"
-    if [[ "$existing_sha" == "$expected_sha" && "$installed_version" == *"${HYSTERIA_VERSION}"* ]]; then
-      echo "Reusing SHA-256-verified Hysteria ${HYSTERIA_VERSION}." >&2
-      return 0
-    fi
-  fi
-
-  echo "Downloading Hysteria ${HYSTERIA_VERSION} (${asset})..." >&2
-  if ! curl_download "${HYSTERIA_RELEASE_BASE}/${asset}" "$binary" \
-      --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 240; then
-    echo "GitHub unavailable; trying the Hysteria SourceForge mirror for ${asset}..." >&2
-    if ! curl_download "${HYSTERIA_MIRROR_BASE}/${asset}/download" "$binary" \
-        --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 240; then
-      echo "Could not download the Hysteria executable from either source." >&2
-      return 1
-    fi
-  fi
-  if ! printf '%s  %s\n' "$expected_sha" "$binary" | sha256sum -c - >/dev/null 2>&1; then
-    echo "Hysteria executable checksum verification failed." >&2
-    return 1
-  fi
-  chmod 0755 "$binary"
-  local version_output
-  if ! version_output="$(timeout --kill-after=1s 5s "$binary" version 2>&1)" || [[ "$version_output" != *"${HYSTERIA_VERSION}"* ]]; then
-    echo "Downloaded Hysteria executable did not report the pinned version ${HYSTERIA_VERSION}." >&2
-    return 1
-  fi
-  install -o root -g root -m 0755 "$binary" /usr/local/bin/hysteria.new
-  mv -f /usr/local/bin/hysteria.new /usr/local/bin/hysteria
-  echo "Hysteria ${HYSTERIA_VERSION} installed and SHA-256 verified." >&2
-}
-
-phase_start 2 "Installing tunnel and QUIC transport"
-if ! install_hysteria_binary; then
-  echo "Installation stopped before replacing ShahTunnel: Hysteria could not be verified." >&2
-  exit 1
-fi
+phase_start 2 "Installing binary and configuring service"
 install -d -o root -g root -m 0700 /etc/ravanreverse
 install -d -o root -g root -m 0755 /usr/local/bin
 install -d -o root -g root -m 0755 "$STATE_DIR"
@@ -730,55 +293,6 @@ UNIT
     echo "systemd daemon-reload timed out. The binary is installed, but service metadata may need: systemctl daemon-reload" >&2
     exit 1
   fi
-fi
-# Template unit gives each named tunnel its own process and configuration tree.
-# The legacy ravanreverse.service remains untouched for the existing default profile.
-if [[ ! -f /etc/systemd/system/ravanreverse@.service ]]; then
-  cat > "$TMP/ravanreverse@.service" <<'UNIT'
-[Unit]
-Description=Shah Tunnel profile %i
-Wants=network-online.target
-After=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=10
-[Service]
-Type=simple
-UMask=0077
-Environment="S1T_INSTANCE=%i"
-ExecStart=/usr/local/bin/ravanreverse run
-Restart=always
-RestartSec=2
-TimeoutStopSec=20
-LimitNOFILE=262144
-TasksMax=4096
-NoNewPrivileges=true
-PrivateTmp=true
-PrivateDevices=true
-ProtectSystem=strict
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-ProtectHostname=true
-ProtectClock=true
-ProtectProc=invisible
-ProcSubset=pid
-RestrictNamespaces=true
-RestrictRealtime=true
-RestrictSUIDSGID=true
-LockPersonality=true
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-SystemCallArchitectures=native
-ReadWritePaths=/etc/ravanreverse
-[Install]
-WantedBy=multi-user.target
-UNIT
-  install -o root -g root -m 0644 "$TMP/ravanreverse@.service" /etc/systemd/system/ravanreverse@.service
-fi
-if ! timeout --kill-after=3s 15s systemctl daemon-reload; then
-  echo "systemctl daemon-reload timed out. The binary is installed, but service metadata may need: systemctl daemon-reload" >&2
-  exit 1
 fi
 if [[ -f /etc/ravanreverse/config.json ]]; then
   if ! timeout --kill-after=2s 10s systemctl enable ravanreverse >/dev/null; then

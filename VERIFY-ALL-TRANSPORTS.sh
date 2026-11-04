@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Local verification helper. It reuses an existing Go 1.27.3 toolchain and never downloads one.
+# Local verification helper. It reuses an existing Go 1.26.1 toolchain and never downloads one.
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-GO_VERSION="1.27.3"
+GO_VERSION="1.26.1"
 GO_HOME="$ROOT/.toolchains/go${GO_VERSION}"
 GO_BIN=""
 
@@ -18,7 +18,7 @@ version_is_pinned() {
   [[ "$v" == *"go${GO_VERSION}"* ]]
 }
 
-# Reuse only an exact Go 1.27.3 binary. An older/newer system toolchain is not used.
+# Reuse only an exact Go 1.26.1 binary. An older/newer system toolchain is not used.
 for candidate in "$GO_HOME/bin/go" "/usr/local/lib/shah-tunnel/go-${GO_VERSION}/bin/go" "$(command -v go 2>/dev/null || true)"; do
   if [[ -n "$candidate" ]] && version_is_pinned "$candidate"; then
     GO_BIN="$candidate"
@@ -70,7 +70,7 @@ pass "go vet"
 printf '\n== 7/7: Linux binaries build ==\n'
 mkdir -p dist
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-amd64 ./S1T-CAPSULE
-[[ "$(dist/shah-tunnel-linux-amd64 version)" == "Shah Tunnel 1.8.2 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+[[ "$(dist/shah-tunnel-linux-amd64 version)" == "Shah Tunnel 1.6.3 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-arm64 ./S1T-CAPSULE
 (cd dist && sha256sum shah-tunnel-linux-amd64 > shah-tunnel-linux-amd64.sha256)
 (cd dist && sha256sum shah-tunnel-linux-arm64 > shah-tunnel-linux-arm64.sha256)
