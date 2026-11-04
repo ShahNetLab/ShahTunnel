@@ -39,7 +39,8 @@ import (
 )
 
 const (
-	version                          = "1.6.3"
+	version                          = "1.6.2"
+	configPath                       = "/etc/ravanreverse/config.json"
 	maxFrame                         = 64 * 1024
 	defaultTunnelChannels            = 12
 	maxPendingPublicConnections      = 2048
@@ -75,10 +76,6 @@ const (
 )
 
 var (
-	configPath        = "/etc/ravanreverse/config.json"
-	runtimePath       = "/etc/ravanreverse/runtime.json"
-	activeProfileSlug string
-
 	errMaxConcurrentStreams = errors.New("maximum concurrent stream limit reached")
 	errHubLaneClosed        = errors.New("tunnel lane is closed")
 )
@@ -167,18 +164,15 @@ func writeRuntimeStats(role string) {
 	if err != nil {
 		return
 	}
-	if strings.TrimSpace(runtimePath) == "" {
-		runtimePath = "/etc/ravanreverse/runtime.json"
-	}
-	tmp := runtimePath + ".tmp"
-	if err = os.MkdirAll(filepath.Dir(runtimePath), 0700); err != nil {
+	tmp := "/etc/ravanreverse/runtime.json.tmp"
+	if err = os.MkdirAll("/etc/ravanreverse", 0700); err != nil {
 		return
 	}
 	if err = os.WriteFile(tmp, append(b, '\n'), 0600); err != nil {
 		return
 	}
-	_ = os.Rename(tmp, runtimePath)
-	_ = os.Chmod(runtimePath, 0600)
+	_ = os.Rename(tmp, "/etc/ravanreverse/runtime.json")
+	_ = os.Chmod("/etc/ravanreverse/runtime.json", 0600)
 }
 
 type counterWriter struct {
@@ -3318,482 +3312,15 @@ func generateCertificate(certPath, keyPath string) (string, error) {
 	sum := sha256.Sum256(der)
 	return hex.EncodeToString(sum[:]), nil
 }
-
-var (
-	profilesRoot        = "/etc/ravanreverse/tunnels"
-	profileUnitTemplate = "/etc/systemd/system/ravanreverse@.service"
-)
-
-type TunnelProfile struct {
-	Name        string
-	Slug        string
-	ConfigPath  string
-	RuntimePath string
-	Service     string
-	Legacy      bool
-	Role        string
-}
-
-func validateProfileName(name string) error {
-	name = strings.TrimSpace(name)
-	if name == "" || len([]rune(name)) > 64 {
-		return errors.New("tunnel name must contain 1 to 64 characters")
-	}
-	if strings.ContainsAny(name, "/\\\r\n\t") {
-		return errors.New("tunnel name cannot contain slashes or line breaks")
-	}
-	for _, r := range name {
-		if r < 32 || r == 127 {
-			return errors.New("tunnel name contains an invalid control character")
-		}
-	}
-	return nil
-}
-
-func profileSlug(name string) string {
-	name = strings.ToLower(strings.TrimSpace(name))
-	var b strings.Builder
-	lastDash := false
-	for _, r := range name {
-		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
-			b.WriteRune(r)
-			lastDash = false
-		} else if !lastDash && b.Len() > 0 {
-			b.WriteByte('-')
-			lastDash = true
-		}
-	}
-	base := strings.Trim(b.String(), "-")
-	if base == "" {
-		base = "tunnel"
-	}
-	if len(base) > 28 {
-		base = strings.TrimRight(base[:28], "-")
-	}
-	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(name))))
-	return base + "-" + hex.EncodeToString(sum[:4])
-}
-
-func profileDirectory(slug string) string { return filepath.Join(profilesRoot, slug) }
-
-func profileNamePath(slug string) string { return filepath.Join(profileDirectory(slug), "name") }
-
-func writeProfileName(slug, name string) error {
-	if err := os.MkdirAll(profileDirectory(slug), 0700); err != nil {
-		return err
-	}
-	return atomicWriteFile(profileNamePath(slug), []byte(strings.TrimSpace(name)+"\n"), 0600)
-}
-
-func profileNameInUse(name string) bool {
-	profiles, err := listTunnelProfiles()
-	if err != nil {
-		return false
-	}
-	for _, p := range profiles {
-		if !p.Legacy && strings.EqualFold(strings.TrimSpace(p.Name), strings.TrimSpace(name)) {
-			return true
-		}
-	}
-	return false
-}
-
-func listTunnelProfiles() ([]TunnelProfile, error) {
-	profiles := make([]TunnelProfile, 0, 8)
-	if _, err := os.Stat("/etc/ravanreverse/config.json"); err == nil {
-		role := "unknown"
-		if b, e := os.ReadFile("/etc/ravanreverse/config.json"); e == nil {
-			var c Config
-			if json.Unmarshal(b, &c) == nil {
-				role = strings.ToUpper(c.Role)
-			}
-		}
-		profiles = append(profiles, TunnelProfile{Name: "Existing default tunnel", Slug: "legacy", ConfigPath: "/etc/ravanreverse/config.json", RuntimePath: "/etc/ravanreverse/runtime.json", Service: "ravanreverse.service", Legacy: true, Role: role})
-	}
-	entries, err := os.ReadDir(profilesRoot)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		slug := entry.Name()
-		if slug == "" || strings.ContainsAny(slug, "/\\") {
-			continue
-		}
-		dir := filepath.Join(profilesRoot, slug)
-		config := filepath.Join(dir, "config.json")
-		b, e := os.ReadFile(config)
-		if e != nil {
-			continue
-		}
-		var c Config
-		if json.Unmarshal(b, &c) != nil {
-			continue
-		}
-		nameBytes, _ := os.ReadFile(filepath.Join(dir, "name"))
-		name := strings.TrimSpace(string(nameBytes))
-		if name == "" {
-			name = slug
-		}
-		profiles = append(profiles, TunnelProfile{Name: name, Slug: slug, ConfigPath: config, RuntimePath: filepath.Join(dir, "runtime.json"), Service: "ravanreverse@" + slug + ".service", Role: strings.ToUpper(c.Role)})
-	}
-	sort.Slice(profiles, func(i, j int) bool {
-		if profiles[i].Legacy != profiles[j].Legacy {
-			return profiles[i].Legacy
-		}
-		return strings.ToLower(profiles[i].Name) < strings.ToLower(profiles[j].Name)
-	})
-	return profiles, nil
-}
-
-func chooseTunnelProfile() (TunnelProfile, error) {
-	profiles, err := listTunnelProfiles()
-	if err != nil {
-		return TunnelProfile{}, err
-	}
-	if len(profiles) == 0 {
-		return TunnelProfile{}, errors.New("no saved tunnels; use Manage Tunnels to create one")
-	}
-	fmt.Println()
-	fmt.Println(paint(ansiCyan+ansiBold, "  SAVED TUNNELS"))
-	for i, p := range profiles {
-		status := ""
-		if exec.Command("systemctl", "is-active", "--quiet", p.Service).Run() == nil {
-			status = paint(ansiGreen, "  ● RUNNING")
-		} else {
-			status = paint(ansiDim, "  ○ STOPPED")
-		}
-		fmt.Printf("  [%d] %-24s %-7s %s%s\n", i+1, p.Name, p.Role, status, map[bool]string{true: "  (existing)", false: ""}[p.Legacy])
-	}
-	choice := ask("Select tunnel (0 to cancel)", "0")
-	idx, e := strconv.Atoi(choice)
-	if e != nil || idx < 1 || idx > len(profiles) {
-		return TunnelProfile{}, errors.New("selection cancelled or invalid")
-	}
-	return profiles[idx-1], nil
-}
-
-func profileListenAddresses(c Config) []string {
-	c = normalizeConfig(c)
-	var addrs []string
-	if c.Role == "hub" {
-		addrs = append(addrs, c.ControlListen)
-		if transportModeAllowsHTTP2(c.Transport) {
-			if a, err := adjacentPortAddress(c.ControlListen); err == nil {
-				addrs = append(addrs, a)
-			}
-		}
-		if transportModeAllowsHTTP1(c.Transport) {
-			if a, err := secondAdjacentPortAddress(c.ControlListen); err == nil {
-				addrs = append(addrs, a)
-			}
-		}
-		for _, p := range c.Ports {
-			addrs = append(addrs, p.Listen)
-		}
-	} else if c.Role == "relay" {
-		for _, p := range c.Ports {
-			addrs = append(addrs, p.Listen)
-		}
-	}
-	return addrs
-}
-
-func checkProfilePortConflicts(candidate Config, excludeSlug string) error {
-	candidatePorts := map[string]bool{}
-	for _, addr := range profileListenAddresses(candidate) {
-		_, port, err := net.SplitHostPort(addr)
-		if err == nil {
-			candidatePorts[port] = true
-		}
-	}
-	if len(candidatePorts) == 0 {
-		return nil
-	}
-	profiles, err := listTunnelProfiles()
-	if err != nil {
-		return err
-	}
-	for _, p := range profiles {
-		if !p.Legacy && p.Slug == excludeSlug {
-			continue
-		}
-		b, e := os.ReadFile(p.ConfigPath)
-		if e != nil {
-			continue
-		}
-		var existing Config
-		if json.Unmarshal(b, &existing) != nil {
-			continue
-		}
-		for _, addr := range profileListenAddresses(existing) {
-			_, port, e := net.SplitHostPort(addr)
-			if e == nil && candidatePorts[port] {
-				return fmt.Errorf("port %s is already reserved by tunnel %q; choose a different port for this tunnel", port, p.Name)
-			}
-		}
-	}
-	return nil
-}
-
-func ensureProfileUnitTemplate() error {
-	unit := `[Unit]
-Description=Shah Tunnel profile (%i)
-Wants=network-online.target
-After=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=10
-[Service]
-Type=simple
-UMask=0077
-ExecStart=/usr/local/bin/ravanreverse run --config /etc/ravanreverse/tunnels/%i/config.json --runtime /etc/ravanreverse/tunnels/%i/runtime.json
-Restart=always
-RestartSec=2
-TimeoutStopSec=20
-LimitNOFILE=262144
-TasksMax=4096
-NoNewPrivileges=true
-PrivateTmp=true
-PrivateDevices=true
-ProtectSystem=strict
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-ProtectHostname=true
-ProtectClock=true
-ProtectProc=invisible
-ProcSubset=pid
-RestrictNamespaces=true
-RestrictRealtime=true
-RestrictSUIDSGID=true
-LockPersonality=true
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-SystemCallArchitectures=native
-ReadWritePaths=/etc/ravanreverse/tunnels/%i
-[Install]
-WantedBy=multi-user.target
-`
-	if err := atomicWriteFile(profileUnitTemplate, []byte(unit), 0644); err != nil {
-		return err
-	}
-	out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("systemd daemon-reload: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-func ensureProfileTunnelRunning(slug string, restartActive bool) error {
-	if !isRoot() {
-		return errors.New("run as root")
-	}
-	if _, err := os.Stat(filepath.Join(profileDirectory(slug), "config.json")); err != nil {
-		return errors.New("tunnel configuration was not found")
-	}
-	if err := ensureProfileUnitTemplate(); err != nil {
-		return err
-	}
-	unit := "ravanreverse@" + slug + ".service"
-	if err := runSystemctl("enable", unit); err != nil {
-		return fmt.Errorf("enable tunnel %s: %w", slug, err)
-	}
-	active := exec.Command("systemctl", "is-active", "--quiet", unit).Run() == nil
-	var err error
-	if active && restartActive {
-		err = runSystemctl("restart", unit)
-	} else if !active {
-		_ = exec.Command("systemctl", "reset-failed", unit).Run()
-		err = runSystemctl("start", unit)
-	}
-	if err != nil || exec.Command("systemctl", "is-active", "--quiet", unit).Run() != nil {
-		showServiceLogs(unit, 40)
-		if err != nil {
-			return fmt.Errorf("tunnel %s failed to start: %w", slug, err)
-		}
-		return fmt.Errorf("tunnel %s did not reach active state; recent logs are shown above", slug)
-	}
-	fmt.Printf("Tunnel %q is active and enabled at boot.\n", slug)
-	return nil
-}
-
-func showServiceLogs(unit string, n int) {
-	out, err := exec.Command("journalctl", "-u", unit, "-n", strconv.Itoa(n), "--no-pager", "-o", "short-iso").CombinedOutput()
-	if len(out) > 0 {
-		fmt.Print(string(out))
-	}
-	if err != nil {
-		fmt.Printf("Could not read service logs for %s: %v\n", unit, err)
-	}
-}
-
-func performTunnelAction(action string) error {
-	p, err := chooseTunnelProfile()
-	if err != nil {
-		return err
-	}
-	unit := p.Service
-	if action == "start" {
-		if p.Legacy {
-			return ensureTunnelRunning(false)
-		}
-		return ensureProfileTunnelRunning(p.Slug, false)
-	}
-	if action == "stop" {
-		if err := runSystemctl("stop", unit); err != nil {
-			return err
-		}
-		if exec.Command("systemctl", "is-active", "--quiet", unit).Run() == nil {
-			return errors.New("tunnel service is still active after stop")
-		}
-		fmt.Printf("Tunnel %q stopped.\n", p.Name)
-		return nil
-	}
-	if action == "restart" {
-		if p.Legacy {
-			return ensureTunnelRunning(true)
-		}
-		return ensureProfileTunnelRunning(p.Slug, true)
-	}
-	if action == "status" {
-		out, e := exec.Command("systemctl", "status", unit, "--no-pager", "-l").CombinedOutput()
-		if len(out) > 0 {
-			fmt.Print(string(out))
-		}
-		fmt.Println("\n--- Recent service logs ---")
-		showServiceLogs(unit, 60)
-		return e
-	}
-	return errors.New("unknown tunnel action")
-}
-
-func stopAndDisableTunnelUnit(unit string) error {
-	_ = exec.Command("systemctl", "disable", "--now", unit).Run()
-	state := func() string {
-		b, _ := exec.Command("systemctl", "show", unit, "-p", "ActiveState", "--value").Output()
-		return strings.TrimSpace(string(b))
-	}
-	for i := 0; i < 20; i++ {
-		s := state()
-		if s == "" || s == "inactive" || s == "failed" || s == "unknown" || s == "dead" {
-			return nil
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	_ = exec.Command("systemctl", "kill", "--kill-who=all", "--signal=KILL", unit).Run()
-	_ = exec.Command("systemctl", "stop", unit).Run()
-	for i := 0; i < 8; i++ {
-		s := state()
-		if s == "" || s == "inactive" || s == "failed" || s == "unknown" || s == "dead" {
-			return nil
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	return fmt.Errorf("service %s would not stop (state=%s); tunnel files were kept", unit, state())
-}
-
-func deleteSelectedTunnel() error {
-	p, err := chooseTunnelProfile()
-	if err != nil {
-		return err
-	}
-	if !askYN("Delete tunnel "+p.Name+" and its own configuration? (y/N)", "n") {
-		return errors.New("deletion cancelled")
-	}
-	if err := stopAndDisableTunnelUnit(p.Service); err != nil {
-		return err
-	}
-	if p.Legacy {
-		if b, e := os.ReadFile(p.ConfigPath); e == nil {
-			var c Config
-			if json.Unmarshal(b, &c) == nil {
-				for _, path := range []string{c.CertFile, c.KeyFile} {
-					if path == "" {
-						continue
-					}
-					clean := filepath.Clean(path)
-					rel, relErr := filepath.Rel("/etc/ravanreverse", clean)
-					if relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-						_ = os.Remove(clean)
-					}
-				}
-			}
-		}
-		if err := os.Remove(p.ConfigPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		_ = os.Remove(p.RuntimePath)
-		_ = os.Remove("/etc/systemd/system/ravanreverse.service")
-	} else {
-		dir := profileDirectory(p.Slug)
-		info, e := os.Lstat(dir)
-		if e == nil && info.Mode()&os.ModeSymlink != 0 {
-			return errors.New("refusing to remove a tunnel profile directory that is a symbolic link")
-		}
-		if e != nil && !errors.Is(e, os.ErrNotExist) {
-			return e
-		}
-		if err := os.RemoveAll(dir); err != nil {
-			return fmt.Errorf("remove tunnel files: %w", err)
-		}
-	}
-	_ = exec.Command("systemctl", "reset-failed", p.Service).Run()
-	_ = exec.Command("systemctl", "daemon-reload").Run()
-	fmt.Printf("Tunnel %q was deleted. Other tunnels were left unchanged.\n", p.Name)
-	return nil
-}
-
-func manageTunnelProfiles() error {
-	for {
-		uiRule()
-		fmt.Println(paint(ansiCyan+ansiBold, "  TUNNEL PROFILES"))
-		fmt.Println("  [1]  Create a new tunnel")
-		fmt.Println("  [2]  Delete a tunnel by name")
-		fmt.Println("  [3]  List saved tunnels")
-		fmt.Println("  [0]  Back to main menu")
-		switch ask("Select an operation", "0") {
-		case "1":
-			return setup()
-		case "2":
-			if err := deleteSelectedTunnel(); err != nil {
-				fmt.Println(paint(ansiYellow, "  "+err.Error()))
-			}
-			_ = ask("Press Enter to continue", "")
-		case "3":
-			profiles, err := listTunnelProfiles()
-			if err != nil {
-				return err
-			}
-			if len(profiles) == 0 {
-				fmt.Println("No saved tunnels.")
-			} else {
-				for _, p := range profiles {
-					state := "STOPPED"
-					if exec.Command("systemctl", "is-active", "--quiet", p.Service).Run() == nil {
-						state = "RUNNING"
-					}
-					fmt.Printf("  • %-24s role=%-7s state=%s\n", p.Name, p.Role, state)
-				}
-			}
-			_ = ask("Press Enter to continue", "")
-		case "0":
-			return nil
-		default:
-			fmt.Println("Invalid selection.")
-		}
-	}
-}
-
 func setup() error {
 	wizardStep = 0
-	configPath = "/etc/ravanreverse/config.json"
-	runtimePath = "/etc/ravanreverse/runtime.json"
-	activeProfileSlug = ""
 	uiHeader("SHAH TUNNEL // SPACE SETUP", "WIZARD   •   SECURE LINK   •   TRANSPORT ROUTING")
-	uiInfo("Create an independent named tunnel profile. Existing tunnels and their configuration are preserved.")
+	uiInfo("Step-by-step setup. Each step asks for one input.")
+	if _, err := os.Stat(configPath); err == nil {
+		if !wizardYesNo("Overwrite the existing configuration? (y/N)", "n") {
+			return errors.New("Setup cancelled; the existing configuration was preserved")
+		}
+	}
 
 	uiRule()
 	fmt.Println(paint(ansiCyan+ansiBold, "  SELECT SERVER ROLE"))
@@ -3801,34 +3328,6 @@ func setup() error {
 	fmt.Printf("  %s %s\n", paint(ansiGreen+ansiBold, "2"), "🔗 AGENT   | OUTSIDE — connects securely to Iran and forwards traffic to local services")
 	fmt.Printf("  %s %s\n", paint(ansiGreen+ansiBold, "3"), "🌐 RELAY   | THIRD SERVER — public entry point that forwards TCP traffic")
 	role := wizardAsk("Select role (1/2/3)", "")
-	profileName := wizardAsk("Enter a name for this tunnel", "")
-	if err := validateProfileName(profileName); err != nil {
-		return err
-	}
-	if profileNameInUse(profileName) {
-		return fmt.Errorf("a tunnel named %q already exists; choose another name", profileName)
-	}
-	activeProfileSlug = profileSlug(profileName)
-	profileDir := profileDirectory(activeProfileSlug)
-	if _, err := os.Lstat(profileDir); err == nil {
-		return fmt.Errorf("tunnel name %q already has a saved profile; choose another name", profileName)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if err := os.MkdirAll(profileDir, 0700); err != nil {
-		return err
-	}
-	configPath = filepath.Join(profileDir, "config.json")
-	runtimePath = filepath.Join(profileDir, "runtime.json")
-	profileSaved := false
-	defer func() {
-		if !profileSaved {
-			_ = os.RemoveAll(profileDir)
-		}
-	}()
-	if err := writeProfileName(activeProfileSlug, profileName); err != nil {
-		return err
-	}
 	tok, err := randomHex(32)
 	if err != nil {
 		return err
@@ -3843,7 +3342,7 @@ func setup() error {
 			return err
 		}
 		uiInfo("Allow TCP on the control port, control+1 for HTTP/2 CONNECT, and control+2 for HTTP/1.1 CONNECT as selected. Select the same transport policy on both endpoints.")
-		c.CertFile, c.KeyFile = filepath.Join(profileDir, "hub.crt"), filepath.Join(profileDir, "hub.key")
+		c.CertFile, c.KeyFile = "/etc/ravanreverse/hub.crt", "/etc/ravanreverse/hub.key"
 		for i := 1; i <= 100; i++ {
 			defID := "main"
 			if i > 1 {
@@ -3866,9 +3365,6 @@ func setup() error {
 		if err = validateConfig(c); err != nil {
 			return err
 		}
-		if err = checkProfilePortConflicts(c, activeProfileSlug); err != nil {
-			return err
-		}
 		fp, e := generateCertificate(c.CertFile, c.KeyFile)
 		if e != nil {
 			return e
@@ -3877,7 +3373,6 @@ func setup() error {
 		if err = saveConfig(c); err != nil {
 			return err
 		}
-		profileSaved = true
 		uiRule()
 		uiCard("✅ HUB CONFIGURED", []uiCardRow{
 			{Text: "Configuration saved successfully.", Color: ansiGreen},
@@ -3942,7 +3437,8 @@ func setup() error {
 		if err = saveConfig(c); err != nil {
 			return err
 		}
-		profileSaved = true
+		_ = os.Remove("/etc/ravanreverse/hub.key")
+		_ = os.Remove("/etc/ravanreverse/hub.crt")
 		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s. Option 7 covers TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT, and HTTP/1.1 CONNECT.", c.TunnelChannels, c.Transport))
 		uiSuccess("Agent configuration saved. Reconnection is automatic if a lane drops.")
 	case "3", "relay", "front":
@@ -3966,24 +3462,22 @@ func setup() error {
 			}
 		}
 		c = normalizeConfig(c)
-		if err = checkProfilePortConflicts(c, activeProfileSlug); err != nil {
-			return err
-		}
 		if err = saveConfig(c); err != nil {
 			return err
 		}
-		profileSaved = true
+		_ = os.Remove("/etc/ravanreverse/hub.key")
+		_ = os.Remove("/etc/ravanreverse/hub.crt")
 		uiSuccess("Relay configured.")
 		uiWarn("Relay changes the client entry point only. The Relay operator and network path may still see the Iran destination IP.")
 	default:
 		return errors.New("Invalid role. Enter 1 for HUB, 2 for Agent, or 3 for Relay.")
 	}
-	fmt.Printf("\n  %s %s\n", paint(ansiGreen+ansiBold, "✓"), "Tunnel "+profileName+" saved: "+configPath)
-	uiInfo("Creating an independent systemd service and enabling automatic startup…")
-	if err := ensureProfileTunnelRunning(activeProfileSlug, true); err != nil {
-		return fmt.Errorf("tunnel %q was saved, but automatic startup failed: %w", profileName, err)
+	fmt.Printf("\n  %s %s\n", paint(ansiGreen+ansiBold, "✓"), "Configuration saved: "+configPath)
+	uiInfo("Enabling the service and automatic startup after VPS reboot…")
+	if err := ensureTunnelRunning(true); err != nil {
+		return fmt.Errorf("configuration was saved, but automatic startup failed: %w", err)
 	}
-	uiSuccess("Tunnel is active. Other named tunnels remain unchanged.")
+	uiSuccess("Tunnel is active and configured to start automatically after reboot.")
 	return nil
 }
 
@@ -4125,20 +3619,12 @@ if [[ ! "$LAST" =~ ^[0-9]+$ ]] || (( NOW < LAST )); then
   exit 0
 fi
 (( NOW - LAST >= INTERVAL )) || exit 0
-FAILED=0
-if systemctl is-active --quiet ravanreverse.service; then
-  systemctl restart ravanreverse.service || FAILED=1
-fi
-while read -r UNIT _; do
-  [[ "$UNIT" == ravanreverse@*.service ]] || continue
-  systemctl restart "$UNIT" || FAILED=1
-done < <(systemctl list-units --type=service --state=active --no-legend 'ravanreverse@*.service' 2>/dev/null || true)
-if (( FAILED == 0 )); then
+if systemctl restart ravanreverse; then
   printf '%s\n' "$NOW" > "${STATE}.tmp"
   mv -f "${STATE}.tmp" "$STATE"
-  logger -t shah-tunnel-restart "Shah Tunnel profiles restarted by configured interval (${INTERVAL}s)." 2>/dev/null || true
+  logger -t shah-tunnel-restart "Shah Tunnel restarted by its configured interval (${INTERVAL}s)." 2>/dev/null || true
 else
-  logger -t shah-tunnel-restart "One or more Shah Tunnel restarts failed; they will be retried next minute." 2>/dev/null || true
+  logger -t shah-tunnel-restart "Scheduled Shah Tunnel restart failed; it will be retried next minute." 2>/dev/null || true
   exit 1
 fi
 `
@@ -4226,13 +3712,8 @@ func setRestartSchedule(interval restartInterval) error {
 	if !isRoot() {
 		return errors.New("run as root")
 	}
-	if _, legacyErr := os.Stat("/etc/systemd/system/ravanreverse.service"); legacyErr != nil {
-		if _, profileErr := os.Stat(profileUnitTemplate); profileErr != nil {
-			profiles, _ := listTunnelProfiles()
-			if len(profiles) == 0 {
-				return errors.New("Shah Tunnel is not installed; create a tunnel before setting a restart schedule")
-			}
-		}
+	if _, err := os.Stat("/etc/systemd/system/ravanreverse.service"); err != nil {
+		return errors.New("Shah Tunnel is not installed; install it before setting a restart schedule")
 	}
 	if _, err := os.Stat("/etc/cron.d"); err != nil {
 		return errors.New("/etc/cron.d is unavailable; this scheduler supports Debian/Ubuntu-style cron")
@@ -4317,32 +3798,6 @@ func manageRestartSchedule() error {
 
 var errUninstallCancelled = errors.New("uninstall cancelled")
 
-func installedProfileUnits() []string {
-	seen := map[string]bool{}
-	var units []string
-	add := func(unit string) {
-		if strings.HasPrefix(unit, "ravanreverse@") && strings.HasSuffix(unit, ".service") && unit != "ravanreverse@.service" && !seen[unit] {
-			seen[unit] = true
-			units = append(units, unit)
-		}
-	}
-	for _, pattern := range []string{"/etc/systemd/system/multi-user.target.wants/ravanreverse@*.service", "/etc/systemd/system/ravanreverse@*.service"} {
-		matches, _ := filepath.Glob(pattern)
-		for _, match := range matches {
-			add(filepath.Base(match))
-		}
-	}
-	out, _ := exec.Command("systemctl", "list-units", "--all", "--type=service", "--no-legend", "ravanreverse@*.service").Output()
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) > 0 {
-			add(fields[0])
-		}
-	}
-	sort.Strings(units)
-	return units
-}
-
 func uninstall() error {
 	fmt.Println("This permanently removes only Shah Tunnel files and its own service.")
 	fmt.Println("Xray, x-ui, other services and manually-created firewall rules are left untouched.")
@@ -4351,13 +3806,8 @@ func uninstall() error {
 		return errUninstallCancelled
 	}
 
-	// Stop and disable only Shah Tunnel services, including every named profile.
-	// Never touch unrelated services or the Xray/x-ui stack.
-	for _, unit := range installedProfileUnits() {
-		if err := stopAndDisableTunnelUnit(unit); err != nil {
-			return err
-		}
-	}
+	// Stop and disable only this unit. Do not remove files while systemd still
+	// reports the unit as active/deactivating.
 	_ = exec.Command("systemctl", "disable", "ravanreverse").Run()
 	_ = exec.Command("systemctl", "stop", "ravanreverse").Run()
 	state := func() string {
@@ -4388,9 +3838,6 @@ func uninstall() error {
 
 	if err := os.Remove("/etc/systemd/system/ravanreverse.service"); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove service unit: %w", err)
-	}
-	if err := os.Remove(profileUnitTemplate); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove profile service template: %w", err)
 	}
 	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
 		return fmt.Errorf("systemd daemon-reload failed: %v %s", err, strings.TrimSpace(string(out)))
@@ -4906,25 +4353,13 @@ func geoDisplay(g ServerGeo) (string, string) {
 	}
 	return g.IP, country
 }
-func anyTunnelIsActive() bool {
-	if tunnelIsActive() {
-		return true
-	}
-	for _, unit := range installedProfileUnits() {
-		if exec.Command("systemctl", "is-active", "--quiet", unit).Run() == nil {
-			return true
-		}
-	}
-	return false
-}
-
 func menu() {
 	if !ensureRoot() {
 		return
 	}
 	for {
 		state := paint(ansiYellow, "○ OFFLINE / NOT CONFIGURED")
-		if anyTunnelIsActive() {
+		if tunnelIsActive() {
 			state = paint(ansiGreen+ansiBold, "● ONLINE")
 		}
 		uiHeader("SHAH TUNNEL // COMMAND DECK", "SPACE NETWORK   •   ENCRYPTED CONTROL   •   TCP TUNNEL")
@@ -4938,7 +4373,7 @@ func menu() {
 		menuItem := func(key, title, desc string) {
 			fmt.Printf("  %s  %s %s\n", paint(ansiPurple+ansiBold, "["+key+"]"), paint(ansiBold, fmt.Sprintf("%-32s", title)), paint(ansiDim, desc))
 		}
-		menuItem("1", "🛠️ Tunnel Profiles", "Create, list and delete named tunnels")
+		menuItem("1", "🛠️ Configure / Create Tunnel", "Step-by-step setup wizard")
 		menuItem("2", "🚀 Start Tunnel", "Start the service")
 		menuItem("3", "🛑 Stop Tunnel", "Stop the running service")
 		menuItem("4", "🔄 Restart Tunnel", "Reload saved configuration")
@@ -4951,15 +4386,18 @@ func menu() {
 		var err error
 		switch choice {
 		case "1":
-			err = manageTunnelProfiles()
+			err = setup() // setup starts/restarts the service automatically on success
 		case "2":
-			err = performTunnelAction("start")
+			err = ensureTunnelRunning(false)
 		case "3":
-			err = performTunnelAction("stop")
+			err = runSystemctl("stop", "ravanreverse")
+			if err == nil && tunnelIsActive() {
+				err = errors.New("service is still active after stop")
+			}
 		case "4":
-			err = performTunnelAction("restart")
+			err = ensureTunnelRunning(true)
 		case "5":
-			err = performTunnelAction("status")
+			err = showStatusAndLogs()
 		case "6":
 			err = manageRestartSchedule()
 		case "7":
@@ -5001,32 +4439,6 @@ func main() {
 	case "menu":
 		menu()
 	case "run":
-		configPath = "/etc/ravanreverse/config.json"
-		runtimePath = "/etc/ravanreverse/runtime.json"
-		for i := 2; i < len(os.Args); i++ {
-			arg := os.Args[i]
-			if strings.HasPrefix(arg, "--config=") {
-				configPath = strings.TrimPrefix(arg, "--config=")
-				continue
-			}
-			if strings.HasPrefix(arg, "--runtime=") {
-				runtimePath = strings.TrimPrefix(arg, "--runtime=")
-				continue
-			}
-			if arg == "--config" || arg == "--runtime" {
-				if i+1 >= len(os.Args) {
-					log.Fatalf("%s requires a path", arg)
-				}
-				i++
-				if arg == "--config" {
-					configPath = os.Args[i]
-				} else {
-					runtimePath = os.Args[i]
-				}
-				continue
-			}
-			log.Fatalf("unknown run option: %s", arg)
-		}
 		cfg, err := loadConfig()
 		if err != nil {
 			log.Fatal(err)
@@ -5054,7 +4466,7 @@ func main() {
 	case "version", "--version", "-v":
 		fmt.Printf("Shah Tunnel %s (%s)\n", version, runtimeArch())
 	default:
-		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|run [--config PATH] [--runtime PATH]|uninstall|version]\n", version)
+		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|run|uninstall|version]\n", version)
 	}
 }
 
