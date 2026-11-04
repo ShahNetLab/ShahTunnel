@@ -13,7 +13,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base32"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -40,12 +39,12 @@ import (
 )
 
 const (
-	version                          = "1.8.2"
+	version                          = "1.6.2"
+	configPath                       = "/etc/ravanreverse/config.json"
 	maxFrame                         = 64 * 1024
 	defaultTunnelChannels            = 12
 	maxPendingPublicConnections      = 2048
 	controlBurstLimit                = 8
-	wireFairQuantum                  = 32 * 1024
 	streamAdmissionWait              = 5 * time.Second
 	maxTunnelChannels                = 16
 	msgOpen                     byte = 1
@@ -56,19 +55,12 @@ const (
 	msgPing                     byte = 6
 	msgPong                     byte = 7
 	maxStreams                       = 512
-	streamWindowFrames               = 16
+	streamWindowFrames               = 8
 	maxQueuedPayloadBytes            = int64(64 << 20)
 	wireWriteTimeout                 = 30 * time.Second
-	heartbeatInterval                = 5 * time.Second
-	heartbeatTimeout                 = 20 * time.Second
-	sessionReadTimeout               = 35 * time.Second
 	reverseStreamOpenTimeout         = 18 * time.Second
 	transportAuto                    = "auto"
-	transportAdaptive                = "adaptive" // legacy adaptive mode: the four original TCP transports
-	transportAdaptiveAll             = "adaptive_all"
-	transportHysteria                = "hysteria2_quic"
-	hysteriaBinary                   = "/usr/local/bin/hysteria"
-	defaultHysteriaSOCKSListen       = "127.0.0.1:11080"
+	transportAdaptive                = "adaptive"
 	transportTCP                     = "tcp_tls"
 	transportWebSocket               = "websocket_tls"
 	transportHTTP2                   = "http2_connect"
@@ -82,8 +74,6 @@ const (
 	msgHalfClose                byte = 8
 	msgDataAck                  byte = 9
 )
-
-var configRoot = "/etc/ravanreverse"
 
 var (
 	errMaxConcurrentStreams = errors.New("maximum concurrent stream limit reached")
@@ -109,163 +99,10 @@ type Config struct {
 	CertFile      string `json:"cert_file,omitempty"`
 	KeyFile       string `json:"key_file,omitempty"`
 	Fingerprint   string `json:"fingerprint,omitempty"`
-	HysteriaAuth  string `json:"hysteria_auth,omitempty"`
-	HysteriaObfs  string `json:"hysteria_obfs_password,omitempty"`
 	// TunnelChannels controls the number of independent authenticated TCP/TLS lanes
 	// between Agent and Hub. Missing values on old configs are upgraded in memory to the current default.
-	TunnelChannels      int           `json:"tunnel_channels,omitempty"`
-	HysteriaSOCKSListen string        `json:"hysteria_socks_listen,omitempty"`
-	Ports               []PortMapping `json:"ports,omitempty"`
-}
-
-// activeProfileName selects an isolated tunnel profile. The legacy "default"
-// profile keeps the original paths for backwards compatibility.
-var (
-	activeProfileName        = "default"
-	configPath               = "/etc/ravanreverse/config.json"
-	hysteriaServerConfigPath = "/etc/ravanreverse/hysteria-server.yaml"
-	hysteriaClientConfigPath = "/etc/ravanreverse/hysteria-client.yaml"
-)
-
-func validTunnelProfileName(name string) bool {
-	if name == "" || len(name) > 32 || name == "." || name == ".." {
-		return false
-	}
-	for _, r := range name {
-		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_') {
-			return false
-		}
-	}
-	return true
-}
-
-func profileDirFor(name string) string {
-	if name == "" || name == "default" {
-		return configRoot
-	}
-	return filepath.Join(configRoot, "profiles", name)
-}
-
-func configPathForProfile(name string) string {
-	return filepath.Join(profileDirFor(name), "config.json")
-}
-
-func setActiveProfile(name string) error {
-	if !validTunnelProfileName(name) {
-		return fmt.Errorf("invalid tunnel name %q (use 1-32 letters, numbers, hyphen or underscore)", name)
-	}
-	activeProfileName = name
-	dir := profileDirFor(name)
-	configPath = filepath.Join(dir, "config.json")
-	hysteriaServerConfigPath = filepath.Join(dir, "hysteria-server.yaml")
-	hysteriaClientConfigPath = filepath.Join(dir, "hysteria-client.yaml")
-	return nil
-}
-
-func profileServiceName(name string) string {
-	if name == "" || name == "default" {
-		return "ravanreverse"
-	}
-	return "ravanreverse@" + name
-}
-
-func activeServiceName() string { return profileServiceName(activeProfileName) }
-
-func activeServiceUnitAvailable() bool {
-	unit := "/etc/systemd/system/ravanreverse.service"
-	if activeProfileName != "default" {
-		unit = "/etc/systemd/system/ravanreverse@.service"
-	}
-	_, err := os.Stat(unit)
-	return err == nil
-}
-
-func listTunnelProfiles() ([]string, error) {
-	profiles := make([]string, 0, 4)
-	if st, err := os.Stat(configPathForProfile("default")); err == nil && st.Mode().IsRegular() {
-		profiles = append(profiles, "default")
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	root := filepath.Join(configRoot, "profiles")
-	entries, err := os.ReadDir(root)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() || !validTunnelProfileName(entry.Name()) {
-			continue
-		}
-		st, statErr := os.Stat(configPathForProfile(entry.Name()))
-		if statErr == nil && st.Mode().IsRegular() {
-			profiles = append(profiles, entry.Name())
-		}
-	}
-	sort.Strings(profiles)
-	return profiles, nil
-}
-
-func chooseTunnelProfile(prompt string) error {
-	profiles, err := listTunnelProfiles()
-	if err != nil {
-		return fmt.Errorf("list tunnel profiles: %w", err)
-	}
-	if len(profiles) == 0 {
-		return errors.New("no configured tunnels; choose [1] to create one first")
-	}
-	fmt.Println("\n  CONFIGURED TUNNELS")
-	for _, name := range profiles {
-		marker := "  "
-		if name == activeProfileName {
-			marker = "* "
-		}
-		fmt.Printf("  %s%s\n", marker, name)
-	}
-	name := strings.TrimSpace(ask(prompt, profiles[0]))
-	for _, existing := range profiles {
-		if name == existing {
-			return setActiveProfile(name)
-		}
-	}
-	return fmt.Errorf("tunnel %q does not exist; choose one of the listed names", name)
-}
-
-func hysteriaSOCKSListenFor(cfg Config) string {
-	if strings.TrimSpace(cfg.HysteriaSOCKSListen) != "" {
-		return strings.TrimSpace(cfg.HysteriaSOCKSListen)
-	}
-	return defaultHysteriaSOCKSListen
-}
-
-func allocateHysteriaSOCKSListen() (string, error) {
-	used := map[string]bool{}
-	profiles, err := listTunnelProfiles()
-	if err != nil {
-		return "", err
-	}
-	for _, name := range profiles {
-		b, readErr := os.ReadFile(configPathForProfile(name))
-		if readErr != nil {
-			return "", readErr
-		}
-		var c Config
-		if json.Unmarshal(b, &c) == nil && c.Role == "agent" && usesHysteria(c.Transport) {
-			used[hysteriaSOCKSListenFor(c)] = true
-		}
-	}
-	for port := 11080; port <= 11999; port++ {
-		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-		if used[addr] {
-			continue
-		}
-		ln, listenErr := net.Listen("tcp", addr)
-		if listenErr != nil {
-			continue
-		}
-		_ = ln.Close()
-		return addr, nil
-	}
-	return "", errors.New("no free local Hysteria SOCKS port available in 11080-11999")
+	TunnelChannels int           `json:"tunnel_channels,omitempty"`
+	Ports          []PortMapping `json:"ports,omitempty"`
 }
 
 type RuntimeSnapshot struct {
@@ -297,11 +134,6 @@ var agentMetricChannels int64
 // agentPreferredTransport remembers the last authenticated transport independently per lane.
 // It is used only by adaptive mode; legacy auto mode keeps its deterministic TCP-then-WebSocket order.
 var agentPreferredTransport sync.Map // map[int]string
-// A short per-transport circuit breaker prevents all lanes from repeatedly
-// hitting a path already known to be failing. It is local to one Agent process.
-var agentTransportCooldown sync.Map // map[string]int64 (Unix nanoseconds)
-const adaptiveTransportCooldown = 12 * time.Second
-
 var nextHubSessionID atomic.Uint64
 
 // logAuthFailure rate-limits unauthenticated peer logs to reduce journal flooding.
@@ -332,16 +164,15 @@ func writeRuntimeStats(role string) {
 	if err != nil {
 		return
 	}
-	runtimePath := filepath.Join(profileDirFor(activeProfileName), "runtime.json")
-	tmp := runtimePath + ".tmp"
-	if err = os.MkdirAll(filepath.Dir(runtimePath), 0700); err != nil {
+	tmp := "/etc/ravanreverse/runtime.json.tmp"
+	if err = os.MkdirAll("/etc/ravanreverse", 0700); err != nil {
 		return
 	}
 	if err = os.WriteFile(tmp, append(b, '\n'), 0600); err != nil {
 		return
 	}
-	_ = os.Rename(tmp, runtimePath)
-	_ = os.Chmod(runtimePath, 0600)
+	_ = os.Rename(tmp, "/etc/ravanreverse/runtime.json")
+	_ = os.Chmod("/etc/ravanreverse/runtime.json", 0600)
 }
 
 type counterWriter struct {
@@ -661,30 +492,10 @@ func clientWebSocketUpgrade(conn net.Conn, host string) (net.Conn, error) {
 }
 
 func validTransportMode(mode string) bool {
-	return mode == transportAuto || mode == transportAdaptive || mode == transportAdaptiveAll || mode == transportHysteria || mode == transportTCP || mode == transportWebSocket || mode == transportHTTP2 || mode == transportHTTP1 || mode == transportHTTPConnectAuto
+	return mode == transportAuto || mode == transportAdaptive || mode == transportTCP || mode == transportWebSocket || mode == transportHTTP2 || mode == transportHTTP1 || mode == transportHTTPConnectAuto
 }
 func transportAllowed(configured, observed string) bool {
-	if configured == transportAuto || configured == transportAdaptive || configured == transportAdaptiveAll || configured == observed {
-		return true
-	}
-	return configured == transportHTTPConnectAuto && (observed == transportHTTP2 || observed == transportHTTP1)
-}
-
-// Hysteria-only mode deliberately keeps the inner TCP control listener on
-// loopback. Only the local Hysteria sidecar may reach it; the public path is UDP.
-func transportAllowedPeer(configured, observed string, remote net.Addr) bool {
-	if configured != transportHysteria {
-		return transportAllowed(configured, observed)
-	}
-	if observed != transportTCP || remote == nil {
-		return false
-	}
-	host, _, err := net.SplitHostPort(remote.String())
-	if err != nil {
-		return false
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return configured == transportAuto || configured == transportAdaptive || configured == observed || (configured == transportHTTPConnectAuto && (observed == transportHTTP2 || observed == transportHTTP1))
 }
 
 type frame struct {
@@ -700,85 +511,6 @@ type wireRequest struct {
 	done chan error
 }
 
-// fairWireDataQueue schedules payload frames with deficit round-robin (DRR).
-// A large upload on one forwarded TCP stream must not monopolize the shared
-// outer tunnel lane and delay small packets belonging to Telegram/other flows.
-// The stream ID is the fairness key; control frames remain on the separate
-// priority queue. With 32 KiB source chunks, one quantum gives each active flow
-// one full chunk per round while still handling smaller final chunks fairly.
-type fairWireDataQueue struct {
-	queues  map[uint32][]*wireRequest
-	order   []uint32
-	deficit map[uint32]int
-	cursor  int
-	queued  int
-}
-
-func newFairWireDataQueue() *fairWireDataQueue {
-	return &fairWireDataQueue{
-		queues:  make(map[uint32][]*wireRequest),
-		deficit: make(map[uint32]int),
-	}
-}
-
-func (q *fairWireDataQueue) enqueue(req *wireRequest) {
-	if req == nil {
-		return
-	}
-	if _, exists := q.queues[req.id]; !exists {
-		q.order = append(q.order, req.id)
-		q.deficit[req.id] = 0
-	}
-	q.queues[req.id] = append(q.queues[req.id], req)
-	q.queued++
-}
-
-func (q *fairWireDataQueue) dequeue() *wireRequest {
-	for q.queued > 0 && len(q.order) > 0 {
-		if q.cursor >= len(q.order) {
-			q.cursor = 0
-		}
-		id := q.order[q.cursor]
-		queue := q.queues[id]
-		if len(queue) == 0 {
-			delete(q.queues, id)
-			delete(q.deficit, id)
-			q.order = append(q.order[:q.cursor], q.order[q.cursor+1:]...)
-			if q.cursor >= len(q.order) {
-				q.cursor = 0
-			}
-			continue
-		}
-		req := queue[0]
-		cost := len(req.data)
-		if cost < 1 {
-			cost = 1
-		}
-		if q.deficit[id] < cost {
-			q.deficit[id] += wireFairQuantum
-			q.cursor = (q.cursor + 1) % len(q.order)
-			continue
-		}
-		q.deficit[id] -= cost
-		queue[0] = nil
-		queue = queue[1:]
-		q.queued--
-		if len(queue) == 0 {
-			delete(q.queues, id)
-			delete(q.deficit, id)
-			q.order = append(q.order[:q.cursor], q.order[q.cursor+1:]...)
-			if q.cursor >= len(q.order) {
-				q.cursor = 0
-			}
-		} else {
-			q.queues[id] = queue
-			q.cursor = (q.cursor + 1) % len(q.order)
-		}
-		return req
-	}
-	return nil
-}
-
 type wire struct {
 	conn       net.Conn
 	controlQ   chan *wireRequest
@@ -786,7 +518,7 @@ type wire struct {
 	done       chan struct{}
 	once       sync.Once
 	rttNanos   atomic.Int64 // EWMA of authenticated PING/PONG round-trip time; zero until measured.
-	lastPongAt atomic.Int64 // Unix nanoseconds of the latest PONG; used to evict a blackholed lane.
+	lastPongAt atomic.Int64 // Unix nanoseconds of the latest valid PONG, for diagnostics/future health checks.
 }
 
 func newWire(c net.Conn) *wire {
@@ -799,7 +531,6 @@ func newWire(c net.Conn) *wire {
 		dataQ:    make(chan *wireRequest, 64),
 		done:     make(chan struct{}),
 	}
-	w.lastPongAt.Store(time.Now().UnixNano())
 	go w.writeLoop()
 	return w
 }
@@ -886,23 +617,11 @@ func (w *wire) writeRequest(req *wireRequest) error {
 
 func (w *wire) writeLoop() {
 	controlStreak := 0
-	fairData := newFairWireDataQueue()
 	for {
-		// Pull all currently submitted data into per-stream DRR queues before
-		// choosing the next frame. This prevents one busy sender from winning
-		// simply because its goroutine repeatedly fills the shared FIFO first.
-		for {
-			select {
-			case req := <-w.dataQ:
-				fairData.enqueue(req)
-			default:
-				goto dataDrained
-			}
-		}
-	dataDrained:
 		var req *wireRequest
-		// Control frames (OPEN/ACK/CLOSE/PING) remain latency-sensitive, but a
-		// bounded burst prevents them from starving payload when data is waiting.
+		// Prefer control traffic, but cap consecutive control frames when payload
+		// is already queued. Without this bound a stream of ACK/PING frames can
+		// starve user payload and cause avoidable latency spikes under concurrency.
 		if controlStreak < controlBurstLimit {
 			select {
 			case <-w.done:
@@ -913,20 +632,19 @@ func (w *wire) writeLoop() {
 			}
 		}
 		if req == nil {
-			req = fairData.dequeue()
-			if req != nil {
+			// At the burst limit, take payload immediately if any is waiting.
+			select {
+			case req = <-w.dataQ:
 				controlStreak = 0
+			default:
 			}
 		}
 		if req == nil {
-			// No payload is queued. Wait for new data or control. New data is
-			// enqueued and arbitrated on the next loop; it is never written FIFO.
 			select {
 			case <-w.done:
 				return
-			case dataReq := <-w.dataQ:
-				fairData.enqueue(dataReq)
-				continue
+			case req = <-w.dataQ:
+				controlStreak = 0
 			case req = <-w.controlQ:
 				controlStreak++
 			}
@@ -1207,17 +925,7 @@ func acknowledge(ch chan struct{}) {
 }
 
 func heartbeat(w *wire, stop <-chan struct{}) {
-	heartbeatWithTimings(w, stop, heartbeatInterval, heartbeatTimeout)
-}
-
-// heartbeatWithTimings sends a small authenticated liveness probe and closes
-// a lane after several missed replies. A single lost packet does not trigger
-// failover; the timeout requires sustained loss or a blackholed route.
-func heartbeatWithTimings(w *wire, stop <-chan struct{}, interval, timeout time.Duration) {
-	if interval <= 0 || timeout <= interval {
-		return
-	}
-	t := time.NewTicker(interval)
+	t := time.NewTicker(15 * time.Second)
 	defer t.Stop()
 	for {
 		select {
@@ -1226,14 +934,8 @@ func heartbeatWithTimings(w *wire, stop <-chan struct{}, interval, timeout time.
 		case <-w.done:
 			return
 		case <-t.C:
-			last := w.lastPongAt.Load()
-			if last == 0 || time.Since(time.Unix(0, last)) > timeout {
-				log.Printf("tunnel lane health check expired; closing the unresponsive path")
-				w.close()
-				return
-			}
-			// The timestamp is echoed by current peers. Older peers return an
-			// empty PONG; both forms count as liveness acknowledgements.
+			// The timestamp is echoed by compatible peers. Older peers ignore the
+			// payload and return an empty PONG, so this enhancement is wire-compatible.
 			var payload [8]byte
 			binary.BigEndian.PutUint64(payload[:], uint64(time.Now().UnixNano()))
 			if err := w.send(msgPing, 0, payload[:]); err != nil {
@@ -1244,16 +946,15 @@ func heartbeatWithTimings(w *wire, stop <-chan struct{}, interval, timeout time.
 	}
 }
 
-// observePong refreshes path liveness for both timestamped and legacy empty
-// PONGs. A wall-clock adjustment or malformed timestamp does not affect the
-// health signal. The 1/8 EWMA dampens transient RTT scheduling spikes.
+// observePong records the round-trip time encoded by our own PING timestamp.
+// A wall-clock adjustment or malformed/stale payload is ignored instead of
+// poisoning lane selection. The 1/8 EWMA dampens transient scheduling spikes.
 func (w *wire) observePong(payload []byte) {
-	now := time.Now().UnixNano()
-	w.lastPongAt.Store(now)
 	if len(payload) != 8 {
 		return
 	}
 	sentAt := int64(binary.BigEndian.Uint64(payload))
+	now := time.Now().UnixNano()
 	elapsed := now - sentAt
 	if elapsed <= 0 || elapsed > int64(2*time.Minute) {
 		return
@@ -1453,7 +1154,7 @@ func (s *hubSession) run() {
 	defer close(stop)
 	go heartbeat(s.wire, stop)
 	for {
-		_ = s.wire.conn.SetReadDeadline(time.Now().Add(sessionReadTimeout))
+		_ = s.wire.conn.SetReadDeadline(time.Now().Add(50 * time.Second))
 		f, err := s.wire.receive()
 		if err != nil {
 			log.Printf("reverse agent session ended (connection closed or timed out)")
@@ -1754,7 +1455,7 @@ func (s *agentSession) run() {
 	defer close(stop)
 	go heartbeat(s.wire, stop)
 	for {
-		_ = s.wire.conn.SetReadDeadline(time.Now().Add(sessionReadTimeout))
+		_ = s.wire.conn.SetReadDeadline(time.Now().Add(50 * time.Second))
 		f, err := s.wire.receive()
 		if err != nil {
 			return
@@ -1999,9 +1700,6 @@ func adjacentPortAddress(addr string) (string, error) { return offsetPortAddress
 // secondAdjacentPortAddress reserves TCP control port + 2 for HTTP/1.1 CONNECT.
 func secondAdjacentPortAddress(addr string) (string, error) { return offsetPortAddress(addr, 2) }
 
-// hysteriaUDPAddress reserves UDP control port + 3 for the QUIC sidecar.
-func hysteriaUDPAddress(addr string) (string, error) { return offsetPortAddress(addr, 3) }
-
 func nextPortLabel(addr string) string {
 	out, err := adjacentPortAddress(addr)
 	if err != nil {
@@ -2019,11 +1717,11 @@ func secondNextPortLabel(addr string) string {
 }
 
 func transportModeAllowsHTTP2(mode string) bool {
-	return mode == transportAdaptive || mode == transportAdaptiveAll || mode == transportHTTP2 || mode == transportHTTPConnectAuto
+	return mode == transportAdaptive || mode == transportHTTP2 || mode == transportHTTPConnectAuto
 }
 
 func transportModeAllowsHTTP1(mode string) bool {
-	return mode == transportAdaptive || mode == transportAdaptiveAll || mode == transportHTTP1 || mode == transportHTTPConnectAuto
+	return mode == transportAdaptive || mode == transportHTTP1 || mode == transportHTTPConnectAuto
 }
 
 // tunnelStreamConn adapts a bidirectional HTTP/2 CONNECT stream to net.Conn.
@@ -2262,11 +1960,8 @@ func runAgentOverStream(conn net.Conn, cfg Config, channel int, displayTransport
 	adjustAgentChannels(1)
 	defer adjustAgentChannels(-1)
 	defer conn.Close()
-	if cfg.Transport == transportAdaptive || cfg.Transport == transportAdaptiveAll {
+	if cfg.Transport == transportAdaptive {
 		agentPreferredTransport.Store(channel, displayTransport)
-	}
-	if cfg.Transport == transportAdaptiveAll {
-		clearAdaptiveTransportFailure(displayTransport)
 	}
 	log.Printf("tunnel lane %d/%d connected via %s; forwarding through %d configured port mapping(s)", channel, cfg.TunnelChannels, displayTransport, len(normalizeConfig(cfg).Ports))
 	targets := make(map[string]string, len(cfg.Ports))
@@ -2404,7 +2099,7 @@ func (h *hubServer) serveAgent(raw net.Conn, tlsCfg *tls.Config) {
 	var authReader *bufio.Reader
 	if bytes.Equal(prefix, []byte("GET ")) {
 		observed = transportWebSocket
-		if !transportAllowedPeer(h.cfg.Transport, observed, raw.RemoteAddr()) {
+		if !transportAllowed(h.cfg.Transport, observed) {
 			_ = writeFull(tc, []byte("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"))
 			logAuthFailure("WebSocket transport not enabled by Hub policy")
 			return
@@ -2416,7 +2111,7 @@ func (h *hubServer) serveAgent(raw net.Conn, tlsCfg *tls.Config) {
 		c = &websocketConn{Conn: tc, r: r, clientSide: false}
 		authReader = bufio.NewReaderSize(c, 256)
 	} else {
-		if !transportAllowedPeer(h.cfg.Transport, observed, raw.RemoteAddr()) {
+		if !transportAllowed(h.cfg.Transport, observed) {
 			_ = writeFull(tc, []byte("NO\n"))
 			logAuthFailure("TCP/TLS transport not enabled by Hub policy")
 			return
@@ -2526,485 +2221,17 @@ func acceptRetryDelay(attempt int) time.Duration {
 	return delay
 }
 
-const hysteriaRelease = "v2.13.0"
-
-func usesHysteria(mode string) bool {
-	return mode == transportHysteria || mode == transportAdaptiveAll
-}
-
-func validHysteriaSecret(s string) bool {
-	// Keep accepting the original 32-byte hex format for existing profiles.
-	if len(s) == 64 {
-		decoded, err := hex.DecodeString(s)
-		return err == nil && len(decoded) == 32
-	}
-	// New credentials use unpadded Base32: 32 random bytes remain 256-bit,
-	// but the 52-character value fits on a narrow mobile terminal line.
-	if len(s) == 52 {
-		decoded, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(s)
-		return err == nil && len(decoded) == 32
-	}
-	return false
-}
-
-func randomHysteriaSecret() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b), nil
-}
-
-// New Agent tokens use unpadded Base32 so all 256 random bits fit on a
-// narrow mobile terminal line. Existing hexadecimal tokens remain valid.
-func randomAgentToken() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b), nil
-}
-
-// compactFingerprint uses the canonical 64-character hexadecimal SHA-256
-// value. This remains compatible with older Agent releases and is one
-// contiguous alphanumeric word for native mobile-terminal selection.
-func compactFingerprint(value string) (string, error) {
-	pin, err := normalizeFingerprint(value)
-	if err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(pin), nil
-}
-
-type displayedCredential struct {
-	label string
-	value string
-	color string
-}
-
-type credentialGroup struct {
-	title       string
-	credentials []displayedCredential
-	accent      string
-}
-
-// uiCredentialGroupCard renders two credentials in one compact nebula-styled
-// frame. Each secret occupies a dedicated, unbroken line so Termius can select
-// the complete Base32 value with its native long-press copy action.
-func uiCredentialGroupCard(group credentialGroup) {
-	width := len([]rune(group.title))
-	for _, item := range group.credentials {
-		if n := len([]rune(item.label)); n > width {
-			width = n
-		}
-		if n := len([]rune(item.value)); n > width {
-			width = n
-		}
-	}
-	if width < 42 {
-		width = 42
-	}
-	if width > 76 {
-		width = 76
-	}
-	border := func(text string) string { return paint(group.accent+ansiBold, text) }
-	line := func(text, color string) {
-		visible := len([]rune(text))
-		if visible > width {
-			// Do not truncate a credential. A legacy 64-hex token may wrap
-			// on narrow terminals, but its complete value remains on screen.
-			for visible > width {
-				runes := []rune(text)
-				part := string(runes[:width])
-				fmt.Printf("  %s %s %s\n", border("│"), paint(color, part), border("│"))
-				text = string(runes[width:])
-				visible = len([]rune(text))
-			}
-		}
-		fmt.Printf("  %s %s%s %s\n", border("│"), paint(color, text), strings.Repeat(" ", width-visible), border("│"))
-	}
-	fmt.Printf("  %s\n", border("╭"+strings.Repeat("─", width+2)+"╮"))
-	line("✦  "+group.title, ansiPurple+ansiBold)
-	for i, item := range group.credentials {
-		line("✧  "+item.label, ansiCyan+ansiBold)
-		line(item.value, item.color+ansiBold)
-		if i != len(group.credentials)-1 {
-			line(strings.Repeat("·  ", width/3), ansiDim)
-		}
-	}
-	fmt.Printf("  %s\n", border("╰"+strings.Repeat("─", width+2)+"╯"))
-	fmt.Println()
-}
-
-// printAgentCredentials deliberately leaves text selection to the SSH client.
-// Termius Android does not document forwarding a normal screen tap as an xterm
-// mouse click; its documented mobile workflow is long-press -> select -> Copy.
-// OSC 52 remains supported by Termius for applications that explicitly issue
-// clipboard writes, but it cannot be triggered by a touch event the server
-// never receives.
-func printAgentCredentials(token, fingerprint, hysteriaAuth, salamander string) {
-	fmt.Println()
-	groups := []credentialGroup{{
-		title:  "HUB  →  AGENT  /  ACCESS KEYS",
-		accent: ansiPurple,
-		credentials: []displayedCredential{
-			{label: "AGENT TOKEN", value: token, color: ansiYellow},
-			{label: "CERTIFICATE SHA-256", value: fingerprint, color: ansiCyan},
-		},
-	}}
-	if hysteriaAuth != "" || salamander != "" {
-		groups = append(groups, credentialGroup{
-			title:  "HYSTERIA 2  /  UDP CREDENTIALS",
-			accent: ansiPinkGlow,
-			credentials: []displayedCredential{
-				{label: "HYSTERIA 2 PASSWORD", value: hysteriaAuth, color: ansiYellow},
-				{label: "SALAMANDER PASSWORD", value: salamander, color: ansiCyan},
-			},
-		})
-	}
-	fmt.Println(paint(ansiPurple+ansiBold, "  ✦  SECURE CREDENTIALS  ·  NEBULA VAULT  ✦"))
-	for _, group := range groups {
-		uiCredentialGroupCard(group)
-	}
-	fmt.Println()
-}
-
-func hysteriaFingerprint(s string) (string, error) {
-	pin, err := normalizeFingerprint(s)
-	if err != nil {
-		return "", err
-	}
-	parts := make([]string, len(pin))
-	for i, b := range pin {
-		parts[i] = fmt.Sprintf("%02X", b)
-	}
-	return strings.Join(parts, ":"), nil
-}
-
-func writePrivateConfig(path string, content []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".hysteria-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if err = tmp.Chmod(0600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err = tmp.Write(content); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err = tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err = tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
-}
-
-func hysteriaServerConfigContent(cfg Config) ([]byte, error) {
-	if !validHysteriaSecret(cfg.HysteriaAuth) || !validHysteriaSecret(cfg.HysteriaObfs) {
-		return nil, errors.New("invalid Hysteria credentials")
-	}
-	udpAddr, err := hysteriaUDPAddress(cfg.ControlListen)
-	if err != nil {
-		return nil, err
-	}
-	_, controlPort, err := net.SplitHostPort(cfg.ControlListen)
-	if err != nil {
-		return nil, err
-	}
-	// ACL is intentionally default-deny: the authenticated Hysteria SOCKS
-	// client can reach only the loopback ShahTunnel control TCP port.
-	content := fmt.Sprintf(`listen: %s
-tls:
-  cert: %s
-  key: %s
-  sniGuard: disable
-auth:
-  type: password
-  password: %s
-obfs:
-  type: salamander
-  salamander:
-    password: %s
-acl:
-  inline:
-    - direct(127.0.0.1, tcp/%s)
-    - reject(all)
-`, strconv.Quote(udpAddr), strconv.Quote(cfg.CertFile), strconv.Quote(cfg.KeyFile), strconv.Quote(cfg.HysteriaAuth), strconv.Quote(cfg.HysteriaObfs), controlPort)
-	return []byte(content), nil
-}
-
-func writeHysteriaServerConfig(cfg Config) error {
-	content, err := hysteriaServerConfigContent(cfg)
-	if err != nil {
-		return err
-	}
-	return writePrivateConfig(hysteriaServerConfigPath, content)
-}
-
-func hysteriaClientConfigContent(cfg Config) ([]byte, error) {
-	if !validHysteriaSecret(cfg.HysteriaAuth) || !validHysteriaSecret(cfg.HysteriaObfs) {
-		return nil, errors.New("invalid Hysteria credentials")
-	}
-	serverAddr, err := hysteriaUDPAddress(cfg.HubAddr)
-	if err != nil {
-		return nil, err
-	}
-	fingerprint, err := hysteriaFingerprint(cfg.Fingerprint)
-	if err != nil {
-		return nil, err
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "server: %s\nauth: %s\n", strconv.Quote(serverAddr), strconv.Quote(cfg.HysteriaAuth))
-	b.WriteString("tls:\n")
-	if sni := strings.TrimSpace(cfg.TLSServerName); sni != "" {
-		fmt.Fprintf(&b, "  sni: %s\n", strconv.Quote(sni))
-	}
-	// Hysteria uses the existing pinned Hub certificate as the trust anchor.
-	// The inner ShahTunnel TLS handshake independently verifies the same pin.
-	fmt.Fprintf(&b, "  insecure: true\n  pinSHA256: %s\n", strconv.Quote(fingerprint))
-	fmt.Fprintf(&b, "obfs:\n  type: salamander\n  salamander:\n    password: %s\n", strconv.Quote(cfg.HysteriaObfs))
-	fmt.Fprintf(&b, "socks5:\n  listen: %s\n  disableUDP: true\n", strconv.Quote(hysteriaSOCKSListenFor(cfg)))
-	return []byte(b.String()), nil
-}
-
-func writeHysteriaClientConfig(cfg Config) error {
-	content, err := hysteriaClientConfigContent(cfg)
-	if err != nil {
-		return err
-	}
-	return writePrivateConfig(hysteriaClientConfigPath, content)
-}
-
-func startHysteriaSidecar(mode, configFile string) (context.CancelFunc, error) {
-	if mode != "server" && mode != "client" {
-		return nil, fmt.Errorf("unsupported Hysteria sidecar mode %q", mode)
-	}
-	if _, err := os.Stat(configFile); err != nil {
-		return nil, fmt.Errorf("Hysteria config %s: %w", configFile, err)
-	}
-	binary, err := exec.LookPath(hysteriaBinary)
-	if err != nil {
-		return nil, fmt.Errorf("Hysteria 2 binary not found at %s; rerun the ShahTunnel installer", hysteriaBinary)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	launch := func() (<-chan error, error) {
-		cmd := exec.CommandContext(ctx, binary, mode, "-c", configFile)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Start(); err != nil {
-			return nil, err
-		}
-		done := make(chan error, 1)
-		go func() { done <- cmd.Wait() }()
-		return done, nil
-	}
-	done, err := launch()
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("launch Hysteria %s: %w", mode, err)
-	}
-	select {
-	case err := <-done:
-		cancel()
-		if err == nil {
-			err = errors.New("process exited during startup")
-		}
-		return nil, fmt.Errorf("Hysteria %s exited during startup: %w", mode, err)
-	case <-time.After(350 * time.Millisecond):
-	case <-ctx.Done():
-		cancel()
-		return nil, ctx.Err()
-	}
-	// Restart the companion process if it exits later. ShahTunnel's systemd
-	// unit owns this child, so stopping the main service also stops the sidecar.
-	go func(current <-chan error) {
-		backoff := time.Second
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case processErr := <-current:
-				if ctx.Err() != nil {
-					return
-				}
-				log.Printf("Hysteria %s process stopped (%v); restarting in %s", mode, processErr, backoff)
-			}
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(jitteredBackoff(backoff)):
-				}
-				next, startErr := launch()
-				if startErr != nil {
-					log.Printf("Hysteria %s restart failed: %v", mode, startErr)
-					if backoff < 30*time.Second {
-						backoff *= 2
-						if backoff > 30*time.Second {
-							backoff = 30 * time.Second
-						}
-					}
-					continue
-				}
-				current = next
-				if backoff > time.Second {
-					backoff /= 2
-				}
-				break
-			}
-		}
-	}(done)
-	log.Printf("Hysteria 2 %s sidecar started (%s)", mode, hysteriaRelease)
-	return cancel, nil
-}
-
-func waitForTCPListener(address string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", address, 150*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			return true
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return false
-}
-
-// dialSOCKS5 connects to a local Hysteria SOCKS5 listener and returns an
-// established TCP CONNECT stream. It supports IPv4, IPv6, and DNS targets.
-func dialSOCKS5(ctx context.Context, proxyAddr, targetAddr string) (net.Conn, error) {
-	d := net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}
-	conn, err := d.DialContext(ctx, "tcp", proxyAddr)
-	if err != nil {
-		return nil, fmt.Errorf("connect local SOCKS5 listener %s: %w", proxyAddr, err)
-	}
-	fail := func(e error) (net.Conn, error) { _ = conn.Close(); return nil, e }
-	deadline := time.Now().Add(8 * time.Second)
-	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-		deadline = ctxDeadline
-	}
-	_ = conn.SetDeadline(deadline)
-	if err := writeFull(conn, []byte{0x05, 0x01, 0x00}); err != nil {
-		return fail(fmt.Errorf("SOCKS5 greeting: %w", err))
-	}
-	var method [2]byte
-	if _, err := io.ReadFull(conn, method[:]); err != nil {
-		return fail(fmt.Errorf("SOCKS5 method response: %w", err))
-	}
-	if method[0] != 0x05 || method[1] != 0x00 {
-		return fail(errors.New("SOCKS5 proxy does not accept no-auth mode"))
-	}
-	host, portText, err := net.SplitHostPort(targetAddr)
-	if err != nil {
-		return fail(fmt.Errorf("invalid SOCKS5 target %q: %w", targetAddr, err))
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil || port < 1 || port > 65535 {
-		return fail(errors.New("invalid SOCKS5 target port"))
-	}
-	request := []byte{0x05, 0x01, 0x00}
-	if ip := net.ParseIP(host); ip != nil {
-		if v4 := ip.To4(); v4 != nil {
-			request = append(request, 0x01)
-			request = append(request, v4...)
-		} else {
-			request = append(request, 0x04)
-			request = append(request, ip.To16()...)
-		}
-	} else {
-		if len(host) == 0 || len(host) > 255 {
-			return fail(errors.New("SOCKS5 target hostname length is invalid"))
-		}
-		request = append(request, 0x03, byte(len(host)))
-		request = append(request, host...)
-	}
-	request = append(request, byte(port>>8), byte(port))
-	if err := writeFull(conn, request); err != nil {
-		return fail(fmt.Errorf("SOCKS5 CONNECT request: %w", err))
-	}
-	var reply [4]byte
-	if _, err := io.ReadFull(conn, reply[:]); err != nil {
-		return fail(fmt.Errorf("SOCKS5 CONNECT response: %w", err))
-	}
-	if reply[0] != 0x05 || reply[2] != 0x00 {
-		return fail(errors.New("invalid SOCKS5 response header"))
-	}
-	if reply[1] != 0x00 {
-		return fail(fmt.Errorf("SOCKS5 CONNECT rejected with reply code 0x%02x", reply[1]))
-	}
-	var boundLen int
-	switch reply[3] {
-	case 0x01:
-		boundLen = 4
-	case 0x04:
-		boundLen = 16
-	case 0x03:
-		var n [1]byte
-		if _, err := io.ReadFull(conn, n[:]); err != nil {
-			return fail(err)
-		}
-		boundLen = int(n[0])
-	default:
-		return fail(errors.New("invalid SOCKS5 bound address type"))
-	}
-	if _, err := io.CopyN(io.Discard, conn, int64(boundLen+2)); err != nil {
-		return fail(fmt.Errorf("read SOCKS5 bound address: %w", err))
-	}
-	_ = conn.SetDeadline(time.Time{})
-	return conn, nil
-}
-
 func runHub(cfg Config) error {
 	cfg = normalizeConfig(cfg)
 	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
 	if err != nil {
 		return fmt.Errorf("load hub certificate/key: %w; run setup again", err)
 	}
-	controlListen := cfg.ControlListen
-	if cfg.Transport == transportHysteria {
-		_, controlPort, splitErr := net.SplitHostPort(cfg.ControlListen)
-		if splitErr != nil {
-			return fmt.Errorf("parse Hysteria-only control port: %w", splitErr)
-		}
-		controlListen = net.JoinHostPort("127.0.0.1", controlPort)
-	}
-	control, err := net.Listen("tcp", controlListen)
+	control, err := net.Listen("tcp", cfg.ControlListen)
 	if err != nil {
-		return fmt.Errorf("listen control %s: %w", controlListen, err)
+		return fmt.Errorf("listen control %s: %w", cfg.ControlListen, err)
 	}
 	defer control.Close()
-	var sidecarCancel context.CancelFunc
-	if usesHysteria(cfg.Transport) {
-		if configErr := writeHysteriaServerConfig(cfg); configErr != nil {
-			if cfg.Transport == transportHysteria {
-				return fmt.Errorf("write Hysteria server config: %w", configErr)
-			}
-			log.Printf("WARNING: Hysteria config unavailable; adaptive mode will retain the four TCP paths: %v", configErr)
-		} else {
-			sidecarCancel, err = startHysteriaSidecar("server", hysteriaServerConfigPath)
-			if err != nil {
-				if cfg.Transport == transportHysteria {
-					return fmt.Errorf("start Hysteria QUIC/UDP server: %w", err)
-				}
-				log.Printf("WARNING: Hysteria QUIC/UDP is unavailable; adaptive mode will retain the four TCP paths: %v", err)
-			} else {
-				defer sidecarCancel()
-				udpAddr, _ := hysteriaUDPAddress(cfg.ControlListen)
-				log.Printf("Hysteria 2 QUIC/UDP listener enabled on %s; SOCKS ACL is restricted to the local ShahTunnel control port", udpAddr)
-			}
-		}
-	}
 	type listenerMap struct {
 		listener net.Listener
 		id       string
@@ -3239,30 +2466,6 @@ func runAgent(cfg Config) error {
 	if cfg.TunnelChannels < 1 || cfg.TunnelChannels > maxTunnelChannels {
 		return fmt.Errorf("tunnel_channels must be between 1 and %d", maxTunnelChannels)
 	}
-	if usesHysteria(cfg.Transport) {
-		if configErr := writeHysteriaClientConfig(cfg); configErr != nil {
-			if cfg.Transport == transportHysteria {
-				return fmt.Errorf("write Hysteria client config: %w", configErr)
-			}
-			log.Printf("WARNING: Hysteria client config unavailable; adaptive mode will retain the four TCP paths: %v", configErr)
-		} else {
-			sidecarCancel, startErr := startHysteriaSidecar("client", hysteriaClientConfigPath)
-			if startErr != nil {
-				if cfg.Transport == transportHysteria {
-					return fmt.Errorf("start Hysteria QUIC/UDP client: %w", startErr)
-				}
-				log.Printf("WARNING: Hysteria QUIC/UDP is unavailable; adaptive mode will retain the four TCP paths: %v", startErr)
-			} else {
-				defer sidecarCancel()
-				if !waitForTCPListener(hysteriaSOCKSListenFor(cfg), 3*time.Second) {
-					if cfg.Transport == transportHysteria {
-						return errors.New("Hysteria local SOCKS listener did not become ready")
-					}
-					log.Printf("WARNING: Hysteria local SOCKS listener did not become ready; adaptive mode will continue trying the TCP transports")
-				}
-			}
-		}
-	}
 	startMetricsReporter("agent")
 	log.Printf("starting %d independent authenticated tunnel lanes", cfg.TunnelChannels)
 	var workers sync.WaitGroup
@@ -3330,12 +2533,8 @@ func isAdaptiveTransport(mode string) bool {
 	}
 }
 
-func isAdaptiveAllTransport(mode string) bool {
-	return isAdaptiveTransport(mode) || mode == transportHysteria
-}
-
 func adaptiveTransportCandidates(preferred string) []string {
-	// Legacy adaptive mode intentionally retains the exact original four TCP paths.
+	// Order the implemented transports with the last successful path first.
 	all := []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1}
 	out := make([]string, 0, len(all))
 	if isAdaptiveTransport(preferred) {
@@ -3349,129 +2548,44 @@ func adaptiveTransportCandidates(preferred string) []string {
 	return out
 }
 
-func adaptiveTransportCandidatesForLane(preferred string, channel int) []string {
-	out := adaptiveTransportCandidates(preferred)
-	if isAdaptiveTransport(preferred) || len(out) < 2 {
-		return out
-	}
-	return rotateCandidates(out, channel)
-}
-
-func adaptiveAllTransportCandidates(preferred string) []string {
-	all := []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1, transportHysteria}
-	out := make([]string, 0, len(all))
-	if isAdaptiveAllTransport(preferred) {
-		out = append(out, preferred)
-	}
-	for _, mode := range all {
-		if mode != preferred {
-			out = append(out, mode)
-		}
-	}
-	return out
-}
-
-func adaptiveAllTransportCandidatesForLane(preferred string, channel int) []string {
-	out := adaptiveAllTransportCandidates(preferred)
-	if isAdaptiveAllTransport(preferred) || len(out) < 2 {
-		return out
-	}
-	return rotateCandidates(out, channel)
-}
-
-func rotateCandidates(candidates []string, channel int) []string {
-	if len(candidates) < 2 {
-		return candidates
-	}
-	start := 0
-	if channel > 0 {
-		start = (channel - 1) % len(candidates)
-	}
-	rotated := make([]string, 0, len(candidates))
-	rotated = append(rotated, candidates[start:]...)
-	rotated = append(rotated, candidates[:start]...)
-	return rotated
-}
-
-func markAdaptiveTransportFailed(mode string, now time.Time) {
-	if isAdaptiveAllTransport(mode) {
-		agentTransportCooldown.Store(mode, now.Add(adaptiveTransportCooldown).UnixNano())
-	}
-}
-
-func clearAdaptiveTransportFailure(mode string) { agentTransportCooldown.Delete(mode) }
-
-func adaptiveTransportCoolingDown(mode string, now time.Time) bool {
-	v, ok := agentTransportCooldown.Load(mode)
-	if !ok {
-		return false
-	}
-	until, ok := v.(int64)
-	if !ok {
-		agentTransportCooldown.Delete(mode)
-		return false
-	}
-	if now.UnixNano() >= until {
-		agentTransportCooldown.Delete(mode)
-		return false
-	}
-	return true
-}
-
-func filterCoolingAdaptiveCandidates(candidates []string, now time.Time) []string {
-	filtered := make([]string, 0, len(candidates))
-	for _, candidate := range candidates {
-		if !adaptiveTransportCoolingDown(candidate, now) {
-			filtered = append(filtered, candidate)
-		}
-	}
-	// Never deadlock the transport manager when every path is marked bad; after
-	// exhausting the cooldown list it probes all candidates again.
-	if len(filtered) == 0 {
-		return append([]string(nil), candidates...)
-	}
-	return filtered
-}
-
 func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 	mode := cfg.Transport
 	if mode == "" {
 		mode = transportAuto
 	}
-	if mode != transportAuto && mode != transportAdaptive && mode != transportAdaptiveAll {
+	if mode != transportAuto && mode != transportAdaptive {
 		return connectAndRunAgentWithTransport(cfg, pin, channel, mode)
 	}
 
-	preferred := ""
-	if mode == transportAdaptive || mode == transportAdaptiveAll {
+	preferred := transportTCP
+	if mode == transportAdaptive {
 		if v, ok := agentPreferredTransport.Load(channel); ok {
-			if saved, ok := v.(string); ok {
-				if (mode == transportAdaptive && isAdaptiveTransport(saved)) || (mode == transportAdaptiveAll && isAdaptiveAllTransport(saved)) {
-					preferred = saved
-				}
+			if saved, ok := v.(string); ok && isAdaptiveTransport(saved) {
+				preferred = saved
 			}
 		}
 	}
 	candidates := []string{transportTCP, transportWebSocket}
 	if mode == transportAdaptive {
-		candidates = adaptiveTransportCandidatesForLane(preferred, channel)
-	} else if mode == transportAdaptiveAll {
-		candidates = filterCoolingAdaptiveCandidates(adaptiveAllTransportCandidatesForLane(preferred, channel), time.Now())
+		candidates = adaptiveTransportCandidates(preferred)
 	}
 
+	// Every candidate is a real transport implementation in this build. A failed
+	// connect, handshake, or ended lane moves to the next candidate immediately.
+	// The outer worker's jittered backoff still applies after every candidate fails.
 	var lastErr error
 	for i, candidate := range candidates {
 		err := connectAndRunAgentWithTransport(cfg, pin, channel, candidate)
 		if err == nil {
-			clearAdaptiveTransportFailure(candidate)
 			return nil
-		}
-		if mode == transportAdaptiveAll {
-			markAdaptiveTransportFailed(candidate, time.Now())
 		}
 		lastErr = err
 		if i < len(candidates)-1 {
-			log.Printf("tunnel lane %d: %s failed or closed; trying %s", channel, candidate, candidates[i+1])
+			if mode == transportAdaptive {
+				log.Printf("tunnel lane %d: adaptive transport %s failed or closed; trying %s", channel, candidate, candidates[i+1])
+			} else {
+				log.Printf("tunnel lane %d: TCP/TLS attempt failed or closed; trying WebSocket/TLS fallback", channel)
+			}
 		}
 	}
 	if lastErr == nil {
@@ -3500,37 +2614,9 @@ func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode s
 	if mode == transportWebSocket {
 		tlsCfg.NextProtos = []string{"http/1.1"}
 	}
-	var rawConn net.Conn
-	var err error
-	if mode == transportHysteria {
-		_, hubPort, splitErr := net.SplitHostPort(cfg.HubAddr)
-		if splitErr != nil {
-			return fmt.Errorf("parse Hub control port for Hysteria SOCKS route: %w", splitErr)
-		}
-		target := net.JoinHostPort("127.0.0.1", hubPort)
-		ctx, cancel := context.WithTimeout(context.Background(), 9*time.Second)
-		defer cancel()
-		rawConn, err = dialSOCKS5(ctx, hysteriaSOCKSListenFor(cfg), target)
-		if err != nil {
-			return fmt.Errorf("Hysteria QUIC/UDP SOCKS path: %w", err)
-		}
-		tlsConn := tls.Client(rawConn, tlsCfg)
-		if err = tlsConn.HandshakeContext(ctx); err != nil {
-			_ = rawConn.Close()
-			return fmt.Errorf("TLS inside Hysteria path: %w", err)
-		}
-		rawConn = tlsConn
-	} else {
-		tlsConn, dialErr := tls.DialWithDialer(&d, "tcp", cfg.HubAddr, tlsCfg)
-		if dialErr != nil {
-			return dialErr
-		}
-		rawConn = tlsConn
-	}
-	tlsConn, ok := rawConn.(*tls.Conn)
-	if !ok {
-		_ = rawConn.Close()
-		return errors.New("internal TLS transport setup failed")
+	tlsConn, err := tls.DialWithDialer(&d, "tcp", cfg.HubAddr, tlsCfg)
+	if err != nil {
+		return err
 	}
 	var c net.Conn = tlsConn
 	if mode == transportWebSocket {
@@ -3562,11 +2648,8 @@ func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode s
 	_ = c.SetDeadline(time.Time{})
 	adjustAgentChannels(1)
 	defer adjustAgentChannels(-1)
-	if cfg.Transport == transportAdaptive || cfg.Transport == transportAdaptiveAll {
+	if cfg.Transport == transportAdaptive {
 		agentPreferredTransport.Store(channel, mode)
-	}
-	if cfg.Transport == transportAdaptiveAll {
-		clearAdaptiveTransportFailure(mode)
 	}
 	log.Printf("tunnel lane %d/%d connected via %s; forwarding through %d configured port mapping(s)", channel, cfg.TunnelChannels, mode, len(normalizeConfig(cfg).Ports))
 	targets := make(map[string]string, len(cfg.Ports))
@@ -3587,9 +2670,6 @@ func normalizeConfig(c Config) Config {
 	}
 	// Upgrade existing Agent profiles to the current independent-lane performance profile.
 	// Each lane reconnects independently; no Hub-side config change is required.
-	if c.Role == "agent" && usesHysteria(c.Transport) && strings.TrimSpace(c.HysteriaSOCKSListen) == "" {
-		c.HysteriaSOCKSListen = defaultHysteriaSOCKSListen
-	}
 	if c.Role == "agent" && c.TunnelChannels < defaultTunnelChannels {
 		c.TunnelChannels = defaultTunnelChannels
 	}
@@ -3640,7 +2720,7 @@ func validateConfig(c Config) error {
 		return errors.New("role must be hub, agent, or relay")
 	}
 	if (c.Role == "hub" || c.Role == "agent") && !validTransportMode(c.Transport) {
-		return fmt.Errorf("unsupported transport %q (supported: auto, adaptive, adaptive_all, hysteria2_quic, tcp_tls, websocket_tls, http2_connect, http1_connect, http_connect_auto)", c.Transport)
+		return fmt.Errorf("unsupported transport %q (supported: auto, adaptive, tcp_tls, websocket_tls, http2_connect, http1_connect, http_connect_auto)", c.Transport)
 	}
 	if c.Role == "agent" && (c.TunnelChannels < 1 || c.TunnelChannels > maxTunnelChannels) {
 		return fmt.Errorf("tunnel_channels must be between 1 and %d", maxTunnelChannels)
@@ -3658,14 +2738,6 @@ func validateConfig(c Config) error {
 		}
 		if c.CertFile == "" || c.KeyFile == "" {
 			return errors.New("cert_file/key_file required for hub")
-		}
-		if usesHysteria(c.Transport) {
-			if _, err := hysteriaUDPAddress(c.ControlListen); err != nil {
-				return fmt.Errorf("Hysteria QUIC/UDP port: %w", err)
-			}
-			if !validHysteriaSecret(c.HysteriaAuth) || !validHysteriaSecret(c.HysteriaObfs) {
-				return errors.New("Hysteria and Salamander passwords must each be a valid 32-byte Base32 or legacy hexadecimal value; rerun setup")
-			}
 		}
 		if transportModeAllowsHTTP2(c.Transport) {
 			if _, err := adjacentPortAddress(c.ControlListen); err != nil {
@@ -3714,17 +2786,6 @@ func validateConfig(c Config) error {
 			addrs[p.Listen] = true
 		}
 	} else if c.Role == "agent" {
-		if usesHysteria(c.Transport) {
-			listen := hysteriaSOCKSListenFor(c)
-			if err := validateTCPAddress("local Hysteria SOCKS listener", listen); err != nil {
-				return err
-			}
-			host, _, _ := net.SplitHostPort(listen)
-			ip := net.ParseIP(host)
-			if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
-				return errors.New("local Hysteria SOCKS listener must bind only to localhost or a loopback IP (127.0.0.1 / ::1)")
-			}
-		}
 		if err := validateTCPAddress("hub address", c.HubAddr); err != nil {
 			return err
 		}
@@ -3745,14 +2806,6 @@ func validateConfig(c Config) error {
 		}
 		if _, err := normalizeFingerprint(c.Fingerprint); err != nil {
 			return err
-		}
-		if usesHysteria(c.Transport) {
-			if _, err := hysteriaUDPAddress(c.HubAddr); err != nil {
-				return fmt.Errorf("Hysteria QUIC/UDP endpoint: %w", err)
-			}
-			if !validHysteriaSecret(c.HysteriaAuth) || !validHysteriaSecret(c.HysteriaObfs) {
-				return errors.New("Hysteria and Salamander passwords must each be valid 32-byte Base32 or legacy hexadecimal values; use the credentials displayed by the Hub")
-			}
 		}
 	} else {
 		for _, p := range c.Ports {
@@ -3807,20 +2860,11 @@ func validMappingID(s string) bool {
 func normalizeFingerprint(s string) ([]byte, error) {
 	s = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "sha256:"))
 	s = strings.ReplaceAll(s, ":", "")
-	if b, err := hex.DecodeString(s); err == nil && len(b) == sha256.Size {
-		return b, nil
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != sha256.Size {
+		return nil, errors.New("fingerprint must be SHA-256 hex (64 hex chars, colons optional)")
 	}
-	// Accept the 52-character Base32 form used by an intermediate mobile
-	// build, as well as older Base64URL and canonical hexadecimal pins.
-	if len(s) == 52 {
-		if b, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(s); err == nil && len(b) == sha256.Size {
-			return b, nil
-		}
-	}
-	if b, err := base64.RawURLEncoding.DecodeString(s); err == nil && len(b) == sha256.Size {
-		return b, nil
-	}
-	return nil, errors.New("fingerprint must be SHA-256 hex (64 chars), Base64URL (43 chars), or Base32 (52 chars)")
+	return b, nil
 }
 func loadConfig() (Config, error) {
 	b, err := os.ReadFile(configPath)
@@ -3889,12 +2933,12 @@ var wizardStep int
 
 const (
 	ansiReset    = "\033[0m"
-	ansiCyan     = "\033[38;2;82;220;255m"
-	ansiBlue     = "\033[38;2;92;151;255m"
-	ansiPurple   = "\033[38;2;181;112;255m"
-	ansiGreen    = "\033[38;2;79;231;194m"
-	ansiYellow   = "\033[38;2;255;214;128m"
-	ansiRed      = "\033[38;2;255;105;145m"
+	ansiCyan     = "\033[36m"
+	ansiBlue     = "\033[34m"
+	ansiPurple   = "\033[35m"
+	ansiGreen    = "\033[32m"
+	ansiYellow   = "\033[33m"
+	ansiRed      = "\033[31m"
 	ansiPinkGlow = "\033[1;38;2;255;92;200m"
 	ansiBold     = "\033[1m"
 	ansiDim      = "\033[2m"
@@ -3972,67 +3016,29 @@ func logoLuminance(rgb uint32) int {
 	return (299*r + 587*g + 114*b) / 1000
 }
 
-// drawShahTunnelLogo paints the embedded 22x22 logo as 11 terminal rows and
-// pairs it with a compact cosmic wordmark. It uses true-color half blocks and
-// degrades to a simple star-mark when color is disabled.
-func drawShahTunnelLogo() {
-	if os.Getenv("NO_COLOR") != "" || strings.EqualFold(os.Getenv("TERM"), "dumb") {
-		fmt.Println(paint(ansiPurple+ansiBold, "  ✦  SHAH TUNNEL  ✧  SECURE GALACTIC RELAY  ✦"))
-		return
-	}
-	taglines := map[int]string{
-		0: "✦  SHAH TUNNEL",
-		1: "GALACTIC SECURE RELAY",
-		2: "TLS 1.3  •  ZERO TRUST",
-		3: "5-PATH ADAPTIVE CORE",
-		4: "ISOLATED MULTI-TUNNEL",
-		5: "✧  ENCRYPTED TRANSIT  ✦",
-	}
-	for y := 0; y < len(shahTunnelLogoPixels); y += 2 {
-		upper := shahTunnelLogoPixels[y]
-		lower := upper
-		if y+1 < len(shahTunnelLogoPixels) {
-			lower = shahTunnelLogoPixels[y+1]
-		}
-		fmt.Print("  ")
-		for x := 0; x < len(upper) && x < len(lower); x++ {
-			top := shahTunnelLogoPalette[logoPixelIndex(upper[x])]
-			bottom := shahTunnelLogoPalette[logoPixelIndex(lower[x])]
-			tr, tg, tb := (top>>16)&0xff, (top>>8)&0xff, top&0xff
-			br, bg, bb := (bottom>>16)&0xff, (bottom>>8)&0xff, bottom&0xff
-			fmt.Printf("\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm▀", tr, tg, tb, br, bg, bb)
-		}
-		fmt.Print(ansiReset)
-		if label, ok := taglines[y/2]; ok {
-			color := ansiCyan + ansiBold
-			if y == 0 {
-				color = ansiPurple + ansiBold
-			}
-			if y >= 8 {
-				color = ansiPinkGlow + ansiBold
-			}
-			fmt.Print("   " + paint(color, label))
-		}
-		fmt.Println()
-	}
-	fmt.Println(paint(ansiPurple+ansiBold, "  ·  ✦  ·  NEBULA NETWORK  /  PRIVATE TRANSIT  ·  ✦  ·"))
-}
+// drawShahTunnelLogo is intentionally disabled to keep the terminal menu compact.
+func drawShahTunnelLogo() {}
 
 func uiRule() {
-	segments := []string{ansiPinkGlow, ansiPurple, ansiBlue, ansiCyan, ansiBlue, ansiPurple, ansiPinkGlow}
-	fmt.Print("  ")
-	for i := 0; i < 62; i++ {
-		fmt.Print(paint(segments[i%len(segments)], "─"))
-	}
-	fmt.Println()
+	fmt.Println(paint(ansiPinkGlow, "  ──────────────────────────────────────────────────────────────"))
 }
 
 // shahTunnelHeaderArt keeps the requested banner's spacing stable; do not
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
+	"        +------------------------------------------+",
+	"        |               SHAH TUNNEL                |",
+	"        |          SECURE RELAY / TLS 1.3          |",
+	"        +==========================================+",
+	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
+	"        |      ENCRYPTED TRANSIT / TOKEN AUTH      |",
+	"        |       EDGE > SECURE RELAY > TARGET       |",
+	"        |     ZERO TRUST / MULTI-LANE / ONLINE     |",
+	"        |     SESSION: ACTIVE / PRIVATE ROUTE      |",
+	"        +------------------------------------------+",
 	"  ╔══════════════════════════════════════════════════════════════╗",
 	"  ║                         COMMAND DECK                         ║",
-	"  ║       NEBULA ROUTING   •   TLS 1.3   •   ZERO TRUST          ║",
+	"  ║       SECURE RELAY   •   TLS 1.3   •   ZERO TRUST            ║",
 	"  ╚══════════════════════════════════════════════════════════════╝",
 }
 
@@ -4049,9 +3055,9 @@ var shahTunnelRouteArt = func() []string {
 		"  ╭" + strings.Repeat("─", shahTunnelRouteWidth) + "╮",
 		line("NETWORK ROUTE  /  TCP FORWARDING"),
 		line("CLIENT ── TCP ──▶ HUB ═ TLS 1.3 + TOKEN AUTH ═▶ AGENT"),
-		line("PATHS: TCP/TLS | WS/TLS | H2 | H1 | HYSTERIA 2 QUIC/UDP"),
-		line("OPTION 8: 5-PATH ADAPTIVE • OPTION 7: QUIC/UDP ONLY"),
-		line("5s HEARTBEAT • 20s DEAD-PATH DETECTION • TLS 1.3"),
+		line("PATHS: TCP/TLS | WS/TLS | H2 CONNECT | H1 CONNECT"),
+		line("OPTION 7: ADAPTIVE FAILOVER ACROSS 4 PATHS"),
+		line("CERT PINNING • TOKEN AUTH • TLS 1.3"),
 		"  ╰" + strings.Repeat("─", shahTunnelRouteWidth) + "╯",
 	}
 }()
@@ -4074,7 +3080,7 @@ func uiRouteDiagram() {
 // paintNeonHeaderLine renders box borders in the same bright pink as the
 // Command Deck frame while keeping the text inside each box independently colored.
 func paintNeonHeaderLine(index int, line, contentColor string) string {
-	if index == 0 || index == len(shahTunnelHeaderArt)-1 {
+	if index == 0 || index == 3 || index == 9 || index == 10 || index == 13 {
 		return paint(ansiPinkGlow, line)
 	}
 	runes := []rune(line)
@@ -4117,18 +3123,36 @@ func paintNeonRouteLine(index int, line, contentColor string) string {
 }
 
 func uiHeader(_, _ string) {
-	// The large bitmap/ANSI logo is reserved for documentation and image assets.
-	// Do not render it in SSH terminals; keep the compact route diagram and menu frame.
 	fmt.Println()
-	uiRouteDiagram()
+	drawShahTunnelLogo()
 	fmt.Println()
 	for i, line := range shahTunnelHeaderArt {
+		if i == 10 {
+			fmt.Println()
+			uiRouteDiagram()
+			fmt.Println()
+		}
+		// Report the actual service state in the brand banner instead of always
+		// claiming that a private session is active.
+		if i == 8 {
+			if tunnelIsActive() {
+				line = "        |     SESSION: ACTIVE / PRIVATE ROUTE      |"
+			} else {
+				line = "        |   SESSION: STANDBY / SETUP REQUIRED      |"
+			}
+		}
 		color := ansiDim
 		switch i {
-		case 1:
+		case 0, 3, 9:
+			color = ansiCyan + ansiBold
+		case 1, 4, 6, 11:
+			color = ansiCyan + ansiBold
+		case 10, 13:
 			color = ansiPurple + ansiBold
-		case 2:
+		case 12:
 			color = ansiGreen + ansiBold
+		case 2, 5, 7, 8:
+			color = ansiDim
 		}
 		fmt.Println(paintNeonHeaderLine(i, line, color))
 	}
@@ -4183,9 +3207,8 @@ func wizardAskTransport(prompt string) (string, error) {
 	fmt.Printf("  %s\n", paint(ansiGreen, "4) HTTP/1.1 CONNECT/TLS — implemented on control port + 2"))
 	fmt.Printf("  %s\n", paint(ansiGreen, "5) HTTP CONNECT fallback — HTTP/2, then HTTP/1.1"))
 	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
-	fmt.Printf("  %s\n", paint(ansiGreen, "7) Hysteria 2 / QUIC / UDP + Salamander — independent UDP path"))
-	fmt.Printf("  %s\n", paint(ansiPinkGlow, "8) FULL ADAPTIVE FAILOVER — all 4 TCP transports + Hysteria UDP"))
-	choice := wizardAsk(prompt+" (1-8)", "8")
+	fmt.Printf("  %s\n", paint(ansiPinkGlow, "7) FULL ADAPTIVE FAILOVER — all 4 implemented transports"))
+	choice := wizardAsk(prompt+" (1-7)", "7")
 	switch choice {
 	case "1":
 		return transportTCP, nil
@@ -4200,11 +3223,9 @@ func wizardAskTransport(prompt string) (string, error) {
 	case "6":
 		return transportAuto, nil
 	case "7":
-		return transportHysteria, nil
-	case "8":
-		return transportAdaptiveAll, nil
+		return transportAdaptive, nil
 	default:
-		return "", errors.New("invalid transport selection; enter a number from 1 to 8")
+		return "", errors.New("invalid transport selection; enter a number from 1 to 7")
 	}
 }
 
@@ -4291,135 +3312,14 @@ func generateCertificate(certPath, keyPath string) (string, error) {
 	sum := sha256.Sum256(der)
 	return hex.EncodeToString(sum[:]), nil
 }
-
-type profileBindEndpoint struct{ network, address string }
-
-func bindEndpointsForConfig(c Config) []profileBindEndpoint {
-	var out []profileBindEndpoint
-	add := func(network, address string) {
-		if strings.TrimSpace(address) != "" {
-			out = append(out, profileBindEndpoint{network, address})
-		}
-	}
-	switch c.Role {
-	case "hub":
-		if c.Transport == transportHysteria {
-			_, port, err := net.SplitHostPort(c.ControlListen)
-			if err == nil {
-				add("tcp", net.JoinHostPort("127.0.0.1", port))
-			}
-		} else {
-			add("tcp", c.ControlListen)
-			if transportModeAllowsHTTP2(c.Transport) {
-				if a, err := offsetPortAddress(c.ControlListen, 1); err == nil {
-					add("tcp", a)
-				}
-			}
-			if transportModeAllowsHTTP1(c.Transport) {
-				if a, err := offsetPortAddress(c.ControlListen, 2); err == nil {
-					add("tcp", a)
-				}
-			}
-		}
-		if usesHysteria(c.Transport) {
-			if a, err := hysteriaUDPAddress(c.ControlListen); err == nil {
-				add("udp", a)
-			}
-		}
-		for _, mapping := range c.Ports {
-			add("tcp", mapping.Listen)
-		}
-	case "agent":
-		if usesHysteria(c.Transport) {
-			add("tcp", hysteriaSOCKSListenFor(c))
-		}
-	case "relay":
-		for _, mapping := range c.Ports {
-			add("tcp", mapping.Listen)
-		}
-	}
-	return out
-}
-
-func endpointHostsOverlap(a, b string) bool {
-	ha, pa, ea := net.SplitHostPort(a)
-	hb, pb, eb := net.SplitHostPort(b)
-	if ea != nil || eb != nil || pa != pb {
-		return false
-	}
-	if strings.EqualFold(ha, hb) || ha == "" || hb == "" {
-		return true
-	}
-	ipa, ipb := net.ParseIP(ha), net.ParseIP(hb)
-	if ipa == nil || ipb == nil {
-		return true
-	} // conservative for hostnames which may resolve to the same interface
-	return ipa.IsUnspecified() || ipb.IsUnspecified() || ipa.Equal(ipb)
-}
-
-func validateNoCrossProfilePortConflicts(candidate Config, candidateName string) error {
-	candidate = normalizeConfig(candidate)
-	profiles, err := listTunnelProfiles()
-	if err != nil {
-		return fmt.Errorf("check existing tunnel profiles: %w", err)
-	}
-	for _, name := range profiles {
-		if name == candidateName {
-			continue
-		}
-		b, readErr := os.ReadFile(configPathForProfile(name))
-		if readErr != nil {
-			return fmt.Errorf("read existing profile %q while checking ports: %w", name, readErr)
-		}
-		var other Config
-		if err := json.Unmarshal(b, &other); err != nil {
-			return fmt.Errorf("existing profile %q has invalid configuration: %w", name, err)
-		}
-		other = normalizeConfig(other)
-		for _, a := range bindEndpointsForConfig(candidate) {
-			for _, b := range bindEndpointsForConfig(other) {
-				if a.network == b.network && endpointHostsOverlap(a.address, b.address) {
-					return fmt.Errorf("port conflict: new tunnel %q needs %s %s, already used by tunnel %q; choose another port", candidateName, strings.ToUpper(a.network), a.address, name)
-				}
-			}
-		}
-	}
-	return nil
-}
-
 func setup() error {
 	wizardStep = 0
 	uiHeader("SHAH TUNNEL // SPACE SETUP", "WIZARD   •   SECURE LINK   •   TRANSPORT ROUTING")
-	uiInfo("Each tunnel is saved under its own name. Existing tunnels are never overwritten by creating a new one.")
-	profiles, listErr := listTunnelProfiles()
-	if listErr != nil {
-		return fmt.Errorf("list existing tunnel profiles: %w", listErr)
-	}
-	suggestedName := "default"
-	if len(profiles) > 0 {
-		suggestedName = "tunnel" + strconv.Itoa(len(profiles)+1)
-	}
-	profileName := strings.TrimSpace(wizardAsk("New tunnel name (letters, numbers, - or _)", suggestedName))
-	if !validTunnelProfileName(profileName) {
-		return errors.New("invalid tunnel name; use 1-32 letters, numbers, hyphen or underscore")
-	}
-	for _, existing := range profiles {
-		if existing == profileName {
-			return fmt.Errorf("tunnel %q already exists; choose a new name or delete only that tunnel first", profileName)
+	uiInfo("Step-by-step setup. Each step asks for one input.")
+	if _, err := os.Stat(configPath); err == nil {
+		if !wizardYesNo("Overwrite the existing configuration? (y/N)", "n") {
+			return errors.New("Setup cancelled; the existing configuration was preserved")
 		}
-	}
-	if profileName != "default" {
-		if st, statErr := os.Lstat(profileDirFor(profileName)); statErr == nil {
-			if st.Mode()&os.ModeSymlink != 0 {
-				return errors.New("tunnel profile path is a symbolic link; refusing to write through it")
-			}
-			return fmt.Errorf("tunnel profile directory %q already exists without a registered configuration; inspect it before reusing the name", profileName)
-		} else if !errors.Is(statErr, os.ErrNotExist) {
-			return fmt.Errorf("inspect tunnel profile directory: %w", statErr)
-		}
-	}
-	if err := setActiveProfile(profileName); err != nil {
-		return err
 	}
 
 	uiRule()
@@ -4428,7 +3328,7 @@ func setup() error {
 	fmt.Printf("  %s %s\n", paint(ansiGreen+ansiBold, "2"), "🔗 AGENT   | OUTSIDE — connects securely to Iran and forwards traffic to local services")
 	fmt.Printf("  %s %s\n", paint(ansiGreen+ansiBold, "3"), "🌐 RELAY   | THIRD SERVER — public entry point that forwards TCP traffic")
 	role := wizardAsk("Select role (1/2/3)", "")
-	tok, err := randomAgentToken()
+	tok, err := randomHex(32)
 	if err != nil {
 		return err
 	}
@@ -4441,24 +3341,8 @@ func setup() error {
 		if err != nil {
 			return err
 		}
-		if usesHysteria(c.Transport) {
-			c.HysteriaAuth, err = randomHysteriaSecret()
-			if err != nil {
-				return err
-			}
-			c.HysteriaObfs, err = randomHysteriaSecret()
-			if err != nil {
-				return err
-			}
-		}
-		if c.Transport == transportHysteria {
-			uiInfo("Hysteria-only mode: expose UDP control+3. The inner TCP control listener is bound to 127.0.0.1 and is not exposed publicly.")
-		} else if c.Transport == transportAdaptiveAll {
-			uiInfo("Adaptive-all needs TCP control, TCP control+1, TCP control+2, and UDP control+3. Keep the same policy and Hysteria credentials on both endpoints.")
-		} else {
-			uiInfo("Open the TCP control port and only the extra TCP ports required by the selected transport.")
-		}
-		c.CertFile, c.KeyFile = filepath.Join(profileDirFor(activeProfileName), "hub.crt"), filepath.Join(profileDirFor(activeProfileName), "hub.key")
+		uiInfo("Allow TCP on the control port, control+1 for HTTP/2 CONNECT, and control+2 for HTTP/1.1 CONNECT as selected. Select the same transport policy on both endpoints.")
+		c.CertFile, c.KeyFile = "/etc/ravanreverse/hub.crt", "/etc/ravanreverse/hub.key"
 		for i := 1; i <= 100; i++ {
 			defID := "main"
 			if i > 1 {
@@ -4481,9 +3365,6 @@ func setup() error {
 		if err = validateConfig(c); err != nil {
 			return err
 		}
-		if err = validateNoCrossProfilePortConflicts(c, activeProfileName); err != nil {
-			return err
-		}
 		fp, e := generateCertificate(c.CertFile, c.KeyFile)
 		if e != nil {
 			return e
@@ -4496,26 +3377,17 @@ func setup() error {
 		uiCard("✅ HUB CONFIGURED", []uiCardRow{
 			{Text: "Configuration saved successfully.", Color: ansiGreen},
 		}, ansiGreen+ansiBold)
-		fingerprintDisplay, fpErr := compactFingerprint(c.Fingerprint)
-		if fpErr != nil {
-			return fmt.Errorf("prepare Agent fingerprint display: %w", fpErr)
-		}
-		printAgentCredentials(c.Token, fingerprintDisplay, c.HysteriaAuth, c.HysteriaObfs)
-		controlRows := []uiCardRow{}
-		if c.Transport == transportHysteria {
-			controlRows = append(controlRows, uiCardRow{Text: "Local-only TCP control: 127.0.0.1:" + portOf(c.ControlListen), Color: ansiDim})
-		} else {
-			controlRows = append(controlRows,
-				uiCardRow{Text: "TCP/TLS + WebSocket/TLS: " + portOf(c.ControlListen) + " (TCP)", Color: ansiPurple + ansiBold},
-				uiCardRow{Text: "HTTP/2 CONNECT: " + nextPortLabel(c.ControlListen) + " (TCP)", Color: ansiBlue + ansiBold},
-				uiCardRow{Text: "HTTP/1.1 CONNECT: " + secondNextPortLabel(c.ControlListen) + " (TCP)", Color: ansiBlue + ansiBold},
-			)
-		}
-		if usesHysteria(c.Transport) {
-			udpAddr, _ := hysteriaUDPAddress(c.ControlListen)
-			controlRows = append(controlRows, uiCardRow{Text: "Hysteria 2 QUIC: " + portOf(udpAddr) + " (UDP)", Color: ansiGreen + ansiBold})
-		}
-		uiCard("🔌 CONTROL PORTS", controlRows, ansiPinkGlow)
+		uiCard("🔐 AGENT TOKEN", []uiCardRow{
+			{Text: c.Token, Color: ansiYellow + ansiBold},
+		}, ansiYellow)
+		uiCard("🛡️ CERTIFICATE SHA-256 FINGERPRINT", []uiCardRow{
+			{Text: c.Fingerprint, Color: ansiCyan + ansiBold},
+		}, ansiCyan)
+		uiCard("🔌 CONTROL PORTS", []uiCardRow{
+			{Text: "TCP/TLS + WebSocket/TLS: " + portOf(c.ControlListen), Color: ansiPurple + ansiBold},
+			{Text: "HTTP/2 CONNECT: " + nextPortLabel(c.ControlListen) + " (TCP)", Color: ansiBlue + ansiBold},
+			{Text: "HTTP/1.1 CONNECT: " + secondNextPortLabel(c.ControlListen) + " (TCP)", Color: ansiBlue + ansiBold},
+		}, ansiPinkGlow)
 		mappingRows := make([]uiCardRow, 0, len(c.Ports))
 		for _, p := range c.Ports {
 			mappingRows = append(mappingRows, uiCardRow{Text: fmt.Sprintf("ID=%s   LISTEN=%s", p.ID, p.Listen), Color: ansiCyan})
@@ -4542,16 +3414,6 @@ func setup() error {
 		c.TLSServerName = wizardAsk("Optional TLS SNI hostname on a domain you control (leave blank to derive from Hub hostname)", "")
 		c.Token = wizardAsk("Token shown on the Iran Hub", "")
 		c.Fingerprint = wizardAsk("Hub certificate SHA-256 fingerprint", "")
-		if usesHysteria(c.Transport) {
-			c.HysteriaSOCKSListen, err = allocateHysteriaSOCKSListen()
-			if err != nil {
-				return fmt.Errorf("allocate isolated Hysteria SOCKS listener: %w", err)
-			}
-			c.HysteriaAuth = wizardAsk("Hysteria password shown on the Hub", "")
-			c.HysteriaObfs = wizardAsk("Hysteria Salamander password shown on the Hub", "")
-			udpAddr, _ := hysteriaUDPAddress(c.HubAddr)
-			uiInfo("Hysteria 2 uses QUIC over UDP port " + portOf(udpAddr) + "; allow that UDP port on the Hub firewall.")
-		}
 		for i := 1; i <= 100; i++ {
 			defID := "main"
 			if i > 1 {
@@ -4572,19 +3434,13 @@ func setup() error {
 			}
 		}
 		c = normalizeConfig(c)
-		if err = validateConfig(c); err != nil {
-			return err
-		}
-		if err = validateNoCrossProfilePortConflicts(c, activeProfileName); err != nil {
-			return err
-		}
 		if err = saveConfig(c); err != nil {
 			return err
 		}
-		_ = os.Remove(filepath.Join(profileDirFor(activeProfileName), "hub.key"))
-		_ = os.Remove(filepath.Join(profileDirFor(activeProfileName), "hub.crt"))
-		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s.", c.TunnelChannels, c.Transport))
-		uiSuccess("Agent configuration saved. Adaptive-all spreads lanes across the enabled TCP and QUIC/UDP paths; failed lanes reconnect and try the remaining transports.")
+		_ = os.Remove("/etc/ravanreverse/hub.key")
+		_ = os.Remove("/etc/ravanreverse/hub.crt")
+		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s. Option 7 covers TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT, and HTTP/1.1 CONNECT.", c.TunnelChannels, c.Transport))
+		uiSuccess("Agent configuration saved. Reconnection is automatic if a lane drops.")
 	case "3", "relay", "front":
 		c.Role = "relay"
 		c.Token = "relay-mode-not-used-" + tok
@@ -4606,17 +3462,11 @@ func setup() error {
 			}
 		}
 		c = normalizeConfig(c)
-		if err = validateConfig(c); err != nil {
-			return err
-		}
-		if err = validateNoCrossProfilePortConflicts(c, activeProfileName); err != nil {
-			return err
-		}
 		if err = saveConfig(c); err != nil {
 			return err
 		}
-		_ = os.Remove(filepath.Join(profileDirFor(activeProfileName), "hub.key"))
-		_ = os.Remove(filepath.Join(profileDirFor(activeProfileName), "hub.crt"))
+		_ = os.Remove("/etc/ravanreverse/hub.key")
+		_ = os.Remove("/etc/ravanreverse/hub.crt")
 		uiSuccess("Relay configured.")
 		uiWarn("Relay changes the client entry point only. The Relay operator and network path may still see the Iran destination IP.")
 	default:
@@ -4659,7 +3509,7 @@ func runSystemctl(args ...string) error {
 	return err
 }
 func tunnelIsActive() bool {
-	return exec.Command("systemctl", "is-active", "--quiet", activeServiceName()).Run() == nil
+	return exec.Command("systemctl", "is-active", "--quiet", "ravanreverse").Run() == nil
 }
 
 // ensureTunnelRunning enables boot-time startup and verifies the service really became active.
@@ -4668,24 +3518,23 @@ func ensureTunnelRunning(restartActive bool) error {
 	if !isRoot() {
 		return errors.New("run as root")
 	}
-	if !activeServiceUnitAvailable() {
-		return errors.New("Shah Tunnel service unit is not installed; rerun the installer")
+	if _, err := os.Stat("/etc/systemd/system/ravanreverse.service"); err != nil {
+		return errors.New("Shah Tunnel is not installed; run the installer first")
 	}
-	unit := activeServiceName()
-	if err := runSystemctl("enable", unit); err != nil {
+	if err := runSystemctl("enable", "ravanreverse"); err != nil {
 		return fmt.Errorf("could not enable automatic startup: %w", err)
 	}
 	var err error
 	if tunnelIsActive() {
 		if restartActive {
-			err = runSystemctl("restart", unit)
+			err = runSystemctl("restart", "ravanreverse")
 		} else {
 			fmt.Println("Shah Tunnel is already running.")
 		}
 	} else {
 		// Clear a previous failed/start-limit state so a manual start can recover.
-		_ = exec.Command("systemctl", "reset-failed", unit).Run()
-		err = runSystemctl("start", unit)
+		_ = exec.Command("systemctl", "reset-failed", "ravanreverse").Run()
+		err = runSystemctl("start", "ravanreverse")
 	}
 	if err != nil || !tunnelIsActive() {
 		showRecentLogs(40)
@@ -4699,7 +3548,7 @@ func ensureTunnelRunning(restartActive bool) error {
 }
 
 func showRecentLogs(n int) {
-	out, err := exec.Command("journalctl", "-u", activeServiceName(), "-n", strconv.Itoa(n), "--no-pager", "-o", "short-iso").CombinedOutput()
+	out, err := exec.Command("journalctl", "-u", "ravanreverse", "-n", strconv.Itoa(n), "--no-pager", "-o", "short-iso").CombinedOutput()
 	if len(out) > 0 {
 		fmt.Print(string(out))
 	}
@@ -4709,10 +3558,10 @@ func showRecentLogs(n int) {
 }
 
 func showStatusAndLogs() error {
-	if !activeServiceUnitAvailable() {
-		return errors.New("Shah Tunnel service unit is not installed")
+	if _, err := os.Stat("/etc/systemd/system/ravanreverse.service"); err != nil {
+		return errors.New("Shah Tunnel is not installed")
 	}
-	out, err := exec.Command("systemctl", "status", activeServiceName(), "--no-pager", "-l").CombinedOutput()
+	out, err := exec.Command("systemctl", "status", "ravanreverse", "--no-pager", "-l").CombinedOutput()
 	if len(out) > 0 {
 		fmt.Print(string(out))
 	}
@@ -4724,22 +3573,13 @@ func showStatusAndLogs() error {
 	return nil
 }
 
-type restartPaths struct{ dir, config, state, cron, script string }
-
-func currentRestartPaths() restartPaths {
-	if activeProfileName == "" || activeProfileName == "default" {
-		// Preserve the original single-profile scheduler paths across upgrades.
-		return restartPaths{dir: "/etc/shah-tunnel", config: "/etc/shah-tunnel/restart.conf", state: "/var/lib/shah-tunnel/last-restart", cron: "/etc/cron.d/shah-tunnel-restart", script: "/usr/local/sbin/shah-tunnel-restart-check"}
-	}
-	suffix := activeProfileName
-	return restartPaths{
-		dir:    filepath.Join("/etc/shah-tunnel", suffix),
-		config: filepath.Join("/etc/shah-tunnel", suffix, "restart.conf"),
-		state:  filepath.Join("/var/lib/shah-tunnel", suffix, "last-restart"),
-		cron:   filepath.Join("/etc/cron.d", "shah-tunnel-restart-"+suffix),
-		script: filepath.Join("/usr/local/sbin", "shah-tunnel-restart-check-"+suffix),
-	}
-}
+const (
+	restartScheduleDir    = "/etc/shah-tunnel"
+	restartScheduleConfig = "/etc/shah-tunnel/restart.conf"
+	restartScheduleState  = "/var/lib/shah-tunnel/last-restart"
+	restartCronFile       = "/etc/cron.d/shah-tunnel-restart"
+	restartCronScript     = "/usr/local/sbin/shah-tunnel-restart-check"
+)
 
 type restartInterval struct {
 	label   string
@@ -4754,12 +3594,12 @@ var restartIntervals = []restartInterval{
 	{label: "10 hours", seconds: int64(10 * time.Hour / time.Second)},
 }
 
-const restartCronScriptBodyPrefix = `#!/usr/bin/env bash
+const restartCronScriptBody = `#!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-CONFIG="__SHAH_TUNNEL_CONFIG__"
-STATE="__SHAH_TUNNEL_STATE__"
-LOCK="__SHAH_TUNNEL_LOCK__"
+CONFIG="/etc/shah-tunnel/restart.conf"
+STATE="/var/lib/shah-tunnel/last-restart"
+LOCK="/run/lock/shah-tunnel-restart.lock"
 [[ -r "$CONFIG" ]] || exit 0
 IFS= read -r INTERVAL < "$CONFIG" || exit 0
 [[ "$INTERVAL" =~ ^[0-9]+$ ]] || exit 0
@@ -4779,7 +3619,7 @@ if [[ ! "$LAST" =~ ^[0-9]+$ ]] || (( NOW < LAST )); then
   exit 0
 fi
 (( NOW - LAST >= INTERVAL )) || exit 0
-if systemctl restart __SHAH_TUNNEL_UNIT__; then
+if systemctl restart ravanreverse; then
   printf '%s\n' "$NOW" > "${STATE}.tmp"
   mv -f "${STATE}.tmp" "$STATE"
   logger -t shah-tunnel-restart "Shah Tunnel restarted by its configured interval (${INTERVAL}s)." 2>/dev/null || true
@@ -4810,13 +3650,12 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
 }
 
 func removeRestartScheduleFiles() error {
-	p := currentRestartPaths()
-	for _, path := range []string{p.cron, p.script, p.config, p.state, p.config + ".tmp", p.state + ".tmp", p.cron + ".tmp", p.script + ".tmp"} {
+	for _, path := range []string{restartCronFile, restartCronScript, restartScheduleConfig, restartScheduleState, restartScheduleConfig + ".tmp", restartScheduleState + ".tmp", restartCronFile + ".tmp", restartCronScript + ".tmp"} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
-	for _, dir := range []string{p.dir, filepath.Dir(p.state)} {
+	for _, dir := range []string{restartScheduleDir, "/var/lib/shah-tunnel"} {
 		if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) {
 			return err
 		}
@@ -4825,20 +3664,19 @@ func removeRestartScheduleFiles() error {
 }
 
 func restartScheduleStatus() string {
-	p := currentRestartPaths()
-	data, err := os.ReadFile(p.config)
+	data, err := os.ReadFile(restartScheduleConfig)
 	if err != nil {
 		return "No scheduled restart"
 	}
-	cronEntry, err := os.ReadFile(p.cron)
-	if err != nil || !strings.Contains(string(cronEntry), p.script) {
+	cronEntry, err := os.ReadFile(restartCronFile)
+	if err != nil || !strings.Contains(string(cronEntry), restartCronScript) {
 		return "Incomplete: cron entry is missing or invalid"
 	}
-	checker, err := os.ReadFile(p.script)
-	if err != nil || !strings.Contains(string(checker), "systemctl restart "+activeServiceName()) {
+	checker, err := os.ReadFile(restartCronScript)
+	if err != nil || !strings.Contains(string(checker), "systemctl restart ravanreverse") {
 		return "Incomplete: restart checker is missing or invalid"
 	}
-	state, err := os.ReadFile(p.state)
+	state, err := os.ReadFile(restartScheduleState)
 	if err != nil {
 		return "Incomplete: timer state is missing"
 	}
@@ -4874,8 +3712,8 @@ func setRestartSchedule(interval restartInterval) error {
 	if !isRoot() {
 		return errors.New("run as root")
 	}
-	if !activeServiceUnitAvailable() {
-		return errors.New("Shah Tunnel service unit is not installed; install it before setting a restart schedule")
+	if _, err := os.Stat("/etc/systemd/system/ravanreverse.service"); err != nil {
+		return errors.New("Shah Tunnel is not installed; install it before setting a restart schedule")
 	}
 	if _, err := os.Stat("/etc/cron.d"); err != nil {
 		return errors.New("/etc/cron.d is unavailable; this scheduler supports Debian/Ubuntu-style cron")
@@ -4903,29 +3741,17 @@ func setRestartSchedule(interval restartInterval) error {
 			return fmt.Errorf("could not start cron daemon: %w: %s", err, strings.TrimSpace(string(out)))
 		}
 	}
-	p := currentRestartPaths()
-	if err := atomicWriteFile(p.state, []byte(strconv.FormatInt(time.Now().Unix(), 10)+"\n"), 0600); err != nil {
+	if err := atomicWriteFile(restartScheduleState, []byte(strconv.FormatInt(time.Now().Unix(), 10)+"\n"), 0600); err != nil {
 		return fmt.Errorf("initialize schedule timer: %w", err)
 	}
-	if err := atomicWriteFile(p.config, []byte(strconv.FormatInt(interval.seconds, 10)+"\n"), 0600); err != nil {
+	if err := atomicWriteFile(restartScheduleConfig, []byte(strconv.FormatInt(interval.seconds, 10)+"\n"), 0600); err != nil {
 		return fmt.Errorf("write schedule configuration: %w", err)
 	}
-	scriptBody := strings.NewReplacer(
-		"__SHAH_TUNNEL_UNIT__", activeServiceName(),
-		"__SHAH_TUNNEL_CONFIG__", p.config,
-		"__SHAH_TUNNEL_STATE__", p.state,
-		"__SHAH_TUNNEL_LOCK__", func() string {
-			if activeProfileName == "default" {
-				return "/run/lock/shah-tunnel-restart.lock"
-			}
-			return filepath.Join("/run/lock", "shah-tunnel-restart-"+activeProfileName+".lock")
-		}(),
-	).Replace(restartCronScriptBodyPrefix)
-	if err := atomicWriteFile(p.script, []byte(scriptBody), 0750); err != nil {
+	if err := atomicWriteFile(restartCronScript, []byte(restartCronScriptBody), 0750); err != nil {
 		return fmt.Errorf("write restart checker: %w", err)
 	}
-	cron := "SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n* * * * * root " + p.script + " >/dev/null 2>&1\n"
-	if err := atomicWriteFile(p.cron, []byte(cron), 0644); err != nil {
+	cron := "SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n* * * * * root " + restartCronScript + " >/dev/null 2>&1\n"
+	if err := atomicWriteFile(restartCronFile, []byte(cron), 0644); err != nil {
 		return fmt.Errorf("write cron entry: %w", err)
 	}
 	fmt.Printf("\n  ✓ Scheduled restart enabled: every %s. The first restart is after the selected interval.\n", interval.label)
@@ -4973,71 +3799,51 @@ func manageRestartSchedule() error {
 var errUninstallCancelled = errors.New("uninstall cancelled")
 
 func uninstall() error {
-	fmt.Println("This permanently removes all Shah Tunnel profiles, their own services and configuration.")
+	fmt.Println("This permanently removes only Shah Tunnel files and its own service.")
 	fmt.Println("Xray, x-ui, other services and manually-created firewall rules are left untouched.")
 	if ask("Type DELETE SHAH TUNNEL to confirm complete removal", "") != "DELETE SHAH TUNNEL" {
 		fmt.Println("Cancelled.")
 		return errUninstallCancelled
 	}
-	profiles, err := listTunnelProfiles()
-	if err != nil {
-		return fmt.Errorf("list tunnel profiles before uninstall: %w", err)
+
+	// Stop and disable only this unit. Do not remove files while systemd still
+	// reports the unit as active/deactivating.
+	_ = exec.Command("systemctl", "disable", "ravanreverse").Run()
+	_ = exec.Command("systemctl", "stop", "ravanreverse").Run()
+	state := func() string {
+		b, _ := exec.Command("systemctl", "show", "ravanreverse", "-p", "ActiveState", "--value").Output()
+		return strings.TrimSpace(string(b))
 	}
-	units := map[string]bool{"ravanreverse": true}
-	for _, name := range profiles {
-		units[profileServiceName(name)] = true
-	}
-	for unit := range units {
-		_ = exec.Command("systemctl", "disable", unit).Run()
-		_ = exec.Command("systemctl", "stop", unit).Run()
-		state := func() string {
-			b, _ := exec.Command("systemctl", "show", unit, "-p", "ActiveState", "--value").Output()
-			return strings.TrimSpace(string(b))
-		}
-		for i := 0; i < 20; i++ {
-			s := state()
-			if s == "" || s == "inactive" || s == "failed" || s == "unknown" || s == "dead" {
-				break
-			}
-			time.Sleep(250 * time.Millisecond)
-		}
+	for i := 0; i < 20; i++ {
 		s := state()
-		if s == "active" || s == "deactivating" || s == "activating" || s == "reloading" {
-			_ = exec.Command("systemctl", "kill", "--kill-who=all", "--signal=KILL", unit).Run()
-			_ = exec.Command("systemctl", "stop", unit).Run()
-			time.Sleep(500 * time.Millisecond)
-			s = state()
+		if s == "" || s == "inactive" || s == "failed" || s == "unknown" || s == "dead" {
+			break
 		}
-		if s == "active" || s == "deactivating" || s == "activating" || s == "reloading" {
-			return fmt.Errorf("service %s would not stop (state=%s); all files were kept", unit, s)
-		}
+		time.Sleep(250 * time.Millisecond)
 	}
-	profileSet := map[string]bool{"default": true}
-	for _, name := range profiles {
-		profileSet[name] = true
+	s := state()
+	if s == "active" || s == "deactivating" || s == "activating" || s == "reloading" {
+		// Last-resort signal is scoped to the Shah Tunnel systemd unit only.
+		_ = exec.Command("systemctl", "kill", "--kill-who=all", "--signal=KILL", "ravanreverse").Run()
+		_ = exec.Command("systemctl", "stop", "ravanreverse").Run()
+		time.Sleep(500 * time.Millisecond)
+		s = state()
 	}
-	for name := range profileSet {
-		if err := setActiveProfile(name); err != nil {
-			return err
-		}
-		if err := removeRestartScheduleFiles(); err != nil {
-			return fmt.Errorf("remove scheduled restart for %s: %w", name, err)
-		}
+	if s == "active" || s == "deactivating" || s == "activating" || s == "reloading" {
+		return fmt.Errorf("service would not stop (state=%s); files were kept. Check: systemctl status ravanreverse", s)
 	}
-	for _, path := range []string{
-		"/etc/systemd/system/ravanreverse.service", "/etc/systemd/system/ravanreverse@.service",
-	} {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove unit file %s: %w", path, err)
-		}
+	if err := removeRestartScheduleFiles(); err != nil {
+		return fmt.Errorf("remove Shah Tunnel restart schedule: %w", err)
+	}
+
+	if err := os.Remove("/etc/systemd/system/ravanreverse.service"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove service unit: %w", err)
 	}
 	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
 		return fmt.Errorf("systemd daemon-reload failed: %v %s", err, strings.TrimSpace(string(out)))
 	}
-	for unit := range units {
-		_ = exec.Command("systemctl", "reset-failed", unit).Run()
-	}
-	for _, path := range []string{configRoot, "/usr/local/bin/ravanreverse", "/usr/local/bin/shah-tunnel", "/var/backups/ravanreverse", "/var/log/ravanreverse"} {
+	_ = exec.Command("systemctl", "reset-failed", "ravanreverse").Run()
+	for _, path := range []string{"/etc/ravanreverse", "/usr/local/bin/ravanreverse", "/usr/local/bin/shah-tunnel", "/var/backups/ravanreverse", "/var/log/ravanreverse"} {
 		if err := os.RemoveAll(path); err != nil {
 			return fmt.Errorf("remove %s: %w", path, err)
 		}
@@ -5053,7 +3859,7 @@ func uninstall() error {
 			}
 		}
 	}
-	fmt.Println("All Shah Tunnel profiles, services, binary and configuration have been removed.")
+	fmt.Println("Shah Tunnel service, binary and configuration have been removed.")
 	fmt.Println("Xray/x-ui and unrelated firewall/proxy settings were not changed.")
 	return nil
 }
@@ -5547,157 +4353,54 @@ func geoDisplay(g ServerGeo) (string, string) {
 	}
 	return g.IP, country
 }
-func deleteTunnelProfile(name string) error {
-	if !validTunnelProfileName(name) {
-		return errors.New("invalid tunnel name")
-	}
-	if err := setActiveProfile(name); err != nil {
-		return err
-	}
-	unit := activeServiceName()
-	_ = exec.Command("systemctl", "disable", unit).Run()
-	_ = exec.Command("systemctl", "stop", unit).Run()
-	state := func() string {
-		b, _ := exec.Command("systemctl", "show", unit, "-p", "ActiveState", "--value").Output()
-		return strings.TrimSpace(string(b))
-	}
-	for i := 0; i < 20; i++ {
-		s := state()
-		if s == "" || s == "inactive" || s == "failed" || s == "unknown" || s == "dead" {
-			break
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	s := state()
-	if s == "active" || s == "deactivating" || s == "activating" || s == "reloading" {
-		_ = exec.Command("systemctl", "kill", "--kill-who=all", "--signal=KILL", unit).Run()
-		_ = exec.Command("systemctl", "stop", unit).Run()
-		time.Sleep(500 * time.Millisecond)
-		s = state()
-	}
-	if s == "active" || s == "deactivating" || s == "activating" || s == "reloading" {
-		return fmt.Errorf("tunnel %q could not be stopped (state=%s); its files were preserved", name, s)
-	}
-	if name == "default" {
-		for _, path := range []string{configPath, hysteriaServerConfigPath, hysteriaClientConfigPath, filepath.Join(profileDirFor(name), "hub.crt"), filepath.Join(profileDirFor(name), "hub.key"), filepath.Join(profileDirFor(name), "runtime.json"), filepath.Join(profileDirFor(name), "runtime.json.tmp")} {
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("remove default tunnel file %s: %w", path, err)
-			}
-		}
-	} else {
-		if err := os.RemoveAll(profileDirFor(name)); err != nil {
-			return fmt.Errorf("remove tunnel %q: %w", name, err)
-		}
-	}
-	paths := currentRestartPaths()
-	if checker, err := os.ReadFile(paths.script); err == nil && strings.Contains(string(checker), "systemctl restart "+unit) {
-		if err := removeRestartScheduleFiles(); err != nil {
-			return fmt.Errorf("remove scheduled restart for %s: %w", name, err)
-		}
-	}
-	fmt.Printf("Tunnel %q was stopped and only its configuration was deleted. Other tunnel profiles were not changed.\n", name)
-	return nil
-}
-
-func deleteTunnelFromMenu() error {
-	profiles, err := listTunnelProfiles()
-	if err != nil {
-		return err
-	}
-	if len(profiles) == 0 {
-		return errors.New("there are no configured tunnels to delete")
-	}
-	fmt.Println("\n  TUNNELS AVAILABLE FOR DELETION")
-	for _, name := range profiles {
-		fmt.Printf("  - %s\n", name)
-	}
-	name := strings.TrimSpace(ask("Enter the exact tunnel name to delete", ""))
-	found := false
-	for _, existing := range profiles {
-		if existing == name {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("tunnel %q was not found; no files were changed", name)
-	}
-	if ask("Type the tunnel name again to confirm deletion", "") != name {
-		return errors.New("deletion cancelled; all tunnels were preserved")
-	}
-	return deleteTunnelProfile(name)
-}
-
 func menu() {
 	if !ensureRoot() {
 		return
 	}
 	for {
-		profiles, listErr := listTunnelProfiles()
-		uiHeader("SHAH TUNNEL // COMMAND DECK", "MULTI-TUNNEL   •   ISOLATED PROFILES   •   SECURE ROUTING")
+		state := paint(ansiYellow, "○ OFFLINE / NOT CONFIGURED")
+		if tunnelIsActive() {
+			state = paint(ansiGreen+ansiBold, "● ONLINE")
+		}
+		uiHeader("SHAH TUNNEL // COMMAND DECK", "SPACE NETWORK   •   ENCRYPTED CONTROL   •   TCP TUNNEL")
 		fmt.Printf("  %s %s\n", paint(ansiDim, "VERSION"), paint(ansiCyan, version+"  |  "+runtimeArch()))
+		fmt.Printf("  %s %s\n", paint(ansiDim, "LINK STATUS"), state)
 		serverIP, serverCountry := serverIdentity()
-		fmt.Printf("  %s %s\n", paint(ansiDim, "SERVER IP"), paint(ansiCyan, serverIP))
-		fmt.Printf("  %s %s\n", paint(ansiDim, "COUNTRY"), paint(ansiCyan, serverCountry))
-		uiRule()
-		fmt.Println(paint(ansiCyan+ansiBold, "  CONFIGURED TUNNELS"))
-		if listErr != nil {
-			fmt.Printf("  %s %v\n", paint(ansiRed, "ERROR"), listErr)
-		}
-		if len(profiles) == 0 {
-			fmt.Println("  No tunnels configured yet.")
-		}
-		for _, name := range profiles {
-			_ = setActiveProfile(name)
-			state := paint(ansiYellow, "○ STOPPED")
-			if tunnelIsActive() {
-				state = paint(ansiGreen+ansiBold, "● RUNNING")
-			}
-			fmt.Printf("  %-20s %s\n", name, state)
-		}
-		_ = setActiveProfile("default")
+		fmt.Printf("  %s %s\n", paint(ansiDim, "🌐 SERVER IP"), paint(ansiCyan, serverIP))
+		fmt.Printf("  %s %s\n", paint(ansiDim, "🌍 COUNTRY"), paint(ansiCyan, serverCountry))
 		uiRule()
 		fmt.Println(paint(ansiCyan+ansiBold, "  OPERATIONS"))
 		menuItem := func(key, title, desc string) {
 			fmt.Printf("  %s  %s %s\n", paint(ansiPurple+ansiBold, "["+key+"]"), paint(ansiBold, fmt.Sprintf("%-32s", title)), paint(ansiDim, desc))
 		}
-		menuItem("1", "Create a new tunnel", "Keep existing tunnels")
-		menuItem("2", "Start a tunnel", "Choose existing tunnel")
-		menuItem("3", "Stop a tunnel", "Stop selected tunnel")
-		menuItem("4", "Restart a tunnel", "Restart selected tunnel")
-		menuItem("5", "Status & logs", "Inspect selected tunnel")
-		menuItem("6", "Scheduled restart", "Set selected tunnel schedule")
-		menuItem("7", "Delete one tunnel", "Delete this tunnel only")
-		menuItem("8", "Complete uninstall", "Remove all tunnels")
-		menuItem("0", "Exit", "Close menu")
+		menuItem("1", "🛠️ Configure / Create Tunnel", "Step-by-step setup wizard")
+		menuItem("2", "🚀 Start Tunnel", "Start the service")
+		menuItem("3", "🛑 Stop Tunnel", "Stop the running service")
+		menuItem("4", "🔄 Restart Tunnel", "Reload saved configuration")
+		menuItem("5", "📊 Status & Logs", "Service status and recent errors")
+		menuItem("6", "⏱️ Cron Job / Scheduled Restart", "Restart every selected interval")
+		menuItem("7", "🗑️ Complete Uninstall", "Only Shah Tunnel files and service")
+		menuItem("0", "🚪 Exit", "Close the menu")
 		uiRule()
 		choice := ask("Select an operation", "0")
 		var err error
 		switch choice {
 		case "1":
-			err = setup()
-		case "2", "3", "4", "5", "6":
-			err = chooseTunnelProfile("Enter tunnel name")
-			if err == nil {
-				switch choice {
-				case "2":
-					err = ensureTunnelRunning(false)
-				case "3":
-					err = runSystemctl("stop", activeServiceName())
-					if err == nil && tunnelIsActive() {
-						err = errors.New("service is still active after stop")
-					}
-				case "4":
-					err = ensureTunnelRunning(true)
-				case "5":
-					err = showStatusAndLogs()
-				case "6":
-					err = manageRestartSchedule()
-				}
+			err = setup() // setup starts/restarts the service automatically on success
+		case "2":
+			err = ensureTunnelRunning(false)
+		case "3":
+			err = runSystemctl("stop", "ravanreverse")
+			if err == nil && tunnelIsActive() {
+				err = errors.New("service is still active after stop")
 			}
+		case "4":
+			err = ensureTunnelRunning(true)
+		case "5":
+			err = showStatusAndLogs()
+		case "6":
+			err = manageRestartSchedule()
 		case "7":
-			err = deleteTunnelFromMenu()
-		case "8":
 			err = uninstall()
 			if err == nil {
 				return
@@ -5713,7 +4416,7 @@ func menu() {
 		if err != nil {
 			fmt.Printf("\n  %s %s\n", paint(ansiRed+ansiBold, "✗ ERROR:"), err)
 		}
-		if choice != "8" {
+		if choice != "7" {
 			_ = ask("Press Enter to return to the menu", "")
 		}
 	}
@@ -5721,11 +4424,6 @@ func menu() {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	if instance := strings.TrimSpace(os.Getenv("S1T_INSTANCE")); instance != "" {
-		if err := setActiveProfile(instance); err != nil {
-			log.Fatal(err)
-		}
-	}
 	cmd := "menu"
 	if len(os.Args) > 1 {
 		cmd = os.Args[1]
