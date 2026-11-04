@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 # Shah Tunnel 1.6.2 installer.
-# Downloads Go from the official host first, then SHA-256-verified mirrors if Google is blocked; builds from GitHub source.
+# Uses Go 1.27.3 (required by the current module), tries both official Go download domains, then verified mirrors.
 # No prebuilt ShahTunnel binaries or manual GitHub release uploads are required.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
 VERSION="1.6.2"
-GO_VERSION="1.25.1"
+GO_VERSION="1.27.3"
 GO_BASE="https://dl.google.com/go"
+GO_CN_BASE="https://golang.google.cn/dl"
 STATE_DIR="/usr/local/lib/shah-tunnel"
 GO_CACHE_DIR="/var/cache/shah-tunnel"
 PHASE_HAS_DOWNLOAD=0
@@ -43,7 +44,7 @@ curl_download() {
   local pid=0 rc=0
   rm -f "$headers" "$log" "$dest"
   if [[ ! -t 2 ]]; then
-    if ! curl -4 -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 25 --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log"; then
+    if ! curl --happy-eyeballs-timeout-ms 1500 -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 25 --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log"; then
       if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
       rm -f "$headers" "$log" "$dest"
       return 1
@@ -54,7 +55,7 @@ curl_download() {
     rm -f "$headers" "$log"
     return 0
   fi
-  curl -4 -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 25 --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log" &
+  curl --happy-eyeballs-timeout-ms 1500 -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 25 --dump-header "$headers" "$@" "$url" -o "$dest" 2>"$log" &
   pid=$!
   # Show a single animated indicator while downloading; hide failed mirror
   # errors when QUIET_CURL_ERRORS=1 so normal fallback does not look broken.
@@ -99,7 +100,7 @@ curl_download_resumable() {
     progress_args=(--silent --show-error)
   fi
 
-  if curl -4 --fail --location --proto '=https' --proto-redir '=https' \
+  if curl --happy-eyeballs-timeout-ms 1500 --fail --location --proto '=https' --proto-redir '=https' \
       "${resolve_args[@]}" "${progress_args[@]}" --continue-at - \
       --retry "$retry_count" --retry-delay 2 --retry-connrefused \
       --connect-timeout 8 --max-time "$max_time" \
@@ -392,9 +393,9 @@ build_from_system_go() {
   go_text="$(GOTOOLCHAIN=local "$go_bin" version 2>/dev/null || true)"
   [[ "$go_text" =~ go([0-9]+\.[0-9]+(\.[0-9]+)?) ]] || return 1
   local_go_version="${BASH_REMATCH[1]}"
-  minimum="$(printf '%s\n%s\n' '1.23.0' "$local_go_version" | sort -V | sed -n '1p')"
-  if [[ "$minimum" != "1.23.0" ]]; then
-    echo "Installed Go ${local_go_version} is too old; Shah Tunnel requires Go 1.23.0 or newer." >&2
+  minimum="$(printf '%s\n%s\n' '1.27.0' "$local_go_version" | sort -V | sed -n '1p')"
+  if [[ "$minimum" != "1.27.0" ]]; then
+    echo "Installed Go ${local_go_version} is too old; this Shah Tunnel source requires Go 1.27.0 or newer." >&2
     return 1
   fi
   go_root="$(GOTOOLCHAIN=local "$go_bin" env GOROOT 2>/dev/null || true)"
@@ -471,8 +472,8 @@ prepare_verified_binary() {
 
 official_go_sha256() {
   case "$TARGET_ARCH" in
-    amd64) printf '%s' '7716a0d940a0f6ae8e1f3b3f4f36299dc53e31b16840dbd171254312c41ca12e' ;;
-    arm64) printf '%s' '65a3e34fb2126f55b34e1edfc709121660e1be2dee6bdf405fc399a63a95a87d' ;;
+    amd64) printf '%s' '65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40' ;;
+    arm64) printf '%s' 'a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49' ;;
     *) return 1 ;;
   esac
 }
@@ -481,7 +482,9 @@ build_project_binary() {
   local go_bin="$1" source_dir="$2" go_root="$3"
   (
     cd "$source_dir"
-    env GOROOT="$go_root" GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off \
+    env GOROOT="$go_root" GOTOOLCHAIN=local \
+      GOPROXY="https://proxy.golang.org|direct" GOSUMDB="sum.golang.org" \
+      GOMODCACHE="${GO_CACHE_DIR}/gomod-cache" \
       GOCACHE="${GO_CACHE_DIR}/build-cache-${BUILD_GO_VERSION:-$GO_VERSION}-${TARGET_ARCH}" \
       CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_ARCH" \
       "$go_bin" build -trimpath -ldflags='-s -w -buildid=' \
@@ -523,44 +526,67 @@ build_from_official_go_toolchain() {
       rm -f "$cache_archive"
       local part_file="${GO_CACHE_DIR}/${go_archive}.official.part"
       local official_url="${GO_BASE}/${go_archive}"
+      local cn_official_url="${GO_CN_BASE}/${go_archive}"
       local download_url
-      local -a download_urls=(
-        "$official_url"
+
+      # Both URLs are operated by the Go project/Google and serve the same
+      # official release archive. The SHA-256 must match the official go.dev value.
+      local -a download_urls=("$official_url" "$cn_official_url"
         "https://mirrors.hust.edu.cn/golang/${go_archive}"
         "https://mirror.nju.edu.cn/golang/${go_archive}"
       )
 
       echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH})." >&2
-      echo "Primary source: the official Go distribution host (${GO_BASE})." >&2
-      echo "If Google's CDN is blocked by this VPS network, checksum-verified Go distribution mirrors will be tried automatically." >&2
+      echo "Official sources: ${GO_BASE} and ${GO_CN_BASE}." >&2
+      echo "Community mirrors are accepted only when their archive matches the official Go SHA-256." >&2
 
       # Try the canonical official Go download first. The VPS log shows that
       # Google IPs resolve but TCP/443 is unreachable, so fail quickly and move
       # on instead of cycling through every Google IP for several minutes.
       for download_url in "${download_urls[@]}"; do
         case "$download_url" in
-          "$official_url")
+          "$official_url"|"$cn_official_url")
             echo "Trying official Go download: ${download_url}" >&2
             ;;
           *)
-            echo "Official Go CDN is unreachable; trying verified distribution mirror: ${download_url}" >&2
+            echo "Both official Go endpoints failed; trying checksum-verified mirror: ${download_url}" >&2
             ;;
         esac
 
+        attempt_ok=0
         if QUIET_CURL_ERRORS=1 curl_download_resumable "$download_url" "$part_file" 900 1 75; then
+          attempt_ok=1
+        else
+          echo "Download attempt failed: ${download_url}" >&2
+        fi
+
+        # On the official Google China endpoint, retry with HTTPS-DNS-resolved
+        # IPv4 addresses while keeping TLS hostname verification enabled.
+        if [[ "$attempt_ok" -ne 1 && "$download_url" == "$cn_official_url" ]]; then
+          local cn_ip cn_host="golang.google.cn" cn_ips=()
+          mapfile -t cn_ips < <(resolve_ipv4_via_doh "$cn_host" | awk 'NF && !seen[$0]++' | head -n 3)
+          for cn_ip in "${cn_ips[@]}"; do
+            [[ "$cn_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+            echo "Retrying official Google Go download via ${cn_host} address ${cn_ip} (TLS hostname verification remains enabled)..." >&2
+            if QUIET_CURL_ERRORS=1 curl_download_resumable "$download_url" "$part_file" 900 0 75 "$cn_ip"; then
+              attempt_ok=1
+              break
+            fi
+          done
+        fi
+
+        if [[ "$attempt_ok" -eq 1 ]]; then
           if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
             cp -f "$part_file" "$TMP/$go_archive"
             downloaded=1
             case "$download_url" in
-              "$official_url") echo "Official Go archive downloaded and SHA-256 verified." >&2 ;;
-              *) echo "Go archive from mirror matches the official Go SHA-256; verified." >&2 ;;
+              "$official_url"|"$cn_official_url") echo "Official Go archive downloaded and SHA-256 verified." >&2 ;;
+              *) echo "Mirror archive matches the official Go SHA-256; verified." >&2 ;;
             esac
             break
           fi
           echo "Downloaded archive did not match the official Go SHA-256; discarding it." >&2
           rm -f "$part_file"
-        else
-          echo "Download attempt failed: ${download_url}" >&2
         fi
       done
 
@@ -571,8 +597,8 @@ build_from_official_go_toolchain() {
       fi
 
       if [[ "$downloaded" -ne 1 ]]; then
-        echo "ERROR: Official Go download and all checksum-verified mirrors failed." >&2
-        echo "This VPS cannot currently reach the required download hosts over HTTPS." >&2
+        echo "ERROR: Both official Go domains and all checksum-verified mirrors failed." >&2
+        echo "This VPS must allow outbound HTTPS to golang.google.cn, dl.google.com, or one configured Go mirror. The installer cannot bypass blocked outbound TCP/443." >&2
         return 1
       fi
     fi
@@ -665,8 +691,8 @@ build_from_official_go_toolchain() {
 
 if ! prepare_verified_binary; then
   echo "Installation stopped: no verified ShahTunnel binary could be built." >&2
-  echo "The installer tried the existing system Go, the official Go download host, and checksum-verified Go mirrors." >&2
-  echo "No unverified compiler or binary was installed. This VPS must allow HTTPS to at least one of those download hosts." >&2
+  echo "The installer tried a compatible system Go, both official Go download domains, DNS-over-HTTPS for the Google China endpoint, and checksum-verified mirrors." >&2
+  echo "No unverified compiler or binary was installed. Outbound HTTPS to at least one reachable Go distribution host is required." >&2
   exit 1
 fi
 phase_start 2 "Installing binary and configuring service"
