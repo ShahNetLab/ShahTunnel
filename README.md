@@ -3,14 +3,14 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>v2.1.0 · Secure Reverse TCP Relay · Adaptive Transport Failover</strong></p>
+<p align="center"><strong>v1.6.2 · Secure Reverse TCP Relay · Adaptive Transport Failover</strong></p>
 <p align="center">A reverse TCP relay with an authenticated TLS 1.3 Hub↔Agent channel, certificate pinning, independent lanes and automatic transport recovery.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
 ## Network flow
 
 <p align="center">
-  <img src="docs/img/ShahTunnel-Network-Flow-v2.1.0.png" alt="Shah Tunnel network flow: Client, Hub, private link, Agent and target with four implemented transport paths" width="100%" />
+  <img src="docs/img/ShahTunnel-Network-Flow-v1.6.2.png" alt="Shah Tunnel network flow: Client, Hub, private link, Agent and target with four implemented transport paths" width="100%" />
 </p>
 
 ## Features
@@ -45,12 +45,6 @@ If the Hub control port is `9443`:
 
 Open only the ports needed by the selected mode. All four transports in this version use TCP.
 
-## Multiple tunnel profiles and upload throughput
-
-Each create operation asks for a unique tunnel name and stores its configuration separately. Existing profiles remain intact. Every named profile runs as its own systemd instance; Start, Stop, Restart, Status, and Delete act on the selected profile. Option 7 deletes one profile; option 8 removes the entire installation.
-
-The per-stream in-flight window is increased to 64 frames of up to 64 KiB (about 4 MiB per stream), while each tunnel socket keeps a smaller bounded outbound queue to limit head-of-line delay. On Linux kernels that support BBR, the outer tunnel TCP socket attempts to use BBR per-socket; unsupported kernels retain their existing default. This reduces the throughput ceiling caused by a small flow-control window on high-RTT paths and can improve latency under load. Actual throughput still depends on link capacity, packet loss, congestion, kernel qdisc, and provider limits; application-level changes cannot prevent an uplink from being fully saturated without an appropriate network-level rate limit.
-
 ## Responsible use and privacy
 
 ShahTunnel is a general-purpose TCP relay. Configure it only for servers and services you own or are explicitly authorized to administer. Do not use it to access third-party systems without permission, relay abusive traffic, or disrupt services. Operators are responsible for the endpoints and traffic they choose to forward.
@@ -61,25 +55,17 @@ For upgrade compatibility, the installed systemd unit and configuration director
 
 ## Install
 
-This single-binary package targets Linux amd64 (x86_64). The executable `ravanreverse` is stored directly in `S1T-CAPSULE/` beside `main.go`; no architecture subfolders are used. No Go compiler or Go toolchain is needed on the VPS.
-
-For a downloaded source ZIP, run the local installer from its extracted folder:
-
-```bash
-sudo bash S1T-START.sh
-```
-
-To install directly from the repository's published `main` branch:
+Run as root on Linux amd64 or arm64 with systemd and HTTPS access to the official Go download hosts and the source repository:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 ```
 
-The installer supports Linux amd64/x86_64 only. An amd64 executable cannot run on arm64/aarch64; the installer stops on an unsupported architecture. It downloads `S1T-CAPSULE/ravanreverse`, validates the SHA-256 entry in `S1T-CAPSULE/SHA256SUMS`, and runs the binary's `version` command. Installation is refused unless the reported application version (`2.1.0`) and target architecture (`linux/amd64`) match. When run from a local checkout, it uses the adjacent capsule; when invoked using the one-line command above, it downloads from the repository's `main` branch. No Go toolchain, source archive, build step, or GitHub Release asset is required on the VPS. An existing binary is backed up before replacement, and the installer does not restart an already-active service, avoiding unnecessary interruption of live tunnel sessions.
+The installer downloads the Go `1.26.1` toolchain, trying regional mirrors first and then official distribution hosts. If a transfer is interrupted, it retains a separate partial file per mirror and resumes only from that same mirror with HTTP Range where supported. This avoids mixing partial responses from different hosts. It verifies the pinned SHA-256 checksum before using the archive; unverified archives are never accepted. The installer then downloads the source archive from the `main` branch of this repository and compiles `S1T-CAPSULE` locally for the server architecture with CGO disabled. It does not use GitHub Release assets or install the Go toolchain permanently. The built binary's application version and target architecture are checked before installation. An existing binary is backed up before replacement, and an already-active service is not restarted during installation to avoid dropping live tunnel sessions.
 
 ## Build and tests
 
-The verification helper requires Go 1.23.0 or newer to be installed locally (matching the `go.mod` minimum); it does not download a toolchain. From the repository root:
+The verification helper requires Go 1.26.1 to already be installed locally; it will not download a toolchain. From the repository root:
 
 ```bash
 ./VERIFY-ALL-TRANSPORTS.sh
