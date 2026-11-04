@@ -3,23 +3,23 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>v1.8.1 · Authenticated reverse TCP tunnel · TCP + QUIC/UDP adaptive transport</strong></p>
+<p align="center"><strong>v1.8.2 · Authenticated reverse TCP tunnel · TCP + QUIC/UDP adaptive transport</strong></p>
 <p align="center">An authenticated Hub↔Agent reverse tunnel with four TCP transport choices and an independent Hysteria 2 / QUIC / UDP path.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
 ## Quick install
 
-After the complete v1.8.1 source has been published to the repository's public `main` branch, run this command as `root` on both servers:
+After the complete v1.8.2 source has been published to the repository's public `main` branch, run this command as `root` on both servers:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 ```
 
-Until v1.8.1 is published on `main`, install from this release ZIP. The remote bootstrap intentionally rejects an older or mixed-version branch:
+Until v1.8.2 is published on `main`, install from this release ZIP. The remote bootstrap intentionally rejects an older or mixed-version branch:
 
 ```bash
-unzip ShahTunnel-v1.8.1.zip
-cd ShahTunnel-v1.8.1
+unzip ShahTunnel-v1.8.2.zip
+cd ShahTunnel-v1.8.2
 bash ./S1T-START.sh
 ```
 
@@ -28,7 +28,7 @@ Select `Hub` on the Iran server and `Agent` on the outside server.
 ## Network flow
 
 <p align="center">
-  <img src="docs/img/ShahTunnel-Network-Flow-v1.8.0-en.jpg" alt="ShahTunnel 1.8.1 network flow with four TCP transports and Hysteria 2 QUIC over UDP" width="100%" />
+  <img src="docs/img/ShahTunnel-Network-Flow-v1.8.2-en.jpg" alt="ShahTunnel 1.8.2 network flow with four TCP transports and Hysteria 2 QUIC over UDP" width="100%" />
 </p>
 
 ## Multiple named tunnels on one server
@@ -50,7 +50,7 @@ Select `Hub` on the Iran server and `Agent` on the outside server.
 
 ## Concurrent uploads and interactive traffic
 
-- In v1.8.1, each tunnel lane's outbound payload scheduler changes from a shared FIFO to **Deficit Round Robin (DRR)** keyed by the inner TCP stream ID.
+- In v1.8.2, each tunnel lane's outbound payload scheduler changes from a shared FIFO to **Deficit Round Robin (DRR)** keyed by the inner TCP stream ID.
 - Each stream receives a 32 KiB quantum per round. Larger frames accrue credit over multiple rounds, so a long-running upload cannot monopolize the lane merely by continuously refilling the shared queue ahead of other streams.
 - Control frames (open/close, ACK and heartbeat) retain a separate bounded-priority queue so connection management remains responsive without starving payload.
 - The scheduler is used in both Hub↔Agent directions and across all outer transport modes. Existing backpressure and process-wide queue memory limits remain in place.

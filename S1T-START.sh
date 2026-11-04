@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 1.8.1 installer.
+# Shah Tunnel 1.8.2 installer.
 # Local runs use the adjacent source tree; one-line remote runs bootstrap the matching source bundle.
 # Installer and application versions must match; toolchain and Hysteria binaries are SHA-256 pinned.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="1.8.1"
+VERSION="1.8.2"
 GO_VERSION="1.27.3"
 HYSTERIA_VERSION="v2.13.0"
 HYSTERIA_HASHES_SHA256="e1d2c80994cf57fcef494ea799eedf80088e11fd7243b5b3b23f1288fe1266b5"

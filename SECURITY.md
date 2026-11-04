@@ -2,7 +2,7 @@
 
 ShahTunnel is intended for systems and services the operator owns or is explicitly authorized to administer.
 
-## v1.8.0 transport security
+## v1.8.2 transport security
 
 - Inner Hub-Agent sessions use TLS 1.3, the random ShahTunnel token, and SHA-256 certificate pinning.
 - The optional Hysteria 2 / QUIC transport has separate 256-bit Hysteria and Salamander credentials. The Agent pins the Hysteria TLS certificate; the inner ShahTunnel TLS session checks the same certificate again.

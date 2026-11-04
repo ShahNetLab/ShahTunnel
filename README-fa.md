@@ -18,8 +18,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S
 تا پیش از انتشار نسخهٔ ۱.۸.۱ روی `main`، از ZIP همین نسخه نصب کنید؛ نصب‌کنندهٔ راه‌دور عمداً نسخهٔ قدیمی یا ناهماهنگ را رد می‌کند:
 
 ```bash
-unzip ShahTunnel-v1.8.1.zip
-cd ShahTunnel-v1.8.1
+unzip ShahTunnel-v1.8.2.zip
+cd ShahTunnel-v1.8.2
 bash ./S1T-START.sh
 ```
 
@@ -28,7 +28,7 @@ bash ./S1T-START.sh
 ## نمودار جریان شبکه
 
 <p align="center">
-  <img src="docs/img/ShahTunnel-Network-Flow-v1.8.0-fa.jpg" alt="نمودار فارسی جریان شبکه شاه‌تونل با چهار مسیر TCP و مسیر مستقل Hysteria 2 روی QUIC/UDP" width="100%" />
+  <img src="docs/img/ShahTunnel-Network-Flow-v1.8.2-fa.jpg" alt="نمودار فارسی جریان شبکه شاه‌تونل با چهار مسیر TCP و مسیر مستقل Hysteria 2 روی QUIC/UDP" width="100%" />
 </p>
 
 ## چند تونل نام‌دار روی یک سرور
