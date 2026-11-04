@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1279,5 +1280,125 @@ func TestAgentTLS13PinnedHandshake(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("server handshake did not complete")
+	}
+}
+
+func TestNamedTunnelProfileSlugsAreSafeAndDeterministic(t *testing.T) {
+	first := profileSlug("Iran Hub One")
+	if first != profileSlug("Iran Hub One") {
+		t.Fatal("profile slug is not deterministic")
+	}
+	if first == profileSlug("Iran Hub Two") {
+		t.Fatal("different profile names generated the same slug")
+	}
+	for _, r := range first {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			t.Fatalf("profile slug contains unsafe character %q: %q", r, first)
+		}
+	}
+	if got := profileSlug("تانل ایران"); !strings.HasPrefix(got, "tunnel-") {
+		t.Fatalf("unicode-only name should use safe tunnel prefix, got %q", got)
+	}
+}
+
+func TestValidateNamedTunnelProfileName(t *testing.T) {
+	for _, name := range []string{"Iran Hub", "تانل ایران", "Outside-02", "A_1"} {
+		if err := validateProfileName(name); err != nil {
+			t.Errorf("valid profile name %q rejected: %v", name, err)
+		}
+	}
+	for _, name := range []string{"", "   ", "../bad", "name/other", "line\nbreak", strings.Repeat("x", 65)} {
+		if err := validateProfileName(name); err == nil {
+			t.Errorf("unsafe profile name %q unexpectedly accepted", name)
+		}
+	}
+}
+
+func TestProfileListenAddressesIncludeHubControlAndMappingPorts(t *testing.T) {
+	cfg := Config{
+		Role:          "hub",
+		Transport:     transportAdaptive,
+		ControlListen: "0.0.0.0:9443",
+		Ports: []PortMapping{
+			{ID: "main", Listen: "0.0.0.0:443"},
+			{ID: "web", Listen: "127.0.0.1:8443"},
+		},
+	}
+	got := profileListenAddresses(cfg)
+	want := map[string]bool{
+		"0.0.0.0:9443":   true,
+		"0.0.0.0:9444":   true,
+		"0.0.0.0:9445":   true,
+		"0.0.0.0:443":    true,
+		"127.0.0.1:8443": true,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %d listen addresses", got, len(want))
+	}
+	for _, addr := range got {
+		if !want[addr] {
+			t.Errorf("unexpected listen address %q", addr)
+		}
+	}
+}
+
+func TestNamedTunnelProfilesAreListedSeparatelyByName(t *testing.T) {
+	oldRoot := profilesRoot
+	profilesRoot = t.TempDir()
+	t.Cleanup(func() { profilesRoot = oldRoot })
+
+	for _, item := range []struct{ name, role string }{
+		{name: "Iran Hub", role: "hub"},
+		{name: "Outside Agent", role: "agent"},
+		{name: "Third Relay", role: "relay"},
+	} {
+		slug := profileSlug(item.name)
+		dir := profileDirectory(slug)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeProfileName(slug, item.name); err != nil {
+			t.Fatal(err)
+		}
+		config := fmt.Sprintf(`{"version":"1.6.3","role":%q}`, item.role)
+		if item.role == "hub" {
+			config = `{"version":"1.6.3","role":"hub","transport":"adaptive","control_listen":"0.0.0.0:9443","ports":[{"id":"main","listen":"0.0.0.0:443"}]}`
+		}
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(config), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	profiles, err := listTunnelProfiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]string{}
+	for _, p := range profiles {
+		if !p.Legacy {
+			found[p.Name] = p.Role
+		}
+	}
+	for name, role := range map[string]string{"Iran Hub": "HUB", "Outside Agent": "AGENT", "Third Relay": "RELAY"} {
+		if found[name] != role {
+			t.Errorf("profile %q role = %q, want %q; profiles=%v", name, found[name], role, found)
+		}
+	}
+	if len(found) != 3 {
+		t.Fatalf("found %d named profiles, want 3: %v", len(found), found)
+	}
+	if !profileNameInUse("Outside Agent") {
+		t.Fatal("existing named profile was not detected")
+	}
+	if profileNameInUse("New Profile") {
+		t.Fatal("unused profile name was reported as already used")
+	}
+	conflicting := Config{Role: "hub", Transport: transportAdaptive, ControlListen: "127.0.0.1:9443", Ports: []PortMapping{{ID: "new", Listen: "0.0.0.0:10443"}}}
+	if err := checkProfilePortConflicts(conflicting, "new-profile"); err == nil || !strings.Contains(err.Error(), "Iran Hub") {
+		t.Fatalf("expected named-profile port conflict for Iran Hub, got %v", err)
+	}
+	separate := Config{Role: "hub", Transport: transportAdaptive, ControlListen: "0.0.0.0:10500", Ports: []PortMapping{{ID: "new", Listen: "0.0.0.0:10443"}}}
+	if err := checkProfilePortConflicts(separate, "new-profile"); err != nil {
+		t.Fatalf("separate ports should be accepted, got %v", err)
 	}
 }
