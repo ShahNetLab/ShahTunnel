@@ -25,6 +25,44 @@ import (
 	"time"
 )
 
+func TestUIHeaderDoesNotPrintDecorativeLogo(t *testing.T) {
+	originalTerm := os.Getenv("TERM")
+	originalNoColor, hadNoColor := os.LookupEnv("NO_COLOR")
+	_ = os.Setenv("TERM", "dumb")
+	_ = os.Setenv("NO_COLOR", "1")
+	defer func() {
+		_ = os.Setenv("TERM", originalTerm)
+		if hadNoColor {
+			_ = os.Setenv("NO_COLOR", originalNoColor)
+		} else {
+			_ = os.Unsetenv("NO_COLOR")
+		}
+	}()
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stdout pipe: %v", err)
+	}
+	originalStdout := os.Stdout
+	os.Stdout = writeEnd
+	uiHeader("", "")
+	_ = writeEnd.Close()
+	os.Stdout = originalStdout
+	output, readErr := io.ReadAll(readEnd)
+	_ = readEnd.Close()
+	if readErr != nil {
+		t.Fatalf("read header output: %v", readErr)
+	}
+	got := string(output)
+	for _, forbidden := range []string{"GALACTIC SECURE RELAY", "NEBULA NETWORK", "ENCRYPTED TRANSIT", "5-PATH ADAPTIVE CORE", "▀"} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("terminal header unexpectedly printed decorative logo content %q", forbidden)
+		}
+	}
+	if !strings.Contains(got, "NETWORK ROUTE") || !strings.Contains(got, "COMMAND DECK") {
+		t.Fatalf("compact terminal header lost its route/menu layout: %q", got)
+	}
+}
+
 func TestCredentialCardsUseTwoGroupedFramesForTermius(t *testing.T) {
 	originalTerm := os.Getenv("TERM")
 	_ = os.Setenv("TERM", "dumb")

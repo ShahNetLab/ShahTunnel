@@ -40,7 +40,7 @@ import (
 )
 
 const (
-	version                          = "1.8.1"
+	version                          = "1.8.2"
 	maxFrame                         = 64 * 1024
 	defaultTunnelChannels            = 12
 	maxPendingPublicConnections      = 2048
@@ -4117,8 +4117,8 @@ func paintNeonRouteLine(index int, line, contentColor string) string {
 }
 
 func uiHeader(_, _ string) {
-	fmt.Println()
-	drawShahTunnelLogo()
+	// The large bitmap/ANSI logo is reserved for documentation and image assets.
+	// Do not render it in SSH terminals; keep the compact route diagram and menu frame.
 	fmt.Println()
 	uiRouteDiagram()
 	fmt.Println()
