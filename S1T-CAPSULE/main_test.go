@@ -3,10 +3,13 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base32"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,12 +17,121 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
+
+func TestUIHeaderDoesNotPrintDecorativeLogo(t *testing.T) {
+	originalTerm := os.Getenv("TERM")
+	originalNoColor, hadNoColor := os.LookupEnv("NO_COLOR")
+	_ = os.Setenv("TERM", "dumb")
+	_ = os.Setenv("NO_COLOR", "1")
+	defer func() {
+		_ = os.Setenv("TERM", originalTerm)
+		if hadNoColor {
+			_ = os.Setenv("NO_COLOR", originalNoColor)
+		} else {
+			_ = os.Unsetenv("NO_COLOR")
+		}
+	}()
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stdout pipe: %v", err)
+	}
+	originalStdout := os.Stdout
+	os.Stdout = writeEnd
+	uiHeader("", "")
+	_ = writeEnd.Close()
+	os.Stdout = originalStdout
+	output, readErr := io.ReadAll(readEnd)
+	_ = readEnd.Close()
+	if readErr != nil {
+		t.Fatalf("read header output: %v", readErr)
+	}
+	got := string(output)
+	for _, forbidden := range []string{"GALACTIC SECURE RELAY", "NEBULA NETWORK", "ENCRYPTED TRANSIT", "5-PATH ADAPTIVE CORE", "▀"} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("terminal header unexpectedly printed decorative logo content %q", forbidden)
+		}
+	}
+	if !strings.Contains(got, "NETWORK ROUTE") || !strings.Contains(got, "COMMAND DECK") {
+		t.Fatalf("compact terminal header lost its route/menu layout: %q", got)
+	}
+}
+
+func TestCredentialCardsUseTwoGroupedFramesForTermius(t *testing.T) {
+	originalTerm := os.Getenv("TERM")
+	_ = os.Setenv("TERM", "dumb")
+	defer func() { _ = os.Setenv("TERM", originalTerm) }()
+
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stdout pipe: %v", err)
+	}
+	originalStdout := os.Stdout
+	os.Stdout = writeEnd
+	printAgentCredentials("TOKEN_VALUE", "FINGERPRINT_VALUE", "HYSTERIA_VALUE", "SALAMANDER_VALUE")
+	_ = writeEnd.Close()
+	os.Stdout = originalStdout
+	output, readErr := io.ReadAll(readEnd)
+	_ = readEnd.Close()
+	if readErr != nil {
+		t.Fatalf("read credential output: %v", readErr)
+	}
+	got := string(output)
+	for _, value := range []string{"TOKEN_VALUE", "FINGERPRINT_VALUE", "HYSTERIA_VALUE", "SALAMANDER_VALUE"} {
+		if !strings.Contains(got, value) {
+			t.Fatalf("credential card omitted %q", value)
+		}
+	}
+	if strings.Count(got, "╭") != 2 || strings.Count(got, "╰") != 2 {
+		t.Fatalf("expected two grouped credential frames; got output:\n%s", got)
+	}
+	firstFrame := strings.Index(got, "HUB  →  AGENT  /  ACCESS KEYS")
+	secondFrame := strings.Index(got, "HYSTERIA 2  /  UDP CREDENTIALS")
+	if firstFrame < 0 || secondFrame <= firstFrame {
+		t.Fatalf("expected Hub/Agent frame followed by Hysteria frame:\n%s", got)
+	}
+	for _, forbidden := range []string{"TAP TO COPY", "Copy menu writes", "If your SSH app blocks", "Copy [1]"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("unsupported tap/copy prompt %q is still rendered", forbidden)
+		}
+	}
+	if strings.Contains(got, "long-press") || strings.Contains(got, "TAP TO COPY") {
+		t.Fatal("credential screen should keep the two framed panels clean")
+	}
+}
+
+func TestCredentialGroupCardKeepsEachValueOnOneLine(t *testing.T) {
+	token := strings.Repeat("A", 52)
+	fingerprint := strings.Repeat("B", 52)
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalStdout := os.Stdout
+	os.Stdout = writeEnd
+	uiCredentialGroupCard(credentialGroup{title: "ACCESS KEYS", accent: ansiPurple, credentials: []displayedCredential{
+		{label: "AGENT TOKEN", value: token, color: ansiYellow},
+		{label: "CERTIFICATE SHA-256", value: fingerprint, color: ansiCyan},
+	}})
+	_ = writeEnd.Close()
+	os.Stdout = originalStdout
+	output, _ := io.ReadAll(readEnd)
+	_ = readEnd.Close()
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.Contains(line, token) && strings.Contains(line, fingerprint) {
+			t.Fatal("two credential values must never share a line")
+		}
+	}
+	if !strings.Contains(string(output), token) || !strings.Contains(string(output), fingerprint) {
+		t.Fatal("group card must render both full, unbroken values")
+	}
+}
 
 func TestWebSocketUpgradeAndBidirectionalStream(t *testing.T) {
 	serverRaw, clientRaw := net.Pipe()
@@ -746,6 +858,250 @@ func TestAdaptiveTransportCandidatesPreferLastSuccessfulPath(t *testing.T) {
 	}
 }
 
+func TestAdaptiveTransportCandidatesSpreadFirstTimeLanes(t *testing.T) {
+	base := []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1}
+	for lane := 1; lane <= len(base); lane++ {
+		got := adaptiveTransportCandidatesForLane("", lane)
+		want := append(append([]string{}, base[lane-1:]...), base[:lane-1]...)
+		if !equalStrings(got, want) {
+			t.Fatalf("lane %d first candidates = %v; want %v", lane, got, want)
+		}
+	}
+	if got := adaptiveTransportCandidatesForLane("", len(base)+1); !equalStrings(got, base) {
+		t.Fatalf("lane %d rotation should wrap: got %v, want %v", len(base)+1, got, base)
+	}
+	if got := adaptiveTransportCandidatesForLane(transportHTTP2, 3); got[0] != transportHTTP2 {
+		t.Fatalf("previously authenticated path must remain first, got %v", got)
+	}
+}
+
+func TestAdaptiveAllCandidatesIncludeIndependentUDPPath(t *testing.T) {
+	want := []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1, transportHysteria}
+	got := adaptiveAllTransportCandidates("")
+	if !equalStrings(got, want) {
+		t.Fatalf("adaptive-all candidates = %v; want %v", got, want)
+	}
+	for _, preferred := range want {
+		candidates := adaptiveAllTransportCandidates(preferred)
+		if len(candidates) != len(want) || candidates[0] != preferred {
+			t.Fatalf("preferred %q gives candidates %v", preferred, candidates)
+		}
+		seen := map[string]bool{}
+		for _, candidate := range candidates {
+			if seen[candidate] {
+				t.Fatalf("duplicate candidate %q in %v", candidate, candidates)
+			}
+			seen[candidate] = true
+		}
+	}
+	for lane := 1; lane <= len(want); lane++ {
+		candidates := adaptiveAllTransportCandidatesForLane("", lane)
+		if candidates[0] != want[lane-1] {
+			t.Fatalf("lane %d starts with %q; want %q", lane, candidates[0], want[lane-1])
+		}
+	}
+	if !validTransportMode(transportHysteria) || !validTransportMode(transportAdaptiveAll) {
+		t.Fatal("new Hysteria or adaptive-all mode is not accepted")
+	}
+}
+
+func TestHysteriaOnlyControlIsLoopbackRestricted(t *testing.T) {
+	loopback := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 45678}
+	public := &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 45678}
+	if !transportAllowedPeer(transportHysteria, transportTCP, loopback) {
+		t.Fatal("Hysteria sidecar loopback connection should be allowed")
+	}
+	if transportAllowedPeer(transportHysteria, transportTCP, public) {
+		t.Fatal("public raw TCP connection must not be allowed in Hysteria-only mode")
+	}
+	if transportAllowedPeer(transportHysteria, transportWebSocket, loopback) {
+		t.Fatal("WebSocket must not be enabled in Hysteria-only mode")
+	}
+	if !transportAllowed(transportAdaptiveAll, transportTCP) || !transportAllowed(transportAdaptiveAll, transportHTTP2) {
+		t.Fatal("adaptive-all must retain the TCP fallback transports")
+	}
+}
+
+func TestHysteriaConfigContentsArePinnedAndDefaultDeny(t *testing.T) {
+	auth := strings.Repeat("a", 64)
+	obfs := strings.Repeat("b", 64)
+	cfg := Config{
+		Role: "hub", Transport: transportHysteria, ControlListen: "0.0.0.0:9443",
+		CertFile: "/etc/ravanreverse/hub.crt", KeyFile: "/etc/ravanreverse/hub.key",
+		HysteriaAuth: auth, HysteriaObfs: obfs,
+	}
+	server, err := hysteriaServerConfigContent(cfg)
+	if err != nil {
+		t.Fatalf("server config: %v", err)
+	}
+	for _, fragment := range []string{
+		`listen: "0.0.0.0:9446"`, `type: salamander`, `direct(127.0.0.1, tcp/9443)`, `reject(all)`,
+		`cert: "/etc/ravanreverse/hub.crt"`, auth, obfs,
+	} {
+		if !strings.Contains(string(server), fragment) {
+			t.Errorf("server config missing %q:\n%s", fragment, server)
+		}
+	}
+	cfg.Role, cfg.HubAddr, cfg.TLSServerName = "agent", "hub.example.net:9443", "hub.example.net"
+	cfg.Fingerprint = strings.Repeat("ab", 32)
+	client, err := hysteriaClientConfigContent(cfg)
+	if err != nil {
+		t.Fatalf("client config: %v", err)
+	}
+	for _, fragment := range []string{
+		`server: "hub.example.net:9446"`, `pinSHA256: "AB:AB:AB:AB`, `disableUDP: true`,
+		`listen: "127.0.0.1:11080"`, `type: salamander`, auth, obfs,
+	} {
+		if !strings.Contains(string(client), fragment) {
+			t.Errorf("client config missing %q:\n%s", fragment, client)
+		}
+	}
+	compact, err := randomHysteriaSecret()
+	if err != nil {
+		t.Fatalf("generate compact Hysteria secret: %v", err)
+	}
+	decoded, decodeErr := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(compact)
+	if len(compact) != 52 || decodeErr != nil || len(decoded) != 32 || !validHysteriaSecret(compact) {
+		t.Fatalf("new Hysteria secret must be 52-character Base32 encoding of 32 bytes; got %q (%d bytes, %v)", compact, len(decoded), decodeErr)
+	}
+	if !validHysteriaSecret(auth) || validHysteriaSecret("short") || validHysteriaSecret(strings.Repeat("z", 64)) {
+		t.Fatal("Hysteria credentials must accept legacy 32-byte hex and new 32-byte Base32 formats only")
+	}
+	token, err := randomAgentToken()
+	if err != nil {
+		t.Fatalf("generate compact Agent token: %v", err)
+	}
+	tokenBytes, tokenErr := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(token)
+	if len(token) != 52 || tokenErr != nil || len(tokenBytes) != 32 {
+		t.Fatalf("Agent token must be 52-character Base32 for 256-bit entropy; got %q (%d bytes, %v)", token, len(tokenBytes), tokenErr)
+	}
+
+	hexFingerprint := strings.Repeat("ab", 32)
+	shortFingerprint, err := compactFingerprint(hexFingerprint)
+	if err != nil {
+		t.Fatalf("compact fingerprint: %v", err)
+	}
+	if len(shortFingerprint) != 64 {
+		t.Fatalf("compact fingerprint must be 64 hexadecimal characters for backward compatibility; got %d", len(shortFingerprint))
+	}
+	decodedFingerprint, err := normalizeFingerprint(shortFingerprint)
+	if err != nil || fmt.Sprintf("%x", decodedFingerprint) != hexFingerprint {
+		t.Fatalf("compact fingerprint did not round-trip: %x (%v)", decodedFingerprint, err)
+	}
+}
+
+func TestDialSOCKS5TCPConnect(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		var greeting [3]byte
+		if _, err = io.ReadFull(conn, greeting[:]); err != nil {
+			serverErr <- err
+			return
+		}
+		if !bytes.Equal(greeting[:], []byte{0x05, 0x01, 0x00}) {
+			serverErr <- fmt.Errorf("unexpected greeting %v", greeting)
+			return
+		}
+		if err = writeFull(conn, []byte{0x05, 0x00}); err != nil {
+			serverErr <- err
+			return
+		}
+		var header [4]byte
+		if _, err = io.ReadFull(conn, header[:]); err != nil {
+			serverErr <- err
+			return
+		}
+		if header != [4]byte{0x05, 0x01, 0x00, 0x01} {
+			serverErr <- fmt.Errorf("unexpected CONNECT header %v", header)
+			return
+		}
+		var target [6]byte
+		if _, err = io.ReadFull(conn, target[:]); err != nil {
+			serverErr <- err
+			return
+		}
+		if !bytes.Equal(target[:4], []byte{127, 0, 0, 1}) || binary.BigEndian.Uint16(target[4:]) != 9443 {
+			serverErr <- fmt.Errorf("unexpected target %v", target)
+			return
+		}
+		if err = writeFull(conn, []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x12, 0x34}); err != nil {
+			serverErr <- err
+			return
+		}
+		_, err = io.WriteString(conn, "tunnel-ready")
+		serverErr <- err
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := dialSOCKS5(ctx, ln.Addr().String(), "127.0.0.1:9443")
+	if err != nil {
+		t.Fatalf("dial SOCKS5: %v", err)
+	}
+	defer client.Close()
+	got := make([]byte, len("tunnel-ready"))
+	if _, err := io.ReadFull(client, got); err != nil {
+		t.Fatalf("read tunneled payload: %v", err)
+	}
+	if string(got) != "tunnel-ready" {
+		t.Fatalf("payload = %q", got)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("SOCKS server: %v", err)
+	}
+}
+
+func TestWireObservePongRefreshesLivenessForLegacyEmptyPong(t *testing.T) {
+	local, peer := net.Pipe()
+	defer peer.Close()
+	w := newWire(local)
+	defer w.close()
+	before := w.lastPongAt.Load()
+	time.Sleep(time.Millisecond)
+	w.observePong(nil)
+	if got := w.lastPongAt.Load(); got <= before {
+		t.Fatalf("empty legacy PONG did not refresh liveness: before=%d after=%d", before, got)
+	}
+}
+
+func TestHeartbeatClosesBlackholedLane(t *testing.T) {
+	local, peer := net.Pipe()
+	w := newWire(local)
+	defer peer.Close()
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		var frame [17]byte // 9-byte frame header + 8-byte PING timestamp
+		for {
+			if _, err := io.ReadFull(peer, frame[:]); err != nil {
+				return
+			}
+		}
+	}()
+	stop := make(chan struct{})
+	go heartbeatWithTimings(w, stop, 5*time.Millisecond, 20*time.Millisecond)
+	select {
+	case <-w.done:
+	case <-time.After(250 * time.Millisecond):
+		close(stop)
+		w.close()
+		<-readerDone
+		t.Fatal("heartbeat did not close a lane that stopped returning PONGs")
+	}
+	close(stop)
+	<-readerDone
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -832,6 +1188,116 @@ func TestWireObservePongTracksRTTAndIgnoresMalformedPayload(t *testing.T) {
 	w.observePong([]byte{1, 2, 3})
 	if after := w.roundTripTime(); after != before {
 		t.Fatalf("malformed PONG changed RTT from %s to %s", before, after)
+	}
+}
+
+func TestFairWireDataQueueRoundRobinsBusyStreams(t *testing.T) {
+	q := newFairWireDataQueue()
+	q.enqueue(&wireRequest{typ: msgData, id: 10, data: []byte("a1")})
+	q.enqueue(&wireRequest{typ: msgData, id: 10, data: []byte("a2")})
+	q.enqueue(&wireRequest{typ: msgData, id: 10, data: []byte("a3")})
+	q.enqueue(&wireRequest{typ: msgData, id: 20, data: []byte("b1")})
+
+	got := make([]uint32, 0, 4)
+	for i := 0; i < 4; i++ {
+		req := q.dequeue()
+		if req == nil {
+			t.Fatalf("dequeue %d returned nil", i)
+		}
+		got = append(got, req.id)
+	}
+	want := []uint32{10, 20, 10, 10}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("DRR stream order = %v; want %v", got, want)
+		}
+	}
+	if q.dequeue() != nil {
+		t.Fatal("queue should be empty after draining all requests")
+	}
+}
+
+func TestFairWireDataQueueSharesBytesAcrossDifferentFrameSizes(t *testing.T) {
+	q := newFairWireDataQueue()
+	q.enqueue(&wireRequest{typ: msgData, id: 1, data: make([]byte, 2*wireFairQuantum)})
+	q.enqueue(&wireRequest{typ: msgData, id: 2, data: make([]byte, wireFairQuantum)})
+	q.enqueue(&wireRequest{typ: msgData, id: 3, data: []byte("interactive")})
+
+	first := q.dequeue()
+	second := q.dequeue()
+	third := q.dequeue()
+	// The two short flows fit in one quantum, while the 64 KiB frame from
+	// stream 1 must accrue two quanta before it can be scheduled.
+	if first == nil || second == nil || third == nil || first.id != 2 || second.id != 3 || third.id != 1 {
+		t.Fatalf("DRR frame order = (%v, %v, %v); want streams (2, 3, 1)", requestID(first), requestID(second), requestID(third))
+	}
+}
+
+func requestID(req *wireRequest) uint32 {
+	if req == nil {
+		return 0
+	}
+	return req.id
+}
+
+func TestWireWriteLoopFairnessPreventsSingleUploadFlowStarvingOthers(t *testing.T) {
+	writerConn, readerConn := net.Pipe()
+	defer readerConn.Close()
+	w := &wire{
+		conn:     writerConn,
+		controlQ: make(chan *wireRequest, 8),
+		dataQ:    make(chan *wireRequest, 8),
+		done:     make(chan struct{}),
+	}
+	writerDone := make(chan struct{})
+	go func() {
+		w.writeLoop()
+		close(writerDone)
+	}()
+
+	requests := []*wireRequest{
+		{typ: msgData, id: 11, data: []byte("upload-1"), done: make(chan error, 1)},
+		{typ: msgData, id: 11, data: []byte("upload-2"), done: make(chan error, 1)},
+		{typ: msgData, id: 11, data: []byte("upload-3"), done: make(chan error, 1)},
+		{typ: msgData, id: 22, data: []byte("chat"), done: make(chan error, 1)},
+	}
+	for _, req := range requests {
+		w.dataQ <- req
+	}
+
+	got := make([]uint32, 0, len(requests))
+	for i := 0; i < len(requests); i++ {
+		_ = readerConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		typ, id, _, err := readTestFrame(readerConn)
+		if err != nil {
+			t.Fatalf("read fair-scheduled frame %d: %v", i, err)
+		}
+		if typ != msgData {
+			t.Fatalf("frame %d type = %d; want msgData", i, typ)
+		}
+		got = append(got, id)
+	}
+	want := []uint32{11, 22, 11, 11}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("wire scheduler order = %v; want %v", got, want)
+		}
+	}
+	for _, req := range requests {
+		select {
+		case err := <-req.done:
+			if err != nil {
+				t.Fatalf("scheduled request failed: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("scheduled request was not acknowledged")
+		}
+	}
+	w.close()
+	select {
+	case <-writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("wire writer did not stop after close")
 	}
 }
 
@@ -1069,19 +1535,9 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
-		"        +------------------------------------------+",
-		"        |               SHAH TUNNEL                |",
-		"        |          SECURE RELAY / TLS 1.3          |",
-		"        +==========================================+",
-		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
-		"        |      ENCRYPTED TRANSIT / TOKEN AUTH      |",
-		"        |       EDGE > SECURE RELAY > TARGET       |",
-		"        |     ZERO TRUST / MULTI-LANE / ONLINE     |",
-		"        |     SESSION: ACTIVE / PRIVATE ROUTE      |",
-		"        +------------------------------------------+",
 		"  ╔══════════════════════════════════════════════════════════════╗",
 		"  ║                         COMMAND DECK                         ║",
-		"  ║       SECURE RELAY   •   TLS 1.3   •   ZERO TRUST            ║",
+		"  ║       NEBULA ROUTING   •   TLS 1.3   •   ZERO TRUST          ║",
 		"  ╚══════════════════════════════════════════════════════════════╝",
 	}
 	if len(shahTunnelHeaderArt) != len(want) {
@@ -1091,12 +1547,8 @@ func TestShahTunnelHeaderLayout(t *testing.T) {
 		if shahTunnelHeaderArt[i] != want[i] {
 			t.Errorf("header line %d:\n got: %q\nwant: %q", i+1, shahTunnelHeaderArt[i], want[i])
 		}
-		width := 52
-		if i >= 10 {
-			width = 66
-		}
-		if got := len([]rune(shahTunnelHeaderArt[i])); got != width {
-			t.Errorf("header line %d has visual width %d; want %d", i+1, got, width)
+		if got := len([]rune(shahTunnelHeaderArt[i])); got != 66 {
+			t.Errorf("header line %d has visual width %d; want 66", i+1, got)
 		}
 	}
 }
@@ -1105,9 +1557,9 @@ func TestShahTunnelRouteDiagram(t *testing.T) {
 	wantContains := []string{
 		"NETWORK ROUTE  /  TCP FORWARDING",
 		"CLIENT ── TCP ──▶ HUB ═ TLS 1.3 + TOKEN AUTH ═▶ AGENT",
-		"PATHS: TCP/TLS | WS/TLS | H2 CONNECT | H1 CONNECT",
-		"OPTION 7: ADAPTIVE FAILOVER ACROSS 4 PATHS",
-		"CERT PINNING • TOKEN AUTH • TLS 1.3",
+		"PATHS: TCP/TLS | WS/TLS | H2 | H1 | HYSTERIA 2 QUIC/UDP",
+		"OPTION 8: 5-PATH ADAPTIVE • OPTION 7: QUIC/UDP ONLY",
+		"5s HEARTBEAT • 20s DEAD-PATH DETECTION • TLS 1.3",
 	}
 	if len(shahTunnelRouteArt) != 7 {
 		t.Fatalf("route diagram has %d lines; want 7", len(shahTunnelRouteArt))
@@ -1283,122 +1735,208 @@ func TestAgentTLS13PinnedHandshake(t *testing.T) {
 	}
 }
 
-func TestNamedTunnelProfileSlugsAreSafeAndDeterministic(t *testing.T) {
-	first := profileSlug("Iran Hub One")
-	if first != profileSlug("Iran Hub One") {
-		t.Fatal("profile slug is not deterministic")
+func TestTunnelProfilePathsAreIsolatedAndValidated(t *testing.T) {
+	oldRoot, oldName := configRoot, activeProfileName
+	oldConfig, oldServer, oldClient := configPath, hysteriaServerConfigPath, hysteriaClientConfigPath
+	t.Cleanup(func() {
+		configRoot, activeProfileName = oldRoot, oldName
+		configPath, hysteriaServerConfigPath, hysteriaClientConfigPath = oldConfig, oldServer, oldClient
+	})
+	configRoot = t.TempDir()
+	if err := setActiveProfile("main-edge"); err != nil {
+		t.Fatalf("set profile: %v", err)
 	}
-	if first == profileSlug("Iran Hub Two") {
-		t.Fatal("different profile names generated the same slug")
+	if configPath != filepath.Join(configRoot, "profiles", "main-edge", "config.json") {
+		t.Fatalf("profile config path = %q", configPath)
 	}
-	for _, r := range first {
-		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
-			t.Fatalf("profile slug contains unsafe character %q: %q", r, first)
+	if hysteriaServerConfigPath != filepath.Join(profileDirFor("main-edge"), "hysteria-server.yaml") {
+		t.Fatalf("profile Hysteria server path = %q", hysteriaServerConfigPath)
+	}
+	if profileServiceName("main-edge") != "ravanreverse@main-edge" || profileServiceName("default") != "ravanreverse" {
+		t.Fatal("profile service names are not isolated")
+	}
+	for _, invalid := range []string{"", "../bad", "a/b", "bad name", strings.Repeat("a", 33)} {
+		if validTunnelProfileName(invalid) {
+			t.Errorf("invalid profile name %q was accepted", invalid)
 		}
 	}
-	if got := profileSlug("تانل ایران"); !strings.HasPrefix(got, "tunnel-") {
-		t.Fatalf("unicode-only name should use safe tunnel prefix, got %q", got)
+	if !validTunnelProfileName("Edge_01-prod") {
+		t.Fatal("valid profile name was rejected")
 	}
 }
 
-func TestValidateNamedTunnelProfileName(t *testing.T) {
-	for _, name := range []string{"Iran Hub", "تانل ایران", "Outside-02", "A_1"} {
-		if err := validateProfileName(name); err != nil {
-			t.Errorf("valid profile name %q rejected: %v", name, err)
-		}
+func TestListTunnelProfilesFindsOnlyValidConfigDirectories(t *testing.T) {
+	oldRoot := configRoot
+	t.Cleanup(func() { configRoot = oldRoot })
+	configRoot = t.TempDir()
+	if err := os.MkdirAll(filepath.Join(profileDirFor("alpha")), 0700); err != nil {
+		t.Fatal(err)
 	}
-	for _, name := range []string{"", "   ", "../bad", "name/other", "line\nbreak", strings.Repeat("x", 65)} {
-		if err := validateProfileName(name); err == nil {
-			t.Errorf("unsafe profile name %q unexpectedly accepted", name)
-		}
+	if err := os.MkdirAll(filepath.Join(profileDirFor("beta")), 0700); err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestProfileListenAddressesIncludeHubControlAndMappingPorts(t *testing.T) {
-	cfg := Config{
-		Role:          "hub",
-		Transport:     transportAdaptive,
-		ControlListen: "0.0.0.0:9443",
-		Ports: []PortMapping{
-			{ID: "main", Listen: "0.0.0.0:443"},
-			{ID: "web", Listen: "127.0.0.1:8443"},
-		},
+	if err := os.WriteFile(configPathForProfile("alpha"), []byte(`{"role":"hub"}`), 0600); err != nil {
+		t.Fatal(err)
 	}
-	got := profileListenAddresses(cfg)
-	want := map[string]bool{
-		"0.0.0.0:9443":   true,
-		"0.0.0.0:9444":   true,
-		"0.0.0.0:9445":   true,
-		"0.0.0.0:443":    true,
-		"127.0.0.1:8443": true,
+	if err := os.WriteFile(filepath.Join(profileDirFor("beta"), "readme.txt"), []byte("not a config"), 0600); err != nil {
+		t.Fatal(err)
 	}
-	if len(got) != len(want) {
-		t.Fatalf("got %v, want %d listen addresses", got, len(want))
-	}
-	for _, addr := range got {
-		if !want[addr] {
-			t.Errorf("unexpected listen address %q", addr)
-		}
-	}
-}
-
-func TestNamedTunnelProfilesAreListedSeparatelyByName(t *testing.T) {
-	oldRoot := profilesRoot
-	profilesRoot = t.TempDir()
-	t.Cleanup(func() { profilesRoot = oldRoot })
-
-	for _, item := range []struct{ name, role string }{
-		{name: "Iran Hub", role: "hub"},
-		{name: "Outside Agent", role: "agent"},
-		{name: "Third Relay", role: "relay"},
-	} {
-		slug := profileSlug(item.name)
-		dir := profileDirectory(slug)
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			t.Fatal(err)
-		}
-		if err := writeProfileName(slug, item.name); err != nil {
-			t.Fatal(err)
-		}
-		config := fmt.Sprintf(`{"version":"1.6.3","role":%q}`, item.role)
-		if item.role == "hub" {
-			config = `{"version":"1.6.3","role":"hub","transport":"adaptive","control_listen":"0.0.0.0:9443","ports":[{"id":"main","listen":"0.0.0.0:443"}]}`
-		}
-		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(config), 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	profiles, err := listTunnelProfiles()
+	got, err := listTunnelProfiles()
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := map[string]string{}
-	for _, p := range profiles {
-		if !p.Legacy {
-			found[p.Name] = p.Role
+	if !equalStrings(got, []string{"alpha"}) {
+		t.Fatalf("profiles = %v; want [alpha]", got)
+	}
+}
+
+func TestProfilePortConflictDetectionIsScopedAndNetworkAware(t *testing.T) {
+	oldRoot, oldName := configRoot, activeProfileName
+	t.Cleanup(func() { configRoot, activeProfileName = oldRoot, oldName })
+	configRoot = t.TempDir()
+	if err := os.MkdirAll(profileDirFor("existing"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	other := Config{Role: "hub", Transport: transportAdaptiveAll, ControlListen: "0.0.0.0:9443", Ports: []PortMapping{{ID: "web", Listen: "0.0.0.0:443"}}}
+	b, _ := json.Marshal(other)
+	if err := os.WriteFile(configPathForProfile("existing"), b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	candidate := Config{Role: "hub", Transport: transportTCP, ControlListen: "0.0.0.0:9543", Ports: []PortMapping{{ID: "web2", Listen: "0.0.0.0:443"}}}
+	if err := validateNoCrossProfilePortConflicts(candidate, "new-one"); err == nil || !strings.Contains(err.Error(), "port conflict") {
+		t.Fatalf("expected public listener port conflict, got %v", err)
+	}
+	candidate.Ports[0].Listen = "0.0.0.0:8448"
+	if err := validateNoCrossProfilePortConflicts(candidate, "new-one"); err != nil {
+		t.Fatalf("distinct TCP ports should coexist: %v", err)
+	}
+	candidate.Transport = transportHysteria
+	candidate.ControlListen = "127.0.0.1:9443"
+	// TCP and UDP may share a numeric port; only same-protocol socket conflicts.
+	if endpointHostsOverlap("0.0.0.0:9446", "0.0.0.0:9446") != true {
+		t.Fatal("wildcard TCP bind overlap was not detected")
+	}
+}
+
+func TestAdaptiveAllTransportCircuitBreakerSkipsRecentlyFailedPath(t *testing.T) {
+	agentTransportCooldown = sync.Map{}
+	t.Cleanup(func() { agentTransportCooldown = sync.Map{} })
+	now := time.Now()
+	base := []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1, transportHysteria}
+	markAdaptiveTransportFailed(transportTCP, now)
+	markAdaptiveTransportFailed(transportHTTP2, now)
+	got := filterCoolingAdaptiveCandidates(base, now.Add(time.Second))
+	want := []string{transportWebSocket, transportHTTP1, transportHysteria}
+	if !equalStrings(got, want) {
+		t.Fatalf("healthy candidate order = %v; want %v", got, want)
+	}
+	got = filterCoolingAdaptiveCandidates(base, now.Add(adaptiveTransportCooldown+time.Second))
+	if !equalStrings(got, base) {
+		t.Fatalf("expired cooldowns should restore all paths, got %v", got)
+	}
+	for _, mode := range base {
+		markAdaptiveTransportFailed(mode, now)
+	}
+	got = filterCoolingAdaptiveCandidates(base, now.Add(time.Second))
+	if !equalStrings(got, base) {
+		t.Fatalf("when all paths are cooled, manager must probe all again: %v", got)
+	}
+}
+
+func TestAllocateHysteriaSOCKSPortIsUniquePerAgentProfile(t *testing.T) {
+	oldRoot := configRoot
+	t.Cleanup(func() { configRoot = oldRoot })
+	configRoot = t.TempDir()
+	if err := os.MkdirAll(profileDirFor("existing"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	existing := Config{
+		Version: version, Role: "agent", Transport: transportAdaptiveAll,
+		HubAddr: "203.0.113.10:9443", Token: strings.Repeat("a", 64),
+		Fingerprint: strings.Repeat("b", 64), HysteriaAuth: strings.Repeat("c", 64),
+		HysteriaObfs: strings.Repeat("d", 64), HysteriaSOCKSListen: "127.0.0.1:11080",
+		Ports: []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
+	}
+	b, err := json.Marshal(existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPathForProfile("existing"), b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := allocateHysteriaSOCKSListen()
+	if err != nil {
+		t.Fatalf("allocate Hysteria SOCKS port: %v", err)
+	}
+	if got == existing.HysteriaSOCKSListen {
+		t.Fatalf("allocated duplicate SOCKS listener %s", got)
+	}
+	host, portText, err := net.SplitHostPort(got)
+	if err != nil || host != "127.0.0.1" {
+		t.Fatalf("allocated listener %q is not loopback: %v", got, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 11080 || port > 11999 {
+		t.Fatalf("allocated port %q is outside the managed range", portText)
+	}
+}
+
+func TestValidateAgentHysteriaRequiresValidLocalSOCKSListener(t *testing.T) {
+	c := Config{
+		Version: version, Role: "agent", Transport: transportHysteria,
+		HubAddr: "203.0.113.10:9443", Token: strings.Repeat("a", 64),
+		Fingerprint: strings.Repeat("b", 64), HysteriaAuth: strings.Repeat("c", 64),
+		HysteriaObfs: strings.Repeat("d", 64), HysteriaSOCKSListen: "0.0.0.0:11080",
+		Ports: []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
+	}
+	if err := validateConfig(c); err == nil || !strings.Contains(err.Error(), "local Hysteria SOCKS listener") {
+		t.Fatalf("expected invalid local SOCKS listener error, got %v", err)
+	}
+	c.HysteriaSOCKSListen = "127.0.0.1:11080"
+	if err := validateConfig(c); err != nil {
+		t.Fatalf("valid loopback SOCKS listener rejected: %v", err)
+	}
+}
+
+func TestDeleteTunnelProfileRemovesOnlyNamedProfile(t *testing.T) {
+	oldRoot, oldName := configRoot, activeProfileName
+	oldConfig, oldServer, oldClient := configPath, hysteriaServerConfigPath, hysteriaClientConfigPath
+	oldPATH := os.Getenv("PATH")
+	t.Cleanup(func() {
+		configRoot, activeProfileName = oldRoot, oldName
+		configPath, hysteriaServerConfigPath, hysteriaClientConfigPath = oldConfig, oldServer, oldClient
+		_ = os.Setenv("PATH", oldPATH)
+	})
+	configRoot = t.TempDir()
+	fakeBin := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(fakeBin, 0700); err != nil {
+		t.Fatal(err)
+	}
+	fakeSystemctl := filepath.Join(fakeBin, "systemctl")
+	if err := os.WriteFile(fakeSystemctl, []byte(`#!/bin/sh
+if [ "$1" = "show" ]; then echo inactive; fi
+exit 0
+`), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("PATH", fakeBin+string(os.PathListSeparator)+oldPATH); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"remove-me", "keep-me"} {
+		if err := os.MkdirAll(profileDirFor(name), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configPathForProfile(name), []byte(`{"role":"hub"}`), 0600); err != nil {
+			t.Fatal(err)
 		}
 	}
-	for name, role := range map[string]string{"Iran Hub": "HUB", "Outside Agent": "AGENT", "Third Relay": "RELAY"} {
-		if found[name] != role {
-			t.Errorf("profile %q role = %q, want %q; profiles=%v", name, found[name], role, found)
-		}
+	if err := deleteTunnelProfile("remove-me"); err != nil {
+		t.Fatalf("delete selected profile: %v", err)
 	}
-	if len(found) != 3 {
-		t.Fatalf("found %d named profiles, want 3: %v", len(found), found)
+	if _, err := os.Stat(profileDirFor("remove-me")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("selected profile directory still exists or stat failed unexpectedly: %v", err)
 	}
-	if !profileNameInUse("Outside Agent") {
-		t.Fatal("existing named profile was not detected")
-	}
-	if profileNameInUse("New Profile") {
-		t.Fatal("unused profile name was reported as already used")
-	}
-	conflicting := Config{Role: "hub", Transport: transportAdaptive, ControlListen: "127.0.0.1:9443", Ports: []PortMapping{{ID: "new", Listen: "0.0.0.0:10443"}}}
-	if err := checkProfilePortConflicts(conflicting, "new-profile"); err == nil || !strings.Contains(err.Error(), "Iran Hub") {
-		t.Fatalf("expected named-profile port conflict for Iran Hub, got %v", err)
-	}
-	separate := Config{Role: "hub", Transport: transportAdaptive, ControlListen: "0.0.0.0:10500", Ports: []PortMapping{{ID: "new", Listen: "0.0.0.0:10443"}}}
-	if err := checkProfilePortConflicts(separate, "new-profile"); err != nil {
-		t.Fatalf("separate ports should be accepted, got %v", err)
+	if _, err := os.Stat(configPathForProfile("keep-me")); err != nil {
+		t.Fatalf("unselected profile was damaged: %v", err)
 	}
 }
