@@ -1281,3 +1281,53 @@ func TestAgentTLS13PinnedHandshake(t *testing.T) {
 		t.Fatal("server handshake did not complete")
 	}
 }
+
+func TestTunnelIDIsStableAndSystemdSafe(t *testing.T) {
+	for _, name := range []string{"iran-main", "Outside Server", "ایران-خارج"} {
+		id := tunnelID(name)
+		if id == "" || len(id) > 48 {
+			t.Fatalf("tunnelID(%q) produced invalid length/value %q", name, id)
+		}
+		for _, r := range id {
+			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+				t.Fatalf("tunnelID(%q) contains unsafe rune %q in %q", name, r, id)
+			}
+		}
+		if again := tunnelID(name); again != id {
+			t.Fatalf("tunnelID(%q) is not stable: %q then %q", name, id, again)
+		}
+	}
+	if tunnelID("ایران") == tunnelID("خارج") {
+		t.Fatal("different non-ASCII tunnel names must not collide")
+	}
+}
+
+func TestUploadFlowControlWindowIsExpanded(t *testing.T) {
+	if streamWindowFrames < 64 {
+		t.Fatalf("stream window = %d frames; want at least 64", streamWindowFrames)
+	}
+	if maxFrame < 64*1024 {
+		t.Fatalf("maximum frame = %d bytes; want at least 64 KiB", maxFrame)
+	}
+	if got := int64(streamWindowFrames) * int64(maxFrame); got < 4<<20 {
+		t.Fatalf("per-stream in-flight window = %d bytes; want at least 4 MiB", got)
+	}
+}
+
+func TestListenAddressConflictDetection(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"0.0.0.0:9443", "127.0.0.1:9443", true},
+		{"127.0.0.1:9443", "127.0.0.1:9443", true},
+		{"127.0.0.1:9443", "127.0.0.1:9444", false},
+		{"192.0.2.1:443", "198.51.100.2:443", false},
+		{"[::]:443", "192.0.2.1:443", true},
+	}
+	for _, tc := range cases {
+		if got := listenAddressesConflict(tc.a, tc.b); got != tc.want {
+			t.Errorf("listenAddressesConflict(%q, %q) = %v; want %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+}

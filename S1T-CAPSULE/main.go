@@ -39,8 +39,9 @@ import (
 )
 
 const (
-	version                          = "1.6.2"
-	configPath                       = "/etc/ravanreverse/config.json"
+	version                          = "2.1.0"
+	legacyConfigPath                 = "/etc/ravanreverse/config.json"
+	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
 	defaultTunnelChannels            = 12
 	maxPendingPublicConnections      = 2048
@@ -55,7 +56,7 @@ const (
 	msgPing                     byte = 6
 	msgPong                     byte = 7
 	maxStreams                       = 512
-	streamWindowFrames               = 8
+	streamWindowFrames               = 64
 	maxQueuedPayloadBytes            = int64(64 << 20)
 	wireWriteTimeout                 = 30 * time.Second
 	reverseStreamOpenTimeout         = 18 * time.Second
@@ -80,6 +81,10 @@ var (
 	errHubLaneClosed        = errors.New("tunnel lane is closed")
 )
 
+// configPath is selected by the manager or by the systemd instance argument.
+// The legacy path remains readable so upgrades preserve existing installations.
+var configPath = legacyConfigPath
+
 type PortMapping struct {
 	ID     string `json:"id"`
 	Listen string `json:"listen,omitempty"` // Hub public listener
@@ -87,6 +92,7 @@ type PortMapping struct {
 }
 
 type Config struct {
+	Name          string `json:"name,omitempty"`
 	Version       string `json:"version"`
 	Role          string `json:"role"`                // hub on Iran, agent on outside
 	Transport     string `json:"transport,omitempty"` // auto, adaptive, tcp_tls, websocket_tls, http2_connect, http1_connect, or http_connect_auto
@@ -164,15 +170,16 @@ func writeRuntimeStats(role string) {
 	if err != nil {
 		return
 	}
-	tmp := "/etc/ravanreverse/runtime.json.tmp"
-	if err = os.MkdirAll("/etc/ravanreverse", 0700); err != nil {
+	runtimePath := runtimeStatsPath()
+	tmp := runtimePath + ".tmp"
+	if err = os.MkdirAll(filepath.Dir(runtimePath), 0700); err != nil {
 		return
 	}
 	if err = os.WriteFile(tmp, append(b, '\n'), 0600); err != nil {
 		return
 	}
-	_ = os.Rename(tmp, "/etc/ravanreverse/runtime.json")
-	_ = os.Chmod("/etc/ravanreverse/runtime.json", 0600)
+	_ = os.Rename(tmp, runtimePath)
+	_ = os.Chmod(runtimePath, 0600)
 }
 
 type counterWriter struct {
@@ -522,13 +529,13 @@ type wire struct {
 }
 
 func newWire(c net.Conn) *wire {
-	tuneTCPConn(c)
+	tuneTunnelTCPConn(c)
 	w := &wire{
 		conn: c,
 		// Control traffic (OPEN/ACK/CLOSE/PING) must not queue behind
 		// bulk payloads. Data remains bounded so a slow path applies backpressure.
 		controlQ: make(chan *wireRequest, 256),
-		dataQ:    make(chan *wireRequest, 64),
+		dataQ:    make(chan *wireRequest, 32),
 		done:     make(chan struct{}),
 	}
 	go w.writeLoop()
@@ -538,29 +545,52 @@ func newWire(c net.Conn) *wire {
 // tuneTCPConn applies latency-safe options without disabling Linux TCP
 // autotuning or forcing oversized per-socket buffers. It also works with a
 // tls.Conn by tuning the underlying TCP socket.
+func rawTCPConn(c net.Conn) *net.TCPConn {
+	for depth := 0; c != nil && depth < 5; depth++ {
+		switch wrapped := c.(type) {
+		case *net.TCPConn:
+			return wrapped
+		case *tls.Conn:
+			c = wrapped.NetConn()
+		case *websocketConn:
+			c = wrapped.Conn
+		case *bufferedConn:
+			c = wrapped.Conn
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
 func tuneTCPConn(c net.Conn) {
-	if c == nil {
-		return
-	}
-	raw := c
-	switch wrapped := c.(type) {
-	case *tls.Conn:
-		raw = wrapped.NetConn()
-	case *websocketConn:
-		raw = wrapped.Conn
-	case *bufferedConn:
-		raw = wrapped.Conn
-	}
-	if tc, ok := raw.(*tls.Conn); ok {
-		raw = tc.NetConn()
-	}
-	tcp, ok := raw.(*net.TCPConn)
-	if !ok {
+	tcp := rawTCPConn(c)
+	if tcp == nil {
 		return
 	}
 	_ = tcp.SetNoDelay(true)
 	_ = tcp.SetKeepAlive(true)
 	_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+}
+
+// tuneTunnelTCPConn enables BBR only on the outer tunnel socket and only when
+// the running Linux kernel supports it. This is per-socket; it never changes
+// the server-wide congestion-control policy. Unsupported kernels keep their
+// configured default algorithm without failing the tunnel.
+func tuneTunnelTCPConn(c net.Conn) {
+	tuneTCPConn(c)
+	tcp := rawTCPConn(c)
+	if tcp == nil {
+		return
+	}
+	raw, err := tcp.SyscallConn()
+	if err != nil {
+		return
+	}
+	_ = raw.Control(func(fd uintptr) {
+		// Linux TCP_CONGESTION socket option (13).
+		_ = syscall.SetsockoptString(int(fd), syscall.IPPROTO_TCP, 13, "bbr")
+	})
 }
 
 func adjustAgentChannels(delta int64) {
@@ -1114,7 +1144,7 @@ func (s *hubSession) addStream(c net.Conn, portID ...string) (uint32, *hubStream
 	return id, st, nil
 }
 func (s *hubSession) pumpPublicToAgent(id uint32, st *hubStream) {
-	buf := make([]byte, 32*1024)
+	buf := make([]byte, maxFrame)
 	for {
 		n, readErr := st.conn.Read(buf)
 		if n > 0 {
@@ -1415,7 +1445,7 @@ func (s *agentSession) openTarget(ctx context.Context, id uint32, key string) {
 	go s.pumpTargetToHub(id, st)
 }
 func (s *agentSession) pumpTargetToHub(id uint32, st *agentStream) {
-	buf := make([]byte, 32*1024)
+	buf := make([]byte, maxFrame)
 	for {
 		n, readErr := st.conn.Read(buf)
 		if n > 0 {
@@ -2920,6 +2950,326 @@ func saveConfig(c Config) error {
 	}
 	return os.Chmod(configPath, 0600)
 }
+
+// TunnelProfile is one independently configured systemd tunnel instance.
+type TunnelProfile struct {
+	Name    string
+	ID      string
+	Path    string
+	Service string
+	Role    string
+	Legacy  bool
+}
+
+func tunnelID(name string) string {
+	name = strings.TrimSpace(name)
+	var b strings.Builder
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			b.WriteRune(r)
+		} else if b.Len() == 0 || !strings.HasSuffix(b.String(), "-") {
+			b.WriteByte('-')
+		}
+	}
+	slug := strings.Trim(b.String(), "-._")
+	if slug == "" || slug != strings.ToLower(name) {
+		sum := sha256.Sum256([]byte(name))
+		if slug == "" {
+			slug = "tunnel"
+		}
+		if len(slug) > 24 {
+			slug = slug[:24]
+		}
+		slug += "-" + hex.EncodeToString(sum[:4])
+	}
+	if len(slug) > 48 {
+		sum := sha256.Sum256([]byte(name))
+		slug = slug[:39] + "-" + hex.EncodeToString(sum[:4])
+	}
+	return slug
+}
+
+func tunnelConfigPath(name string) string {
+	return filepath.Join(tunnelConfigDir, tunnelID(name)+".json")
+}
+
+func runtimeStatsPath() string {
+	if filepath.Clean(configPath) == filepath.Clean(legacyConfigPath) {
+		return "/etc/ravanreverse/runtime.json"
+	}
+	base := strings.TrimSuffix(filepath.Base(configPath), filepath.Ext(configPath))
+	return filepath.Join(filepath.Dir(configPath), base+".runtime.json")
+}
+
+func currentServiceName() string {
+	if filepath.Clean(configPath) == filepath.Clean(legacyConfigPath) {
+		return "ravanreverse"
+	}
+	id := strings.TrimSuffix(filepath.Base(configPath), filepath.Ext(configPath))
+	return "ravanreverse@" + id
+}
+
+func listTunnelProfiles() ([]TunnelProfile, error) {
+	profiles := make([]TunnelProfile, 0)
+	if data, err := os.ReadFile(legacyConfigPath); err == nil {
+		var c Config
+		if json.Unmarshal(data, &c) == nil {
+			name := strings.TrimSpace(c.Name)
+			if name == "" {
+				name = "legacy-" + c.Role
+			}
+			profiles = append(profiles, TunnelProfile{Name: name, ID: "legacy", Path: legacyConfigPath, Service: "ravanreverse", Role: c.Role, Legacy: true})
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	entries, err := os.ReadDir(tunnelConfigDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+			continue
+		}
+		path := filepath.Join(tunnelConfigDir, entry.Name())
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			continue
+		}
+		var c Config
+		if json.Unmarshal(data, &c) != nil {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		name := strings.TrimSpace(c.Name)
+		if name == "" {
+			name = id
+		}
+		profiles = append(profiles, TunnelProfile{Name: name, ID: id, Path: path, Service: "ravanreverse@" + id, Role: c.Role})
+	}
+	sort.Slice(profiles, func(i, j int) bool { return strings.ToLower(profiles[i].Name) < strings.ToLower(profiles[j].Name) })
+	return profiles, nil
+}
+
+func profileListenAddresses(c Config) []string {
+	c = normalizeConfig(c)
+	addresses := make([]string, 0, len(c.Ports)+3)
+	switch c.Role {
+	case "hub":
+		if c.ControlListen != "" {
+			addresses = append(addresses, c.ControlListen)
+			if transportModeAllowsHTTP2(c.Transport) {
+				if addr, err := adjacentPortAddress(c.ControlListen); err == nil {
+					addresses = append(addresses, addr)
+				}
+			}
+			if transportModeAllowsHTTP1(c.Transport) {
+				if addr, err := secondAdjacentPortAddress(c.ControlListen); err == nil {
+					addresses = append(addresses, addr)
+				}
+			}
+		}
+		for _, mapping := range c.Ports {
+			if mapping.Listen != "" {
+				addresses = append(addresses, mapping.Listen)
+			}
+		}
+	case "relay":
+		for _, mapping := range c.Ports {
+			if mapping.Listen != "" {
+				addresses = append(addresses, mapping.Listen)
+			}
+		}
+	}
+	return addresses
+}
+
+func listenAddressesConflict(a, b string) bool {
+	ha, pa, errA := net.SplitHostPort(a)
+	hb, pb, errB := net.SplitHostPort(b)
+	if errA != nil || errB != nil || pa != pb {
+		return false
+	}
+	ha, hb = strings.Trim(strings.ToLower(ha), "[]"), strings.Trim(strings.ToLower(hb), "[]")
+	wildcard := func(host string) bool { return host == "" || host == "0.0.0.0" || host == "::" }
+	return ha == hb || wildcard(ha) || wildcard(hb)
+}
+
+func ensureNoPortConflicts(c Config, skipPath string) error {
+	newAddresses := profileListenAddresses(c)
+	if len(newAddresses) == 0 {
+		return nil
+	}
+	profiles, err := listTunnelProfiles()
+	if err != nil {
+		return err
+	}
+	for _, profile := range profiles {
+		if filepath.Clean(profile.Path) == filepath.Clean(skipPath) {
+			continue
+		}
+		data, readErr := os.ReadFile(profile.Path)
+		if readErr != nil {
+			continue
+		}
+		var existing Config
+		if json.Unmarshal(data, &existing) != nil {
+			continue
+		}
+		for _, newAddr := range newAddresses {
+			for _, oldAddr := range profileListenAddresses(existing) {
+				if listenAddressesConflict(newAddr, oldAddr) {
+					return fmt.Errorf("listen address %s conflicts with tunnel %q (%s); choose a different port. Existing tunnel remains unchanged", newAddr, profile.Name, oldAddr)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func ensureTunnelTemplateUnit() error {
+	unitPath := "/etc/systemd/system/ravanreverse@.service"
+	if _, err := os.Stat("/usr/local/bin/ravanreverse"); err != nil {
+		return errors.New("Shah Tunnel binary is not installed; run the installer first")
+	}
+	unit := `[Unit]
+Description=Shah Tunnel authenticated reverse TCP tunnel (%i)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+[Service]
+Type=simple
+UMask=0077
+ExecStart=/usr/local/bin/ravanreverse run --config /etc/ravanreverse/tunnels/%i.json
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+LimitNOFILE=262144
+TasksMax=4096
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+ReadWritePaths=/etc/ravanreverse
+[Install]
+WantedBy=multi-user.target
+`
+	if err := atomicWriteFile(unitPath, []byte(unit), 0644); err != nil {
+		return fmt.Errorf("write tunnel service template: %w", err)
+	}
+	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+		return fmt.Errorf("systemd daemon-reload failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func chooseTunnel(prompt string) bool {
+	profiles, err := listTunnelProfiles()
+	if err != nil {
+		fmt.Printf("Could not list tunnels: %v\n", err)
+		return false
+	}
+	if len(profiles) == 0 {
+		uiWarn("No configured tunnels yet. Use option 1 to create one.")
+		return false
+	}
+	fmt.Println(paint(ansiCyan+ansiBold, "\n  CONFIGURED TUNNELS"))
+	for i, profile := range profiles {
+		state := paint(ansiYellow, "○ STOPPED")
+		if exec.Command("systemctl", "is-active", "--quiet", profile.Service).Run() == nil {
+			state = paint(ansiGreen+ansiBold, "● RUNNING")
+		}
+		fmt.Printf("  [%d] 🛰️ %-24s %-8s %s\n", i+1, profile.Name, strings.ToUpper(profile.Role), state)
+	}
+	choice := strings.TrimSpace(ask(prompt, "1"))
+	selected := -1
+	if n, parseErr := strconv.Atoi(choice); parseErr == nil && n >= 1 && n <= len(profiles) {
+		selected = n - 1
+	} else {
+		for i, profile := range profiles {
+			if strings.EqualFold(choice, profile.Name) || strings.EqualFold(choice, profile.ID) {
+				selected = i
+				break
+			}
+		}
+	}
+	if selected < 0 {
+		uiWarn("Tunnel name/number was not found.")
+		return false
+	}
+	configPath = profiles[selected].Path
+	return true
+}
+
+func deleteOneTunnel() error {
+	profiles, err := listTunnelProfiles()
+	if err != nil {
+		return err
+	}
+	if len(profiles) == 0 {
+		uiWarn("There are no tunnels to delete.")
+		return nil
+	}
+	if !chooseTunnel("Select the tunnel to delete (number or name)") {
+		return nil
+	}
+	selectedPath := configPath
+	service := currentServiceName()
+	var selected *TunnelProfile
+	for i := range profiles {
+		if filepath.Clean(profiles[i].Path) == filepath.Clean(selectedPath) {
+			selected = &profiles[i]
+			break
+		}
+	}
+	if selected == nil {
+		return errors.New("selected tunnel profile disappeared")
+	}
+	if !askYN("Delete tunnel '"+selected.Name+"' only? Other tunnels will remain. (y/N)", "n") {
+		uiInfo("Deletion cancelled; no tunnel was changed.")
+		return nil
+	}
+	_ = exec.Command("systemctl", "disable", "--now", service).Run()
+	state, _ := exec.Command("systemctl", "show", service, "-p", "ActiveState", "--value").Output()
+	activeState := strings.TrimSpace(string(state))
+	if activeState == "active" || activeState == "deactivating" || activeState == "activating" {
+		return fmt.Errorf("could not stop %s (state=%s); configuration was kept", service, activeState)
+	}
+	var cfg Config
+	if data, readErr := os.ReadFile(selected.Path); readErr == nil {
+		_ = json.Unmarshal(data, &cfg)
+	}
+	if !selected.Legacy {
+		for _, certPath := range []string{cfg.CertFile, cfg.KeyFile} {
+			if certPath != "" && filepath.Clean(filepath.Dir(certPath)) == filepath.Clean(tunnelConfigDir) {
+				_ = os.Remove(certPath)
+			}
+		}
+	}
+	if err := os.Remove(selected.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove tunnel configuration: %w", err)
+	}
+	_ = os.Remove(runtimeStatsPath())
+	uiSuccess("Tunnel '" + selected.Name + "' was deleted. Other tunnel configurations were preserved.")
+	return nil
+}
+
 func randomHex(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -3314,12 +3664,27 @@ func generateCertificate(certPath, keyPath string) (string, error) {
 }
 func setup() error {
 	wizardStep = 0
-	uiHeader("SHAH TUNNEL // SPACE SETUP", "WIZARD   •   SECURE LINK   •   TRANSPORT ROUTING")
-	uiInfo("Step-by-step setup. Each step asks for one input.")
-	if _, err := os.Stat(configPath); err == nil {
-		if !wizardYesNo("Overwrite the existing configuration? (y/N)", "n") {
-			return errors.New("Setup cancelled; the existing configuration was preserved")
+	uiHeader("SHAH TUNNEL // SPACE SETUP", "MULTI-TUNNEL MANAGER   •   TLS 1.3   •   ZERO TRUST")
+	uiInfo("Create a separate tunnel profile. Existing tunnels and their services will not be overwritten.")
+	name := strings.TrimSpace(wizardAsk("Unique tunnel name (letters, numbers, spaces; example: iran-main)", ""))
+	if name == "" || len([]rune(name)) > 64 || strings.ContainsAny(name, "/\\\\\r\n\x00") {
+		return errors.New("tunnel name is empty, too long, or contains an invalid path character")
+	}
+	profiles, err := listTunnelProfiles()
+	if err != nil {
+		return err
+	}
+	id := tunnelID(name)
+	for _, profile := range profiles {
+		if strings.EqualFold(profile.Name, name) || profile.ID == id {
+			return fmt.Errorf("a tunnel named %q already exists; choose a different name (the existing tunnel was preserved)", profile.Name)
 		}
+	}
+	configPath = tunnelConfigPath(name)
+	if _, err := os.Stat(configPath); err == nil {
+		return fmt.Errorf("tunnel file already exists for %q; existing configuration was preserved", name)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 
 	uiRule()
@@ -3332,7 +3697,7 @@ func setup() error {
 	if err != nil {
 		return err
 	}
-	c := Config{Version: version, Token: tok}
+	c := Config{Name: name, Version: version, Token: tok}
 	switch role {
 	case "1", "hub", "iran":
 		c.Role = "hub"
@@ -3342,47 +3707,45 @@ func setup() error {
 			return err
 		}
 		uiInfo("Allow TCP on the control port, control+1 for HTTP/2 CONNECT, and control+2 for HTTP/1.1 CONNECT as selected. Select the same transport policy on both endpoints.")
-		c.CertFile, c.KeyFile = "/etc/ravanreverse/hub.crt", "/etc/ravanreverse/hub.key"
+		c.CertFile = filepath.Join(tunnelConfigDir, id+".crt")
+		c.KeyFile = filepath.Join(tunnelConfigDir, id+".key")
 		for i := 1; i <= 100; i++ {
 			defID := "main"
 			if i > 1 {
 				defID = fmt.Sprintf("port%d", i)
 			}
-			id := wizardAsk(fmt.Sprintf("Mapping ID #%d (must match on the Agent)", i), defID)
+			mappingID := wizardAsk(fmt.Sprintf("Mapping ID #%d (must match on the Agent)", i), defID)
 			listenDefault := "0.0.0.0:443"
 			if i > 1 {
 				listenDefault = "0.0.0.0:" + strconv.Itoa(8443+i-2)
 			}
-			addr := wizardAsk(fmt.Sprintf("Public listen address for %s", id), listenDefault)
-			c.Ports = append(c.Ports, PortMapping{ID: id, Listen: addr})
+			addr := wizardAsk(fmt.Sprintf("Public listen address for %s", mappingID), listenDefault)
+			c.Ports = append(c.Ports, PortMapping{ID: mappingID, Listen: addr})
 			if !wizardYesNo("Add another public port? (y/N)", "n") {
 				break
 			}
 		}
 		c = normalizeConfig(c)
-		// Validate before rotating certificate/key files, so a typo cannot invalidate
-		// a previously working Hub configuration.
+		if err = ensureNoPortConflicts(c, configPath); err != nil {
+			return err
+		}
 		if err = validateConfig(c); err != nil {
 			return err
 		}
-		fp, e := generateCertificate(c.CertFile, c.KeyFile)
-		if e != nil {
-			return e
+		fp, certErr := generateCertificate(c.CertFile, c.KeyFile)
+		if certErr != nil {
+			return certErr
 		}
 		c.Fingerprint = fp
 		if err = saveConfig(c); err != nil {
+			_ = os.Remove(c.CertFile)
+			_ = os.Remove(c.KeyFile)
 			return err
 		}
 		uiRule()
-		uiCard("✅ HUB CONFIGURED", []uiCardRow{
-			{Text: "Configuration saved successfully.", Color: ansiGreen},
-		}, ansiGreen+ansiBold)
-		uiCard("🔐 AGENT TOKEN", []uiCardRow{
-			{Text: c.Token, Color: ansiYellow + ansiBold},
-		}, ansiYellow)
-		uiCard("🛡️ CERTIFICATE SHA-256 FINGERPRINT", []uiCardRow{
-			{Text: c.Fingerprint, Color: ansiCyan + ansiBold},
-		}, ansiCyan)
+		uiCard("✅ HUB CONFIGURED  /  "+name, []uiCardRow{{Text: "A new independent tunnel profile was saved.", Color: ansiGreen}}, ansiGreen+ansiBold)
+		uiCard("🔐 AGENT TOKEN", []uiCardRow{{Text: c.Token, Color: ansiYellow + ansiBold}}, ansiYellow)
+		uiCard("🛡️ CERTIFICATE SHA-256 FINGERPRINT", []uiCardRow{{Text: c.Fingerprint, Color: ansiCyan + ansiBold}}, ansiCyan)
 		uiCard("🔌 CONTROL PORTS", []uiCardRow{
 			{Text: "TCP/TLS + WebSocket/TLS: " + portOf(c.ControlListen), Color: ansiPurple + ansiBold},
 			{Text: "HTTP/2 CONNECT: " + nextPortLabel(c.ControlListen) + " (TCP)", Color: ansiBlue + ansiBold},
@@ -3419,16 +3782,16 @@ func setup() error {
 			if i > 1 {
 				defID = fmt.Sprintf("port%d", i)
 			}
-			id := wizardAsk(fmt.Sprintf("Mapping ID #%d (must match the Hub)", i), defID)
+			mappingID := wizardAsk(fmt.Sprintf("Mapping ID #%d (must match the Hub)", i), defID)
 			targetDefault := "127.0.0.1:443"
 			if i > 1 {
 				targetDefault = ""
 			}
-			target := wizardAsk(fmt.Sprintf("Local target for mapping %s on the outside server (IP:PORT)", id), targetDefault)
+			target := wizardAsk(fmt.Sprintf("Local target for mapping %s on the outside server (IP:PORT)", mappingID), targetDefault)
 			if strings.TrimSpace(target) == "" {
-				return fmt.Errorf("target for mapping %q is required", id)
+				return fmt.Errorf("target for mapping %q is required", mappingID)
 			}
-			c.Ports = append(c.Ports, PortMapping{ID: id, Target: target})
+			c.Ports = append(c.Ports, PortMapping{ID: mappingID, Target: target})
 			if !wizardYesNo("Add another target mapping? (y/N)", "n") {
 				break
 			}
@@ -3437,9 +3800,7 @@ func setup() error {
 		if err = saveConfig(c); err != nil {
 			return err
 		}
-		_ = os.Remove("/etc/ravanreverse/hub.key")
-		_ = os.Remove("/etc/ravanreverse/hub.crt")
-		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s. Option 7 covers TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT, and HTTP/1.1 CONNECT.", c.TunnelChannels, c.Transport))
+		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s.", c.TunnelChannels, c.Transport))
 		uiSuccess("Agent configuration saved. Reconnection is automatic if a lane drops.")
 	case "3", "relay", "front":
 		c.Role = "relay"
@@ -3449,35 +3810,36 @@ func setup() error {
 			if i > 1 {
 				defID = fmt.Sprintf("front%d", i)
 			}
-			id := wizardAsk(fmt.Sprintf("Relay mapping ID #%d", i), defID)
+			mappingID := wizardAsk(fmt.Sprintf("Relay mapping ID #%d", i), defID)
 			listenDefault := "0.0.0.0:443"
 			if i > 1 {
 				listenDefault = "0.0.0.0:" + strconv.Itoa(8443+i-2)
 			}
-			listen := wizardAsk(fmt.Sprintf("Public client listener for %s", id), listenDefault)
-			target := wizardAsk(fmt.Sprintf("Reachable Iran-side target for %s (IP:PORT)", id), "")
-			c.Ports = append(c.Ports, PortMapping{ID: id, Listen: listen, Target: target})
+			listen := wizardAsk(fmt.Sprintf("Public client listener for %s", mappingID), listenDefault)
+			target := wizardAsk(fmt.Sprintf("Reachable Iran-side target for %s (IP:PORT)", mappingID), "")
+			c.Ports = append(c.Ports, PortMapping{ID: mappingID, Listen: listen, Target: target})
 			if !wizardYesNo("Add another Relay port? (y/N)", "n") {
 				break
 			}
 		}
 		c = normalizeConfig(c)
+		if err = ensureNoPortConflicts(c, configPath); err != nil {
+			return err
+		}
 		if err = saveConfig(c); err != nil {
 			return err
 		}
-		_ = os.Remove("/etc/ravanreverse/hub.key")
-		_ = os.Remove("/etc/ravanreverse/hub.crt")
 		uiSuccess("Relay configured.")
 		uiWarn("Relay changes the client entry point only. The Relay operator and network path may still see the Iran destination IP.")
 	default:
-		return errors.New("Invalid role. Enter 1 for HUB, 2 for Agent, or 3 for Relay.")
+		return errors.New("invalid role; enter 1 for HUB, 2 for Agent, or 3 for Relay")
 	}
 	fmt.Printf("\n  %s %s\n", paint(ansiGreen+ansiBold, "✓"), "Configuration saved: "+configPath)
-	uiInfo("Enabling the service and automatic startup after VPS reboot…")
+	uiInfo("Enabling the independent service and automatic startup after VPS reboot…")
 	if err := ensureTunnelRunning(true); err != nil {
 		return fmt.Errorf("configuration was saved, but automatic startup failed: %w", err)
 	}
-	uiSuccess("Tunnel is active and configured to start automatically after reboot.")
+	uiSuccess("Tunnel '" + name + "' is active. Existing tunnels were not changed.")
 	return nil
 }
 
@@ -3509,32 +3871,35 @@ func runSystemctl(args ...string) error {
 	return err
 }
 func tunnelIsActive() bool {
-	return exec.Command("systemctl", "is-active", "--quiet", "ravanreverse").Run() == nil
+	return exec.Command("systemctl", "is-active", "--quiet", currentServiceName()).Run() == nil
 }
 
-// ensureTunnelRunning enables boot-time startup and verifies the service really became active.
-// restartActive reloads freshly-written configuration when setup was just completed.
+// ensureTunnelRunning enables and manages only the currently selected profile.
 func ensureTunnelRunning(restartActive bool) error {
 	if !isRoot() {
 		return errors.New("run as root")
 	}
-	if _, err := os.Stat("/etc/systemd/system/ravanreverse.service"); err != nil {
-		return errors.New("Shah Tunnel is not installed; run the installer first")
+	service := currentServiceName()
+	if filepath.Clean(configPath) != filepath.Clean(legacyConfigPath) {
+		if err := ensureTunnelTemplateUnit(); err != nil {
+			return err
+		}
+	} else if _, err := os.Stat("/etc/systemd/system/ravanreverse.service"); err != nil {
+		return errors.New("legacy Shah Tunnel service is not installed; select a named tunnel or run the installer")
 	}
-	if err := runSystemctl("enable", "ravanreverse"); err != nil {
-		return fmt.Errorf("could not enable automatic startup: %w", err)
+	if err := runSystemctl("enable", service); err != nil {
+		return fmt.Errorf("could not enable automatic startup for %s: %w", service, err)
 	}
 	var err error
 	if tunnelIsActive() {
 		if restartActive {
-			err = runSystemctl("restart", "ravanreverse")
+			err = runSystemctl("restart", service)
 		} else {
-			fmt.Println("Shah Tunnel is already running.")
+			fmt.Printf("Tunnel service %s is already running.\n", service)
 		}
 	} else {
-		// Clear a previous failed/start-limit state so a manual start can recover.
-		_ = exec.Command("systemctl", "reset-failed", "ravanreverse").Run()
-		err = runSystemctl("start", "ravanreverse")
+		_ = exec.Command("systemctl", "reset-failed", service).Run()
+		err = runSystemctl("start", service)
 	}
 	if err != nil || !tunnelIsActive() {
 		showRecentLogs(40)
@@ -3543,12 +3908,13 @@ func ensureTunnelRunning(restartActive bool) error {
 		}
 		return errors.New("service did not reach active state; recent logs are shown above")
 	}
-	fmt.Println("Shah Tunnel is active; automatic startup at boot is enabled.")
+	fmt.Printf("Tunnel service %s is active; automatic startup at boot is enabled.\n", service)
 	return nil
 }
 
 func showRecentLogs(n int) {
-	out, err := exec.Command("journalctl", "-u", "ravanreverse", "-n", strconv.Itoa(n), "--no-pager", "-o", "short-iso").CombinedOutput()
+	service := currentServiceName()
+	out, err := exec.Command("journalctl", "-u", service, "-n", strconv.Itoa(n), "--no-pager", "-o", "short-iso").CombinedOutput()
 	if len(out) > 0 {
 		fmt.Print(string(out))
 	}
@@ -3558,17 +3924,22 @@ func showRecentLogs(n int) {
 }
 
 func showStatusAndLogs() error {
-	if _, err := os.Stat("/etc/systemd/system/ravanreverse.service"); err != nil {
-		return errors.New("Shah Tunnel is not installed")
+	service := currentServiceName()
+	if filepath.Clean(configPath) != filepath.Clean(legacyConfigPath) {
+		if _, err := os.Stat(filepath.Join(tunnelConfigDir, filepath.Base(configPath))); err != nil {
+			return errors.New("selected tunnel configuration was not found")
+		}
+	} else if _, err := os.Stat("/etc/systemd/system/ravanreverse.service"); err != nil {
+		return errors.New("legacy Shah Tunnel service is not installed")
 	}
-	out, err := exec.Command("systemctl", "status", "ravanreverse", "--no-pager", "-l").CombinedOutput()
+	out, err := exec.Command("systemctl", "status", service, "--no-pager", "-l").CombinedOutput()
 	if len(out) > 0 {
 		fmt.Print(string(out))
 	}
 	fmt.Println("\n--- Recent service logs ---")
 	showRecentLogs(40)
 	if err != nil && !tunnelIsActive() {
-		return errors.New("service is not active; see logs above")
+		return errors.New("selected tunnel is not active; see logs above")
 	}
 	return nil
 }
@@ -3619,7 +3990,15 @@ if [[ ! "$LAST" =~ ^[0-9]+$ ]] || (( NOW < LAST )); then
   exit 0
 fi
 (( NOW - LAST >= INTERVAL )) || exit 0
-if systemctl restart ravanreverse; then
+RESTART_FAILED=0
+if systemctl is-active --quiet ravanreverse; then
+  systemctl restart ravanreverse || RESTART_FAILED=1
+fi
+while read -r UNIT; do
+  [[ -n "$UNIT" ]] || continue
+  systemctl restart "$UNIT" || RESTART_FAILED=1
+done < <(systemctl list-units --type=service --state=active --no-legend --no-pager 'ravanreverse@*.service' 2>/dev/null | awk '{print $1}')
+if (( RESTART_FAILED == 0 )); then
   printf '%s\n' "$NOW" > "${STATE}.tmp"
   mv -f "${STATE}.tmp" "$STATE"
   logger -t shah-tunnel-restart "Shah Tunnel restarted by its configured interval (${INTERVAL}s)." 2>/dev/null || true
@@ -3673,7 +4052,7 @@ func restartScheduleStatus() string {
 		return "Incomplete: cron entry is missing or invalid"
 	}
 	checker, err := os.ReadFile(restartCronScript)
-	if err != nil || !strings.Contains(string(checker), "systemctl restart ravanreverse") {
+	if err != nil || !strings.Contains(string(checker), "ravanreverse@*.service") {
 		return "Incomplete: restart checker is missing or invalid"
 	}
 	state, err := os.ReadFile(restartScheduleState)
@@ -3806,43 +4185,53 @@ func uninstall() error {
 		return errUninstallCancelled
 	}
 
-	// Stop and disable only this unit. Do not remove files while systemd still
-	// reports the unit as active/deactivating.
-	_ = exec.Command("systemctl", "disable", "ravanreverse").Run()
-	_ = exec.Command("systemctl", "stop", "ravanreverse").Run()
-	state := func() string {
-		b, _ := exec.Command("systemctl", "show", "ravanreverse", "-p", "ActiveState", "--value").Output()
-		return strings.TrimSpace(string(b))
+	// Stop and disable the legacy unit plus every named instance before deleting files.
+	services := map[string]bool{"ravanreverse": true}
+	profiles, _ := listTunnelProfiles()
+	for _, profile := range profiles {
+		services[profile.Service] = true
 	}
-	for i := 0; i < 20; i++ {
-		s := state()
-		if s == "" || s == "inactive" || s == "failed" || s == "unknown" || s == "dead" {
-			break
+	if out, err := exec.Command("systemctl", "list-units", "--all", "--plain", "--no-legend", "--no-pager", "ravanreverse@*.service").Output(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) > 0 && strings.HasPrefix(fields[0], "ravanreverse@") {
+				services[fields[0]] = true
+			}
 		}
-		time.Sleep(250 * time.Millisecond)
 	}
-	s := state()
-	if s == "active" || s == "deactivating" || s == "activating" || s == "reloading" {
-		// Last-resort signal is scoped to the Shah Tunnel systemd unit only.
-		_ = exec.Command("systemctl", "kill", "--kill-who=all", "--signal=KILL", "ravanreverse").Run()
-		_ = exec.Command("systemctl", "stop", "ravanreverse").Run()
-		time.Sleep(500 * time.Millisecond)
-		s = state()
+	for service := range services {
+		_ = exec.Command("systemctl", "disable", service).Run()
+		_ = exec.Command("systemctl", "stop", service).Run()
 	}
-	if s == "active" || s == "deactivating" || s == "activating" || s == "reloading" {
-		return fmt.Errorf("service would not stop (state=%s); files were kept. Check: systemctl status ravanreverse", s)
+	for service := range services {
+		b, _ := exec.Command("systemctl", "show", service, "-p", "ActiveState", "--value").Output()
+		state := strings.TrimSpace(string(b))
+		if state == "active" || state == "deactivating" || state == "activating" || state == "reloading" {
+			_ = exec.Command("systemctl", "kill", "--kill-who=all", "--signal=KILL", service).Run()
+			_ = exec.Command("systemctl", "stop", service).Run()
+			time.Sleep(300 * time.Millisecond)
+			b, _ = exec.Command("systemctl", "show", service, "-p", "ActiveState", "--value").Output()
+			state = strings.TrimSpace(string(b))
+		}
+		if state == "active" || state == "deactivating" || state == "activating" || state == "reloading" {
+			return fmt.Errorf("service %s would not stop (state=%s); files were kept", service, state)
+		}
 	}
 	if err := removeRestartScheduleFiles(); err != nil {
 		return fmt.Errorf("remove Shah Tunnel restart schedule: %w", err)
 	}
 
-	if err := os.Remove("/etc/systemd/system/ravanreverse.service"); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove service unit: %w", err)
+	for _, unitPath := range []string{"/etc/systemd/system/ravanreverse.service", "/etc/systemd/system/ravanreverse@.service"} {
+		if err := os.Remove(unitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove service unit %s: %w", unitPath, err)
+		}
 	}
 	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
 		return fmt.Errorf("systemd daemon-reload failed: %v %s", err, strings.TrimSpace(string(out)))
 	}
-	_ = exec.Command("systemctl", "reset-failed", "ravanreverse").Run()
+	for service := range services {
+		_ = exec.Command("systemctl", "reset-failed", service).Run()
+	}
 	for _, path := range []string{"/etc/ravanreverse", "/usr/local/bin/ravanreverse", "/usr/local/bin/shah-tunnel", "/var/backups/ravanreverse", "/var/log/ravanreverse"} {
 		if err := os.RemoveAll(path); err != nil {
 			return fmt.Errorf("remove %s: %w", path, err)
@@ -4353,54 +4742,107 @@ func geoDisplay(g ServerGeo) (string, string) {
 	}
 	return g.IP, country
 }
+func uiCommandDeckHeader() {
+	width := 66
+	inner := width - 2
+	lines := []string{
+		"╔" + strings.Repeat("═", inner) + "╗",
+		"║" + centerUI("COMMAND DECK", inner) + "║",
+		"║" + centerUI("NEBULA ROUTING   •   TLS 1.3   •   ZERO TRUST", inner) + "║",
+		"╚" + strings.Repeat("═", inner) + "╝",
+	}
+	for i, line := range lines {
+		if i == 1 {
+			fmt.Println(paint(ansiPurple+ansiBold, line))
+		} else if i == 2 {
+			fmt.Println(paint(ansiGreen+ansiBold, line))
+		} else {
+			fmt.Println(paint(ansiPinkGlow, line))
+		}
+	}
+	fmt.Println()
+}
+
 func menu() {
 	if !ensureRoot() {
 		return
 	}
 	for {
-		state := paint(ansiYellow, "○ OFFLINE / NOT CONFIGURED")
-		if tunnelIsActive() {
-			state = paint(ansiGreen+ansiBold, "● ONLINE")
+		profiles, _ := listTunnelProfiles()
+		activeCount := 0
+		for _, profile := range profiles {
+			if exec.Command("systemctl", "is-active", "--quiet", profile.Service).Run() == nil {
+				activeCount++
+			}
 		}
-		uiHeader("SHAH TUNNEL // COMMAND DECK", "SPACE NETWORK   •   ENCRYPTED CONTROL   •   TCP TUNNEL")
+		state := paint(ansiYellow, "○ OFFLINE / NOT CONFIGURED")
+		if activeCount > 0 {
+			state = paint(ansiGreen+ansiBold, fmt.Sprintf("● %d RUNNING", activeCount))
+		}
+		uiCommandDeckHeader()
 		fmt.Printf("  %s %s\n", paint(ansiDim, "VERSION"), paint(ansiCyan, version+"  |  "+runtimeArch()))
-		fmt.Printf("  %s %s\n", paint(ansiDim, "LINK STATUS"), state)
+		fmt.Printf("  %s %s\n", paint(ansiDim, "SERVER STATUS"), state)
 		serverIP, serverCountry := serverIdentity()
 		fmt.Printf("  %s %s\n", paint(ansiDim, "🌐 SERVER IP"), paint(ansiCyan, serverIP))
 		fmt.Printf("  %s %s\n", paint(ansiDim, "🌍 COUNTRY"), paint(ansiCyan, serverCountry))
 		uiRule()
+		fmt.Println(paint(ansiCyan+ansiBold, "  CONFIGURED TUNNELS"))
+		if len(profiles) == 0 {
+			fmt.Printf("  %s\n", paint(ansiDim, "No tunnels configured yet."))
+		} else {
+			for _, profile := range profiles {
+				status := paint(ansiYellow, "○ STOPPED")
+				if exec.Command("systemctl", "is-active", "--quiet", profile.Service).Run() == nil {
+					status = paint(ansiGreen+ansiBold, "● RUNNING")
+				}
+				fmt.Printf("  🛰️ %-24s │ %-6s │ %s\n", profile.Name, strings.ToUpper(profile.Role), status)
+			}
+		}
+		uiRule()
 		fmt.Println(paint(ansiCyan+ansiBold, "  OPERATIONS"))
 		menuItem := func(key, title, desc string) {
-			fmt.Printf("  %s  %s %s\n", paint(ansiPurple+ansiBold, "["+key+"]"), paint(ansiBold, fmt.Sprintf("%-32s", title)), paint(ansiDim, desc))
+			fmt.Printf("  %s  %s %s\n", paint(ansiPurple+ansiBold, "["+key+"]"), paint(ansiBold, fmt.Sprintf("%-34s", title)), paint(ansiDim, desc))
 		}
-		menuItem("1", "🛠️ Configure / Create Tunnel", "Step-by-step setup wizard")
-		menuItem("2", "🚀 Start Tunnel", "Start the service")
-		menuItem("3", "🛑 Stop Tunnel", "Stop the running service")
-		menuItem("4", "🔄 Restart Tunnel", "Reload saved configuration")
-		menuItem("5", "📊 Status & Logs", "Service status and recent errors")
-		menuItem("6", "⏱️ Cron Job / Scheduled Restart", "Restart every selected interval")
-		menuItem("7", "🗑️ Complete Uninstall", "Only Shah Tunnel files and service")
-		menuItem("0", "🚪 Exit", "Close the menu")
+		menuItem("1", "🆕 Create a new tunnel", "Keep existing tunnels")
+		menuItem("2", "🚀 Start a tunnel", "Choose an existing tunnel")
+		menuItem("3", "🛑 Stop a tunnel", "Stop selected tunnel")
+		menuItem("4", "🔄 Restart a tunnel", "Restart selected tunnel")
+		menuItem("5", "📊 Status & Logs", "Inspect selected tunnel")
+		menuItem("6", "⏰ Scheduled restart", "Restart active tunnels on interval")
+		menuItem("7", "🗑️ Delete one tunnel", "Delete this tunnel only")
+		menuItem("8", "💣 Complete uninstall", "Remove all tunnels")
+		menuItem("0", "🚪 Exit", "Close menu")
 		uiRule()
 		choice := ask("Select an operation", "0")
 		var err error
 		switch choice {
 		case "1":
-			err = setup() // setup starts/restarts the service automatically on success
+			err = setup()
 		case "2":
-			err = ensureTunnelRunning(false)
+			if chooseTunnel("Select the tunnel to start (number or name)") {
+				err = ensureTunnelRunning(false)
+			}
 		case "3":
-			err = runSystemctl("stop", "ravanreverse")
-			if err == nil && tunnelIsActive() {
-				err = errors.New("service is still active after stop")
+			if chooseTunnel("Select the tunnel to stop (number or name)") {
+				service := currentServiceName()
+				err = runSystemctl("stop", service)
+				if err == nil && tunnelIsActive() {
+					err = fmt.Errorf("service %s is still active after stop", service)
+				}
 			}
 		case "4":
-			err = ensureTunnelRunning(true)
+			if chooseTunnel("Select the tunnel to restart (number or name)") {
+				err = ensureTunnelRunning(true)
+			}
 		case "5":
-			err = showStatusAndLogs()
+			if chooseTunnel("Select the tunnel to inspect (number or name)") {
+				err = showStatusAndLogs()
+			}
 		case "6":
 			err = manageRestartSchedule()
 		case "7":
+			err = deleteOneTunnel()
+		case "8":
 			err = uninstall()
 			if err == nil {
 				return
@@ -4411,12 +4853,12 @@ func menu() {
 		case "0":
 			return
 		default:
-			err = errors.New("Invalid option")
+			err = errors.New("invalid option")
 		}
 		if err != nil {
 			fmt.Printf("\n  %s %s\n", paint(ansiRed+ansiBold, "✗ ERROR:"), err)
 		}
-		if choice != "7" {
+		if choice != "8" {
 			_ = ask("Press Enter to return to the menu", "")
 		}
 	}
@@ -4439,6 +4881,14 @@ func main() {
 	case "menu":
 		menu()
 	case "run":
+		for i := 2; i < len(os.Args); i++ {
+			if os.Args[i] == "--config" && i+1 < len(os.Args) {
+				configPath = filepath.Clean(os.Args[i+1])
+				i++
+			} else {
+				log.Fatalf("unknown run argument %q", os.Args[i])
+			}
+		}
 		cfg, err := loadConfig()
 		if err != nil {
 			log.Fatal(err)
@@ -4466,7 +4916,7 @@ func main() {
 	case "version", "--version", "-v":
 		fmt.Printf("Shah Tunnel %s (%s)\n", version, runtimeArch())
 	default:
-		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|run|uninstall|version]\n", version)
+		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|run [--config PATH]|uninstall|version]\n", version)
 	}
 }
 
