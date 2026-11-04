@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 # Shah Tunnel 1.6.2 installer.
-# Builds from the repository source using the official Go toolchain.
+# Downloads the official Go toolchain directly from dl.google.com, verifies SHA-256, and builds from GitHub source.
 # No prebuilt ShahTunnel binaries or manual GitHub release uploads are required.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
 VERSION="1.6.2"
 GO_VERSION="1.25.1"
 GO_BASE="https://dl.google.com/go"
-GO_WEB_BASE="https://go.dev/dl"
 STATE_DIR="/usr/local/lib/shah-tunnel"
 GO_CACHE_DIR="/var/cache/shah-tunnel"
 PHASE_HAS_DOWNLOAD=0
@@ -79,59 +78,41 @@ curl_download() {
 # Download a large official archive while retaining partial bytes between retries.
 # Unlike curl_download(), this helper never removes the destination on failure.
 curl_download_resumable() {
-  local url="$1" dest="$2" max_time="${3:-900}" retry_count="${4:-3}" speed_time="${5:-90}" resolve_ip="${6:-}"
-  local headers="${TMP}/curl-resume-headers.$$" log="${TMP}/curl-resume-log.$$"
-  local rc=0 pid=0 frame=0 url_host
-  local -a resolve_args=()
+  local url="$1" dest="$2" max_time="${3:-900}" retry_count="${4:-1}" speed_time="${5:-75}" resolve_ip="${6:-}"
+  local url_host rc=0
+  local -a resolve_args=() progress_args=()
 
+  # Keep partial bytes after a network interruption; the next attempt resumes
+  # with an HTTP Range request instead of downloading the whole Go archive again.
   [[ -f "$dest" ]] || : > "$dest"
-  rm -f "$headers" "$log"
-  : > "$log"
   if [[ -n "$resolve_ip" ]]; then
     url_host="${url#https://}"
     url_host="${url_host%%/*}"
     resolve_args=(--resolve "${url_host}:443:${resolve_ip}")
   fi
 
-  if [[ ! -t 2 ]]; then
-    if curl -4 -fsSL --proto '=https' --proto-redir '=https' \
-        "${resolve_args[@]}" --continue-at - \
-        --retry "$retry_count" --retry-delay 2 --retry-connrefused \
-        --connect-timeout 12 --max-time "$max_time" \
-        --speed-time "$speed_time" --speed-limit 1024 \
-        --dump-header "$headers" "$url" -o "$dest" 2>"$log"; then
-      rm -f "$headers" "$log"
-      return 0
-    else
-      rc=$?
-    fi
-    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
-    rm -f "$headers" "$log"
-    return "$rc"
+  # Show curl's real transfer percentage/ETA in an interactive SSH terminal.
+  # In non-interactive runs, keep output clean while preserving error messages.
+  if [[ -t 2 ]]; then
+    progress_args=(--progress-bar --show-error)
+  else
+    progress_args=(--silent --show-error)
   fi
 
-  curl -4 -fsSL --proto '=https' --proto-redir '=https' \
-      "${resolve_args[@]}" --continue-at - \
+  if curl -4 --fail --location --proto '=https' --proto-redir '=https' \
+      "${resolve_args[@]}" "${progress_args[@]}" --continue-at - \
       --retry "$retry_count" --retry-delay 2 --retry-connrefused \
-      --connect-timeout 12 --max-time "$max_time" \
+      --connect-timeout 8 --max-time "$max_time" \
       --speed-time "$speed_time" --speed-limit 1024 \
-      --dump-header "$headers" "$url" -o "$dest" 2>"$log" &
-  pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
-    draw_indeterminate_bar "$frame"
-    frame=$((frame + 1))
-    sleep 0.12
-  done
-  wait "$pid" || rc=$?
-  printf '\r\033[2K' >&2
-  if (( rc != 0 )); then
-    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
-    rm -f "$headers" "$log"
-    return "$rc"
+      "$url" -o "$dest"; then
+    return 0
+  else
+    rc=$?
   fi
-  PHASE_HAS_DOWNLOAD=1
-  rm -f "$headers" "$log"
-  return 0
+
+  # Do not delete the partial archive here. A later official-IP attempt or
+  # another installer run can continue from the bytes already received.
+  return "$rc"
 }
 
 # Resolve a host through authenticated DNS-over-HTTPS when the VPS resolver is
@@ -149,7 +130,7 @@ resolve_ipv4_via_doh() {
     entry="${entry#*|}"
     doh_ip="${entry%%|*}"
     doh_path="${entry#*|}"
-    response="$(curl -4 -fsS --proto '=https' --connect-timeout 8 --max-time 15 \
+    response="$(curl -4 -fsS --proto '=https' --connect-timeout 4 --max-time 8 \
       --resolve "${doh_host}:443:${doh_ip}" \
       -H 'accept: application/dns-json' \
       "https://${doh_host}${doh_path}?name=${host}&type=A" 2>/dev/null || true)"
@@ -433,19 +414,19 @@ install_compatible_go_from_apt() {
 }
 
 prepare_verified_binary() {
-  # Reuse a compatible system toolchain first; this avoids unnecessary downloads.
-  if build_from_system_go; then
-    return 0
-  fi
-
-  # Normal installation path: download and SHA-256-verify Go from the official
-  # Go distribution service, then compile ShahTunnel from the GitHub source.
+  # Preferred route: reuse a verified official Go toolchain cache, or download
+  # Go directly from dl.google.com and verify its official pinned SHA-256.
   if build_from_official_go_toolchain; then
     return 0
   fi
 
-  # Automatic fallback for networks that block Google's download CDN: install a
-  # sufficiently new Go release from the VPS's configured signed APT repository.
+  # Fallback only when the official Go host is unreachable: use a compatible
+  # Go toolchain already installed on this VPS.
+  if build_from_system_go; then
+    return 0
+  fi
+
+  # Final fallback: install Go from the VPS distribution's signed APT sources.
   if install_compatible_go_from_apt && build_from_system_go; then
     return 0
   fi
@@ -506,52 +487,51 @@ build_from_official_go_toolchain() {
       rm -f "$cache_archive"
       local part_file="${GO_CACHE_DIR}/${go_archive}.official.part"
       local official_url="${GO_BASE}/${go_archive}"
-      local -a official_ips=() official_urls=("${GO_WEB_BASE}/${go_archive}" "${official_url}")
-      local candidate_url
-      echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) from the official Go download service..." >&2
+      local -a official_ips=()
+      local official_ip
+      echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) from the official Go distribution host: ${GO_BASE}" >&2
+      echo "Resolving the official download host through HTTPS DNS first; TLS certificate and SHA-256 will both be verified." >&2
 
-      # go.dev is the official download front door. It may redirect to the
-      # canonical dl.google.com CDN, so both paths are attempted automatically.
-      for candidate_url in "${official_urls[@]}"; do
-        echo "Trying official endpoint: ${candidate_url}" >&2
-        if curl_download_resumable "$candidate_url" "$part_file" 900 2 60; then
+      # First bypass the VPS's possibly broken DNS resolver. DNS-over-HTTPS is
+      # used only to obtain IP addresses; the actual archive is still fetched
+      # from dl.google.com with its hostname and normal TLS certificate check.
+      mapfile -t official_ips < <(
+        resolve_ipv4_via_doh "dl.google.com" \
+          | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/' \
+          | sort -u
+      )
+
+      if [[ "${#official_ips[@]}" -gt 0 ]]; then
+        for official_ip in "${official_ips[@]}"; do
+          echo "Downloading from official Go host via resolved address ${official_ip} (HTTPS hostname verification enabled)..." >&2
+          if curl_download_resumable "$official_url" "$part_file" 900 1 75 "$official_ip"; then
+            if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
+              cp -f "$part_file" "$TMP/$go_archive"
+              downloaded=1
+              echo "Official Go archive downloaded and SHA-256 verified." >&2
+              break
+            fi
+            echo "The downloaded archive did not match the official SHA-256; discarding it before the next address." >&2
+            rm -f "$part_file"
+          fi
+        done
+      else
+        echo "HTTPS DNS lookup did not return an address; falling back to the VPS resolver for the same official URL." >&2
+      fi
+
+      # Last network fallback: use the VPS's normal resolver. This is attempted
+      # once with a short connection/DNS timeout; it never switches to a mirror.
+      if [[ "$downloaded" -ne 1 ]]; then
+        echo "Trying the official Go URL using the VPS DNS resolver..." >&2
+        if curl_download_resumable "$official_url" "$part_file" 900 0 75; then
           if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
             cp -f "$part_file" "$TMP/$go_archive"
             downloaded=1
             echo "Official Go archive downloaded and SHA-256 verified." >&2
-            break
+          else
+            echo "The official archive SHA-256 did not match; removing the invalid file." >&2
+            rm -f "$part_file"
           fi
-          echo "Downloaded data did not match the official pinned SHA-256; discarding it." >&2
-          rm -f "$part_file"
-        fi
-      done
-
-      # Try every IPv4 address returned by the VPS resolver. This can help when
-      # one CDN edge is unreachable but another address for the official host works.
-      if [[ "$downloaded" -ne 1 ]]; then
-        mapfile -t official_ips < <({
-          if command -v getent >/dev/null 2>&1; then
-            getent ahostsv4 dl.google.com 2>/dev/null | awk '{print $1}'
-          fi
-          resolve_ipv4_via_doh "dl.google.com"
-        } | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/' | sort -u)
-        if [[ "${#official_ips[@]}" -eq 0 ]]; then
-          echo "Could not obtain alternate IPv4 addresses for dl.google.com; checking the OS package repositories next if needed." >&2
-        else
-          local official_ip
-          for official_ip in "${official_ips[@]}"; do
-            echo "Retrying official Go CDN at ${official_ip} with HTTPS hostname verification..." >&2
-            if curl_download_resumable "$official_url" "$part_file" 900 2 60 "$official_ip"; then
-              if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
-                cp -f "$part_file" "$TMP/$go_archive"
-                downloaded=1
-                echo "Official Go archive downloaded and SHA-256 verified." >&2
-                break
-              fi
-              echo "SHA-256 mismatch; discarding partial archive." >&2
-              rm -f "$part_file"
-            fi
-          done
         fi
       fi
       if [[ "$downloaded" -eq 1 ]]; then
