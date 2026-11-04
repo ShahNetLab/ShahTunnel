@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>v1.6.3 · Secure Reverse TCP Relay · Adaptive Transport Failover</strong></p>
+<p align="center"><strong>v1.6.2 · Secure Reverse TCP Relay · Adaptive Transport Failover</strong></p>
 <p align="center">A reverse TCP relay with an authenticated TLS 1.3 Hub↔Agent channel, certificate pinning, independent lanes and automatic transport recovery.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
@@ -20,10 +20,6 @@
 - **Security:** TLS 1.3 for the private Hub↔Agent channel, token authentication and SHA-256 certificate pinning.
 - **Concurrency:** twelve independent lanes by default, bounded queues and load-aware session selection.
 - **Management:** interactive CLI, systemd integration, status and logs, installer and local verification script.
-
-## Named tunnels
-
-Use **Manage Tunnels** from the main menu to create, list, or delete named tunnel profiles. When creating one, choose HUB, AGENT, or RELAY, then enter a unique name. Every profile has its own configuration, TLS certificate/key (for HUB), runtime state, and systemd service (`ravanreverse@NAME.service`), so multiple tunnels can run simultaneously on one server. The Start, Stop, Restart, and Status actions let you select the profile by name. Deleting one profile stops and removes only that profile; other profiles and the existing default installation are preserved. Listening ports are checked against saved profiles to help prevent conflicts.
 
 ## Transport menu
 
@@ -55,17 +51,17 @@ ShahTunnel is a general-purpose TCP relay. Configure it only for servers and ser
 
 The server information display may make outbound HTTPS requests to public IP and GeoIP providers (including ipify, icanhazip, checkip.amazonaws.com, ipinfo.io, ip.sb, ipapi.co and ipwho.is) to determine the server's public IPv4 address and country. These providers can observe the server's public IP and request metadata; the GeoIP lookups do not include the tunnel token or tunnel payload.
 
-For upgrade compatibility, an existing default installation keeps its legacy unit `ravanreverse.service` and configuration at `/etc/ravanreverse/config.json`. New named profiles use `ravanreverse@NAME.service` and store their files under `/etc/ravanreverse/tunnels/NAME/`. The installer also provides the `shah-tunnel` command as a symlink. Do not rename these local paths manually.
+For upgrade compatibility, the installed systemd unit and configuration directory still use the legacy names `ravanreverse.service` and `/etc/ravanreverse`; the installer also provides the `shah-tunnel` command as a symlink. These are local compatibility names, not third-party download destinations. Do not rename them manually on an existing server; a future rename would need an explicit migration.
 
 ## Install
 
-Run as root on Linux amd64 or arm64 with systemd and HTTPS access to GitHub:
+Run as root on Linux amd64 or arm64 with systemd and HTTPS access to the official Go download hosts and the source repository:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 ```
 
-The installer downloads the prebuilt binary for the server architecture directly from this repository's `S1T-CAPSULE` folder: `shah-tunnel-linux-amd64` or `shah-tunnel-linux-arm64`. The binaries are stored in the repository itself, not in GitHub Releases. The installer verifies the pinned SHA-256 checksum, then checks the binary's application version and architecture before installation. No Go toolchain, source archive, or local compilation is needed on the target server. When publishing an update, replace both architecture binaries and the installer in the repository. An existing binary is backed up before replacement, and an already-active service is not restarted during installation to avoid dropping live tunnel sessions.
+The installer downloads the Go `1.26.1` toolchain, trying regional mirrors first and then official distribution hosts. If a transfer is interrupted, it retains a separate partial file per mirror and resumes only from that same mirror with HTTP Range where supported. This avoids mixing partial responses from different hosts. It verifies the pinned SHA-256 checksum before using the archive; unverified archives are never accepted. The installer then downloads the source archive from the `main` branch of this repository and compiles `S1T-CAPSULE` locally for the server architecture with CGO disabled. It does not use GitHub Release assets or install the Go toolchain permanently. The built binary's application version and target architecture are checked before installation. An existing binary is backed up before replacement, and an already-active service is not restarted during installation to avoid dropping live tunnel sessions.
 
 ## Build and tests
 
