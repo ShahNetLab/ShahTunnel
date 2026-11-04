@@ -58,14 +58,14 @@ For upgrade compatibility, the installed systemd unit and configuration director
 Run as root on Linux amd64 or arm64 with systemd and HTTPS access to the official Go download hosts and the source repository:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/release-1.6.3/S1T-START.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 ```
 
-This ZIP intentionally contains source code and the installer only; it does not bundle compiled executables. Create a branch named `release-1.6.3`, upload the ZIP contents to that branch, and allow the included GitHub Actions workflow to build the Linux `amd64` and `arm64` binaries and publish them under `dist/` with SHA-256 sidecar files. After the workflow succeeds, run the one-line command above on the VPS. The installer downloads only the binary matching the VPS architecture, verifies the published SHA-256 and embedded version/architecture, then installs it; Go is not required on the VPS. If no published binary is available, the installer can use compatible system Go `1.23.0` or newer, or a cached verified Go toolchain. Go mirror downloads remain disabled by default; explicitly set `SHAHTUNNEL_ALLOW_GO_DOWNLOAD=1` to enable the legacy fallback. An existing binary is backed up before replacement, and an already-active service is not restarted during installation.
+The installer downloads the Go `1.27.3` toolchain directly from official Go distribution hosts (`go.dev`, `dl.google.com`, and Google Storage). If a transfer is interrupted, it retains a separate partial file per official host and resumes only from that same URL. Connection timeout and retry limits are extended for slower VPS networks; no third-party mirrors are used. It verifies the official pinned SHA-256 checksum before using the archive; unverified archives are never accepted. The installer then downloads the source archive from the `main` branch of this repository and compiles `S1T-CAPSULE` locally for the server architecture with CGO disabled. It does not use GitHub Release assets or add Go to the system PATH; the SHA-256-verified toolchain is cached in the ShahTunnel state directory for reuse. The built binary's application version and target architecture are checked before installation. An existing binary is backed up before replacement, and an already-active service is not restarted during installation to avoid dropping live tunnel sessions.
 
 ## Build and tests
 
-The verification helper requires a local Go compiler version 1.23.0 or newer; it will not download a toolchain. From the repository root:
+The verification helper requires Go 1.27.3 to already be installed locally; it will not download a toolchain. From the repository root:
 
 ```bash
 ./VERIFY-ALL-TRANSPORTS.sh
@@ -78,8 +78,8 @@ gofmt -w S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go
 go test -race -count=20 ./S1T-CAPSULE
 go vet ./S1T-CAPSULE
 mkdir -p dist
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-amd64 ./S1T-CAPSULE
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-arm64 ./S1T-CAPSULE
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-amd64 ./S1T-CAPSULE
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-arm64 ./S1T-CAPSULE
 (cd dist && sha256sum shah-tunnel-linux-amd64 > shah-tunnel-linux-amd64.sha256)
 (cd dist && sha256sum shah-tunnel-linux-arm64 > shah-tunnel-linux-arm64.sha256)
 ```

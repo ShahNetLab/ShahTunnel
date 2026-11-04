@@ -58,14 +58,14 @@ ShahTunnel یک رلهٔ عمومی TCP است. آن را فقط برای سرو
 روی Linux amd64 یا arm64 با systemd، با دسترسی HTTPS به میزبان‌های رسمی دانلود Go و مخزن سورس، دستور را با کاربر root اجرا کنید:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/release-1.6.3/S1T-START.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 ```
 
-این ZIP عمداً فقط سورس برنامه و نصب‌کننده را دارد و هیچ باینری کامپایل‌شده‌ای داخل آن نیست. ابتدا در مخزن GitHub شاخه‌ای با نام `release-1.6.3` بسازید و محتوای ZIP را در ریشهٔ همان شاخه بارگذاری کنید. سپس GitHub Actions با workflow همراه بسته، باینری‌های Linux برای `amd64` و `arm64` را می‌سازد و همراه فایل‌های SHA-256 در پوشهٔ `dist/` همان شاخه منتشر می‌کند. پس از موفق شدن workflow، دستور بالا را روی VPS اجرا کنید. نصب‌کننده فقط باینری متناسب با معماری سرور را از GitHub دریافت می‌کند، SHA-256 و نسخه/معماری داخلی آن را بررسی می‌کند و نصب را انجام می‌دهد؛ روی VPS به Go نیازی نیست. اگر هنوز باینری منتشر نشده باشد، نصب‌کننده می‌تواند از Go سازگار `1.23.0` یا بالاتر یا ابزار Go تأییدشدهٔ ذخیره‌شده استفاده کند. دانلود Go از آینه‌ها به‌صورت پیش‌فرض خاموش است و فقط با `SHAHTUNNEL_ALLOW_GO_DOWNLOAD=1` فعال می‌شود. پیش از جایگزینی از باینری قبلی پشتیبان می‌گیرد و سرویس فعال را برای جلوگیری از قطع تونل‌ها ری‌استارت نمی‌کند.
+نصب‌کننده ابزار Go نسخهٔ `1.27.3` را مستقیماً از سرورهای رسمی Go (`go.dev`، `dl.google.com` و Google Storage) دریافت می‌کند. اگر دانلود قطع شود، فایل ناقص هر میزبان رسمی جداگانه نگهداری و فقط از همان میزبان ادامه داده می‌شود؛ بنابراین داده‌های چند میزبان با هم مخلوط نمی‌شوند. مهلت اتصال و تلاش مجدد برای VPSهای کند افزایش یافته است. پیش از استفاده، SHA-256 رسمی فایل بررسی می‌شود و آرشیو تأییدنشده پذیرفته نمی‌شود. سپس سورس شاخهٔ `main` همین مخزن دریافت شده و روی سرور، باینری متناسب با معماری با `CGO_ENABLED=0` ساخته می‌شود. هیچ باینری از GitHub Releases دانلود نمی‌شود و ابزار Go وارد PATH عمومی سیستم نمی‌شود؛ نسخهٔ تأییدشده با SHA-256 در مسیر اختصاصی ShahTunnel برای اجرای بعدی نگهداری می‌شود. پیش از نصب، نسخه و معماری باینری ساخته‌شده بررسی می‌شود. از باینری قبلی نسخهٔ پشتیبان نگه داشته می‌شود و سرویس فعال برای جلوگیری از قطع اتصال‌های جاری ری‌استارت نمی‌شود.
 
 ## ساخت و تست
 
-برای اجرای اسکریپت تست، Go نسخهٔ 1.23.0 یا بالاتر باید از قبل روی سیستم موجود باشد؛ این اسکریپت ابزار Go را دانلود نمی‌کند. از ریشهٔ مخزن اجرا کنید:
+برای اجرای اسکریپت تست، Go 1.27.3 باید از قبل روی سیستم موجود باشد؛ این اسکریپت ابزار Go را دانلود نمی‌کند. از ریشهٔ مخزن اجرا کنید:
 
 ```bash
 ./VERIFY-ALL-TRANSPORTS.sh
@@ -78,8 +78,8 @@ gofmt -w S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go
 go test -race -count=20 ./S1T-CAPSULE
 go vet ./S1T-CAPSULE
 mkdir -p dist
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-amd64 ./S1T-CAPSULE
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-arm64 ./S1T-CAPSULE
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-amd64 ./S1T-CAPSULE
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-arm64 ./S1T-CAPSULE
 (cd dist && sha256sum shah-tunnel-linux-amd64 > shah-tunnel-linux-amd64.sha256)
 (cd dist && sha256sum shah-tunnel-linux-arm64 > shah-tunnel-linux-arm64.sha256)
 ```
