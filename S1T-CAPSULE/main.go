@@ -28,7 +28,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -38,15 +37,15 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe"
 )
 
 const (
-	version                          = "1.8.0"
+	version                          = "1.8.1"
 	maxFrame                         = 64 * 1024
 	defaultTunnelChannels            = 12
 	maxPendingPublicConnections      = 2048
 	controlBurstLimit                = 8
+	wireFairQuantum                  = 32 * 1024
 	streamAdmissionWait              = 5 * time.Second
 	maxTunnelChannels                = 16
 	msgOpen                     byte = 1
@@ -701,6 +700,85 @@ type wireRequest struct {
 	done chan error
 }
 
+// fairWireDataQueue schedules payload frames with deficit round-robin (DRR).
+// A large upload on one forwarded TCP stream must not monopolize the shared
+// outer tunnel lane and delay small packets belonging to Telegram/other flows.
+// The stream ID is the fairness key; control frames remain on the separate
+// priority queue. With 32 KiB source chunks, one quantum gives each active flow
+// one full chunk per round while still handling smaller final chunks fairly.
+type fairWireDataQueue struct {
+	queues  map[uint32][]*wireRequest
+	order   []uint32
+	deficit map[uint32]int
+	cursor  int
+	queued  int
+}
+
+func newFairWireDataQueue() *fairWireDataQueue {
+	return &fairWireDataQueue{
+		queues:  make(map[uint32][]*wireRequest),
+		deficit: make(map[uint32]int),
+	}
+}
+
+func (q *fairWireDataQueue) enqueue(req *wireRequest) {
+	if req == nil {
+		return
+	}
+	if _, exists := q.queues[req.id]; !exists {
+		q.order = append(q.order, req.id)
+		q.deficit[req.id] = 0
+	}
+	q.queues[req.id] = append(q.queues[req.id], req)
+	q.queued++
+}
+
+func (q *fairWireDataQueue) dequeue() *wireRequest {
+	for q.queued > 0 && len(q.order) > 0 {
+		if q.cursor >= len(q.order) {
+			q.cursor = 0
+		}
+		id := q.order[q.cursor]
+		queue := q.queues[id]
+		if len(queue) == 0 {
+			delete(q.queues, id)
+			delete(q.deficit, id)
+			q.order = append(q.order[:q.cursor], q.order[q.cursor+1:]...)
+			if q.cursor >= len(q.order) {
+				q.cursor = 0
+			}
+			continue
+		}
+		req := queue[0]
+		cost := len(req.data)
+		if cost < 1 {
+			cost = 1
+		}
+		if q.deficit[id] < cost {
+			q.deficit[id] += wireFairQuantum
+			q.cursor = (q.cursor + 1) % len(q.order)
+			continue
+		}
+		q.deficit[id] -= cost
+		queue[0] = nil
+		queue = queue[1:]
+		q.queued--
+		if len(queue) == 0 {
+			delete(q.queues, id)
+			delete(q.deficit, id)
+			q.order = append(q.order[:q.cursor], q.order[q.cursor+1:]...)
+			if q.cursor >= len(q.order) {
+				q.cursor = 0
+			}
+		} else {
+			q.queues[id] = queue
+			q.cursor = (q.cursor + 1) % len(q.order)
+		}
+		return req
+	}
+	return nil
+}
+
 type wire struct {
 	conn       net.Conn
 	controlQ   chan *wireRequest
@@ -808,11 +886,23 @@ func (w *wire) writeRequest(req *wireRequest) error {
 
 func (w *wire) writeLoop() {
 	controlStreak := 0
+	fairData := newFairWireDataQueue()
 	for {
+		// Pull all currently submitted data into per-stream DRR queues before
+		// choosing the next frame. This prevents one busy sender from winning
+		// simply because its goroutine repeatedly fills the shared FIFO first.
+		for {
+			select {
+			case req := <-w.dataQ:
+				fairData.enqueue(req)
+			default:
+				goto dataDrained
+			}
+		}
+	dataDrained:
 		var req *wireRequest
-		// Prefer control traffic, but cap consecutive control frames when payload
-		// is already queued. Without this bound a stream of ACK/PING frames can
-		// starve user payload and cause avoidable latency spikes under concurrency.
+		// Control frames (OPEN/ACK/CLOSE/PING) remain latency-sensitive, but a
+		// bounded burst prevents them from starving payload when data is waiting.
 		if controlStreak < controlBurstLimit {
 			select {
 			case <-w.done:
@@ -823,19 +913,20 @@ func (w *wire) writeLoop() {
 			}
 		}
 		if req == nil {
-			// At the burst limit, take payload immediately if any is waiting.
-			select {
-			case req = <-w.dataQ:
+			req = fairData.dequeue()
+			if req != nil {
 				controlStreak = 0
-			default:
 			}
 		}
 		if req == nil {
+			// No payload is queued. Wait for new data or control. New data is
+			// enqueued and arbitrated on the next loop; it is never written FIFO.
 			select {
 			case <-w.done:
 				return
-			case req = <-w.dataQ:
-				controlStreak = 0
+			case dataReq := <-w.dataQ:
+				fairData.enqueue(dataReq)
+				continue
 			case req = <-w.controlQ:
 				controlStreak++
 			}
@@ -2474,22 +2565,15 @@ func randomAgentToken() (string, error) {
 	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b), nil
 }
 
-// compactFingerprint converts the canonical 32-byte SHA-256 fingerprint to
-// unpadded Base64URL (43 chars) for a single-line mobile display. The Agent
-// accepts this representation and stores/uses the same fingerprint bytes.
+// compactFingerprint uses the canonical 64-character hexadecimal SHA-256
+// value. This remains compatible with older Agent releases and is one
+// contiguous alphanumeric word for native mobile-terminal selection.
 func compactFingerprint(value string) (string, error) {
 	pin, err := normalizeFingerprint(value)
 	if err != nil {
 		return "", err
 	}
-	return base64.RawURLEncoding.EncodeToString(pin), nil
-}
-
-// osc52ClipboardSequence requests a clipboard write containing only the value.
-// A value is copied when the terminal reports a pointer press on its credential
-// card; no numbered copy menu or extra explanatory text is rendered.
-func osc52ClipboardSequence(value string) string {
-	return "\033]52;c;" + base64.StdEncoding.EncodeToString([]byte(value)) + "\a"
+	return hex.EncodeToString(pin), nil
 }
 
 type displayedCredential struct {
@@ -2498,263 +2582,91 @@ type displayedCredential struct {
 	color string
 }
 
-const credentialCardHeight = 4 // top border, title, value, bottom border
-
-func credentialIndexAtRow(endRow, count, clickedRow int) int {
-	if count <= 0 {
-		return -1
-	}
-	firstRow := endRow - count*credentialCardHeight
-	offset := clickedRow - firstRow
-	if offset < 0 || offset >= count*credentialCardHeight {
-		return -1
-	}
-	return offset / credentialCardHeight
+type credentialGroup struct {
+	title       string
+	credentials []displayedCredential
+	accent      string
 }
 
-func credentialValueAtRow(endRow, count, clickedRow int, credentials []displayedCredential) (string, bool) {
-	index := credentialIndexAtRow(endRow, count, clickedRow)
-	if index < 0 || index >= len(credentials) {
-		return "", false
-	}
-	return credentials[index].value, true
-}
-
-func parseSGRMouseReport(report string) (button, x, y int, pressed bool, err error) {
-	parts := strings.Split(report, ";")
-	if len(parts) != 3 {
-		return 0, 0, 0, false, errors.New("invalid SGR mouse report")
-	}
-	button, err = strconv.Atoi(parts[0])
-	if err != nil {
-		return 0, 0, 0, false, err
-	}
-	x, err = strconv.Atoi(parts[1])
-	if err != nil {
-		return 0, 0, 0, false, err
-	}
-	y, err = strconv.Atoi(parts[2])
-	if err != nil {
-		return 0, 0, 0, false, err
-	}
-	pressed = button&32 == 0 && button&3 != 3
-	return button, x, y, pressed, nil
-}
-
-func ioctlTermios(fd int, request uintptr, state *syscall.Termios) error {
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), request, uintptr(unsafe.Pointer(state)))
-	if errno != 0 {
-		return errno
-	}
-	return nil
-}
-
-type terminalMouseSession struct {
-	fd       int
-	original syscall.Termios
-	closed   sync.Once
-}
-
-func startTerminalMouseSession() (*terminalMouseSession, error) {
-	if os.Getenv("TERM") == "" || os.Getenv("TERM") == "dumb" {
-		return nil, nil
-	}
-	fd := int(os.Stdin.Fd())
-	var original syscall.Termios
-	if err := ioctlTermios(fd, syscall.TCGETS, &original); err != nil {
-		return nil, nil // non-interactive input: keep the ordinary framed output
-	}
-	raw := original
-	raw.Lflag &^= syscall.ECHO | syscall.ICANON
-	raw.Cc[syscall.VMIN] = 1
-	raw.Cc[syscall.VTIME] = 0
-	if err := ioctlTermios(fd, syscall.TCSETS, &raw); err != nil {
-		return nil, err
-	}
-	session := &terminalMouseSession{fd: fd, original: original}
-	fmt.Fprint(os.Stdout, "\033[?1000h\033[?1006h") // xterm click reporting + SGR coordinates
-	return session, nil
-}
-
-func (s *terminalMouseSession) close() {
-	if s == nil {
-		return
-	}
-	s.closed.Do(func() {
-		fmt.Fprint(os.Stdout, "\033[?1006l\033[?1000l")
-		_ = ioctlTermios(s.fd, syscall.TCSETS, &s.original)
-	})
-}
-
-func readTTYByte(fd int, timeout time.Duration) (byte, error) {
-	if fd < 0 || fd >= 1024 {
-		return 0, errors.New("unsupported terminal file descriptor")
-	}
-	var set syscall.FdSet
-	set.Bits[fd/64] |= int64(1) << uint(fd%64)
-	tv := syscall.NsecToTimeval(timeout.Nanoseconds())
-	n, err := syscall.Select(fd+1, &set, nil, nil, &tv)
-	if err != nil {
-		return 0, err
-	}
-	if n == 0 {
-		return 0, errors.New("terminal response timeout")
-	}
-	var one [1]byte
-	nRead, err := syscall.Read(fd, one[:])
-	if err != nil {
-		return 0, err
-	}
-	if nRead != 1 {
-		return 0, io.EOF
-	}
-	return one[0], nil
-}
-
-func queryTerminalCursorRow(fd int) (int, error) {
-	fmt.Fprint(os.Stdout, "\033[6n")
-	deadline := time.Now().Add(900 * time.Millisecond)
-	var response strings.Builder
-	for response.Len() < 32 {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return 0, errors.New("terminal cursor query timed out")
+// uiCredentialGroupCard renders two credentials in one compact nebula-styled
+// frame. Each secret occupies a dedicated, unbroken line so Termius can select
+// the complete Base32 value with its native long-press copy action.
+func uiCredentialGroupCard(group credentialGroup) {
+	width := len([]rune(group.title))
+	for _, item := range group.credentials {
+		if n := len([]rune(item.label)); n > width {
+			width = n
 		}
-		b, err := readTTYByte(fd, remaining)
-		if err != nil {
-			return 0, err
+		if n := len([]rune(item.value)); n > width {
+			width = n
 		}
-		response.WriteByte(b)
-		if b == 'R' {
-			value := response.String()
-			start := strings.LastIndex(value, "\033[")
-			if start < 0 {
-				return 0, errors.New("invalid terminal cursor response")
+	}
+	if width < 42 {
+		width = 42
+	}
+	if width > 76 {
+		width = 76
+	}
+	border := func(text string) string { return paint(group.accent+ansiBold, text) }
+	line := func(text, color string) {
+		visible := len([]rune(text))
+		if visible > width {
+			// Do not truncate a credential. A legacy 64-hex token may wrap
+			// on narrow terminals, but its complete value remains on screen.
+			for visible > width {
+				runes := []rune(text)
+				part := string(runes[:width])
+				fmt.Printf("  %s %s %s\n", border("│"), paint(color, part), border("│"))
+				text = string(runes[width:])
+				visible = len([]rune(text))
 			}
-			fields := strings.Split(strings.TrimSuffix(value[start+2:], "R"), ";")
-			if len(fields) != 2 {
-				return 0, errors.New("invalid terminal cursor coordinates")
-			}
-			row, parseErr := strconv.Atoi(fields[0])
-			if parseErr != nil || row < 1 {
-				return 0, errors.New("invalid terminal cursor row")
-			}
-			return row, nil
+		}
+		fmt.Printf("  %s %s%s %s\n", border("│"), paint(color, text), strings.Repeat(" ", width-visible), border("│"))
+	}
+	fmt.Printf("  %s\n", border("╭"+strings.Repeat("─", width+2)+"╮"))
+	line("✦  "+group.title, ansiPurple+ansiBold)
+	for i, item := range group.credentials {
+		line("✧  "+item.label, ansiCyan+ansiBold)
+		line(item.value, item.color+ansiBold)
+		if i != len(group.credentials)-1 {
+			line(strings.Repeat("·  ", width/3), ansiDim)
 		}
 	}
-	return 0, errors.New("terminal cursor response was too long")
+	fmt.Printf("  %s\n", border("╰"+strings.Repeat("─", width+2)+"╯"))
+	fmt.Println()
 }
 
-// readCredentialTapOrEnter waits for a click on any row of a credential card
-// or Enter. A click is actionable only in SSH clients that forward xterm mouse
-// reports; clients that do not forward pointer events retain native text
-// selection/long-press behavior.
-func readCredentialTapOrEnter(fd, endRow, count int, credentials []displayedCredential) error {
-	for {
-		b, err := readTTYByte(fd, 24*time.Hour)
-		if err != nil {
-			return err
-		}
-		if b == '\r' || b == '\n' {
-			return nil
-		}
-		if b == 3 {
-			return errors.New("credential display interrupted")
-		}
-		if b != 0x1b {
-			continue
-		}
-		next, err := readTTYByte(fd, time.Second)
-		if err != nil || next != '[' {
-			continue
-		}
-		next, err = readTTYByte(fd, time.Second)
-		if err != nil {
-			continue
-		}
-		if next == 'M' { // legacy X10 mouse report: button, x, y are byte-offset encoded
-			buttonByte, err1 := readTTYByte(fd, time.Second)
-			xByte, err2 := readTTYByte(fd, time.Second)
-			yByte, err3 := readTTYByte(fd, time.Second)
-			if err1 == nil && err2 == nil && err3 == nil && xByte >= 33 {
-				button, y := int(buttonByte)-32, int(yByte)-32
-				pressed := button >= 0 && button&32 == 0 && button&3 != 3
-				if pressed {
-					if value, ok := credentialValueAtRow(endRow, count, y, credentials); ok {
-						fmt.Fprint(os.Stdout, osc52ClipboardSequence(value))
-					}
-				}
-			}
-			continue
-		}
-		if next != '<' { // ignore non-mouse CSI keys such as arrows
-			continue
-		}
-		var report strings.Builder
-		for report.Len() < 40 {
-			c, readErr := readTTYByte(fd, time.Second)
-			if readErr != nil {
-				break
-			}
-			if c == 'M' || c == 'm' {
-				_, _, y, pressed, parseErr := parseSGRMouseReport(report.String())
-				if parseErr == nil && pressed {
-					if value, ok := credentialValueAtRow(endRow, count, y, credentials); ok {
-						fmt.Fprint(os.Stdout, osc52ClipboardSequence(value))
-					}
-				}
-				break
-			}
-			report.WriteByte(c)
-		}
-	}
-}
-
+// printAgentCredentials deliberately leaves text selection to the SSH client.
+// Termius Android does not document forwarding a normal screen tap as an xterm
+// mouse click; its documented mobile workflow is long-press -> select -> Copy.
+// OSC 52 remains supported by Termius for applications that explicitly issue
+// clipboard writes, but it cannot be triggered by a touch event the server
+// never receives.
 func printAgentCredentials(token, fingerprint, hysteriaAuth, salamander string) {
-	credentials := []displayedCredential{
-		{label: "AGENT TOKEN • TAP TO COPY", value: token, color: ansiYellow + ansiBold},
-		{label: "CERTIFICATE SHA-256 • TAP TO COPY", value: fingerprint, color: ansiCyan + ansiBold},
-	}
+	fmt.Println()
+	groups := []credentialGroup{{
+		title:  "HUB  →  AGENT  /  ACCESS KEYS",
+		accent: ansiPurple,
+		credentials: []displayedCredential{
+			{label: "AGENT TOKEN", value: token, color: ansiYellow},
+			{label: "CERTIFICATE SHA-256", value: fingerprint, color: ansiCyan},
+		},
+	}}
 	if hysteriaAuth != "" || salamander != "" {
-		credentials = append(credentials,
-			displayedCredential{label: "HYSTERIA 2 PASSWORD • TAP TO COPY", value: hysteriaAuth, color: ansiYellow + ansiBold},
-			displayedCredential{label: "SALAMANDER PASSWORD • TAP TO COPY", value: salamander, color: ansiCyan + ansiBold},
-		)
+		groups = append(groups, credentialGroup{
+			title:  "HYSTERIA 2  /  UDP CREDENTIALS",
+			accent: ansiPinkGlow,
+			credentials: []displayedCredential{
+				{label: "HYSTERIA 2 PASSWORD", value: hysteriaAuth, color: ansiYellow},
+				{label: "SALAMANDER PASSWORD", value: salamander, color: ansiCyan},
+			},
+		})
 	}
-
-	// Keep the original framed terminal-card layout. Each credential has its
-	// own card so selecting/copying one never includes another label or value.
-	fmt.Print("\r\n")
-	for _, credential := range credentials {
-		uiCard(credential.label, []uiCardRow{{Text: credential.value, Color: credential.color}}, ansiPinkGlow)
+	fmt.Println(paint(ansiPurple+ansiBold, "  ✦  SECURE CREDENTIALS  ·  NEBULA VAULT  ✦"))
+	for _, group := range groups {
+		uiCredentialGroupCard(group)
 	}
-	fmt.Printf("  %s\n", paint(ansiDim, "Tap a credential card to copy • Press Enter to continue"))
-
-	session, err := startTerminalMouseSession()
-	if err != nil || session == nil {
-		return
-	}
-	defer session.close()
-	endRow, err := queryTerminalCursorRow(session.fd)
-	if err != nil {
-		return
-	}
-
-	// The card block is the final credential output. Derive tap rows from the
-	// terminal's post-render cursor position, which also accounts for scrolling.
-	interrupted := make(chan os.Signal, 1)
-	finished := make(chan struct{})
-	signal.Notify(interrupted, os.Interrupt, syscall.SIGTERM)
-	defer func() { signal.Stop(interrupted); close(finished) }()
-	go func() {
-		select {
-		case <-interrupted:
-			session.close()
-			os.Exit(130)
-		case <-finished:
-		}
-	}()
-	_ = readCredentialTapOrEnter(session.fd, endRow, len(credentials), credentials)
+	fmt.Println()
 }
 
 func hysteriaFingerprint(s string) (string, error) {
@@ -3898,12 +3810,17 @@ func normalizeFingerprint(s string) ([]byte, error) {
 	if b, err := hex.DecodeString(s); err == nil && len(b) == sha256.Size {
 		return b, nil
 	}
-	// New setup screens show a 43-character unpadded Base64URL value so it
-	// fits on mobile screens. Accept it alongside legacy SHA-256 hex pins.
+	// Accept the 52-character Base32 form used by an intermediate mobile
+	// build, as well as older Base64URL and canonical hexadecimal pins.
+	if len(s) == 52 {
+		if b, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(s); err == nil && len(b) == sha256.Size {
+			return b, nil
+		}
+	}
 	if b, err := base64.RawURLEncoding.DecodeString(s); err == nil && len(b) == sha256.Size {
 		return b, nil
 	}
-	return nil, errors.New("fingerprint must be SHA-256 hex (64 chars) or unpadded Base64URL (43 chars)")
+	return nil, errors.New("fingerprint must be SHA-256 hex (64 chars), Base64URL (43 chars), or Base32 (52 chars)")
 }
 func loadConfig() (Config, error) {
 	b, err := os.ReadFile(configPath)
@@ -3972,12 +3889,12 @@ var wizardStep int
 
 const (
 	ansiReset    = "\033[0m"
-	ansiCyan     = "\033[36m"
-	ansiBlue     = "\033[34m"
-	ansiPurple   = "\033[35m"
-	ansiGreen    = "\033[32m"
-	ansiYellow   = "\033[33m"
-	ansiRed      = "\033[31m"
+	ansiCyan     = "\033[38;2;82;220;255m"
+	ansiBlue     = "\033[38;2;92;151;255m"
+	ansiPurple   = "\033[38;2;181;112;255m"
+	ansiGreen    = "\033[38;2;79;231;194m"
+	ansiYellow   = "\033[38;2;255;214;128m"
+	ansiRed      = "\033[38;2;255;105;145m"
 	ansiPinkGlow = "\033[1;38;2;255;92;200m"
 	ansiBold     = "\033[1m"
 	ansiDim      = "\033[2m"
@@ -4055,29 +3972,67 @@ func logoLuminance(rgb uint32) int {
 	return (299*r + 587*g + 114*b) / 1000
 }
 
-// drawShahTunnelLogo is intentionally disabled to keep the terminal menu compact.
-func drawShahTunnelLogo() {}
+// drawShahTunnelLogo paints the embedded 22x22 logo as 11 terminal rows and
+// pairs it with a compact cosmic wordmark. It uses true-color half blocks and
+// degrades to a simple star-mark when color is disabled.
+func drawShahTunnelLogo() {
+	if os.Getenv("NO_COLOR") != "" || strings.EqualFold(os.Getenv("TERM"), "dumb") {
+		fmt.Println(paint(ansiPurple+ansiBold, "  ✦  SHAH TUNNEL  ✧  SECURE GALACTIC RELAY  ✦"))
+		return
+	}
+	taglines := map[int]string{
+		0: "✦  SHAH TUNNEL",
+		1: "GALACTIC SECURE RELAY",
+		2: "TLS 1.3  •  ZERO TRUST",
+		3: "5-PATH ADAPTIVE CORE",
+		4: "ISOLATED MULTI-TUNNEL",
+		5: "✧  ENCRYPTED TRANSIT  ✦",
+	}
+	for y := 0; y < len(shahTunnelLogoPixels); y += 2 {
+		upper := shahTunnelLogoPixels[y]
+		lower := upper
+		if y+1 < len(shahTunnelLogoPixels) {
+			lower = shahTunnelLogoPixels[y+1]
+		}
+		fmt.Print("  ")
+		for x := 0; x < len(upper) && x < len(lower); x++ {
+			top := shahTunnelLogoPalette[logoPixelIndex(upper[x])]
+			bottom := shahTunnelLogoPalette[logoPixelIndex(lower[x])]
+			tr, tg, tb := (top>>16)&0xff, (top>>8)&0xff, top&0xff
+			br, bg, bb := (bottom>>16)&0xff, (bottom>>8)&0xff, bottom&0xff
+			fmt.Printf("\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm▀", tr, tg, tb, br, bg, bb)
+		}
+		fmt.Print(ansiReset)
+		if label, ok := taglines[y/2]; ok {
+			color := ansiCyan + ansiBold
+			if y == 0 {
+				color = ansiPurple + ansiBold
+			}
+			if y >= 8 {
+				color = ansiPinkGlow + ansiBold
+			}
+			fmt.Print("   " + paint(color, label))
+		}
+		fmt.Println()
+	}
+	fmt.Println(paint(ansiPurple+ansiBold, "  ·  ✦  ·  NEBULA NETWORK  /  PRIVATE TRANSIT  ·  ✦  ·"))
+}
 
 func uiRule() {
-	fmt.Println(paint(ansiPinkGlow, "  ──────────────────────────────────────────────────────────────"))
+	segments := []string{ansiPinkGlow, ansiPurple, ansiBlue, ansiCyan, ansiBlue, ansiPurple, ansiPinkGlow}
+	fmt.Print("  ")
+	for i := 0; i < 62; i++ {
+		fmt.Print(paint(segments[i%len(segments)], "─"))
+	}
+	fmt.Println()
 }
 
 // shahTunnelHeaderArt keeps the requested banner's spacing stable; do not
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
-	"        +------------------------------------------+",
-	"        |               SHAH TUNNEL                |",
-	"        |          SECURE RELAY / TLS 1.3          |",
-	"        +==========================================+",
-	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
-	"        |      ENCRYPTED TRANSIT / TOKEN AUTH      |",
-	"        |       EDGE > SECURE RELAY > TARGET       |",
-	"        |     ZERO TRUST / MULTI-LANE / ONLINE     |",
-	"        |     SESSION: ACTIVE / PRIVATE ROUTE      |",
-	"        +------------------------------------------+",
 	"  ╔══════════════════════════════════════════════════════════════╗",
 	"  ║                         COMMAND DECK                         ║",
-	"  ║       SECURE RELAY   •   TLS 1.3   •   ZERO TRUST            ║",
+	"  ║       NEBULA ROUTING   •   TLS 1.3   •   ZERO TRUST          ║",
 	"  ╚══════════════════════════════════════════════════════════════╝",
 }
 
@@ -4119,7 +4074,7 @@ func uiRouteDiagram() {
 // paintNeonHeaderLine renders box borders in the same bright pink as the
 // Command Deck frame while keeping the text inside each box independently colored.
 func paintNeonHeaderLine(index int, line, contentColor string) string {
-	if index == 0 || index == 3 || index == 9 || index == 10 || index == 13 {
+	if index == 0 || index == len(shahTunnelHeaderArt)-1 {
 		return paint(ansiPinkGlow, line)
 	}
 	runes := []rune(line)
@@ -4165,33 +4120,15 @@ func uiHeader(_, _ string) {
 	fmt.Println()
 	drawShahTunnelLogo()
 	fmt.Println()
+	uiRouteDiagram()
+	fmt.Println()
 	for i, line := range shahTunnelHeaderArt {
-		if i == 10 {
-			fmt.Println()
-			uiRouteDiagram()
-			fmt.Println()
-		}
-		// Report the actual service state in the brand banner instead of always
-		// claiming that a private session is active.
-		if i == 8 {
-			if tunnelIsActive() {
-				line = "        |     SESSION: ACTIVE / PRIVATE ROUTE      |"
-			} else {
-				line = "        |   SESSION: STANDBY / SETUP REQUIRED      |"
-			}
-		}
 		color := ansiDim
 		switch i {
-		case 0, 3, 9:
-			color = ansiCyan + ansiBold
-		case 1, 4, 6, 11:
-			color = ansiCyan + ansiBold
-		case 10, 13:
+		case 1:
 			color = ansiPurple + ansiBold
-		case 12:
+		case 2:
 			color = ansiGreen + ansiBold
-		case 2, 5, 7, 8:
-			color = ansiDim
 		}
 		fmt.Println(paintNeonHeaderLine(i, line, color))
 	}

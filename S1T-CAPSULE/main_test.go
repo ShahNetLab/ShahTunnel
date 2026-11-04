@@ -8,7 +8,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base32"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -26,7 +25,7 @@ import (
 	"time"
 )
 
-func TestCredentialCardsRemainFramedWithoutCopyMenu(t *testing.T) {
+func TestCredentialCardsUseTwoGroupedFramesForTermius(t *testing.T) {
 	originalTerm := os.Getenv("TERM")
 	_ = os.Setenv("TERM", "dumb")
 	defer func() { _ = os.Setenv("TERM", originalTerm) }()
@@ -51,41 +50,48 @@ func TestCredentialCardsRemainFramedWithoutCopyMenu(t *testing.T) {
 			t.Fatalf("credential card omitted %q", value)
 		}
 	}
-	if strings.Count(got, "╭") != 4 || strings.Count(got, "╰") != 4 {
-		t.Fatalf("expected four separate framed credential cards; got output:\n%s", got)
+	if strings.Count(got, "╭") != 2 || strings.Count(got, "╰") != 2 {
+		t.Fatalf("expected two grouped credential frames; got output:\n%s", got)
 	}
-	for _, forbidden := range []string{"Copy menu writes", "If your SSH app blocks", "Copy [1]", "[4] Salamander"} {
+	firstFrame := strings.Index(got, "HUB  →  AGENT  /  ACCESS KEYS")
+	secondFrame := strings.Index(got, "HYSTERIA 2  /  UDP CREDENTIALS")
+	if firstFrame < 0 || secondFrame <= firstFrame {
+		t.Fatalf("expected Hub/Agent frame followed by Hysteria frame:\n%s", got)
+	}
+	for _, forbidden := range []string{"TAP TO COPY", "Copy menu writes", "If your SSH app blocks", "Copy [1]"} {
 		if strings.Contains(got, forbidden) {
-			t.Fatalf("obsolete copy menu text %q is still present", forbidden)
+			t.Fatalf("unsupported tap/copy prompt %q is still rendered", forbidden)
 		}
+	}
+	if strings.Contains(got, "long-press") || strings.Contains(got, "TAP TO COPY") {
+		t.Fatal("credential screen should keep the two framed panels clean")
 	}
 }
 
-func TestCredentialTapRowsSelectOnlyOneValue(t *testing.T) {
-	credentials := []displayedCredential{
-		{value: "TOKEN"}, {value: "FINGERPRINT"}, {value: "HYSTERIA"}, {value: "SALAMANDER"},
+func TestCredentialGroupCardKeepsEachValueOnOneLine(t *testing.T) {
+	token := strings.Repeat("A", 52)
+	fingerprint := strings.Repeat("B", 52)
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
 	}
-	endRow := 40
-	for i, want := range []string{"TOKEN", "FINGERPRINT", "HYSTERIA", "SALAMANDER"} {
-		clickedRow := endRow - len(credentials)*credentialCardHeight + i*credentialCardHeight + 2
-		got, ok := credentialValueAtRow(endRow, len(credentials), clickedRow, credentials)
-		if !ok || got != want {
-			t.Fatalf("tap row for card %d selected %q, %v; want %q", i, got, ok, want)
+	originalStdout := os.Stdout
+	os.Stdout = writeEnd
+	uiCredentialGroupCard(credentialGroup{title: "ACCESS KEYS", accent: ansiPurple, credentials: []displayedCredential{
+		{label: "AGENT TOKEN", value: token, color: ansiYellow},
+		{label: "CERTIFICATE SHA-256", value: fingerprint, color: ansiCyan},
+	}})
+	_ = writeEnd.Close()
+	os.Stdout = originalStdout
+	output, _ := io.ReadAll(readEnd)
+	_ = readEnd.Close()
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.Contains(line, token) && strings.Contains(line, fingerprint) {
+			t.Fatal("two credential values must never share a line")
 		}
 	}
-	if _, ok := credentialValueAtRow(endRow, len(credentials), endRow, credentials); ok {
-		t.Fatal("tap outside the displayed credential cards should not select a value")
-	}
-}
-
-func TestParseSGRMouseReport(t *testing.T) {
-	button, x, y, pressed, err := parseSGRMouseReport("0;18;27")
-	if err != nil || button != 0 || x != 18 || y != 27 || !pressed {
-		t.Fatalf("unexpected mouse report parse: button=%d x=%d y=%d pressed=%v err=%v", button, x, y, pressed, err)
-	}
-	_, _, _, pressed, err = parseSGRMouseReport("35;18;27")
-	if err != nil || pressed {
-		t.Fatalf("mouse-motion report should not trigger a copy; pressed=%v err=%v", pressed, err)
+	if !strings.Contains(string(output), token) || !strings.Contains(string(output), fingerprint) {
+		t.Fatal("group card must render both full, unbroken values")
 	}
 }
 
@@ -923,10 +929,6 @@ func TestHysteriaConfigContentsArePinnedAndDefaultDeny(t *testing.T) {
 	if !validHysteriaSecret(auth) || validHysteriaSecret("short") || validHysteriaSecret(strings.Repeat("z", 64)) {
 		t.Fatal("Hysteria credentials must accept legacy 32-byte hex and new 32-byte Base32 formats only")
 	}
-	if seq := osc52ClipboardSequence(compact); !strings.Contains(seq, base64.StdEncoding.EncodeToString([]byte(compact))) {
-		t.Fatal("OSC 52 clipboard sequence does not contain the exact credential")
-	}
-
 	token, err := randomAgentToken()
 	if err != nil {
 		t.Fatalf("generate compact Agent token: %v", err)
@@ -941,8 +943,8 @@ func TestHysteriaConfigContentsArePinnedAndDefaultDeny(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compact fingerprint: %v", err)
 	}
-	if len(shortFingerprint) != 43 {
-		t.Fatalf("compact fingerprint must be 43 Base64URL characters; got %d", len(shortFingerprint))
+	if len(shortFingerprint) != 64 {
+		t.Fatalf("compact fingerprint must be 64 hexadecimal characters for backward compatibility; got %d", len(shortFingerprint))
 	}
 	decodedFingerprint, err := normalizeFingerprint(shortFingerprint)
 	if err != nil || fmt.Sprintf("%x", decodedFingerprint) != hexFingerprint {
@@ -1148,6 +1150,116 @@ func TestWireObservePongTracksRTTAndIgnoresMalformedPayload(t *testing.T) {
 	w.observePong([]byte{1, 2, 3})
 	if after := w.roundTripTime(); after != before {
 		t.Fatalf("malformed PONG changed RTT from %s to %s", before, after)
+	}
+}
+
+func TestFairWireDataQueueRoundRobinsBusyStreams(t *testing.T) {
+	q := newFairWireDataQueue()
+	q.enqueue(&wireRequest{typ: msgData, id: 10, data: []byte("a1")})
+	q.enqueue(&wireRequest{typ: msgData, id: 10, data: []byte("a2")})
+	q.enqueue(&wireRequest{typ: msgData, id: 10, data: []byte("a3")})
+	q.enqueue(&wireRequest{typ: msgData, id: 20, data: []byte("b1")})
+
+	got := make([]uint32, 0, 4)
+	for i := 0; i < 4; i++ {
+		req := q.dequeue()
+		if req == nil {
+			t.Fatalf("dequeue %d returned nil", i)
+		}
+		got = append(got, req.id)
+	}
+	want := []uint32{10, 20, 10, 10}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("DRR stream order = %v; want %v", got, want)
+		}
+	}
+	if q.dequeue() != nil {
+		t.Fatal("queue should be empty after draining all requests")
+	}
+}
+
+func TestFairWireDataQueueSharesBytesAcrossDifferentFrameSizes(t *testing.T) {
+	q := newFairWireDataQueue()
+	q.enqueue(&wireRequest{typ: msgData, id: 1, data: make([]byte, 2*wireFairQuantum)})
+	q.enqueue(&wireRequest{typ: msgData, id: 2, data: make([]byte, wireFairQuantum)})
+	q.enqueue(&wireRequest{typ: msgData, id: 3, data: []byte("interactive")})
+
+	first := q.dequeue()
+	second := q.dequeue()
+	third := q.dequeue()
+	// The two short flows fit in one quantum, while the 64 KiB frame from
+	// stream 1 must accrue two quanta before it can be scheduled.
+	if first == nil || second == nil || third == nil || first.id != 2 || second.id != 3 || third.id != 1 {
+		t.Fatalf("DRR frame order = (%v, %v, %v); want streams (2, 3, 1)", requestID(first), requestID(second), requestID(third))
+	}
+}
+
+func requestID(req *wireRequest) uint32 {
+	if req == nil {
+		return 0
+	}
+	return req.id
+}
+
+func TestWireWriteLoopFairnessPreventsSingleUploadFlowStarvingOthers(t *testing.T) {
+	writerConn, readerConn := net.Pipe()
+	defer readerConn.Close()
+	w := &wire{
+		conn:     writerConn,
+		controlQ: make(chan *wireRequest, 8),
+		dataQ:    make(chan *wireRequest, 8),
+		done:     make(chan struct{}),
+	}
+	writerDone := make(chan struct{})
+	go func() {
+		w.writeLoop()
+		close(writerDone)
+	}()
+
+	requests := []*wireRequest{
+		{typ: msgData, id: 11, data: []byte("upload-1"), done: make(chan error, 1)},
+		{typ: msgData, id: 11, data: []byte("upload-2"), done: make(chan error, 1)},
+		{typ: msgData, id: 11, data: []byte("upload-3"), done: make(chan error, 1)},
+		{typ: msgData, id: 22, data: []byte("chat"), done: make(chan error, 1)},
+	}
+	for _, req := range requests {
+		w.dataQ <- req
+	}
+
+	got := make([]uint32, 0, len(requests))
+	for i := 0; i < len(requests); i++ {
+		_ = readerConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		typ, id, _, err := readTestFrame(readerConn)
+		if err != nil {
+			t.Fatalf("read fair-scheduled frame %d: %v", i, err)
+		}
+		if typ != msgData {
+			t.Fatalf("frame %d type = %d; want msgData", i, typ)
+		}
+		got = append(got, id)
+	}
+	want := []uint32{11, 22, 11, 11}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("wire scheduler order = %v; want %v", got, want)
+		}
+	}
+	for _, req := range requests {
+		select {
+		case err := <-req.done:
+			if err != nil {
+				t.Fatalf("scheduled request failed: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("scheduled request was not acknowledged")
+		}
+	}
+	w.close()
+	select {
+	case <-writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("wire writer did not stop after close")
 	}
 }
 
@@ -1385,19 +1497,9 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
-		"        +------------------------------------------+",
-		"        |               SHAH TUNNEL                |",
-		"        |          SECURE RELAY / TLS 1.3          |",
-		"        +==========================================+",
-		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
-		"        |      ENCRYPTED TRANSIT / TOKEN AUTH      |",
-		"        |       EDGE > SECURE RELAY > TARGET       |",
-		"        |     ZERO TRUST / MULTI-LANE / ONLINE     |",
-		"        |     SESSION: ACTIVE / PRIVATE ROUTE      |",
-		"        +------------------------------------------+",
 		"  ╔══════════════════════════════════════════════════════════════╗",
 		"  ║                         COMMAND DECK                         ║",
-		"  ║       SECURE RELAY   •   TLS 1.3   •   ZERO TRUST            ║",
+		"  ║       NEBULA ROUTING   •   TLS 1.3   •   ZERO TRUST          ║",
 		"  ╚══════════════════════════════════════════════════════════════╝",
 	}
 	if len(shahTunnelHeaderArt) != len(want) {
@@ -1407,12 +1509,8 @@ func TestShahTunnelHeaderLayout(t *testing.T) {
 		if shahTunnelHeaderArt[i] != want[i] {
 			t.Errorf("header line %d:\n got: %q\nwant: %q", i+1, shahTunnelHeaderArt[i], want[i])
 		}
-		width := 52
-		if i >= 10 {
-			width = 66
-		}
-		if got := len([]rune(shahTunnelHeaderArt[i])); got != width {
-			t.Errorf("header line %d has visual width %d; want %d", i+1, got, width)
+		if got := len([]rune(shahTunnelHeaderArt[i])); got != 66 {
+			t.Errorf("header line %d has visual width %d; want 66", i+1, got)
 		}
 	}
 }
