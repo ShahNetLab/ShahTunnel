@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 1.6.2 installer.
+# Shah Tunnel 2.1.0 installer.
 # Downloads the pinned Go toolchain, verifies its SHA-256, fetches the source,
 # and builds the binary on the target server. No GitHub Release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="1.6.2"
+VERSION="2.1.0"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -370,7 +370,7 @@ build_project_binary() {
   )
 }
 build_from_official_go_toolchain() {
-  local go_archive go_sha source_url go_bin go_root source_dir expected_go url downloaded
+  local go_archive go_sha source_url go_bin go_root source_dir expected_go url downloaded script_dir
   go_archive="go${GO_VERSION}.linux-${TARGET_ARCH}.tar.gz"
   go_sha="$(official_go_sha256)"
   source_url="https://codeload.github.com/${OWNER}/${REPO}/tar.gz/refs/heads/main"
@@ -495,16 +495,29 @@ build_from_official_go_toolchain() {
     go_bin="$go_root/bin/go"
   fi
 
-  echo "Downloading ShahTunnel source from ${OWNER}/${REPO} (main branch)..." >&2
-  if ! curl_download "$source_url" "$TMP/shah-tunnel-source.tar.gz" \
-      --retry 2 --retry-delay 1 --connect-timeout 12 --max-time 180; then
-    echo "Could not download the source archive from ${source_url}." >&2
-    return 1
-  fi
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
   mkdir -p "$source_dir"
-  if ! tar -xzf "$TMP/shah-tunnel-source.tar.gz" -C "$source_dir" --strip-components=1; then
-    echo "Could not extract the ShahTunnel source archive." >&2
-    return 1
+  if [[ -n "$script_dir" && -s "$script_dir/go.mod" && -s "$script_dir/S1T-CAPSULE/main.go" ]]; then
+    echo "Building from the local ShahTunnel source beside S1T-START.sh..." >&2
+    if ! cp -a "$script_dir/go.mod" "$source_dir/" ||
+       ! cp -a "$script_dir/S1T-CAPSULE" "$source_dir/"; then
+      echo "Could not copy the local ShahTunnel source tree." >&2
+      return 1
+    fi
+    if [[ -f "$script_dir/go.sum" ]]; then
+      cp -a "$script_dir/go.sum" "$source_dir/" || return 1
+    fi
+  else
+    echo "Downloading ShahTunnel source from ${OWNER}/${REPO} (main branch)..." >&2
+    if ! curl_download "$source_url" "$TMP/shah-tunnel-source.tar.gz" \
+        --retry 2 --retry-delay 1 --connect-timeout 12 --max-time 180; then
+      echo "Could not download the source archive from ${source_url}." >&2
+      return 1
+    fi
+    if ! tar -xzf "$TMP/shah-tunnel-source.tar.gz" -C "$source_dir" --strip-components=1; then
+      echo "Could not extract the ShahTunnel source archive." >&2
+      return 1
+    fi
   fi
   [[ -s "$source_dir/go.mod" && -s "$source_dir/S1T-CAPSULE/main.go" ]] \
     || { echo "The downloaded repository does not contain the expected ShahTunnel source files." >&2; return 1; }
@@ -550,6 +563,7 @@ if ! build_from_official_go_toolchain; then
 fi
 phase_start 2 "Installing binary and configuring service"
 install -d -o root -g root -m 0700 /etc/ravanreverse
+install -d -o root -g root -m 0700 /etc/ravanreverse/tunnels
 install -d -o root -g root -m 0755 /usr/local/bin
 install -d -o root -g root -m 0755 "$STATE_DIR"
 BIN="/usr/local/bin/ravanreverse"
@@ -602,10 +616,50 @@ ReadWritePaths=/etc/ravanreverse
 WantedBy=multi-user.target
 UNIT
   install -o root -g root -m 0644 "$TMP/ravanreverse.service" /etc/systemd/system/ravanreverse.service
-  if ! timeout --kill-after=3s 15s systemctl daemon-reload; then
-    echo "systemd daemon-reload timed out. The binary is installed, but service metadata may need: systemctl daemon-reload" >&2
-    exit 1
-  fi
+fi
+cat > "$TMP/ravanreverse@.service" <<'UNIT'
+[Unit]
+Description=Shah Tunnel authenticated reverse TCP tunnel (%i)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+[Service]
+Type=simple
+UMask=0077
+ExecStart=/usr/local/bin/ravanreverse run --config /etc/ravanreverse/tunnels/%i.json
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+LimitNOFILE=262144
+TasksMax=4096
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+ReadWritePaths=/etc/ravanreverse
+[Install]
+WantedBy=multi-user.target
+UNIT
+install -o root -g root -m 0644 "$TMP/ravanreverse@.service" /etc/systemd/system/ravanreverse@.service
+if ! timeout --kill-after=3s 15s systemctl daemon-reload; then
+  echo "systemd daemon-reload timed out. The binary is installed, but service metadata may need: systemctl daemon-reload" >&2
+  exit 1
 fi
 if [[ -f /etc/ravanreverse/config.json ]]; then
   if ! timeout --kill-after=2s 10s systemctl enable ravanreverse >/dev/null; then
