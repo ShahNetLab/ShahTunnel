@@ -3,23 +3,23 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>v1.8.0 · Authenticated reverse TCP tunnel · TCP + QUIC/UDP adaptive transport</strong></p>
+<p align="center"><strong>v1.8.1 · Authenticated reverse TCP tunnel · TCP + QUIC/UDP adaptive transport</strong></p>
 <p align="center">An authenticated Hub↔Agent reverse tunnel with four TCP transport choices and an independent Hysteria 2 / QUIC / UDP path.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
 ## Quick install
 
-After the complete v1.8.0 source has been published to the repository's public `main` branch, run this command as `root` on both servers:
+After the complete v1.8.1 source has been published to the repository's public `main` branch, run this command as `root` on both servers:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 ```
 
-Until v1.8.0 is published on `main`, install from this release ZIP. The remote bootstrap intentionally rejects an older or mixed-version branch:
+Until v1.8.1 is published on `main`, install from this release ZIP. The remote bootstrap intentionally rejects an older or mixed-version branch:
 
 ```bash
-unzip ShahTunnel-v1.8.0.zip
-cd ShahTunnel-v1.8.0
+unzip ShahTunnel-v1.8.1.zip
+cd ShahTunnel-v1.8.1
 bash ./S1T-START.sh
 ```
 
@@ -28,7 +28,7 @@ Select `Hub` on the Iran server and `Agent` on the outside server.
 ## Network flow
 
 <p align="center">
-  <img src="docs/img/ShahTunnel-Network-Flow-v1.8.0-en.jpg" alt="ShahTunnel 1.8.0 network flow with four TCP transports and Hysteria 2 QUIC over UDP" width="100%" />
+  <img src="docs/img/ShahTunnel-Network-Flow-v1.8.0-en.jpg" alt="ShahTunnel 1.8.1 network flow with four TCP transports and Hysteria 2 QUIC over UDP" width="100%" />
 </p>
 
 ## Multiple named tunnels on one server
@@ -47,6 +47,16 @@ Select `Hub` on the Iran server and `Agent` on the outside server.
 4. The inner ShahTunnel channel remains protected by TLS 1.3, the setup token and SHA-256 certificate pinning, regardless of the selected outer transport.
 5. In option **8**, first-time lanes are spread over five candidates. Every lane remembers its last successfully authenticated transport and tries it first after reconnecting.
 6. The per-stream in-flight window is 16 × 32 KiB frames, while the global queued-payload budget remains capped at 64 MiB to bound memory use on small VPS plans.
+
+## Concurrent uploads and interactive traffic
+
+- In v1.8.1, each tunnel lane's outbound payload scheduler changes from a shared FIFO to **Deficit Round Robin (DRR)** keyed by the inner TCP stream ID.
+- Each stream receives a 32 KiB quantum per round. Larger frames accrue credit over multiple rounds, so a long-running upload cannot monopolize the lane merely by continuously refilling the shared queue ahead of other streams.
+- Control frames (open/close, ACK and heartbeat) retain a separate bounded-priority queue so connection management remains responsive without starving payload.
+- The scheduler is used in both Hub↔Agent directions and across all outer transport modes. Existing backpressure and process-wide queue memory limits remain in place.
+- Fairness is **per inner TCP stream, not per application**. Since payload is encrypted, ShahTunnel cannot identify whether a stream belongs to Instagram, Telegram or YouTube. An app opening many parallel connections can receive a larger aggregate share.
+- This change does not impose a blind fixed upload cap. The tunnel cannot reliably infer the physical uplink capacity from application traffic. If the server's own WAN egress is the bottleneck, CAKE/SQM should be configured at that actual bottleneck using a measured rate. The installer does not replace the host's qdisc automatically, to avoid disrupting existing network policy or SSH connectivity.
+- If the bottleneck is the phone's cellular uplink, a VPS-side scheduler cannot shape packets before they leave the phone's radio link; shaping must be done by the Android VPN client or local router.
 
 ## Transport menu
 
@@ -91,9 +101,9 @@ For a Hub control port of `9443`:
 
 ## Agent credential display and copy
 
-After Hub setup, the Agent token and certificate fingerprint are shown as compact single-line values for mobile terminals. New Agent tokens still contain 256 bits of randomness and use unpadded Base32. SHA-256 fingerprints are displayed as 43-character unpadded Base64URL; the Agent accepts this representation and continues to accept legacy 64-character hexadecimal fingerprints. New Hysteria and Salamander passwords also contain 256 random bits and use 52-character Base32; existing hexadecimal profile values remain supported.
+After Hub setup, credentials are grouped into two framed panels: Agent Token + Certificate SHA-256, and Hysteria 2 Password + Salamander Password. Each value is printed on its own uninterrupted line. New Agent tokens and Hysteria/Salamander passwords contain 256 bits of randomness and use 52-character unpadded Base32. SHA-256 fingerprints remain in the canonical 64-character hexadecimal format for compatibility with earlier Agent releases.
 
-Each credential is displayed in its own original-style framed card. On SSH terminal apps that forward xterm mouse events and permit OSC 52 clipboard writes, tapping anywhere inside a credential card copies only that card's value. No numbered copy menu is shown. If the SSH app does not forward pointer events or blocks OSC 52, use the terminal's native text-selection/long-press behavior; generic SSH terminals do not provide a universal tap-to-copy API.
+For Termius on Android, **long-press the value itself and choose Copy**. The Termius Android interaction guide documents long-press text selection and copy. A plain touch is not a remote Bash input event unless the SSH app explicitly forwards it as a terminal mouse click. This release therefore does not claim one-tap copy from a credential panel.
 
 ## UDP path security
 
