@@ -6,7 +6,7 @@ set -Eeuo pipefail
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
 VERSION="1.6.3"
-GO_VERSION="1.27.3"
+GO_VERSION="1.23.0"
 GO_BASE="https://go.dev/dl"
 GO_OFFICIAL_CDN_BASE="https://dl.google.com/go"
 GO_OFFICIAL_STORAGE_BASE="https://storage.googleapis.com/golang"
@@ -252,8 +252,8 @@ verify_binary() {
 }
 official_go_sha256() {
   case "$TARGET_ARCH" in
-    amd64) printf '%s' '65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40' ;;
-    arm64) printf '%s' 'a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49' ;;
+    amd64) printf '%s' '905a297f19ead44780548933e0ff1a1b86e8327bb459e92f9c0012569f76f5e3' ;;
+    arm64) printf '%s' '62788056693009bcf7020eedc778cdd1781941c6145eab7688bd087bce0f8659' ;;
     *) return 1 ;;
   esac
 }
