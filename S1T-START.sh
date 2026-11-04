@@ -82,56 +82,48 @@ curl_download() {
 curl_download_resumable() {
   local url="$1" dest="$2" max_time="${3:-1800}" retry_count="${4:-4}" speed_time="${5:-300}"
   local headers="${TMP}/curl-resume-headers.$$" log="${TMP}/curl-resume-log.$$"
-  local rc=0 pid=0 frame=0
+  local rc=0
   local -a retry_opts=(--retry "$retry_count" --retry-delay 3 --retry-connrefused --retry-max-time 600)
 
-  # --retry-all-errors is not available in some older curl builds; enable it
-  # only when this curl version advertises support.
-  if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
-    retry_opts+=(--retry-all-errors)
-  fi
-
+  # Do not use --retry-all-errors here. In particular, retrying a permanent DNS
+  # failure (curl exit 6) only repeats the same error and delays the next
+  # official Go endpoint. curl's normal retry policy still retries transient
+  # HTTP/connection failures.
   [[ -f "$dest" ]] || : > "$dest"
   rm -f "$headers" "$log"
-  : > "$log"
 
-  if [[ ! -t 2 ]]; then
-    if curl -fsSL --proto '=https' --proto-redir '=https' \
+  if [[ -t 2 ]]; then
+    # Show curl's real transfer percentage/speed in an interactive SSH session.
+    # The previous animated block was only an activity indicator, not a percent.
+    if curl -fL --progress-bar --proto '=https' --proto-redir '=https' \
         --continue-at - "${retry_opts[@]}" \
-        --connect-timeout 30 --max-time "$max_time" \
+        --connect-timeout 25 --max-time "$max_time" \
         --speed-time "$speed_time" --speed-limit 1024 \
-        --dump-header "$headers" "$url" -o "$dest" 2>"$log"; then
+        --dump-header "$headers" "$url" -o "$dest"; then
+      PHASE_HAS_DOWNLOAD=1
       rm -f "$headers" "$log"
       return 0
     else
       rc=$?
     fi
-    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
     rm -f "$headers" "$log"
     return "$rc"
   fi
 
-  curl -fsSL --proto '=https' --proto-redir '=https' \
+  if curl -fsSL --proto '=https' --proto-redir '=https' \
       --continue-at - "${retry_opts[@]}" \
-      --connect-timeout 30 --max-time "$max_time" \
+      --connect-timeout 25 --max-time "$max_time" \
       --speed-time "$speed_time" --speed-limit 1024 \
-      --dump-header "$headers" "$url" -o "$dest" 2>"$log" &
-  pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
-    draw_indeterminate_bar "$frame"
-    frame=$((frame + 1))
-    sleep 0.12
-  done
-  wait "$pid" || rc=$?
-  printf '\r\033[2K' >&2
-  if (( rc != 0 )); then
-    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
+      --dump-header "$headers" "$url" -o "$dest" 2>"$log"; then
+    PHASE_HAS_DOWNLOAD=1
     rm -f "$headers" "$log"
-    return "$rc"
+    return 0
+  else
+    rc=$?
   fi
-  PHASE_HAS_DOWNLOAD=1
+  if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
   rm -f "$headers" "$log"
-  return 0
+  return "$rc"
 }
 
 # Use most of the available terminal width, then shorten each later phase
@@ -314,12 +306,14 @@ build_from_official_go_toolchain() {
       # No third-party mirrors are used; each host has its own resumable partial
       # file so bytes from different endpoints are never mixed.
       local -a download_sources=(
-        "go.dev|${GO_BASE}"
+        # Start with the direct official Go file host. Some VPS resolvers cannot
+        # resolve go.dev even when the Google-hosted Go archive is reachable.
         "google-cdn|${GO_OFFICIAL_CDN_BASE}"
         "google-storage|${GO_OFFICIAL_STORAGE_BASE}"
+        "go.dev|${GO_BASE}"
       )
       local source source_id base part_file bytes
-      echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) directly from official Go download servers..." >&2
+      echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) from official Go servers; direct file host is tried first..." >&2
       for source in "${download_sources[@]}"; do
         source_id="${source%%|*}"
         base="${source#*|}"
@@ -356,7 +350,17 @@ build_from_official_go_toolchain() {
     fi
 
     if [[ "$downloaded" -ne 1 ]]; then
-      echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the pinned SHA-256." >&2
+      echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the official SHA-256." >&2
+      echo "DNS/HTTPS diagnostics for official Go hosts:" >&2
+      local host
+      for host in dl.google.com storage.googleapis.com go.dev; do
+        if timeout --kill-after=1s 5s python3 -c 'import socket,sys; socket.getaddrinfo(sys.argv[1], 443, type=socket.SOCK_STREAM)' "$host" >/dev/null 2>&1; then
+          echo "  ${host}: DNS resolves" >&2
+        else
+          echo "  ${host}: DNS lookup failed or timed out" >&2
+        fi
+      done
+      echo "If all three fail, repair the VPS DNS resolver/network first; the installer cannot download without DNS." >&2
       return 1
     fi
     echo "Go archive SHA-256 verified." >&2
