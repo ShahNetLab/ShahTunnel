@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 1.6.3 installer.
+# Shah Tunnel 1.6.2 installer.
 # Downloads the pinned Go toolchain, verifies its SHA-256, fetches the source,
 # and builds the binary on the target server. No GitHub Release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="1.6.3"
-GO_VERSION="1.23.0"
-GO_BASE="https://go.dev/dl"
-GO_OFFICIAL_CDN_BASE="https://dl.google.com/go"
-GO_OFFICIAL_STORAGE_BASE="https://storage.googleapis.com/golang"
+VERSION="1.6.2"
+GO_VERSION="1.26.1"
+GO_BASE="https://dl.google.com/go"
+GO_FALLBACK_BASE="https://go.dev/dl"
 STATE_DIR="/usr/local/lib/shah-tunnel"
 GO_CACHE_DIR="/var/cache/shah-tunnel"
 PHASE_HAS_DOWNLOAD=0
@@ -77,53 +76,154 @@ curl_download() {
   PHASE_HAS_DOWNLOAD=1
   rm -f "$headers" "$log"
 }
-# Download a large Go archive from an official Go host and retain partial bytes.
-# Each official host has its own file; bytes from different hosts are never mixed.
+# Download a large file while retaining partial bytes between mirror attempts.
+# Unlike curl_download(), this helper must NEVER remove the destination file on
+# failure, because the next mirror may resume at the existing byte offset.
 curl_download_resumable() {
-  local url="$1" dest="$2" max_time="${3:-1800}" retry_count="${4:-4}" speed_time="${5:-300}"
+  local url="$1" dest="$2" max_time="${3:-0}" retry_count="${4:-3}" speed_time="${5:-180}"
   local headers="${TMP}/curl-resume-headers.$$" log="${TMP}/curl-resume-log.$$"
-  local rc=0
-  local -a retry_opts=(--retry "$retry_count" --retry-delay 3 --retry-connrefused --retry-max-time 600)
+  local rc=0 pid=0 frame=0
 
-  # Do not use --retry-all-errors here. In particular, retrying a permanent DNS
-  # failure (curl exit 6) only repeats the same error and delays the next
-  # official Go endpoint. curl's normal retry policy still retries transient
-  # HTTP/connection failures.
   [[ -f "$dest" ]] || : > "$dest"
   rm -f "$headers" "$log"
+  : > "$log"
 
-  if [[ -t 2 ]]; then
-    # Show curl's real transfer percentage/speed in an interactive SSH session.
-    # The previous animated block was only an activity indicator, not a percent.
-    if curl -fL --progress-bar --proto '=https' --proto-redir '=https' \
-        --continue-at - "${retry_opts[@]}" \
-        --connect-timeout 25 --max-time "$max_time" \
+  if [[ ! -t 2 ]]; then
+    if curl -fsSL --proto '=https' --proto-redir '=https' \
+        --continue-at - \
+        --retry "$retry_count" --retry-delay 1 --retry-connrefused \
+        --connect-timeout 8 --max-time "$max_time" \
         --speed-time "$speed_time" --speed-limit 1024 \
-        --dump-header "$headers" "$url" -o "$dest"; then
-      PHASE_HAS_DOWNLOAD=1
+        --dump-header "$headers" "$url" -o "$dest" 2>"$log"; then
       rm -f "$headers" "$log"
       return 0
     else
       rc=$?
     fi
+    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
     rm -f "$headers" "$log"
     return "$rc"
   fi
 
-  if curl -fsSL --proto '=https' --proto-redir '=https' \
-      --continue-at - "${retry_opts[@]}" \
-      --connect-timeout 25 --max-time "$max_time" \
+  curl -fsSL --proto '=https' --proto-redir '=https' \
+      --continue-at - \
+      --retry "$retry_count" --retry-delay 1 --retry-connrefused \
+      --connect-timeout 8 --max-time "$max_time" \
       --speed-time "$speed_time" --speed-limit 1024 \
-      --dump-header "$headers" "$url" -o "$dest" 2>"$log"; then
-    PHASE_HAS_DOWNLOAD=1
+      --dump-header "$headers" "$url" -o "$dest" 2>"$log" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    draw_indeterminate_bar "$frame"
+    frame=$((frame + 1))
+    sleep 0.12
+  done
+  wait "$pid" || rc=$?
+  printf '\r\033[2K' >&2
+  if (( rc != 0 )); then
+    if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
     rm -f "$headers" "$log"
-    return 0
-  else
-    rc=$?
+    return "$rc"
   fi
-  if [[ "${QUIET_CURL_ERRORS:-0}" != 1 ]]; then cat "$log" >&2; fi
+  PHASE_HAS_DOWNLOAD=1
   rm -f "$headers" "$log"
-  return "$rc"
+  return 0
+}
+
+# Download a Go archive using concurrent byte ranges. This is especially
+# helpful on hosts where a single HTTPS stream is bandwidth-limited. A range
+# is accepted only when the server returns the exact number of bytes; the final
+# archive must match the pinned SHA-256 before it is used.
+curl_download_parallel_ranges() {
+  local url="$1" dest="$2" expected_sha="$3"
+  local workdir="${dest}.chunks" headers="${TMP}/range-headers.$$" probe="${TMP}/range-probe.$$"
+  local total chunk_count=8 chunk_size i start end expected_size part tmp_part
+  local pid rc failed=0 alive frame=0
+  local -a pids=()
+  RANGE_DOWNLOAD_ATTEMPTED=0
+
+  rm -f "$headers" "$probe"
+  # --max-filesize prevents a mirror that ignores Range from streaming the
+  # entire ~67 MB archive just to probe support.
+  if ! curl -fsSL --proto '=https' --proto-redir '=https' --range 0-0 \
+      --max-filesize 1024 --connect-timeout 8 --max-time 12 \
+      --dump-header "$headers" "$url" -o "$probe" 2>/dev/null; then
+    rm -f "$headers" "$probe"
+    return 1
+  fi
+  total="$(sed -nE 's/^[Cc]ontent-[Rr]ange:[[:space:]]*bytes[[:space:]]+0-0\/([0-9]+).*$/\1/p' "$headers" | tail -n 1)"
+  if [[ ! "$total" =~ ^[0-9]+$ ]] || [[ "$(wc -c < "$probe" 2>/dev/null || echo 0)" -ne 1 ]]; then
+    rm -f "$headers" "$probe"
+    return 1
+  fi
+  rm -f "$headers" "$probe"
+  RANGE_DOWNLOAD_ATTEMPTED=1
+
+  mkdir -p "$workdir"
+  chunk_size=$(((total + chunk_count - 1) / chunk_count))
+  pids=()
+  for ((i=0; i<chunk_count; i++)); do
+    start=$((i * chunk_size))
+    (( start < total )) || break
+    end=$((start + chunk_size - 1))
+    (( end < total )) || end=$((total - 1))
+    expected_size=$((end - start + 1))
+    part="${workdir}/chunk-$(printf '%02d' "$i").part"
+    # Completed chunks are reusable on the next invocation, but only if their
+    # byte count matches the expected range length.
+    if [[ -f "$part" ]] && [[ "$(wc -c < "$part")" -eq "$expected_size" ]]; then
+      continue
+    fi
+    tmp_part="${part}.tmp.$$"
+    rm -f "$tmp_part"
+    (
+      if curl -fsSL --proto '=https' --proto-redir '=https' \
+          --range "${start}-${end}" --retry 0 \
+          --connect-timeout 8 --max-time 35 \
+          "$url" -o "$tmp_part" 2>/dev/null &&
+          [[ "$(wc -c < "$tmp_part" 2>/dev/null || echo 0)" -eq "$expected_size" ]]; then
+        mv -f "$tmp_part" "$part"
+        exit 0
+      fi
+      rm -f "$tmp_part"
+      exit 1
+    ) &
+    pids+=("$!")
+  done
+
+  # Keep the existing compact animated indicator while chunks are in flight.
+  while :; do
+    alive=0
+    for pid in "${pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then alive=1; break; fi
+    done
+    (( alive == 1 )) || break
+    draw_indeterminate_bar "$frame"
+    frame=$((frame + 1))
+    sleep 0.12
+  done
+  printf '\r\033[2K' >&2
+  for pid in "${pids[@]}"; do
+    wait "$pid" || failed=1
+  done
+  if (( failed != 0 )); then
+    return 1
+  fi
+
+  local assembled="${TMP}/go-ranges-assembled.$$"
+  : > "$assembled"
+  for ((i=0; i<chunk_count; i++)); do
+    part="${workdir}/chunk-$(printf '%02d' "$i").part"
+    [[ -f "$part" ]] || { rm -f "$assembled"; return 1; }
+    cat "$part" >> "$assembled" || { rm -f "$assembled"; return 1; }
+  done
+  if [[ "$(wc -c < "$assembled")" -ne "$total" ]] ||
+      ! printf '%s  %s\n' "$expected_sha" "$assembled" | sha256sum -c - >/dev/null 2>&1; then
+    rm -f "$assembled"
+    rm -rf "$workdir"
+    return 1
+  fi
+  mv -f "$assembled" "$dest"
+  return 0
 }
 
 # Use most of the available terminal width, then shorten each later phase
@@ -252,8 +352,8 @@ verify_binary() {
 }
 official_go_sha256() {
   case "$TARGET_ARCH" in
-    amd64) printf '%s' '905a297f19ead44780548933e0ff1a1b86e8327bb459e92f9c0012569f76f5e3' ;;
-    arm64) printf '%s' '62788056693009bcf7020eedc778cdd1781941c6145eab7688bd087bce0f8659' ;;
+    amd64) printf '%s' '031f088e5d955bab8657ede27ad4e3bc5b7c1ba281f05f245bcc304f327c987a' ;;
+    arm64) printf '%s' 'a290581cfe4fe28ddd737dde3095f3dbeb7f2e4065cab4eae44dfc53b760c2f7' ;;
     *) return 1 ;;
   esac
 }
@@ -302,45 +402,61 @@ build_from_official_go_toolchain() {
       downloaded=1
     else
       rm -f "$cache_archive"
-      # Download directly from official Go distribution endpoints first.
-      # No third-party mirrors are used; each host has its own resumable partial
-      # file so bytes from different endpoints are never mixed.
+      # Use parallel ranges first for mirrors that support them; if a mirror
+      # lacks byte-range support, fall back to the resumable single-stream path.
       local -a download_sources=(
-        # Start with the direct official Go file host. Some VPS resolvers cannot
-        # resolve go.dev even when the Google-hosted Go archive is reachable.
-        "google-cdn|${GO_OFFICIAL_CDN_BASE}"
-        "google-storage|${GO_OFFICIAL_STORAGE_BASE}"
-        "go.dev|${GO_BASE}"
+        "aliyun|https://mirrors.aliyun.com/golang"
+        "nju|https://mirror.nju.edu.cn/golang"
+        "ustc|https://mirrors.ustc.edu.cn/golang"
+        "tsinghua|https://mirrors.tuna.tsinghua.edu.cn/golang"
+        "tencent|https://mirrors.cloud.tencent.com/go"
+        "163|https://mirrors.163.com/golang"
+        "google|https://dl.google.com/go"
+        "go-dev|https://go.dev/dl"
+        "google-storage|https://storage.googleapis.com/golang"
+        "google-cn|https://golang.google.cn/dl"
       )
       local source source_id base part_file bytes
-      echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) from official Go servers; direct file host is tried first..." >&2
+      echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) using parallel range requests where supported..." >&2
       for source in "${download_sources[@]}"; do
         source_id="${source%%|*}"
         base="${source#*|}"
         url="${base}/${go_archive}"
         part_file="${GO_CACHE_DIR}/${go_archive}.${source_id}.part"
-        echo "Trying official Go source: ${base}..." >&2
+        echo "Trying ${base}..." >&2
 
         if [[ -s "$part_file" ]] && printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
           cp -f "$part_file" "$TMP/$go_archive"
           downloaded=1
-          echo "Using complete official SHA-256-verified Go archive from ${source_id}." >&2
+          echo "Using complete SHA-256-verified archive from ${source_id}." >&2
           break
         fi
 
-        if curl_download_resumable "$url" "$part_file" 1800 4 300; then
+        RANGE_DOWNLOAD_ATTEMPTED=0
+        if curl_download_parallel_ranges "$url" "$part_file" "$go_sha"; then
+          cp -f "$part_file" "$TMP/$go_archive"
+          downloaded=1
+          echo "Parallel download from ${source_id} passed SHA-256 verification." >&2
+          break
+        fi
+        if [[ "$RANGE_DOWNLOAD_ATTEMPTED" == 1 ]]; then
+          echo "Parallel chunks were incomplete at ${source_id}; moving to the next mirror instead of restarting a slow full download." >&2
+          continue
+        fi
+        echo "${source_id} does not support a usable byte-range response; trying a time-limited single stream..." >&2
+        if curl_download_resumable "$url" "$part_file" 35 0 15; then
           if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
             cp -f "$part_file" "$TMP/$go_archive"
             downloaded=1
-            echo "Official Go download from ${source_id} passed SHA-256 verification." >&2
+            echo "Resumable download from ${source_id} passed SHA-256 verification." >&2
             break
           fi
           bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
-          echo "Checksum mismatch from official source ${source_id} (${bytes} bytes); discarding the untrusted file." >&2
+          echo "Checksum mismatch from ${source_id} (${bytes} bytes); discarding its single-stream partial." >&2
           rm -f "$part_file"
         else
           bytes="$(wc -c < "$part_file" 2>/dev/null || printf '0')"
-          echo "Official source ${source_id} failed (${bytes} bytes retained for a later resume attempt)." >&2
+          echo "Download failed from ${source_id} (${bytes} bytes retained for the same mirror)." >&2
         fi
       done
       if [[ "$downloaded" -eq 1 ]]; then
@@ -350,17 +466,7 @@ build_from_official_go_toolchain() {
     fi
 
     if [[ "$downloaded" -ne 1 ]]; then
-      echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the official SHA-256." >&2
-      echo "DNS/HTTPS diagnostics for official Go hosts:" >&2
-      local host
-      for host in dl.google.com storage.googleapis.com go.dev; do
-        if timeout --kill-after=1s 5s python3 -c 'import socket,sys; socket.getaddrinfo(sys.argv[1], 443, type=socket.SOCK_STREAM)' "$host" >/dev/null 2>&1; then
-          echo "  ${host}: DNS resolves" >&2
-        else
-          echo "  ${host}: DNS lookup failed or timed out" >&2
-        fi
-      done
-      echo "If all three fail, repair the VPS DNS resolver/network first; the installer cannot download without DNS." >&2
+      echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the pinned SHA-256." >&2
       return 1
     fi
     echo "Go archive SHA-256 verified." >&2
@@ -439,7 +545,7 @@ build_from_official_go_toolchain() {
 
 if ! build_from_official_go_toolchain; then
   echo "Installation stopped: no verified ShahTunnel binary was built." >&2
-  echo "Go must be downloaded from an official Go host and match the pinned SHA-256; fix VPS DNS/HTTPS access if all official hosts are unreachable." >&2
+  echo "Go archives must match the pinned SHA-256; ShahTunnel is built locally without GitHub Release assets." >&2
   exit 1
 fi
 phase_start 2 "Installing binary and configuring service"
