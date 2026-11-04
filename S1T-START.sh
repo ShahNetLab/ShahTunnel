@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 # Shah Tunnel 1.6.2 installer.
-# Downloads the official Go toolchain directly from dl.google.com, verifies SHA-256, and builds from GitHub source.
+# Downloads Go from the official host first, then SHA-256-verified mirrors if Google is blocked; builds from GitHub source.
 # No prebuilt ShahTunnel binaries or manual GitHub release uploads are required.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
@@ -451,88 +451,19 @@ build_from_system_go() {
   return 0
 }
 
-install_compatible_go_from_apt() {
-  local pkg candidate candidate_version path versioned_bin
-  local -a packages=(golang-1.27-go golang-1.26-go golang-1.25-go golang-1.24-go golang-1.23-go golang-go)
-
-  command -v apt-get >/dev/null 2>&1 || return 1
-  command -v apt-cache >/dev/null 2>&1 || return 1
-  command -v dpkg >/dev/null 2>&1 || return 1
-
-  echo "The official Go download endpoints are unreachable. Checking the VPS distribution's signed APT repositories for Go >= 1.23.0..." >&2
-
-  # Refresh package metadata only when the current cache has no compatible Go.
-  local have_candidate=0
-  for pkg in "${packages[@]}"; do
-    candidate="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
-    candidate_version="${candidate##*:}"
-    if [[ -n "$candidate" && "$candidate" != "(none)" ]] && dpkg --compare-versions "$candidate_version" ge "1.23.0"; then
-      have_candidate=1
-      break
-    fi
-  done
-  if [[ "$have_candidate" -ne 1 ]]; then
-    if ! run_with_spinner "Refreshing official APT package indexes" "$TMP/apt-update.log" \
-        timeout --kill-after=3s 60s apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10; then
-      echo "APT package-index refresh failed; checking any cached package metadata anyway." >&2
-    fi
-  fi
-
-  for pkg in "${packages[@]}"; do
-    candidate="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
-    [[ -n "$candidate" && "$candidate" != "(none)" ]] || continue
-    candidate_version="${candidate##*:}"
-    if ! dpkg --compare-versions "$candidate_version" ge "1.23.0"; then
-      continue
-    fi
-
-    echo "Installing ${pkg} (${candidate}) from the VPS configured APT repositories..." >&2
-    if ! run_with_spinner "Installing Go from APT" "$TMP/apt-install.log" \
-        timeout --kill-after=5s 300s apt-get install -y --no-install-recommends "$pkg"; then
-      echo "APT could not install ${pkg}; trying the next compatible package." >&2
-      continue
-    fi
-
-    # Versioned Ubuntu/Debian packages keep Go under /usr/lib/go-X.Y/bin.
-    if [[ "$pkg" =~ ^golang-(1\.[0-9]+)-go$ ]]; then
-      versioned_bin="/usr/lib/go-${BASH_REMATCH[1]}/bin"
-      if [[ -x "$versioned_bin/go" ]]; then
-        export PATH="${versioned_bin}:${PATH}"
-      fi
-    fi
-    hash -r
-    path="$(command -v go 2>/dev/null || true)"
-    if [[ -z "$path" ]]; then
-      path="$(find /usr/lib -maxdepth 4 -type f -path '/usr/lib/go-*/bin/go' -print 2>/dev/null | sort -V | tail -n 1)"
-      if [[ -n "$path" ]]; then
-        export PATH="$(dirname "$path"):${PATH}"
-        hash -r
-      fi
-    fi
-    if [[ -n "$path" && -x "$path" ]]; then
-      echo "Go package installed from the signed APT repository: $path" >&2
-      return 0
-    fi
-    echo "Installed package did not provide a usable Go >= 1.23.0; trying next package." >&2
-  done
-  return 1
-}
-
 prepare_verified_binary() {
-  # Preferred route: reuse a verified official Go toolchain cache, or download
-  # Go directly from dl.google.com and verify its official pinned SHA-256.
-  if build_from_official_go_toolchain; then
-    return 0
-  fi
-
-  # Fallback only when the official Go host is unreachable: use a compatible
-  # Go toolchain already installed on this VPS.
+  # Reuse a compatible Go installation already present on the VPS first.
+  # This avoids downloading a second toolchain when one is already available.
   if build_from_system_go; then
     return 0
   fi
 
-  # Final fallback: install Go from the VPS distribution's signed APT sources.
-  if install_compatible_go_from_apt && build_from_system_go; then
+  # Otherwise download Go from the official distribution host. If that CDN is
+  # blocked, try university distribution mirrors, accepting them only when
+  # their archive matches the SHA-256 published by the official Go release page.
+  # Do not run apt-get update here: the supplied VPS logs show DNS failures for
+  # Ubuntu repositories, and refreshing APT only wastes time without fixing it.
+  if build_from_official_go_toolchain; then
     return 0
   fi
   return 1
@@ -592,68 +523,58 @@ build_from_official_go_toolchain() {
       rm -f "$cache_archive"
       local part_file="${GO_CACHE_DIR}/${go_archive}.official.part"
       local official_url="${GO_BASE}/${go_archive}"
-      local -a official_ips=()
-      local official_ip
-      echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) from the official Go distribution host: ${GO_BASE}" >&2
-      echo "Resolving the official download host through HTTPS DNS first; TLS certificate and SHA-256 will both be verified." >&2
+      local download_url
+      local -a download_urls=(
+        "$official_url"
+        "https://mirrors.hust.edu.cn/golang/${go_archive}"
+        "https://mirror.nju.edu.cn/golang/${go_archive}"
+      )
 
-      # First bypass the VPS's possibly broken DNS resolver. DNS-over-HTTPS is
-      # used only to obtain IP addresses; the actual archive is still fetched
-      # from dl.google.com with its hostname and normal TLS certificate check.
-      mapfile -t official_ips < <({
-        # Prefer authenticated HTTPS DNS, then query independent public DNS
-        # resolvers directly over UDP/TCP 53 and DNS-over-TLS 853, then ask
-        # the VPS resolver. The HTTP download itself always uses dl.google.com.
-        resolve_ipv4_via_doh "dl.google.com"
-        resolve_ipv4_via_public_dns "dl.google.com"
-        if command -v getent >/dev/null 2>&1; then
-          getent ahostsv4 dl.google.com 2>/dev/null | awk '{print $1}'
-        fi
-      } | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/' | sort -u)
+      echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH})." >&2
+      echo "Primary source: the official Go distribution host (${GO_BASE})." >&2
+      echo "If Google's CDN is blocked by this VPS network, checksum-verified Go distribution mirrors will be tried automatically." >&2
 
-      if [[ "${#official_ips[@]}" -gt 0 ]]; then
-        for official_ip in "${official_ips[@]}"; do
-          echo "Downloading from official Go host via resolved address ${official_ip} (HTTPS hostname verification enabled)..." >&2
-          if curl_download_resumable "$official_url" "$part_file" 900 1 75 "$official_ip"; then
-            if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
-              cp -f "$part_file" "$TMP/$go_archive"
-              downloaded=1
-              echo "Official Go archive downloaded and SHA-256 verified." >&2
-              break
-            fi
-            echo "The downloaded archive did not match the official SHA-256; discarding it before the next address." >&2
-            rm -f "$part_file"
-          fi
-        done
-      else
-        echo "HTTPS DNS lookup did not return an address; falling back to the VPS resolver for the same official URL." >&2
-      fi
+      # Try the canonical official Go download first. The VPS log shows that
+      # Google IPs resolve but TCP/443 is unreachable, so fail quickly and move
+      # on instead of cycling through every Google IP for several minutes.
+      for download_url in "${download_urls[@]}"; do
+        case "$download_url" in
+          "$official_url")
+            echo "Trying official Go download: ${download_url}" >&2
+            ;;
+          *)
+            echo "Official Go CDN is unreachable; trying verified distribution mirror: ${download_url}" >&2
+            ;;
+        esac
 
-      # Last network fallback: use the VPS's normal resolver. This is attempted
-      # once with a short connection/DNS timeout; it never switches to a mirror.
-      if [[ "$downloaded" -ne 1 ]]; then
-        echo "Trying the official Go URL using the VPS DNS resolver..." >&2
-        if curl_download_resumable "$official_url" "$part_file" 900 0 75; then
+        if QUIET_CURL_ERRORS=1 curl_download_resumable "$download_url" "$part_file" 900 1 75; then
           if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
             cp -f "$part_file" "$TMP/$go_archive"
             downloaded=1
-            echo "Official Go archive downloaded and SHA-256 verified." >&2
-          else
-            echo "The official archive SHA-256 did not match; removing the invalid file." >&2
-            rm -f "$part_file"
+            case "$download_url" in
+              "$official_url") echo "Official Go archive downloaded and SHA-256 verified." >&2 ;;
+              *) echo "Go archive from mirror matches the official Go SHA-256; verified." >&2 ;;
+            esac
+            break
           fi
+          echo "Downloaded archive did not match the official Go SHA-256; discarding it." >&2
+          rm -f "$part_file"
+        else
+          echo "Download attempt failed: ${download_url}" >&2
         fi
-      fi
+      done
+
       if [[ "$downloaded" -eq 1 ]]; then
-        # Cache only a fully downloaded and verified archive.
+        # Cache only a fully downloaded archive with the official pinned hash.
         install -o root -g root -m 0644 "$TMP/$go_archive" "$cache_archive"
         rm -f "$part_file"
       fi
-    fi
 
-    if [[ "$downloaded" -ne 1 ]]; then
-      echo "ERROR: Could not obtain a Go ${GO_VERSION} archive matching the pinned SHA-256." >&2
-      return 1
+      if [[ "$downloaded" -ne 1 ]]; then
+        echo "ERROR: Official Go download and all checksum-verified mirrors failed." >&2
+        echo "This VPS cannot currently reach the required download hosts over HTTPS." >&2
+        return 1
+      fi
     fi
     echo "Go archive SHA-256 verified." >&2
     rm -rf "$TMP/go-root" "$toolchain_new"
@@ -744,8 +665,8 @@ build_from_official_go_toolchain() {
 
 if ! prepare_verified_binary; then
   echo "Installation stopped: no verified ShahTunnel binary could be built." >&2
-  echo "The installer tried the official Go download service, available system Go, and compatible Go packages from the VPS APT repositories." >&2
-  echo "If all of those network routes are blocked, the VPS provider/network must allow outbound HTTPS to the official Go CDN or its configured package mirrors." >&2
+  echo "The installer tried the existing system Go, the official Go download host, and checksum-verified Go mirrors." >&2
+  echo "No unverified compiler or binary was installed. This VPS must allow HTTPS to at least one of those download hosts." >&2
   exit 1
 fi
 phase_start 2 "Installing binary and configuring service"
