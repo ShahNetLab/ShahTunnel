@@ -120,9 +120,15 @@ curl_download_resumable() {
 # curl --resolve pins only the IP and keeps TLS hostname verification enabled.
 resolve_ipv4_via_doh() {
   local host="$1" response
+  # All resolver IPs are public, well-known DNS services. They are used only
+  # to discover the CDN address; the later HTTPS request still validates the
+  # certificate for dl.google.com and the Go archive SHA-256.
   local -a doh_hosts=(
     'cloudflare-dns.com|1.1.1.1|/dns-query'
     'dns.google|8.8.8.8|/resolve'
+    'dns.quad9.net|9.9.9.9|/dns-query'
+    'doh.opendns.com|146.112.41.2|/dns-query'
+    'dns.adguard-dns.com|94.140.14.14|/dns-query'
   )
   local entry doh_host doh_ip doh_path
   for entry in "${doh_hosts[@]}"; do
@@ -130,12 +136,13 @@ resolve_ipv4_via_doh() {
     entry="${entry#*|}"
     doh_ip="${entry%%|*}"
     doh_path="${entry#*|}"
-    response="$(curl -4 -fsS --proto '=https' --connect-timeout 4 --max-time 8 \
+    response="$(curl -4 -fsS --proto '=https' --connect-timeout 3 --max-time 6 \
       --resolve "${doh_host}:443:${doh_ip}" \
       -H 'accept: application/dns-json' \
       "https://${doh_host}${doh_path}?name=${host}&type=A" 2>/dev/null || true)"
     if [[ -n "$response" ]]; then
-      printf '%s' "$response" | python3 -c '
+      local answers
+      answers="$(printf '%s' "$response" | python3 -c '
 import ipaddress, json, sys
 try:
     data = json.load(sys.stdin)
@@ -150,9 +157,107 @@ try:
                     pass
 except Exception:
     pass
-' 2>/dev/null
+' 2>/dev/null)"
+      if [[ -n "$answers" ]]; then
+        printf '%s\n' "$answers"
+        return 0
+      fi
     fi
   done
+}
+
+# Last-resort DNS that does not depend on /etc/resolv.conf and does not need
+# curl to resolve any hostname. DNS answers are only used as IP candidates;
+# curl still connects to https://dl.google.com with normal TLS verification.
+resolve_ipv4_via_public_dns() {
+  local host="$1"
+  python3 - "$host" <<'PYDNS'
+import ipaddress, os, socket, ssl, struct, sys
+host = sys.argv[1].rstrip('.')
+resolvers = [
+    ('1.1.1.1', 'cloudflare-dns.com'),
+    ('8.8.8.8', 'dns.google'),
+    ('9.9.9.9', 'dns.quad9.net'),
+    ('208.67.222.222', 'dns.opendns.com'),
+    ('208.67.220.220', 'dns.opendns.com'),
+    ('94.140.14.14', 'dns.adguard-dns.com'),
+]
+try:
+    qname = b''.join(bytes([len(label)]) + label.encode('ascii') for label in host.split('.')) + b'\0'
+except Exception:
+    raise SystemExit(0)
+tid = int.from_bytes(os.urandom(2), 'big')
+query = struct.pack('!HHHHHH', tid, 0x0100, 1, 0, 0, 0) + qname + struct.pack('!HH', 1, 1)
+
+def recv_exact(sock, n):
+    out = b''
+    while len(out) < n:
+        part = sock.recv(n-len(out))
+        if not part: raise OSError('short DNS response')
+        out += part
+    return out
+
+def parse(msg):
+    if len(msg) < 12: return []
+    rid, flags, qd, an, _, _ = struct.unpack('!HHHHHH', msg[:12])
+    if rid != tid or not (flags & 0x8000) or (flags & 0x000f) != 0: return []
+    pos = 12
+    def skip_name(p):
+        while p < len(msg):
+            n = msg[p]
+            if n == 0: return p+1
+            if (n & 0xC0) == 0xC0: return p+2
+            if n & 0xC0: return len(msg)
+            p += n+1
+        return len(msg)
+    for _ in range(qd):
+        pos = skip_name(pos) + 4
+    found = []
+    for _ in range(an):
+        pos = skip_name(pos)
+        if pos + 10 > len(msg): break
+        typ, cls, ttl, size = struct.unpack('!HHIH', msg[pos:pos+10]); pos += 10
+        data = msg[pos:pos+size]; pos += size
+        if typ == 1 and cls == 1 and size == 4:
+            try: found.append(str(ipaddress.IPv4Address(data)))
+            except Exception: pass
+    return found
+
+seen = set()
+for ip, tls_name in resolvers:
+    # UDP/53 and TCP/53 are attempted independently. The query carries no
+    # credentials; authenticity is enforced by the pinned Go archive checksum.
+    for proto in ('udp', 'tcp'):
+        try:
+            if proto == 'udp':
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.settimeout(2.0); s.sendto(query, (ip, 53)); packet, _ = s.recvfrom(4096)
+            else:
+                with socket.create_connection((ip, 53), timeout=2.0) as s:
+                    s.settimeout(2.0); s.sendall(struct.pack('!H', len(query)) + query)
+                    size = struct.unpack('!H', recv_exact(s, 2))[0]
+                    packet = recv_exact(s, size)
+            for answer in parse(packet):
+                if answer not in seen: print(answer); seen.add(answer)
+            if seen: break
+        except Exception:
+            pass
+    if seen: break
+    # DNS-over-TLS on port 853 provides another path when UDP/53 is blocked.
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((ip, 853), timeout=2.5) as raw:
+            raw.settimeout(2.5)
+            with ctx.wrap_socket(raw, server_hostname=tls_name) as s:
+                s.sendall(struct.pack('!H', len(query)) + query)
+                size = struct.unpack('!H', recv_exact(s, 2))[0]
+                packet = recv_exact(s, size)
+        for answer in parse(packet):
+            if answer not in seen: print(answer); seen.add(answer)
+        if seen: break
+    except Exception:
+        pass
+PYDNS
 }
 
 # Use most of the available terminal width, then shorten each later phase
@@ -368,7 +473,7 @@ install_compatible_go_from_apt() {
   done
   if [[ "$have_candidate" -ne 1 ]]; then
     if ! run_with_spinner "Refreshing official APT package indexes" "$TMP/apt-update.log" \
-        timeout --kill-after=5s 180s apt-get update -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20; then
+        timeout --kill-after=3s 60s apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10; then
       echo "APT package-index refresh failed; checking any cached package metadata anyway." >&2
     fi
   fi
@@ -495,11 +600,16 @@ build_from_official_go_toolchain() {
       # First bypass the VPS's possibly broken DNS resolver. DNS-over-HTTPS is
       # used only to obtain IP addresses; the actual archive is still fetched
       # from dl.google.com with its hostname and normal TLS certificate check.
-      mapfile -t official_ips < <(
-        resolve_ipv4_via_doh "dl.google.com" \
-          | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/' \
-          | sort -u
-      )
+      mapfile -t official_ips < <({
+        # Prefer authenticated HTTPS DNS, then query independent public DNS
+        # resolvers directly over UDP/TCP 53 and DNS-over-TLS 853, then ask
+        # the VPS resolver. The HTTP download itself always uses dl.google.com.
+        resolve_ipv4_via_doh "dl.google.com"
+        resolve_ipv4_via_public_dns "dl.google.com"
+        if command -v getent >/dev/null 2>&1; then
+          getent ahostsv4 dl.google.com 2>/dev/null | awk '{print $1}'
+        fi
+      } | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/' | sort -u)
 
       if [[ "${#official_ips[@]}" -gt 0 ]]; then
         for official_ip in "${official_ips[@]}"; do
