@@ -1,16 +1,16 @@
 <p align="center">
-  <img src="docs/img/shah-tunnel-logo.png" alt="Shah Tunnel logo" width="220" />
+  <img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel galaxy emblem" width="360" />
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>v2.1.0 · Secure Reverse TCP Relay · Adaptive Transport Failover</strong></p>
-<p align="center">A reverse TCP relay with an authenticated TLS 1.3 Hub↔Agent channel, certificate pinning, independent lanes and automatic transport recovery.</p>
+<p align="center"><strong>V2.1.0 · Secure Reverse TCP Relay · Adaptive Transport Failover</strong></p>
+<p align="center">A reverse TCP relay that carries public client connections through a Hub to mapped target services via authenticated Agent lanes. The private Hub↔Agent channel uses TLS 1.3, SHA-256 certificate pinning and adaptive recovery across four transport protocols.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
 ## Network flow
 
 <p align="center">
-  <img src="docs/img/ShahTunnel-Network-Flow-v2.1.0.png" alt="Shah Tunnel network flow: Client, Hub, private link, Agent and target with four implemented transport paths" width="100%" />
+  <img src="docs/img/ShahTunnel-Network-Flow.png" alt="Network flow V2.1.0: public clients, Hub, four authenticated private transports, Agent and local target service" width="100%" />
 </p>
 
 ## Features

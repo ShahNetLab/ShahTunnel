@@ -1,16 +1,16 @@
 <p align="center">
-  <img src="docs/img/shah-tunnel-logo.png" alt="لوگوی شاه تونل" width="220" />
+  <img src="docs/img/ShahTunnel-Network.png" alt="نشان کهکشانی شاه‌تونل" width="360" />
 </p>
 
 <h1 align="center">SHAH TUNNEL | شاه تونل</h1>
-<p align="center"><strong>نسخهٔ ۲.۱.۰ · تونل معکوس TCP · بازیابی تطبیقی مسیر</strong></p>
-<p align="center">هدایت پورت‌های عمومی Hub به سرویس مقصد از طریق Agent، با ارتباط خصوصی TLS 1.3، احراز هویت توکن، تثبیت اثرانگشت گواهی و اتصال مجدد خودکار.</p>
+<p align="center"><strong>V2.1.0 · تونل معکوس TCP · بازیابی تطبیقی مسیر</strong></p>
+<p align="center">شاه‌تونل اتصال‌های عمومی TCP را از طریق Hub و مسیرهای احراز هویت‌شدهٔ Agent به سرویس‌های مقصد نگاشت‌شده هدایت می‌کند. ارتباط خصوصی Hub↔Agent از TLS 1.3، تثبیت اثرانگشت SHA-256 و بازیابی تطبیقی در چهار روش انتقال پشتیبانی می‌کند.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
 ## مسیر شبکه | Network Flow
 
 <p align="center">
-  <img src="docs/img/a_polished_neon_cyberpunk_infographic_graphic_dar.png" alt="نمودار فارسی جریان شبکه شاه تونل، شامل کلاینت، هاب، پیوند خصوصی، ایجنت، مقصد و چهار مسیر انتقال" width="100%" />
+  <img src="docs/img/ShahTunnel-Network-Flow-fa.png" alt="نمودار مسیر شبکه نسخه V2.1.0؛ کاربران عمومی، هاب، چهار روش انتقال خصوصی، ایجنت و سرویس مقصد محلی" width="100%" />
 </p>
 
 ## قابلیت‌ها
