@@ -1303,14 +1303,17 @@ func TestTunnelIDIsStableAndSystemdSafe(t *testing.T) {
 }
 
 func TestUploadFlowControlWindowIsExpanded(t *testing.T) {
-	if streamWindowFrames < 64 {
-		t.Fatalf("stream window = %d frames; want at least 64", streamWindowFrames)
+	if streamWindowFrames < 256 {
+		t.Fatalf("stream window = %d frames; want at least 256", streamWindowFrames)
 	}
 	if maxFrame < 64*1024 {
 		t.Fatalf("maximum frame = %d bytes; want at least 64 KiB", maxFrame)
 	}
-	if got := int64(streamWindowFrames) * int64(maxFrame); got < 4<<20 {
-		t.Fatalf("per-stream in-flight window = %d bytes; want at least 4 MiB", got)
+	if got := int64(streamWindowFrames) * int64(maxFrame); got < 16<<20 {
+		t.Fatalf("per-stream in-flight window = %d bytes; want at least 16 MiB", got)
+	}
+	if maxQueuedPayloadBytes < 64<<20 {
+		t.Fatalf("global queued payload budget = %d bytes; want at least 64 MiB", maxQueuedPayloadBytes)
 	}
 }
 

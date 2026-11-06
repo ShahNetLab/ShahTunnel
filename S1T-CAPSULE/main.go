@@ -56,7 +56,7 @@ const (
 	msgPing                     byte = 6
 	msgPong                     byte = 7
 	maxStreams                       = 512
-	streamWindowFrames               = 64
+	streamWindowFrames               = 256
 	maxQueuedPayloadBytes            = int64(64 << 20)
 	wireWriteTimeout                 = 30 * time.Second
 	reverseStreamOpenTimeout         = 18 * time.Second
