@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" role="img" aria-labelledby="title desc">
+  <title id="title">ShahTunnel v1.7.1 network flow</title>
+  <desc id="desc">Public TCP clients enter the Hub. The Hub and Agent communicate over one of the adaptive transport lanes: TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT, HTTP/1.1 CONNECT, and optional REALITY on a separate port. The Agent forwards traffic to configured local targets.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#081226"/><stop offset="0.55" stop-color="#111b36"/><stop offset="1" stop-color="#07162b"/></linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#172747"/><stop offset="1" stop-color="#101c35"/></linearGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#21d4fd"/><stop offset="1" stop-color="#5b8cff"/></linearGradient>
+    <linearGradient id="purple" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#b47cff"/><stop offset="1" stop-color="#68a4ff"/></linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <marker id="arrowCyan" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#43d9ef"/></marker>
+    <marker id="arrowPurple" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#b47cff"/></marker>
+    <style>
+      text{font-family:Arial,'DejaVu Sans',sans-serif;fill:#edf5ff}
+      .muted{fill:#a9bbd7}.tiny{font-size:17px}.small{font-size:19px}.body{font-size:22px}.heading{font-size:28px;font-weight:700}.title{font-size:38px;font-weight:800;letter-spacing:1px}.sub{font-size:20px;fill:#b7c7e4}
+      .card{fill:url(#panel);stroke:#314867;stroke-width:2}.path{fill:#0d1830;stroke:#365477;stroke-width:1.5}.cyan{fill:#55e6f5}.purple{fill:#c69aff}.green{fill:#6df0bd}.orange{fill:#ffcf70}
+    </style>
+  </defs>
+  <rect width="1600" height="1000" fill="url(#bg)"/>
+  <g opacity="0.15" stroke="#4a78a5" stroke-width="1">
+    <path d="M0 120 H1600 M0 180 H1600 M0 240 H1600 M0 300 H1600 M0 360 H1600 M0 420 H1600 M0 480 H1600 M0 540 H1600 M0 600 H1600 M0 660 H1600 M0 720 H1600 M0 780 H1600 M0 840 H1600 M0 900 H1600"/>
+    <path d="M80 0 V1000 M160 0 V1000 M240 0 V1000 M320 0 V1000 M400 0 V1000 M480 0 V1000 M560 0 V1000 M640 0 V1000 M720 0 V1000 M800 0 V1000 M880 0 V1000 M960 0 V1000 M1040 0 V1000 M1120 0 V1000 M1200 0 V1000 M1280 0 V1000 M1360 0 V1000 M1440 0 V1000 M1520 0 V1000"/>
+  </g>
+  <text x="800" y="66" text-anchor="middle" class="title">SHAH TUNNEL  <tspan class="cyan">v1.7.1</tspan></text>
+  <text x="800" y="103" text-anchor="middle" class="sub">Reverse TCP relay · Adaptive transport recovery · Hub ↔ Agent</text>
+  <path d="M160 135 H1440" stroke="url(#cyan)" stroke-width="3" opacity="0.8" filter="url(#glow)"/>
+
+  <!-- ingress -->
+  <rect x="60" y="205" width="365" height="335" rx="22" class="card"/>
+  <rect x="60" y="205" width="365" height="9" rx="5" fill="url(#cyan)"/>
+  <circle cx="242" cy="266" r="34" fill="#163c5c" stroke="#43d9ef" stroke-width="2"/>
+  <path d="M221 270 L242 250 L263 270 M226 266 V284 H258 V266" fill="none" stroke="#6feaff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="242" y="326" text-anchor="middle" class="heading">PUBLIC CLIENTS</text>
+  <text x="242" y="359" text-anchor="middle" class="small muted">Incoming TCP connections</text>
+  <path d="M100 390 H385" stroke="#304665" stroke-width="1.5"/>
+  <text x="95" y="425" class="small">• Public listen port mappings</text>
+  <text x="95" y="461" class="small">• Forwarded by mapping ID</text>
+  <text x="95" y="497" class="small">• Generic TCP payload</text>
+
+  <!-- hub -->
+  <rect x="475" y="205" width="270" height="335" rx="22" class="card"/>
+  <rect x="475" y="205" width="270" height="9" rx="5" fill="#4bdcf4"/>
+  <path d="M595 251 h30 l16 18 -16 18 h-30 l-16 -18z" fill="#133d5d" stroke="#53ddf0" stroke-width="2"/>
+  <path d="M604 255 v26 M616 255 v26 M592 269 h36" stroke="#75eaff" stroke-width="3"/>
+  <text x="610" y="326" text-anchor="middle" class="heading">HUB</text>
+  <text x="610" y="359" text-anchor="middle" class="small muted">Accepts Agent lanes</text>
+  <path d="M510 390 H710" stroke="#304665" stroke-width="1.5"/>
+  <text x="510" y="425" class="small">• Token authentication</text>
+  <text x="510" y="461" class="small">• Session / lane manager</text>
+  <text x="510" y="497" class="small">• Routes to public streams</text>
+
+  <!-- private transport group -->
+  <rect x="795" y="175" width="370" height="395" rx="22" fill="#0b1630" stroke="#8e77cc" stroke-width="2.5"/>
+  <rect x="795" y="175" width="370" height="9" rx="5" fill="url(#purple)"/>
+  <text x="980" y="216" text-anchor="middle" class="heading">PRIVATE HUB ↔ AGENT LINK</text>
+  <text x="980" y="244" text-anchor="middle" class="tiny muted">Adaptive tries the last successful path first</text>
+  <rect x="827" y="267" width="306" height="42" rx="10" class="path"/>
+  <circle cx="850" cy="288" r="6" fill="#54dff5"/><text x="870" y="295" class="body">1  TCP / TLS</text>
+  <rect x="827" y="319" width="306" height="42" rx="10" class="path"/>
+  <circle cx="850" cy="340" r="6" fill="#54dff5"/><text x="870" y="347" class="body">2  WebSocket / TLS</text>
+  <rect x="827" y="371" width="306" height="42" rx="10" class="path"/>
+  <circle cx="850" cy="392" r="6" fill="#54dff5"/><text x="870" y="399" class="body">3  HTTP/2 CONNECT</text>
+  <rect x="827" y="423" width="306" height="42" rx="10" class="path"/>
+  <circle cx="850" cy="444" r="6" fill="#54dff5"/><text x="870" y="451" class="body">4  HTTP/1.1 CONNECT</text>
+  <rect x="827" y="475" width="306" height="42" rx="10" fill="#201a3b" stroke="#a982f3" stroke-width="1.8"/>
+  <circle cx="850" cy="496" r="6" fill="#c69aff"/><text x="870" y="503" class="body purple">5  REALITY <tspan class="tiny">(optional)</tspan></text>
+  <text x="980" y="545" text-anchor="middle" class="tiny muted">Adaptive REALITY listener: control port + 3</text>
+
+  <!-- agent -->
+  <rect x="1215" y="205" width="325" height="335" rx="22" class="card"/>
+  <rect x="1215" y="205" width="325" height="9" rx="5" fill="url(#cyan)"/>
+  <circle cx="1378" cy="266" r="34" fill="#163c5c" stroke="#43d9ef" stroke-width="2"/>
+  <rect x="1360" y="249" width="36" height="34" rx="4" fill="none" stroke="#6feaff" stroke-width="3"/>
+  <path d="M1367 258 h22 M1367 266 h22 M1367 274 h13" stroke="#6feaff" stroke-width="3" stroke-linecap="round"/>
+  <text x="1378" y="326" text-anchor="middle" class="heading">AGENT</text>
+  <text x="1378" y="359" text-anchor="middle" class="small muted">Authenticated lanes</text>
+  <path d="M1249 390 H1505" stroke="#304665" stroke-width="1.5"/>
+  <text x="1249" y="425" class="small">• uTLS ClientHello profiles</text>
+  <text x="1249" y="461" class="small">• Certificate pin on legacy TLS</text>
+  <text x="1249" y="497" class="small">• Per-lane reconnect</text>
+
+  <!-- directional arrows -->
+  <path d="M425 365 H465" stroke="#43d9ef" stroke-width="4" marker-end="url(#arrowCyan)"/>
+  <path d="M745 365 H785" stroke="#43d9ef" stroke-width="4" marker-end="url(#arrowCyan)"/>
+  <path d="M1165 365 H1205" stroke="#b47cff" stroke-width="4" marker-end="url(#arrowPurple)"/>
+
+  <!-- bottom destination and operations -->
+  <path d="M1378 540 V625 H1310 V650" fill="none" stroke="#43d9ef" stroke-width="3" marker-end="url(#arrowCyan)"/>
+  <rect x="1160" y="660" width="380" height="120" rx="18" class="card"/>
+  <text x="1350" y="698" text-anchor="middle" class="heading">LOCAL TARGET SERVICES</text>
+  <text x="1350" y="731" text-anchor="middle" class="small muted">127.0.0.1:PORT / configured mappings</text>
+  <text x="1350" y="758" text-anchor="middle" class="tiny green">Traffic delivered to matching target ID</text>
+
+  <rect x="60" y="635" width="1045" height="145" rx="18" fill="#101d38" stroke="#304665" stroke-width="1.5"/>
+  <text x="90" y="675" class="heading">PORT PLAN (Hub)</text>
+  <text x="90" y="712" class="small"><tspan class="cyan">control</tspan> — TCP/TLS + WebSocket/TLS</text>
+  <text x="90" y="744" class="small"><tspan class="cyan">control + 1</tspan> — HTTP/2 CONNECT</text>
+  <text x="470" y="712" class="small"><tspan class="cyan">control + 2</tspan> — HTTP/1.1 CONNECT</text>
+  <text x="470" y="744" class="small"><tspan class="purple">control + 3</tspan> — REALITY in Adaptive (optional)</text>
+  <text x="90" y="765" class="tiny muted">Standalone option 8 uses the control port for REALITY instead.</text>
+
+  <rect x="60" y="820" width="1480" height="105" rx="18" fill="#0c1a2d" stroke="#2a4865" stroke-width="1.5"/>
+  <text x="90" y="860" class="body"><tspan class="green" font-weight="700">Security:</tspan> token authentication · TLS certificate SHA-256 pinning on legacy TLS paths · REALITY public key + Short ID</text>
+  <text x="90" y="896" class="small muted">Failover reconnects an interrupted lane through the next candidate; it does not migrate an already-open TCP stream in place.</text>
+  <text x="1515" y="970" text-anchor="end" class="tiny muted">ShahTunnel · Network Flow v1.7.1</text>
+</svg>
