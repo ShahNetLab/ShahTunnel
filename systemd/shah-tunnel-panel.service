@@ -1,0 +1,28 @@
+[Unit]
+Description=ShahTunnel read-only local status dashboard
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/shah-tunnel-panel/shah_panel.py --port 8091
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+LockPersonality=true
+RestrictSUIDSGID=true
+ReadOnlyPaths=/etc/ravanreverse
+
+[Install]
+WantedBy=multi-user.target
