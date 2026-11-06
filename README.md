@@ -95,3 +95,53 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w -buildi
 (cd dist && sha256sum shah-tunnel-linux-amd64 > shah-tunnel-linux-amd64.sha256)
 (cd dist && sha256sum shah-tunnel-linux-arm64 > shah-tunnel-linux-arm64.sha256)
 ```
+
+## Local monitoring panel (added in the upgraded bundle)
+
+A read-only dashboard inspired by Nash's monitoring feature is included. It reads ShahTunnel's existing runtime metrics and does not modify the tunnel core.
+
+It shows:
+- systemd state and restart count for each profile;
+- authenticated tunnel connectivity, active/total connections, and byte counters;
+- CPU, memory, disk usage, and system uptime;
+- TCP reachability checks for configured endpoints (Agent → Hub/targets; Hub/Relay → listeners/targets);
+- recent journal logs for each profile.
+
+### Install
+
+From the extracted project directory on the ShahTunnel server:
+
+```bash
+sudo bash tools/install-panel.sh
+```
+
+The dashboard binds to `127.0.0.1:8091` only. For remote viewing, create an SSH port forward from your workstation:
+
+```bash
+ssh -L 8091:127.0.0.1:8091 USER@SERVER
+```
+
+Then open `http://127.0.0.1:8091` locally. To use another port, edit `--port` in `/etc/systemd/system/shah-tunnel-panel.service`, then reload systemd and restart the panel.
+
+### Security and probe semantics
+
+The dashboard is read-only; it cannot restart services or change firewall rules. It has no web login because it binds only to loopback. Do not bind it to a public interface or expose it through a public reverse proxy. Use SSH port forwarding for remote access.
+
+The probes test TCP reachability of endpoints from the configured profile; they do not use ping/ICMP as a health signal. A successful TCP connect alone does not prove that a tunnel is fully operational. The `Connected` runtime field is the indicator for an authenticated ShahTunnel session. This panel does not install or manage GRE/FRP; Nash's GRE/FRP deployment files are tied to a particular server topology and addresses, so they were intentionally not copied into the general ShahTunnel installer.
+
+### Uninstall
+
+```bash
+sudo systemctl disable --now shah-tunnel-panel
+sudo rm -f /etc/systemd/system/shah-tunnel-panel.service
+sudo rm -rf /opt/shah-tunnel-panel
+sudo systemctl daemon-reload
+```
+
+For the design comparison and integration rationale, see [the Nash integration report](docs/nash-integration-report-fa.md).
+
+### Tests
+
+```bash
+python3 -m unittest discover -s tools -p 'test_*.py' -v
+```
