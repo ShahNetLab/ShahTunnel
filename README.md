@@ -3,14 +3,14 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>V2.2.0 · Secure Reverse TCP Relay · External Underlay Adapters</strong></p>
+<p align="center"><strong>V2.2.1 · Secure Reverse TCP Relay · External Underlay Adapters</strong></p>
 <p align="center">A reverse TCP relay that carries public client connections through a Hub to mapped target services via authenticated Agent lanes. The private Hub↔Agent channel uses TLS 1.3, SHA-256 certificate pinning and adaptive recovery across four native transports plus six optional external underlay adapters.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
 ## Network flow
 
 <p align="center">
-  <img src="docs/img/ShahTunnel-Network-Flow.png" alt="Network flow V2.2.0: public clients, Hub, authenticated transports, Agent and local target service" width="100%" />
+  <img src="docs/img/ShahTunnel-Network-Flow.png" alt="Network flow V2.2.1: public clients, Hub, authenticated transports, Agent and local target service" width="100%" />
 </p>
 
 ## Features
@@ -49,7 +49,7 @@ The six new entries are **network-path adapters**, not six new wire protocols im
 - **Psiphon:** a running Psiphon client exposing a local unauthenticated SOCKS5 endpoint (default `127.0.0.1:1080`).
 - **Backhaul:** a separately configured Backhaul client forwarding the Hub control port to a local TCP endpoint (default `127.0.0.1:12080`).
 
-The setup wizard prompts for the local endpoints. Option 8 configures all six entries; a missing or unhealthy local service fails its connection attempt and the Agent proceeds to the next candidate. ShahTunnel does not silently install third-party clients, create Cloudflare accounts, or invent a MASQUE/Tor/Psiphon/Backhaul server configuration. The local SOCKS5 adapters currently require no-auth SOCKS5.
+The setup wizard prompts for the local endpoints. Before saving an Agent profile, it preflights the local dependency: unauthenticated SOCKS5 negotiation, `warp-cli` connection status, or TCP reachability of the Backhaul forward. For option 7, an unavailable sole path stops setup by default, with an explicit override available. For option 8, unavailable optional paths are listed and the user can continue so working native/underlay candidates remain usable while unavailable paths are retried at runtime. This local preflight does not prove end-to-end reachability to the Hub; TLS and token authentication remain the real runtime check. ShahTunnel does not silently install third-party clients, create Cloudflare accounts, or invent a MASQUE/Tor/Psiphon/Backhaul server configuration. The local SOCKS5 adapters currently require no-auth SOCKS5.
 
 ### Adaptive failover behaviour and limits
 
