@@ -3,27 +3,28 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>V2.1.0 · Secure Reverse TCP Relay · Adaptive Transport Failover</strong></p>
-<p align="center">A reverse TCP relay that carries public client connections through a Hub to mapped target services via authenticated Agent lanes. The private Hub↔Agent channel uses TLS 1.3, SHA-256 certificate pinning and adaptive recovery across four transport protocols.</p>
+<p align="center"><strong>V2.2.0 · Secure Reverse TCP Relay · External Underlay Adapters</strong></p>
+<p align="center">A reverse TCP relay that carries public client connections through a Hub to mapped target services via authenticated Agent lanes. The private Hub↔Agent channel uses TLS 1.3, SHA-256 certificate pinning and adaptive recovery across four native transports plus six optional external underlay adapters.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
 ## Network flow
 
 <p align="center">
-  <img src="docs/img/ShahTunnel-Network-Flow.png" alt="Network flow V2.1.0: public clients, Hub, four authenticated private transports, Agent and local target service" width="100%" />
+  <img src="docs/img/ShahTunnel-Network-Flow.png" alt="Network flow V2.2.0: public clients, Hub, authenticated transports, Agent and local target service" width="100%" />
 </p>
 
 ## Features
 
-- **Four implemented transports:** TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT and HTTP/1.1 CONNECT/TLS.
-- **Automatic recovery:** reconnect with jittered backoff and adaptive selection of the last successful transport per lane.
+- **Four native transports:** TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT and HTTP/1.1 CONNECT/TLS.
+- **Six external underlay adapters:** MASQUE-compatible local SOCKS5, Cloudflare WARP system route, secondary WARP SOCKS5 route, Tor SOCKS5, Psiphon SOCKS5 and a Backhaul local TCP forward.
+- **Full adaptive recovery:** option 8 tries four native transports plus the six configured underlays, remembers the last successful path per lane, and tries another candidate after a path closes.
 - **Security:** TLS 1.3 for the private Hub↔Agent channel, token authentication and SHA-256 certificate pinning.
 - **Concurrency:** twelve independent lanes by default, bounded queues and load-aware session selection.
 - **Management:** interactive CLI, systemd integration, status and logs, installer and local verification script.
 
 ## Transport menu
 
-Choose the same transport or strategy on both Hub and Agent.
+Select the matching Hub policy and Agent strategy.
 
 | Option | Transport / strategy | Behaviour |
 |---|---|---|
@@ -33,21 +34,40 @@ Choose the same transport or strategy on both Hub and Agent.
 | `4` | HTTP/1.1 CONNECT/TLS | CONNECT stream over TLS on control port + 2. |
 | `5` | HTTP CONNECT fallback | Tries HTTP/2 CONNECT, then HTTP/1.1 CONNECT if setup fails. |
 | `6` | Automatic fallback | TCP/TLS, then WebSocket/TLS. |
-| `7` | Full adaptive failover | Tries all four implemented transports and remembers the last successful authenticated transport per lane. |
+| `7` | New tunnel methods | Hub accepts the TCP/TLS carrier; Agent selects one external underlay (MASQUE, WARP, WARP-on-WARP, Tor, Psiphon or Backhaul). |
+| `8` | Full adaptive failover | Agent cycles through four native transports plus all six configured underlay adapters. Hub enables all four native transport listeners. |
+
+### External underlay requirements
+
+The six new entries are **network-path adapters**, not six new wire protocols implemented inside ShahTunnel. They use independently managed clients/services on the Agent:
+
+- **MASQUE:** a MASQUE-compatible client exposing a local unauthenticated SOCKS5 endpoint.
+- **Cloudflare WARP:** Cloudflare WARP must already be installed and connected (`warp-cli status` is checked before dialing). Its OS routing carries the native ShahTunnel connection.
+  Note: WARP is a system-level route in this mode. When enabled, other direct connections may also use it; this adapter does not provide per-connection route isolation by itself.
+- **WARP on WARP:** requires a separately managed secondary WARP path exposed as its own local SOCKS5 endpoint. ShahTunnel does not create a second WARP session or account.
+- **Tor:** a running local SOCKS5 service (default `127.0.0.1:9050`). A Hub onion service and `.onion` Hub address are recommended for a Tor-only route.
+- **Psiphon:** a running Psiphon client exposing a local unauthenticated SOCKS5 endpoint (default `127.0.0.1:1080`).
+- **Backhaul:** a separately configured Backhaul client forwarding the Hub control port to a local TCP endpoint (default `127.0.0.1:12080`).
+
+The setup wizard prompts for the local endpoints. Option 8 configures all six entries; a missing or unhealthy local service fails its connection attempt and the Agent proceeds to the next candidate. ShahTunnel does not silently install third-party clients, create Cloudflare accounts, or invent a MASQUE/Tor/Psiphon/Backhaul server configuration. The local SOCKS5 adapters currently require no-auth SOCKS5.
+
+### Adaptive failover behaviour and limits
+
+Option 8 orders four native candidates first, then the six configured underlays. It connects using the first candidate that completes TLS and token authentication, remembers that candidate per lane, and tries the remaining candidates after that lane closes. A lane heartbeat detects dead sessions; the Agent reconnects with jittered backoff after all candidates fail. This is failover/reconnection, not packet duplication or seamless migration of an existing TCP session. Public TCP sessions carried by a failed lane may disconnect and need to reconnect; other healthy lanes continue independently.
 
 ### Hub firewall ports
 
 If the Hub control port is `9443`:
 
-- `9443/TCP`: native TCP/TLS and WebSocket/TLS.
-- `9444/TCP`: HTTP/2 CONNECT (options 3, 5 and 7).
-- `9445/TCP`: HTTP/1.1 CONNECT (options 4, 5 and 7).
+- `9443/TCP`: native TCP/TLS, WebSocket/TLS and all external underlays carried using TCP/TLS.
+- `9444/TCP`: HTTP/2 CONNECT (options 3, 5 and 8).
+- `9445/TCP`: HTTP/1.1 CONNECT (options 4, 5 and 8).
 
-Open only the ports needed by the selected mode. All four transports in this version use TCP.
+Option 7 only needs the control port. Option 8 uses all three ports on the Hub. All four native transports use TCP as their network carrier.
 
 ## Multiple tunnel profiles and upload throughput
 
-Each create operation asks for a unique tunnel name and stores its configuration separately. Existing profiles remain intact. Every named profile runs as its own systemd instance; Start, Stop, Restart, Status, and Delete act on the selected profile. Option 7 deletes one profile; option 8 removes the entire installation.
+Each create operation asks for a unique tunnel name and stores its configuration separately. Existing profiles remain intact. Every named profile runs as its own systemd instance; Start, Stop, Restart, Status, and Delete act on the selected profile. In the main manager menu, option 7 deletes one profile and option 8 removes the entire installation; these manager options are separate from the transport choices in the setup wizard.
 
 The per-stream in-flight window is increased to 64 frames of up to 64 KiB (about 4 MiB per stream), while each tunnel socket keeps a smaller bounded outbound queue to limit head-of-line delay. On Linux kernels that support BBR, the outer tunnel TCP socket attempts to use BBR per-socket; unsupported kernels retain their existing default. This reduces the throughput ceiling caused by a small flow-control window on high-RTT paths and can improve latency under load. Actual throughput still depends on link capacity, packet loss, congestion, kernel qdisc, and provider limits; application-level changes cannot prevent an uplink from being fully saturated without an appropriate network-level rate limit.
 
