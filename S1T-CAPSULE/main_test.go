@@ -194,6 +194,292 @@ func TestTLSAgentTransportsInteroperateWithHub(t *testing.T) {
 	}
 }
 
+func startTestSOCKS5Proxy(t *testing.T, overrideTarget string) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen test SOCKS5 proxy: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			client, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go handleTestSOCKS5Client(client, overrideTarget)
+		}
+	}()
+	return ln
+}
+
+func handleTestSOCKS5Client(client net.Conn, overrideTarget string) {
+	defer client.Close()
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+	var greeting [2]byte
+	if _, err := io.ReadFull(client, greeting[:]); err != nil || greeting[0] != 5 {
+		return
+	}
+	methods := make([]byte, int(greeting[1]))
+	if _, err := io.ReadFull(client, methods); err != nil {
+		return
+	}
+	if err := writeFull(client, []byte{5, 0}); err != nil {
+		return
+	}
+	var request [4]byte
+	if _, err := io.ReadFull(client, request[:]); err != nil || request[0] != 5 || request[1] != 1 {
+		return
+	}
+	var host string
+	switch request[3] {
+	case 1:
+		b := make([]byte, 4)
+		if _, err := io.ReadFull(client, b); err != nil {
+			return
+		}
+		host = net.IP(b).String()
+	case 3:
+		var n [1]byte
+		if _, err := io.ReadFull(client, n[:]); err != nil {
+			return
+		}
+		b := make([]byte, int(n[0]))
+		if _, err := io.ReadFull(client, b); err != nil {
+			return
+		}
+		host = string(b)
+	case 4:
+		b := make([]byte, 16)
+		if _, err := io.ReadFull(client, b); err != nil {
+			return
+		}
+		host = net.IP(b).String()
+	default:
+		return
+	}
+	var portBytes [2]byte
+	if _, err := io.ReadFull(client, portBytes[:]); err != nil {
+		return
+	}
+	target := net.JoinHostPort(host, fmt.Sprintf("%d", int(portBytes[0])<<8|int(portBytes[1])))
+	// The test-only hostname is deliberately resolvable only by this proxy,
+	// proving that the Agent uses SOCKS5 remote DNS rather than local DNS.
+	if host == "hub.invalid" {
+		target = net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", int(portBytes[0])<<8|int(portBytes[1])))
+	}
+	if overrideTarget != "" {
+		target = overrideTarget
+	}
+	upstream, err := net.DialTimeout("tcp", target, 3*time.Second)
+	if err != nil {
+		_ = writeFull(client, []byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	defer upstream.Close()
+	if err := writeFull(client, []byte{5, 0, 0, 1, 127, 0, 0, 1, 0, 0}); err != nil {
+		return
+	}
+	_ = client.SetDeadline(time.Time{})
+	copyDone := make(chan struct{}, 1)
+	go func() {
+		_, _ = io.Copy(upstream, client)
+		if tcp, ok := upstream.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
+		copyDone <- struct{}{}
+	}()
+	_, _ = io.Copy(client, upstream)
+	<-copyDone
+}
+
+func TestMode7ConnectsThroughAgentSOCKS5ExternalPath(t *testing.T) {
+	certDir := t.TempDir()
+	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
+	fingerprint, err := generateCertificate(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("generate certificate: %v", err)
+	}
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("load certificate: %v", err)
+	}
+	pin, err := normalizeFingerprint(fingerprint)
+	if err != nil {
+		t.Fatalf("normalize fingerprint: %v", err)
+	}
+	const token = "f40a12d2a76f4f52a5aefc3a6b1f7e39f40a12d2a76f4f52a5aefc3a6b1f7e39"
+	hubListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hubListener.Close()
+	h := &hubServer{cfg: Config{Role: "hub", Transport: transportNewMethods, Token: token}, sessions: make(map[*hubSession]struct{})}
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for {
+			conn, acceptErr := hubListener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go h.serveAgent(conn, hubTLSConfig(cert))
+		}
+	}()
+
+	cfg := Config{
+		Version:              version,
+		Role:                 "agent",
+		Transport:            transportNewMethods,
+		HubAddr:              hubListener.Addr().String(),
+		TLSServerName:        "localhost",
+		Token:                token,
+		Fingerprint:          fingerprint,
+		TunnelChannels:       1,
+		Ports:                []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
+		ExternalPaths:        []AgentExternalPath{{ID: "tor", Method: "tor", Address: startTestSOCKS5Proxy(t, "").Addr().String()}},
+		SelectedExternalPath: "tor",
+	}
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("validate mode 7 Agent config: %v", err)
+	}
+	agentDone := make(chan error, 1)
+	go func() { agentDone <- connectAndRunAgent(cfg, pin, 77) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.sessionCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h.sessionCount() != 1 {
+		t.Fatal("mode 7 did not establish an authenticated Hub lane through the selected SOCKS5 external path")
+	}
+	h.mu.RLock()
+	var active *hubSession
+	for session := range h.sessions {
+		active = session
+		break
+	}
+	h.mu.RUnlock()
+	if active == nil {
+		t.Fatal("expected an active Hub session")
+	}
+	_ = hubListener.Close()
+	active.shutdown()
+	select {
+	case <-agentDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Agent did not stop after the test closed the tunnel lane")
+	}
+	select {
+	case <-acceptDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Hub accept loop did not stop")
+	}
+}
+
+func TestMode8FallsBackToConfiguredExternalPath(t *testing.T) {
+	certDir := t.TempDir()
+	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
+	fingerprint, err := generateCertificate(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("generate certificate: %v", err)
+	}
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("load certificate: %v", err)
+	}
+	pin, err := normalizeFingerprint(fingerprint)
+	if err != nil {
+		t.Fatalf("normalize fingerprint: %v", err)
+	}
+	const token = "a40a12d2a76f4f52a5aefc3a6b1f7e39a40a12d2a76f4f52a5aefc3a6b1f7e39"
+	hubListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hubListener.Close()
+	h := &hubServer{cfg: Config{Role: "hub", Transport: transportFullAdaptive, Token: token}, sessions: make(map[*hubSession]struct{})}
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for {
+			conn, acceptErr := hubListener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go h.serveAgent(conn, hubTLSConfig(cert))
+		}
+	}()
+
+	deadListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadHubAddr := deadListener.Addr().String()
+	_ = deadListener.Close()
+	proxy := startTestSOCKS5Proxy(t, hubListener.Addr().String())
+	channel := 78
+	agentPreferredPath.Delete(channel)
+	agentPreferredTransport.Delete(channel)
+	t.Cleanup(func() {
+		agentPreferredPath.Delete(channel)
+		agentPreferredTransport.Delete(channel)
+	})
+	cfg := Config{
+		Version:        version,
+		Role:           "agent",
+		Transport:      transportFullAdaptive,
+		HubAddr:        deadHubAddr,
+		TLSServerName:  "localhost",
+		Token:          token,
+		Fingerprint:    fingerprint,
+		TunnelChannels: 1,
+		Ports:          []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
+		ExternalPaths:  []AgentExternalPath{{ID: "tor", Method: "tor", Address: proxy.Addr().String()}},
+	}
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("validate mode 8 Agent config: %v", err)
+	}
+	agentDone := make(chan error, 1)
+	go func() { agentDone <- connectAndRunAgent(cfg, pin, channel) }()
+	deadline := time.Now().Add(8 * time.Second)
+	for h.sessionCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h.sessionCount() != 1 {
+		t.Fatal("mode 8 did not reach the Hub through the SOCKS5 external path after direct-route attempts failed")
+	}
+	if got, ok := agentPreferredPath.Load(channel); !ok || got != "tor" {
+		t.Fatalf("mode 8 did not remember the successful external route: got=%v present=%v", got, ok)
+	}
+	if got, ok := agentPreferredTransport.Load(channel); !ok || got != transportTCP {
+		t.Fatalf("mode 8 did not remember the successful TCP/TLS carrier: got=%v present=%v", got, ok)
+	}
+	h.mu.RLock()
+	var active *hubSession
+	for session := range h.sessions {
+		active = session
+		break
+	}
+	h.mu.RUnlock()
+	if active == nil {
+		t.Fatal("expected an active Hub session")
+	}
+	// Stop the test Hub before closing the lane so adaptive recovery cannot
+	// immediately establish a second candidate against the same fixture.
+	_ = hubListener.Close()
+	active.shutdown()
+	select {
+	case <-agentDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Agent did not stop after the test closed the tunnel lane")
+	}
+	select {
+	case <-acceptDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Hub accept loop did not stop")
+	}
+}
+
 func TestTransportFallbackModesInteroperateWhenHubOnlyAllowsWebSocket(t *testing.T) {
 	certDir := t.TempDir()
 	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
@@ -401,9 +687,11 @@ func TestHTTP1CONNECTBidirectionalStream(t *testing.T) {
 	go func() { defer close(done); _ = server.ServeTLS(h1Listener, "", "") }()
 	t.Cleanup(func() { _ = server.Close(); <-done })
 	cfg := Config{Role: "agent", Transport: transportHTTP1, HubAddr: control.Addr().String(), TLSServerName: "localhost", Token: token, Fingerprint: fingerprint, TunnelChannels: 1}
-	conn, err := dialHTTP1Connect(cfg, nil)
+	proxy := startTestSOCKS5Proxy(t, h1Listener.Addr().String())
+	path := &AgentExternalPath{ID: "tor", Method: "tor", Address: proxy.Addr().String()}
+	conn, err := dialHTTP1ConnectViaPath(cfg, path)
 	if err != nil {
-		t.Fatalf("dial HTTP/1.1 CONNECT: %v", err)
+		t.Fatalf("dial HTTP/1.1 CONNECT through external SOCKS5 path: %v", err)
 	}
 	defer conn.Close()
 	payload := bytes.Repeat([]byte("ShahTunnel-H1-CONNECT-"), 4096)
@@ -472,9 +760,11 @@ func TestHTTP2ConnectBidirectionalStream(t *testing.T) {
 	t.Cleanup(func() { _ = server.Close(); <-serveDone })
 
 	cfg := Config{Role: "agent", Transport: transportHTTP2, HubAddr: baseAddr, TLSServerName: "localhost", Token: token, Fingerprint: fingerprint, TunnelChannels: 1}
-	conn, err := dialHTTP2Connect(cfg, nil)
+	proxy := startTestSOCKS5Proxy(t, h2Listener.Addr().String())
+	path := &AgentExternalPath{ID: "tor", Method: "tor", Address: proxy.Addr().String()}
+	conn, err := dialHTTP2ConnectViaPath(cfg, path)
 	if err != nil {
-		t.Fatalf("dial HTTP/2 CONNECT: %v", err)
+		t.Fatalf("dial HTTP/2 CONNECT through external SOCKS5 path: %v", err)
 	}
 	defer conn.Close()
 	payload := bytes.Repeat([]byte("ShahTunnel-H2-CONNECT-"), 4096)
@@ -706,22 +996,24 @@ func TestTransportConfigDefaultsAndPolicy(t *testing.T) {
 	if !validTransportMode(transportHTTPConnectAuto) || !transportAllowed(transportHTTPConnectAuto, transportHTTP2) || !transportAllowed(transportHTTPConnectAuto, transportHTTP1) {
 		t.Fatal("HTTP CONNECT fallback must allow HTTP/2 and HTTP/1.1 only")
 	}
-	if transportAllowed(transportHTTPConnectAuto, transportTCP) || transportAllowed(transportHTTPConnectAuto, transportWebSocket) {
-		t.Fatal("HTTP CONNECT fallback must not silently allow native TLS/WebSocket transports")
+	if !validTransportMode(transportNewMethods) || !transportAllowed(transportNewMethods, transportTCP) {
+		t.Fatal("mode 7 must accept the Agent external-path TCP/TLS carrier")
 	}
-	if !validTransportMode(transportNewMethods) || !transportAllowed(transportNewMethods, transportTCP) || transportAllowed(transportNewMethods, transportWebSocket) {
-		t.Fatal("new-methods mode must allow the authenticated TCP/TLS carrier only")
-	}
-	if !validTransportMode(transportAdaptiveAll) {
-		t.Fatal("full adaptive mode must be a valid Hub/Agent transport policy")
-	}
-	for _, mode := range []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1} {
-		if !transportAllowed(transportAdaptiveAll, mode) {
-			t.Fatalf("full adaptive Hub policy rejected native transport %q", mode)
+	for _, observed := range []string{transportWebSocket, transportHTTP2, transportHTTP1} {
+		if transportAllowed(transportNewMethods, observed) {
+			t.Fatalf("mode 7 must not accept native transport %q", observed)
 		}
 	}
-	if !transportModeAllowsHTTP2(transportAdaptiveAll) || !transportModeAllowsHTTP1(transportAdaptiveAll) {
-		t.Fatal("full adaptive Hub policy must open both CONNECT listener ports")
+	if !validTransportMode(transportFullAdaptive) {
+		t.Fatal("mode 8 must be a valid transport policy")
+	}
+	for _, observed := range []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1} {
+		if !transportAllowed(transportFullAdaptive, observed) {
+			t.Fatalf("mode 8 must accept native transport %q", observed)
+		}
+	}
+	if transportAllowed(transportHTTPConnectAuto, transportTCP) || transportAllowed(transportHTTPConnectAuto, transportWebSocket) {
+		t.Fatal("HTTP CONNECT fallback must not silently allow native TLS/WebSocket transports")
 	}
 	for _, unsupported := range []string{"unsupported_legacy_transport", "not-a-transport"} {
 		if isAdaptiveTransport(unsupported) {
@@ -730,6 +1022,101 @@ func TestTransportConfigDefaultsAndPolicy(t *testing.T) {
 		if validTransportMode(unsupported) {
 			t.Fatalf("unknown transport %q was accepted", unsupported)
 		}
+	}
+}
+
+func TestAgentExternalPathConfigValidation(t *testing.T) {
+	base := Config{
+		Version:              version,
+		Role:                 "agent",
+		Transport:            transportNewMethods,
+		HubAddr:              "127.0.0.1:9443",
+		Token:                strings.Repeat("a", 64),
+		Fingerprint:          strings.Repeat("a", 64),
+		TunnelChannels:       1,
+		Ports:                []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
+		ExternalPaths:        []AgentExternalPath{{ID: "tor", Method: "tor", Address: "127.0.0.1:9050"}},
+		SelectedExternalPath: "tor",
+	}
+	if err := validateConfig(base); err != nil {
+		t.Fatalf("valid mode 7 SOCKS5 Agent config rejected: %v", err)
+	}
+	missingSelected := base
+	missingSelected.SelectedExternalPath = "missing"
+	if err := validateConfig(missingSelected); err == nil {
+		t.Fatal("mode 7 accepted an unknown selected external path")
+	}
+	missingProxy := base
+	missingProxy.ExternalPaths = []AgentExternalPath{{ID: "tor", Method: "tor"}}
+	if err := validateConfig(missingProxy); err == nil {
+		t.Fatal("Tor path accepted without a local SOCKS5 endpoint")
+	}
+	full := base
+	full.Transport = transportFullAdaptive
+	full.SelectedExternalPath = ""
+	if err := validateConfig(full); err != nil {
+		t.Fatalf("valid mode 8 Agent config rejected: %v", err)
+	}
+}
+
+func TestBackhaulForwardAddressPreservesAdjacentTransportPorts(t *testing.T) {
+	got, err := backhaulForwardAddress("hub.example:9443", "127.0.0.1:19443", "hub.example:9444")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "127.0.0.1:19444" {
+		t.Fatalf("Backhaul HTTP/2 forward = %q; want 127.0.0.1:19444", got)
+	}
+	got, err = backhaulForwardAddress("hub.example:9443", "127.0.0.1:19443", "hub.example:9445")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "127.0.0.1:19445" {
+		t.Fatalf("Backhaul HTTP/1.1 forward = %q; want 127.0.0.1:19445", got)
+	}
+}
+
+func TestSystemExternalPathBindsToSelectedInterface(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("loopback interface is unavailable")
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- conn
+		}
+	}()
+	path := &AgentExternalPath{ID: "warp-test", Method: "warp", Interface: "lo"}
+	conn, err := dialAgentExternalPath(context.Background(), Config{}, path, listener.Addr().String())
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+			t.Skipf("runtime does not permit SO_BINDTODEVICE in this environment: %v", err)
+		}
+		t.Fatalf("dial over selected interface: %v", err)
+	}
+	_ = conn.Close()
+	select {
+	case serverConn := <-accepted:
+		_ = serverConn.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("listener did not receive the socket bound to the selected interface")
+	}
+}
+
+func TestFullAdaptivePathCandidatesIncludeDirectAndConfiguredRoutes(t *testing.T) {
+	cfg := Config{ExternalPaths: []AgentExternalPath{
+		{ID: "warp", Method: "warp"},
+		{ID: "tor", Method: "tor", Address: "127.0.0.1:9050"},
+	}}
+	got := fullAdaptivePathCandidates(cfg, "tor")
+	if len(got) != 3 || got[0] == nil || got[0].ID != "tor" || got[1] != nil || got[2] == nil || got[2].ID != "warp" {
+		t.Fatalf("full adaptive routes = %#v; want preferred tor, direct, warp", got)
 	}
 }
 
@@ -757,472 +1144,6 @@ func TestAdaptiveTransportCandidatesPreferLastSuccessfulPath(t *testing.T) {
 		if len(seen) != len(wantAll) {
 			t.Fatalf("preferred %q candidates miss a path: %v", preferred, got)
 		}
-	}
-}
-
-func TestNewMethodsModeConnectsThroughConfiguredSOCKS5Underlay(t *testing.T) {
-	certDir := t.TempDir()
-	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
-	fingerprint, err := generateCertificate(certPath, keyPath)
-	if err != nil {
-		t.Fatalf("generate certificate: %v", err)
-	}
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil {
-		t.Fatalf("load certificate: %v", err)
-	}
-	pin, err := normalizeFingerprint(fingerprint)
-	if err != nil {
-		t.Fatalf("normalize certificate pin: %v", err)
-	}
-	const token = "a84c4e76e42a42e294cd89d41fcf47aea84c4e76e42a42e294cd89d41fcf47ae"
-
-	hubListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer hubListener.Close()
-	h := &hubServer{cfg: Config{Role: "hub", Transport: transportNewMethods, Token: token}, sessions: make(map[*hubSession]struct{})}
-	go func() {
-		for {
-			conn, acceptErr := hubListener.Accept()
-			if acceptErr != nil {
-				return
-			}
-			go h.serveAgent(conn, hubTLSConfig(cert))
-		}
-	}()
-	socksAddr, _ := startTestSOCKS5Forwarder(t, hubListener.Addr().String())
-	cfg := Config{
-		Role: "agent", Transport: transportNewMethods, HubAddr: hubListener.Addr().String(),
-		TLSServerName: "localhost", Token: token, Fingerprint: fingerprint, TunnelChannels: 1,
-		UnderlayPaths: []UnderlayPath{{Method: underlayPsiphon, Endpoint: socksAddr}},
-	}
-	channel := 91
-	agentPreferredTransport.Delete(channel)
-	t.Cleanup(func() { agentPreferredTransport.Delete(channel) })
-	agentDone := make(chan error, 1)
-	go func() { agentDone <- connectAndRunAgent(cfg, pin, channel) }()
-	deadline := time.Now().Add(5 * time.Second)
-	for h.sessionCount() == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if h.sessionCount() == 0 {
-		t.Fatal("Agent did not establish an authenticated tunnel through the configured SOCKS5 underlay")
-	}
-	if got, ok := agentPreferredTransport.Load(channel); !ok || got != "underlay/psiphon" {
-		t.Fatalf("last successful new-method path = %v (present=%v); want underlay/psiphon", got, ok)
-	}
-	h.mu.RLock()
-	var active *hubSession
-	for session := range h.sessions {
-		active = session
-		break
-	}
-	h.mu.RUnlock()
-	if active == nil {
-		t.Fatal("expected active Hub session")
-	}
-	active.shutdown()
-	select {
-	case <-agentDone:
-	case <-time.After(4 * time.Second):
-		t.Fatal("Agent did not stop after its test Hub session closed")
-	}
-}
-
-func TestFullAdaptiveFallsBackFromNativeTransportsToNewUnderlay(t *testing.T) {
-	certDir := t.TempDir()
-	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
-	fingerprint, err := generateCertificate(certPath, keyPath)
-	if err != nil {
-		t.Fatalf("generate certificate: %v", err)
-	}
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil {
-		t.Fatalf("load certificate: %v", err)
-	}
-	pin, err := normalizeFingerprint(fingerprint)
-	if err != nil {
-		t.Fatalf("normalize certificate pin: %v", err)
-	}
-	const token = "b84c4e76e42a42e294cd89d41fcf47aea84c4e76e42a42e294cd89d41fcf47ae"
-
-	hubListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer hubListener.Close()
-	h := &hubServer{cfg: Config{Role: "hub", Transport: transportAdaptiveAll, Token: token}, sessions: make(map[*hubSession]struct{})}
-	go func() {
-		for {
-			conn, acceptErr := hubListener.Accept()
-			if acceptErr != nil {
-				return
-			}
-			go h.serveAgent(conn, hubTLSConfig(cert))
-		}
-	}()
-	// The proxy intentionally maps the configured (unreachable) Hub address to
-	// the test Hub. This makes all four direct native attempts fail while the
-	// external underlay succeeds, exercising the option-8 fallback path.
-	socksAddr, socksListener := startTestSOCKS5Forwarder(t, hubListener.Addr().String())
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	unreachableHub := closed.Addr().String()
-	_ = closed.Close()
-	cfg := Config{
-		Role: "agent", Transport: transportAdaptiveAll, HubAddr: unreachableHub,
-		TLSServerName: "localhost", Token: token, Fingerprint: fingerprint, TunnelChannels: 1,
-		UnderlayPaths: []UnderlayPath{
-			{Method: underlayMASQUE, Endpoint: socksAddr},
-			{Method: underlayBackhaul, Endpoint: hubListener.Addr().String()},
-		},
-	}
-	channel := 92
-	agentPreferredTransport.Delete(channel)
-	t.Cleanup(func() { agentPreferredTransport.Delete(channel) })
-	agentDone := make(chan error, 1)
-	go func() { agentDone <- connectAndRunAgent(cfg, pin, channel) }()
-	deadline := time.Now().Add(8 * time.Second)
-	for h.sessionCount() == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if h.sessionCount() == 0 {
-		t.Fatal("Full Adaptive Failover did not reach the new MASQUE underlay after native transports failed")
-	}
-	if got, ok := agentPreferredTransport.Load(channel); !ok || got != "underlay/masque" {
-		t.Fatalf("full adaptive preferred path = %v (present=%v); want underlay/masque", got, ok)
-	}
-	h.mu.RLock()
-	var active *hubSession
-	for session := range h.sessions {
-		active = session
-		break
-	}
-	h.mu.RUnlock()
-	if active == nil {
-		t.Fatal("expected active Hub session after adaptive fallback")
-	}
-	// Tear down the active MASQUE-compatible proxy. The same lane must move to
-	// its next configured healthy underlay (Backhaul local forward) automatically.
-	_ = socksListener.Close()
-	active.shutdown()
-	switchDeadline := time.Now().Add(6 * time.Second)
-	for time.Now().Before(switchDeadline) {
-		preferred, ok := agentPreferredTransport.Load(channel)
-		if ok && preferred == "underlay/backhaul" && h.sessionCount() > 0 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if preferred, ok := agentPreferredTransport.Load(channel); !ok || preferred != "underlay/backhaul" || h.sessionCount() == 0 {
-		t.Fatalf("lane did not fail over from MASQUE to Backhaul: preferred=%v present=%v sessions=%d", preferred, ok, h.sessionCount())
-	}
-	h.mu.RLock()
-	var backhaulSession *hubSession
-	for session := range h.sessions {
-		backhaulSession = session
-		break
-	}
-	h.mu.RUnlock()
-	if backhaulSession == nil {
-		t.Fatal("expected active Backhaul-backed Hub session")
-	}
-	backhaulSession.shutdown()
-	select {
-	case <-agentDone:
-	case <-time.After(4 * time.Second):
-		t.Fatal("Agent did not stop after the Backhaul test session closed")
-	}
-}
-
-func startTestSOCKS5Forwarder(t *testing.T, forwardTo string) (string, net.Listener) {
-	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = listener.Close() })
-	go func() {
-		for {
-			client, acceptErr := listener.Accept()
-			if acceptErr != nil {
-				return
-			}
-			go func(client net.Conn) {
-				defer client.Close()
-				var greeting [3]byte
-				if _, e := io.ReadFull(client, greeting[:]); e != nil || !bytes.Equal(greeting[:], []byte{0x05, 0x01, 0x00}) {
-					return
-				}
-				if _, e := client.Write([]byte{0x05, 0x00}); e != nil {
-					return
-				}
-				var header [4]byte
-				if _, e := io.ReadFull(client, header[:]); e != nil || header[0] != 0x05 || header[1] != 0x01 {
-					return
-				}
-				switch header[3] {
-				case 0x01:
-					if _, e := io.CopyN(io.Discard, client, 4+2); e != nil {
-						return
-					}
-				case 0x04:
-					if _, e := io.CopyN(io.Discard, client, 16+2); e != nil {
-						return
-					}
-				case 0x03:
-					var n [1]byte
-					if _, e := io.ReadFull(client, n[:]); e != nil {
-						return
-					}
-					if _, e := io.CopyN(io.Discard, client, int64(n[0])+2); e != nil {
-						return
-					}
-				default:
-					return
-				}
-				upstream, e := net.DialTimeout("tcp", forwardTo, 3*time.Second)
-				if e != nil {
-					_, _ = client.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-					return
-				}
-				defer upstream.Close()
-				if _, e = client.Write([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0}); e != nil {
-					return
-				}
-				done := make(chan struct{}, 1)
-				go func() { _, _ = io.Copy(upstream, client); done <- struct{}{} }()
-				_, _ = io.Copy(client, upstream)
-				select {
-				case <-done:
-				case <-time.After(time.Second):
-				}
-			}(client)
-		}
-	}()
-	return listener.Addr().String(), listener
-}
-
-func TestAdaptiveAllBuildsTenCandidatePaths(t *testing.T) {
-	paths := []UnderlayPath{
-		{Method: underlayMASQUE, Endpoint: "127.0.0.1:10808"},
-		{Method: underlayWARP},
-		{Method: underlayWARPOnWARP, Endpoint: "127.0.0.1:10809"},
-		{Method: underlayTOR, Endpoint: "127.0.0.1:9050"},
-		{Method: underlayPsiphon, Endpoint: "127.0.0.1:1080"},
-		{Method: underlayBackhaul, Endpoint: "127.0.0.1:12080"},
-	}
-	candidates := adaptiveAllTransportCandidates("", paths)
-	if len(candidates) != 10 {
-		t.Fatalf("full adaptive produced %d candidates; want 10: %+v", len(candidates), candidates)
-	}
-	wantNative := []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1}
-	for i, want := range wantNative {
-		if candidates[i].mode != want || candidates[i].path != nil {
-			t.Fatalf("native candidate #%d = %+v; want direct %q", i+1, candidates[i], want)
-		}
-	}
-	for i, path := range paths {
-		candidate := candidates[i+4]
-		if candidate.mode != transportTCP || candidate.path == nil || candidate.path.Method != path.Method {
-			t.Fatalf("underlay candidate #%d = %+v; want TCP carrier over %q", i+1, candidate, path.Method)
-		}
-	}
-	preferred := adaptiveAllTransportCandidates("underlay/tor", paths)
-	if preferred[0].key != "underlay/tor" {
-		t.Fatalf("preferred route was not tried first: %+v", preferred[0])
-	}
-}
-
-func TestValidateUnderlayPaths(t *testing.T) {
-	valid := []UnderlayPath{
-		{Method: underlayMASQUE, Endpoint: "127.0.0.1:10808"},
-		{Method: underlayWARP},
-		{Method: underlayWARPOnWARP, Endpoint: "127.0.0.1:10809"},
-		{Method: underlayTOR, Endpoint: "127.0.0.1:9050"},
-		{Method: underlayPsiphon, Endpoint: "127.0.0.1:1080"},
-		{Method: underlayBackhaul, Endpoint: "127.0.0.1:12080"},
-	}
-	if err := validateUnderlayPaths(valid); err != nil {
-		t.Fatalf("valid six-method configuration rejected: %v", err)
-	}
-	for _, bad := range [][]UnderlayPath{
-		{{Method: underlayTOR}},
-		{{Method: underlayWARP, Endpoint: "127.0.0.1:9050"}},
-		{{Method: "unknown", Endpoint: "127.0.0.1:1"}},
-		{{Method: underlayBackhaul, Endpoint: "not-an-address"}},
-		{{Method: underlayTOR, Endpoint: "127.0.0.1:9050"}, {Method: underlayTOR, Endpoint: "127.0.0.1:9051"}},
-	} {
-		if err := validateUnderlayPaths(bad); err == nil {
-			t.Fatalf("invalid underlay configuration accepted: %+v", bad)
-		}
-	}
-}
-
-func TestProbeUnderlayReadyAcceptsNoAuthSOCKS5(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	serverErr := make(chan error, 1)
-	go func() {
-		conn, acceptErr := ln.Accept()
-		if acceptErr != nil {
-			serverErr <- acceptErr
-			return
-		}
-		defer conn.Close()
-		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-		var greeting [3]byte
-		if _, readErr := io.ReadFull(conn, greeting[:]); readErr != nil {
-			serverErr <- readErr
-			return
-		}
-		if greeting != [3]byte{0x05, 0x01, 0x00} {
-			serverErr <- fmt.Errorf("unexpected SOCKS5 greeting: %v", greeting)
-			return
-		}
-		_, writeErr := conn.Write([]byte{0x05, 0x00})
-		serverErr <- writeErr
-	}()
-
-	if err := probeUnderlayReady(UnderlayPath{Method: underlayMASQUE, Endpoint: ln.Addr().String()}); err != nil {
-		t.Fatalf("expected ready SOCKS5 endpoint, got: %v", err)
-	}
-	if err := <-serverErr; err != nil {
-		t.Fatalf("SOCKS5 probe server: %v", err)
-	}
-}
-
-func TestProbeUnderlayReadyRejectsSOCKS5RequiringAuthentication(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	serverErr := make(chan error, 1)
-	go func() {
-		conn, acceptErr := ln.Accept()
-		if acceptErr != nil {
-			serverErr <- acceptErr
-			return
-		}
-		defer conn.Close()
-		var greeting [3]byte
-		if _, readErr := io.ReadFull(conn, greeting[:]); readErr != nil {
-			serverErr <- readErr
-			return
-		}
-		_, writeErr := conn.Write([]byte{0x05, 0xff})
-		serverErr <- writeErr
-	}()
-
-	err = probeUnderlayReady(UnderlayPath{Method: underlayTOR, Endpoint: ln.Addr().String()})
-	if err == nil || !strings.Contains(err.Error(), "unauthenticated SOCKS5") {
-		t.Fatalf("expected no-auth SOCKS5 validation error, got: %v", err)
-	}
-	if serverErr := <-serverErr; serverErr != nil {
-		t.Fatalf("SOCKS5 probe server: %v", serverErr)
-	}
-}
-
-func TestProbeUnderlayReadyAcceptsBackhaulForward(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	accepted := make(chan struct{})
-	go func() {
-		conn, acceptErr := ln.Accept()
-		if acceptErr == nil {
-			_ = conn.Close()
-		}
-		close(accepted)
-	}()
-	if err := probeUnderlayReady(UnderlayPath{Method: underlayBackhaul, Endpoint: ln.Addr().String()}); err != nil {
-		t.Fatalf("expected reachable Backhaul forward, got: %v", err)
-	}
-	<-accepted
-}
-
-func TestSOCKS5DialContextPreservesRemoteHostname(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	serverErr := make(chan error, 1)
-	go func() {
-		conn, acceptErr := listener.Accept()
-		if acceptErr != nil {
-			serverErr <- acceptErr
-			return
-		}
-		defer conn.Close()
-		greeting := make([]byte, 3)
-		if _, e := io.ReadFull(conn, greeting); e != nil {
-			serverErr <- e
-			return
-		}
-		if !bytes.Equal(greeting, []byte{0x05, 0x01, 0x00}) {
-			serverErr <- fmt.Errorf("unexpected SOCKS5 greeting %v", greeting)
-			return
-		}
-		if _, e := conn.Write([]byte{0x05, 0x00}); e != nil {
-			serverErr <- e
-			return
-		}
-		var header [5]byte
-		if _, e := io.ReadFull(conn, header[:]); e != nil {
-			serverErr <- e
-			return
-		}
-		if header[0] != 0x05 || header[1] != 0x01 || header[3] != 0x03 {
-			serverErr <- fmt.Errorf("expected SOCKS5 domain CONNECT request, got %v", header)
-			return
-		}
-		host := make([]byte, int(header[4]))
-		if _, e := io.ReadFull(conn, host); e != nil {
-			serverErr <- e
-			return
-		}
-		var port [2]byte
-		if _, e := io.ReadFull(conn, port[:]); e != nil {
-			serverErr <- e
-			return
-		}
-		if string(host) != "hub-example.onion" || binary.BigEndian.Uint16(port[:]) != 9443 {
-			serverErr <- fmt.Errorf("proxy got target %s:%d; wanted hub-example.onion:9443", host, binary.BigEndian.Uint16(port[:]))
-			return
-		}
-		if _, e := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x24, 0x00}); e != nil {
-			serverErr <- e
-			return
-		}
-		_, e := conn.Write([]byte("ready"))
-		serverErr <- e
-	}()
-
-	conn, err := socks5DialContext(context.Background(), listener.Addr().String(), "hub-example.onion:9443")
-	if err != nil {
-		t.Fatalf("SOCKS5 dial: %v", err)
-	}
-	defer conn.Close()
-	got := make([]byte, 5)
-	if _, err = io.ReadFull(conn, got); err != nil {
-		t.Fatalf("read tunneled payload: %v", err)
-	}
-	if string(got) != "ready" {
-		t.Fatalf("payload = %q; want ready", got)
-	}
-	if err = <-serverErr; err != nil {
-		t.Fatalf("SOCKS5 fake server: %v", err)
 	}
 }
 
@@ -1586,7 +1507,7 @@ func TestShahTunnelRouteDiagram(t *testing.T) {
 		"NETWORK ROUTE  /  TCP FORWARDING",
 		"CLIENT ── TCP ──▶ HUB ═ TLS 1.3 + TOKEN AUTH ═▶ AGENT",
 		"PATHS: TCP/TLS | WS/TLS | H2 CONNECT | H1 CONNECT",
-		"OPTION 7: ADAPTIVE FAILOVER ACROSS 4 PATHS",
+		"OPTIONS 7/8: EXTERNAL + ADAPTIVE FAILOVER",
 		"CERT PINNING • TOKEN AUTH • TLS 1.3",
 	}
 	if len(shahTunnelRouteArt) != 7 {
