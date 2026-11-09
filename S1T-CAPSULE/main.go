@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "2.2.0"
+	version                          = "2.2.1"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -3873,8 +3873,14 @@ func wizardAskTransport(prompt, role string) (string, []UnderlayPath, error) {
 	fmt.Printf("  %s\n", paint(ansiGreen, "4) HTTP/1.1 CONNECT/TLS — implemented on control port + 2"))
 	fmt.Printf("  %s\n", paint(ansiGreen, "5) HTTP CONNECT fallback — HTTP/2, then HTTP/1.1"))
 	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
-	fmt.Printf("  %s\n", paint(ansiCyan, "7) NEW TUNNEL METHODS — MASQUE / WARP / WARP on WARP / TOR / Psiphon / Backhaul"))
-	fmt.Printf("  %s\n", paint(ansiPinkGlow, "8) FULL ADAPTIVE FAILOVER — 4 native transports + 6 new underlay paths"))
+	if role == "hub" {
+		fmt.Printf("  %s\n", paint(ansiCyan, "7) NEW TUNNEL METHODS — accept Agent's TCP/TLS carrier for its selected external path"))
+		fmt.Printf("  %s\n", paint(ansiPinkGlow, "8) FULL ADAPTIVE FAILOVER — accept native transports and Agent's external paths"))
+		uiInfo("Hub selects what it accepts. The actual MASQUE/WARP/TOR/Psiphon/Backhaul client is configured on the Agent (outside) server.")
+	} else {
+		fmt.Printf("  %s\n", paint(ansiCyan, "7) NEW TUNNEL METHODS — choose one external path on this Agent"))
+		fmt.Printf("  %s\n", paint(ansiPinkGlow, "8) FULL ADAPTIVE FAILOVER — 4 native transports + 6 external paths"))
+	}
 	choice := wizardAsk(prompt+" (1-8)", "8")
 	switch choice {
 	case "1":
@@ -3891,19 +3897,27 @@ func wizardAskTransport(prompt, role string) (string, []UnderlayPath, error) {
 		return transportAuto, nil, nil
 	case "7":
 		if role != "agent" {
+			uiInfo("Hub option 7 accepts the Agent's TCP/TLS carrier. Select and configure the actual external method on the Agent server.")
 			return transportNewMethods, nil, nil
 		}
 		path, err := wizardAskOneUnderlay()
 		if err != nil {
 			return "", nil, err
 		}
+		if err := wizardCheckUnderlayPaths([]UnderlayPath{path}, false); err != nil {
+			return "", nil, err
+		}
 		return transportNewMethods, []UnderlayPath{path}, nil
 	case "8":
 		if role != "agent" {
+			uiInfo("Hub option 8 accepts the four native transports and the TCP/TLS carrier used by configured external paths on the Agent.")
 			return transportAdaptiveAll, nil, nil
 		}
 		paths, err := wizardAskAllUnderlays()
 		if err != nil {
+			return "", nil, err
+		}
+		if err := wizardCheckUnderlayPaths(paths, true); err != nil {
 			return "", nil, err
 		}
 		return transportAdaptiveAll, paths, nil
@@ -3970,6 +3984,89 @@ func wizardConfigureUnderlay(method string) (UnderlayPath, error) {
 		return UnderlayPath{}, err
 	}
 	return path, nil
+}
+
+// probeUnderlayReady checks only the local prerequisite that ShahTunnel can
+// verify before a profile is saved. It does not claim that the remote Hub is
+// reachable through the selected provider; the authenticated TLS handshake
+// remains the end-to-end runtime check.
+func probeUnderlayReady(path UnderlayPath) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	switch path.Method {
+	case underlayWARP:
+		return requireConnectedWARP(ctx)
+	case underlayMASQUE, underlayWARPOnWARP, underlayTOR, underlayPsiphon:
+		return probeSOCKS5Endpoint(ctx, path.Endpoint)
+	case underlayBackhaul:
+		d := net.Dialer{Timeout: 3 * time.Second}
+		conn, err := d.DialContext(ctx, "tcp", path.Endpoint)
+		if err != nil {
+			return fmt.Errorf("Backhaul local TCP forward %s is not reachable: %w", path.Endpoint, err)
+		}
+		_ = conn.Close()
+		return nil
+	default:
+		return fmt.Errorf("unsupported underlay method %q", path.Method)
+	}
+}
+
+// probeSOCKS5Endpoint verifies a local SOCKS5 listener and the no-auth method
+// required by the current Agent adapter. It closes immediately after greeting;
+// it does not open a connection to the Hub or transmit tunnel credentials.
+func probeSOCKS5Endpoint(ctx context.Context, endpoint string) error {
+	d := net.Dialer{Timeout: 3 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", endpoint)
+	if err != nil {
+		return fmt.Errorf("local SOCKS5 endpoint %s is not reachable: %w", endpoint, err)
+	}
+	defer conn.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+	if err := writeFull(conn, []byte{0x05, 0x01, 0x00}); err != nil {
+		return fmt.Errorf("SOCKS5 endpoint %s did not accept the greeting: %w", endpoint, err)
+	}
+	var response [2]byte
+	if _, err := io.ReadFull(conn, response[:]); err != nil {
+		return fmt.Errorf("SOCKS5 endpoint %s did not return a method response: %w", endpoint, err)
+	}
+	if response[0] != 0x05 || response[1] != 0x00 {
+		return fmt.Errorf("SOCKS5 endpoint %s must support unauthenticated SOCKS5 (reply=%d)", endpoint, response[1])
+	}
+	return nil
+}
+
+// wizardCheckUnderlayPaths prevents a missing local helper from being mistaken
+// for a working tunnel. Option 7 defaults to stopping when its only path is
+// unavailable; option 8 can be saved with unavailable optional paths because
+// the native transports and other configured paths may still work.
+func wizardCheckUnderlayPaths(paths []UnderlayPath, allowUnavailable bool) error {
+	var unavailable []string
+	for _, path := range paths {
+		if err := probeUnderlayReady(path); err != nil {
+			unavailable = append(unavailable, fmt.Sprintf("%s: %v", underlayDisplayName(path.Method), err))
+		} else {
+			uiSuccess(underlayDisplayName(path.Method) + " local prerequisite is reachable")
+		}
+	}
+	if len(unavailable) == 0 {
+		return nil
+	}
+	uiWarn("Some selected external paths are not ready on this Agent:")
+	for _, item := range unavailable {
+		fmt.Printf("    - %s\n", item)
+	}
+	if allowUnavailable {
+		if wizardYesNo("Save anyway? Option 8 will try working paths and retry unavailable ones after startup (Y/n)", "y") {
+			return nil
+		}
+	} else if wizardYesNo("Save anyway and let the Agent retry this selected path? (y/N)", "n") {
+		return nil
+	}
+	return errors.New("configuration was not saved because the selected external path is not ready; start its local client/forward and run the setup again")
 }
 
 func wizardYesNo(prompt, def string) bool {
@@ -4100,9 +4197,9 @@ func setup() error {
 			return err
 		}
 		if c.Transport == transportNewMethods {
-			uiInfo("Option 7 accepts the TCP/TLS carrier on the control port. Select option 7 on the Agent and configure the matching external client there.")
+			uiInfo("Hub option 7 accepts the Agent's TCP/TLS carrier. The Agent chooses and verifies the actual external client/path.")
 		} else if c.Transport == transportAdaptiveAll {
-			uiInfo("Option 8 accepts all four native transports. Open the control port and control+1/control+2; configure the six external clients on the Agent.")
+			uiInfo("Hub option 8 accepts all four native transports plus the TCP/TLS carrier used by external paths. Configure and verify those clients on the Agent.")
 		} else {
 			uiInfo("Open only the control/adjacent ports required by the selected transport. Select the matching policy on the Agent.")
 		}
@@ -4246,7 +4343,7 @@ func setup() error {
 	if err := ensureTunnelRunning(true); err != nil {
 		return fmt.Errorf("configuration was saved, but automatic startup failed: %w", err)
 	}
-	uiSuccess("Tunnel '" + name + "' is active. Existing tunnels were not changed.")
+	uiSuccess("Service for tunnel '" + name + "' is running. End-to-end Agent↔Hub connectivity must be confirmed in status/logs; existing tunnels were not changed.")
 	return nil
 }
 
@@ -4315,7 +4412,7 @@ func ensureTunnelRunning(restartActive bool) error {
 		}
 		return errors.New("service did not reach active state; recent logs are shown above")
 	}
-	fmt.Printf("Tunnel service %s is active; automatic startup at boot is enabled.\n", service)
+	fmt.Printf("Tunnel service %s is active; automatic startup at boot is enabled. This confirms the systemd process is running, not that an Agent↔Hub connection has succeeded.\n", service)
 	return nil
 }
 
@@ -4343,12 +4440,45 @@ func showStatusAndLogs() error {
 	if len(out) > 0 {
 		fmt.Print(string(out))
 	}
+	showRuntimeConnectivity()
 	fmt.Println("\n--- Recent service logs ---")
 	showRecentLogs(40)
 	if err != nil && !tunnelIsActive() {
-		return errors.New("selected tunnel is not active; see logs above")
+		return errors.New("selected tunnel service is not active; see logs above")
 	}
 	return nil
+}
+
+// showRuntimeConnectivity distinguishes a live systemd process from a
+// successfully authenticated Agent↔Hub lane. Runtime snapshots are local,
+// mode 0600, and intentionally contain no tokens or endpoint credentials.
+func showRuntimeConnectivity() {
+	fmt.Println("\n--- End-to-end tunnel connectivity ---")
+	b, err := os.ReadFile(runtimeStatsPath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			uiWarn("No runtime connectivity report yet. The service may still be starting.")
+			return
+		}
+		uiWarn("Could not read runtime connectivity report: " + err.Error())
+		return
+	}
+	var snapshot RuntimeSnapshot
+	if err := json.Unmarshal(b, &snapshot); err != nil {
+		uiWarn("Runtime connectivity report is invalid: " + err.Error())
+		return
+	}
+	if time.Since(snapshot.Updated) > 20*time.Second || time.Until(snapshot.Updated) > 2*time.Minute {
+		uiWarn("Runtime connectivity report is stale; check whether the selected service is updating its metrics.")
+		return
+	}
+	if snapshot.Connected {
+		uiSuccess(fmt.Sprintf("%s has at least one authenticated tunnel lane; active public connections=%d", strings.ToUpper(snapshot.Role), snapshot.ActiveConnections))
+	} else if snapshot.Role == "agent" {
+		uiWarn("Agent service is running, but no Agent↔Hub lane is authenticated yet. Check the recent lane errors below.")
+	} else {
+		uiWarn("Hub service is running, but no Agent session is currently connected.")
+	}
 }
 
 const (

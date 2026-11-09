@@ -1063,6 +1063,94 @@ func TestValidateUnderlayPaths(t *testing.T) {
 	}
 }
 
+func TestProbeUnderlayReadyAcceptsNoAuthSOCKS5(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		var greeting [3]byte
+		if _, readErr := io.ReadFull(conn, greeting[:]); readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		if greeting != [3]byte{0x05, 0x01, 0x00} {
+			serverErr <- fmt.Errorf("unexpected SOCKS5 greeting: %v", greeting)
+			return
+		}
+		_, writeErr := conn.Write([]byte{0x05, 0x00})
+		serverErr <- writeErr
+	}()
+
+	if err := probeUnderlayReady(UnderlayPath{Method: underlayMASQUE, Endpoint: ln.Addr().String()}); err != nil {
+		t.Fatalf("expected ready SOCKS5 endpoint, got: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("SOCKS5 probe server: %v", err)
+	}
+}
+
+func TestProbeUnderlayReadyRejectsSOCKS5RequiringAuthentication(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		defer conn.Close()
+		var greeting [3]byte
+		if _, readErr := io.ReadFull(conn, greeting[:]); readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		_, writeErr := conn.Write([]byte{0x05, 0xff})
+		serverErr <- writeErr
+	}()
+
+	err = probeUnderlayReady(UnderlayPath{Method: underlayTOR, Endpoint: ln.Addr().String()})
+	if err == nil || !strings.Contains(err.Error(), "unauthenticated SOCKS5") {
+		t.Fatalf("expected no-auth SOCKS5 validation error, got: %v", err)
+	}
+	if serverErr := <-serverErr; serverErr != nil {
+		t.Fatalf("SOCKS5 probe server: %v", serverErr)
+	}
+}
+
+func TestProbeUnderlayReadyAcceptsBackhaulForward(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := make(chan struct{})
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr == nil {
+			_ = conn.Close()
+		}
+		close(accepted)
+	}()
+	if err := probeUnderlayReady(UnderlayPath{Method: underlayBackhaul, Endpoint: ln.Addr().String()}); err != nil {
+		t.Fatalf("expected reachable Backhaul forward, got: %v", err)
+	}
+	<-accepted
+}
+
 func TestSOCKS5DialContextPreservesRemoteHostname(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
