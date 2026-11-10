@@ -1,9 +1,10 @@
-اصلاح فوری نصب نسخه 2.2.2
+اصلاح خودکار نصب WARP روی VPS ایران — Shah Tunnel 2.2.2
 
-راه کوتاه: فایل ShahTunnel-2.2.2-S1T-START-HOTFIX.sh را در GitHub با نام S1T-START.sh در ریشه مخزن ShahNetLab/ShahTunnel جایگزین کنید. فایل‌های main.go و go.mod را تغییر ندهید. سپس نصب را دوباره اجرا کنید:
+نصب‌کننده ابتدا مخزن رسمی Cloudflare را امتحان می‌کند. اگر pkg.cloudflareclient.com در شبکه ایران Timeout بدهد، کلید عمومی Cloudflare را از نسخه همراه با fingerprint ثابت بررسی می‌کند و سپس دانلود مستقیم بسته را از میزبان رسمی downloads.cloudflareclient.com امتحان می‌کند. نام بسته، نسخه و معماری قبل از نصب کنترل می‌شوند.
 
+برای به‌روزرسانی GitHub، فایل S1T-START.sh را در ریشه مخزن ShahNetLab/ShahTunnel جایگزین کنید. main.go و فایل‌های تنظیمات تونل برای این اصلاح لازم نیست تغییر کنند.
+
+دستور نصب یک‌خطی همچنان همان است:
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 
-اگر بسته کامل را آپلود می‌کنید، محتوای ZIP با حفظ ساختار پوشه‌ها در ریشه مخزن جایگزین شود.
-
-در صورت عدم دسترسی سرور به pkg.cloudflareclient.com، نصب اصلی شاه‌تونل ادامه می‌یابد اما WARP آماده نخواهد شد؛ مسیر WARP تا نصب موفق cloudflare-warp قابل استفاده نیست.
+این اصلاح نیازی به اجرای دستی apt یا دستورات WARP ندارد. اگر هم مخزن APT و هم میزبان دانلود رسمی Cloudflare از شبکه دیتاسنتر قابل دسترسی نباشند، نصب WARP با پیام هشدار رد می‌شود تا نصب Shah Tunnel و مسیر SSH آسیب نبیند.

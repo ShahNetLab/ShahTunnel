@@ -583,12 +583,124 @@ remove_legacy_warp_ssh_bypass() {
   systemctl daemon-reload
 }
 
+CLOUDFLARE_WARP_FALLBACK_VERSION="2026.8.2115.0"
+CLOUDFLARE_WARP_KEY_FINGERPRINT="C068A2B5771775193CBE1F2F6E2DD2174FA1C3BA"
+
+cloudflare_warp_prepare_repository_key() {
+  local key_asc="$1" key_tmp="$2" fingerprint expiry now
+  # Prefer Cloudflare's live endpoint. If this hostname is filtered on an
+  # Iranian VPS, use the current public key fetched from that same official
+  # endpoint during release preparation. Its full fingerprint is pinned below.
+  if ! curl -fLsS --retry 1 --retry-delay 1 --connect-timeout 6 --max-time 18 \
+      https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_asc" 2>/dev/null || [[ ! -s "$key_asc" ]]; then
+    echo "Cloudflare key host is unreachable; using the pinned current Cloudflare signing key." >&2
+    cat > "$key_asc" <<'CLOUDFLARE_WARP_PUBLIC_KEY'
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mQINBGGr2jUBEADHaae1uIKW4JI/E32IR9EJSswkOuZl1J+XXH32U2u3DGtzGuei
+dNXyeQ7AWHp5bM2wO7jGRqH/IwiDVHzp6gmJ8r/SFrE+iljNA71LVXY7FjaOGmKC
+pZnzl3mlY9zsRgmM+oEbTedg2k1jfeHWiYJfTk4efDUGNqF4D62GBFLpOheeXtNU
+DHuZjcRBFKO3wjt3wPpuUx+/NoHrxWK2HZxL6cHUHxmqOHlemGAvZug0pkeAWaAb
+YYmlwsi9/KbnZ22poCfubCebeLIIC4GrQd5ZdJn3efa1ps41gHG/s0RpoQvC128x
+ZQDfdjskuXA0IlDUwzGK2qeY2PEbHpPAH02cm2JrO0NkVBO/4tJ3QkrBRdkOoS1C
+PZRFkzaamA7kZb03wHHLqMZ4lpw+Aa4w0jihndQUvxi9HQVmzjYW1HeQXHmVPdNc
+MT6Y/XxFUFfz65zpZy6s5e8250yIaiNtTuvpcXebmkx0uM4naQFjSJTTlrNeXM/L
+67JppgInRXwlaevNBTm24HhJy0zef1Gpnt6xJDtCX2qNg0GhbuJXbFhgSF1Ct7eY
+tZsfx6UbEXdkwEtcrIAXIqrVjenqcvh8w47I06rqKEoiMliQxh/WrIjTDCsIq/LB
+ki820eS6GsJ5N2JmZ2CQ7Kt+y/Gx9uMDmUcCnHY10vX+Va66/GKMX+vbKQARAQAB
+tDZDbG91ZGZsYXJlIFBhY2thZ2UgUmVwb3NpdG9yeSA8c3VwcG9ydEBjbG91ZGZs
+YXJlLmNvbT6JAlIEEwEIADwCGwMFCwkIBwIDIgIBBhUKCQgLAgQWAgMBAh4HAheA
+FiEEwGiitXcXdRk8vh8vbi3SF0+hw7oFAmi5UcQACgkQbi3SF0+hw7pmgBAAudow
+XU2c8W2t2R6letWslBDd9M13ME9r8b4do/bN2av1xoXHNk1bTPC//1O+JWJPzzHG
+EwRd1XK1U53umPgSQ21RXSWba71iYdfVUnbPBwbmbv4Cp/7kTwMBJsoPxAzyWGkT
+p/u5joDS9KU/85vZeTUNLHrxfuDhMH2elzHYAPsBkqxPosEcgnTmMFZ/4ueZwIn4
+s3sFGUl1kiFhqVn7f2g+PbSC5UI367+mx9Gcw/Ti7NXeYQFrlaMJePpYbmvkdjC2
+Kz+3CVhd+qOSq65bDHI+bW/sqRXmqdUc+lwkCyBhgtrZdTa6e5GFcubagn6U5FQ3
+X1Inv2VDPhiTUKj8S5oTQDErdKyRSlqTj7ZibuXetvsFascJVnsEEQH/lsHUGk7N
+i281X63qRCn+Iv2wB7tAnH1upifl9tS5ouWhu5MVFJUJ9cJPo+naSksf6M0DROLp
+YFX+33IqDDE2bGbQwBUX0TqHOW6Pl/oWnS18EnNvqIRhzVYX/obJvA6sFVF0k4hp
+zEkGCdpAzh/6P27ZvnN8cjlDMgB3c1HdPLQbjZnQ0JbZ6lzyNorwx8rRmxLpgMZd
+k6veLbWGG1tW8oPuuKWfgYVD00BMmJpyNqs2D30njtbkdZ1cRUyqhxS9BZw88Qb0
+TbOm+GteogZ9IbLvjaxCwaojBBzZqXrwGAa4Fso=
+=cDDg
+-----END PGP PUBLIC KEY BLOCK-----
+CLOUDFLARE_WARP_PUBLIC_KEY
+  fi
+
+  if ! gpg --batch --show-keys "$key_asc" >/dev/null 2>&1; then
+    echo "ERROR: Cloudflare signing key is not a valid OpenPGP key; refusing to install WARP." >&2
+    return 1
+  fi
+  fingerprint="$(gpg --batch --with-colons --show-keys "$key_asc" 2>/dev/null | awk -F: '$1=="fpr" {print toupper($10); exit}')"
+  expiry="$(gpg --batch --with-colons --show-keys "$key_asc" 2>/dev/null | awk -F: '$1=="pub" {print $7; exit}')"
+  now="$(date +%s)"
+  if [[ "$fingerprint" != "$CLOUDFLARE_WARP_KEY_FINGERPRINT" ]]; then
+    echo "ERROR: Cloudflare signing-key fingerprint mismatch; refusing to install WARP." >&2
+    return 1
+  fi
+  if [[ -n "$expiry" && "$expiry" =~ ^[0-9]+$ ]] && (( expiry <= now )); then
+    echo "ERROR: Cloudflare signing key is expired; refusing to install WARP." >&2
+    return 1
+  fi
+  if ! gpg --batch --yes --dearmor --output "$key_tmp" "$key_asc" || [[ ! -s "$key_tmp" ]]; then
+    echo "ERROR: Could not convert the verified Cloudflare signing key." >&2
+    return 1
+  fi
+  return 0
+}
+
+cloudflare_warp_install_official_download() {
+  local arch platform url deb package version package_arch
+  arch="$(dpkg --print-architecture 2>/dev/null || true)"
+  case "$arch" in
+    amd64) platform="ubuntu" ;;
+    arm64) platform="ubuntu-arm" ;;
+    *) echo "WARNING: No Cloudflare Ubuntu download mapping for architecture ${arch:-unknown}." >&2; return 1 ;;
+  esac
+  deb="$TMP/cloudflare-warp-official.deb"
+  # These are Cloudflare's own stable-download endpoints. They are a fallback
+  # for Iranian VPS networks where pkg.cloudflareclient.com is unreachable.
+  local urls=(
+    "https://downloads.cloudflareclient.com/v1/download/${platform}/version/${CLOUDFLARE_WARP_FALLBACK_VERSION}"
+    "https://downloads.cloudflareclient.com/v1/download/${platform}/ga"
+  )
+  for url in "${urls[@]}"; do
+    echo "Trying Cloudflare official Linux package download: ${url}" >&2
+    if ! curl_download "$url" "$deb" --retry 2 --retry-delay 2 --connect-timeout 12 --max-time 300; then
+      rm -f "$deb"
+      continue
+    fi
+    if ! command -v dpkg-deb >/dev/null 2>&1; then
+      echo "WARNING: dpkg-deb is unavailable; cannot verify the downloaded package metadata." >&2
+      rm -f "$deb"
+      return 1
+    fi
+    package="$(dpkg-deb -f "$deb" Package 2>/dev/null || true)"
+    version="$(dpkg-deb -f "$deb" Version 2>/dev/null || true)"
+    package_arch="$(dpkg-deb -f "$deb" Architecture 2>/dev/null || true)"
+    if [[ "$package" != "cloudflare-warp" || ( "$package_arch" != "$arch" && "$package_arch" != "all" ) || -z "$version" ]]; then
+      echo "WARNING: Download endpoint did not return a matching cloudflare-warp package; rejecting it." >&2
+      rm -f "$deb"
+      continue
+    fi
+    echo "Cloudflare package verified: ${package} ${version} (${package_arch}). Installing..." >&2
+    if DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y "$deb"; then
+      rm -f "$deb"
+      echo "Cloudflare WARP installed from Cloudflare's official download service." >&2
+      return 0
+    fi
+    echo "WARNING: Official package downloaded, but Ubuntu dependencies could not be installed." >&2
+    rm -f "$deb"
+  done
+  return 1
+}
+
 install_cloudflare_warp() {
   # /etc/os-release defines VERSION globally when sourced. Keep the product
   # version local and unchanged so Ubuntu's marketing version cannot overwrite
   # the Shah Tunnel version used by binary verification.
   local VERSION="${VERSION}"
-  local distro codename key_tmp key_asc repo_file reg_out answer status_out terms_file
+  local distro codename key_tmp key_asc repo_file reg_out answer status_out terms_file key_ready
   local apt_opts=(-o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10)
   if ! command -v apt-get >/dev/null 2>&1; then
     echo "WARNING: Automatic Cloudflare WARP installation is supported by this installer on Ubuntu/Debian only." >&2
@@ -630,34 +742,43 @@ install_cloudflare_warp() {
     install -d -o root -g root -m 0755 /usr/share/keyrings
     key_tmp="$TMP/cloudflare-warp-archive-keyring.gpg"
     key_asc="$TMP/cloudflare-warp-pubkey.gpg.asc"
-    # Never pass a missing/empty download to GPG or install. Cloudflare's
-    # package host is occasionally unreachable from some VPS networks.
-    if ! curl -fLsS --retry 1 --retry-delay 1 --connect-timeout 8 --max-time 25 \
-        https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_asc" || [[ ! -s "$key_asc" ]]; then
-      echo "WARNING: Cloudflare package key could not be downloaded. WARP setup is skipped; Shah Tunnel installation will continue." >&2
-      return 1
+    key_ready=0
+    # Official live key first; a pinned copy of the current official key is
+    # used automatically when Iran routing blocks the pkg.cloudflareclient.com hostname.
+    if cloudflare_warp_prepare_repository_key "$key_asc" "$key_tmp"; then
+      key_ready=1
     fi
-    if ! gpg --batch --yes --dearmor --output "$key_tmp" "$key_asc" || [[ ! -s "$key_tmp" ]]; then
-      echo "WARNING: Cloudflare package key could not be validated. WARP setup is skipped safely." >&2
-      return 1
-    fi
-    install -o root -g root -m 0644 "$key_tmp" /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    printf 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' "$codename" > "$TMP/cloudflare-client.list"
-    install -o root -g root -m 0644 "$TMP/cloudflare-client.list" "$repo_file"
 
-    # Refresh only Cloudflare's repository. This avoids waiting on unrelated
-    # APT mirrors and prevents stale/partial indexes from being mistaken for a
-    # successful WARP repository refresh.
-    if ! apt-get "${apt_opts[@]}" \
-        -o Dir::Etc::sourcelist="$repo_file" \
-        -o Dir::Etc::sourceparts="-" \
-        -o APT::Get::List-Cleanup=0 update; then
-      echo "WARNING: Cloudflare's APT repository is unreachable for ${codename}. WARP setup is skipped; Shah Tunnel installation will continue." >&2
-      return 1
-    fi
-    if ! DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y cloudflare-warp; then
-      echo "WARNING: cloudflare-warp package is unavailable from the configured repository. WARP setup is skipped; Shah Tunnel installation will continue." >&2
-      return 1
+    if [[ "$key_ready" -eq 1 ]]; then
+      install -o root -g root -m 0644 "$key_tmp" /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+      printf 'deb [arch=%s signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' \
+        "$(dpkg --print-architecture)" "$codename" > "$TMP/cloudflare-client.list"
+
+      # Only persist the repository after its own index refresh succeeds.
+      if apt-get "${apt_opts[@]}" \
+          -o Dir::Etc::sourcelist="$TMP/cloudflare-client.list" \
+          -o Dir::Etc::sourceparts="-" \
+          -o APT::Get::List-Cleanup=0 update; then
+        install -o root -g root -m 0644 "$TMP/cloudflare-client.list" "$repo_file"
+        if ! DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y cloudflare-warp; then
+          echo "WARNING: Cloudflare APT package installation failed; switching to Cloudflare's official package download." >&2
+          rm -f "$repo_file"
+          if ! cloudflare_warp_install_official_download; then return 1; fi
+        fi
+      else
+        echo "WARNING: pkg.cloudflareclient.com is unreachable from this VPS; trying Cloudflare's official download service." >&2
+        rm -f "$repo_file"
+        if ! cloudflare_warp_install_official_download; then
+          echo "WARNING: Cloudflare's official download endpoints are also unreachable. WARP setup cannot complete on this network." >&2
+          return 1
+        fi
+      fi
+    else
+      echo "WARNING: Cloudflare APT signing key could not be downloaded from Iran; trying Cloudflare's official package download service." >&2
+      if ! cloudflare_warp_install_official_download; then
+        echo "WARNING: Cloudflare package repository and official download service are both unreachable. WARP setup cannot complete on this network." >&2
+        return 1
+      fi
     fi
   else
     echo "Cloudflare WARP already installed; keeping its existing registration and configuration." >&2
