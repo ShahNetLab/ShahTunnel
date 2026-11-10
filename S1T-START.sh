@@ -584,8 +584,12 @@ remove_legacy_warp_ssh_bypass() {
 }
 
 install_cloudflare_warp() {
-  local distro codename key_tmp repo_file reg_out answer status_out trace_out terms_file
-  local apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+  # /etc/os-release defines VERSION globally when sourced. Keep the product
+  # version local and unchanged so Ubuntu's marketing version cannot overwrite
+  # the Shah Tunnel version used by binary verification.
+  local VERSION="${VERSION}"
+  local distro codename key_tmp key_asc repo_file reg_out answer status_out terms_file
+  local apt_opts=(-o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10)
   if ! command -v apt-get >/dev/null 2>&1; then
     echo "WARNING: Automatic Cloudflare WARP installation is supported by this installer on Ubuntu/Debian only." >&2
     return 0
@@ -613,40 +617,73 @@ install_cloudflare_warp() {
     [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing_pkgs+=(ca-certificates)
     command -v ip >/dev/null 2>&1 || missing_pkgs+=(iproute2)
     if ((${#missing_pkgs[@]})); then
-      apt-get "${apt_opts[@]}" update || echo "WARNING: One or more configured APT mirrors are unavailable; trying with cached package indexes." >&2
-      DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y curl "${missing_pkgs[@]}"
+      if ! apt-get "${apt_opts[@]}" update; then
+        echo "WARNING: APT dependency indexes could not be refreshed; WARP installation is skipped safely." >&2
+        return 1
+      fi
+      if ! DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y curl "${missing_pkgs[@]}"; then
+        echo "WARNING: Required WARP prerequisites could not be installed; WARP installation is skipped safely." >&2
+        return 1
+      fi
     fi
+
     install -d -o root -g root -m 0755 /usr/share/keyrings
     key_tmp="$TMP/cloudflare-warp-archive-keyring.gpg"
-    curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 12 --max-time 60 \
-      https://pkg.cloudflareclient.com/pubkey.gpg -o "$TMP/cloudflare-warp-pubkey.gpg.asc"
-    gpg --batch --yes --dearmor --output "$key_tmp" "$TMP/cloudflare-warp-pubkey.gpg.asc"
+    key_asc="$TMP/cloudflare-warp-pubkey.gpg.asc"
+    # Never pass a missing/empty download to GPG or install. Cloudflare's
+    # package host is occasionally unreachable from some VPS networks.
+    if ! curl -fLsS --retry 1 --retry-delay 1 --connect-timeout 8 --max-time 25 \
+        https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_asc" || [[ ! -s "$key_asc" ]]; then
+      echo "WARNING: Cloudflare package key could not be downloaded. WARP setup is skipped; Shah Tunnel installation will continue." >&2
+      return 1
+    fi
+    if ! gpg --batch --yes --dearmor --output "$key_tmp" "$key_asc" || [[ ! -s "$key_tmp" ]]; then
+      echo "WARNING: Cloudflare package key could not be validated. WARP setup is skipped safely." >&2
+      return 1
+    fi
     install -o root -g root -m 0644 "$key_tmp" /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
     printf 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' "$codename" > "$TMP/cloudflare-client.list"
     install -o root -g root -m 0644 "$TMP/cloudflare-client.list" "$repo_file"
 
-    # Refresh all mirrors first. If a provider mirror such as mirror.hetzner.com
-    # is unreachable, refresh Cloudflare's repository on its own as a fallback.
-    if ! apt-get "${apt_opts[@]}" update; then
-      echo "WARNING: Full APT update failed; refreshing only the official Cloudflare repository." >&2
-      apt-get "${apt_opts[@]}" -o Dir::Etc::sourcelist="$repo_file" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup=0 update
+    # Refresh only Cloudflare's repository. This avoids waiting on unrelated
+    # APT mirrors and prevents stale/partial indexes from being mistaken for a
+    # successful WARP repository refresh.
+    if ! apt-get "${apt_opts[@]}" \
+        -o Dir::Etc::sourcelist="$repo_file" \
+        -o Dir::Etc::sourceparts="-" \
+        -o APT::Get::List-Cleanup=0 update; then
+      echo "WARNING: Cloudflare's APT repository is unreachable for ${codename}. WARP setup is skipped; Shah Tunnel installation will continue." >&2
+      return 1
     fi
-    DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y cloudflare-warp
+    if ! DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y cloudflare-warp; then
+      echo "WARNING: cloudflare-warp package is unavailable from the configured repository. WARP setup is skipped; Shah Tunnel installation will continue." >&2
+      return 1
+    fi
   else
     echo "Cloudflare WARP already installed; keeping its existing registration and configuration." >&2
   fi
-  command -v warp-cli >/dev/null 2>&1 || { echo "ERROR: cloudflare-warp package installed but warp-cli is missing." >&2; return 1; }
-  warp-cli --version
+  command -v warp-cli >/dev/null 2>&1 || { echo "WARNING: cloudflare-warp package installed but warp-cli is missing; WARP setup is skipped safely." >&2; return 1; }
+  if ! warp-cli --version; then
+    echo "WARNING: warp-cli could not communicate with its installation; WARP setup is skipped safely." >&2
+    return 1
+  fi
 
   # Remove only the obsolete Shah Tunnel global-route SSH workaround.
   # WARP Local Proxy mode keeps the host default route untouched.
   remove_legacy_warp_ssh_bypass
+  # Disconnect a previously active system-wide WARP session before changing
+  # its mode; never allow a failed proxy-mode command to be followed by connect.
+  warp-cli disconnect >/dev/null 2>&1 || true
   if systemctl list-unit-files warp-svc.service --no-legend 2>/dev/null | grep -q 'warp-svc.service'; then
-    systemctl enable --now warp-svc.service >/dev/null
+    if ! systemctl enable --now warp-svc.service >/dev/null; then
+      echo "WARNING: warp-svc.service could not be started; WARP setup is skipped safely." >&2
+      return 1
+    fi
   else
-    echo "ERROR: cloudflare-warp is present but warp-svc.service is missing; refusing to configure an unmanaged WARP process." >&2
+    echo "WARNING: cloudflare-warp is present but warp-svc.service is missing; WARP setup is skipped safely." >&2
     return 1
   fi
+  warp-cli disconnect >/dev/null 2>&1 || true
 
   # Cloudflare terms are accepted only after an explicit interactive approval.
   if [[ ! -s "$terms_file" ]]; then
@@ -661,22 +698,58 @@ install_cloudflare_warp() {
       return 0
     fi
     printf 'accepted-on %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP/cloudflare-terms-consented"
+    install -d -o root -g root -m 0700 /etc/shah-tunnel
     install -o root -g root -m 0600 "$TMP/cloudflare-terms-consented" "$terms_file"
   fi
 
   reg_out="$(warp-cli registration show 2>&1 || true)"
   if [[ -z "$reg_out" ]] || grep -Eiq 'not registered|no registration|unregistered' <<<"$reg_out"; then
-    warp-cli --accept-tos registration new
+    if ! warp-cli --accept-tos registration new; then
+      echo "WARNING: WARP registration failed; leaving it disconnected." >&2
+      warp-cli disconnect >/dev/null 2>&1 || true
+      return 1
+    fi
   fi
-  # Restart WARP into Local Proxy mode; never leave its old system-wide
-  # Traffic-and-DNS route active during the mode transition.
-  warp-cli disconnect >/dev/null 2>&1 || true
-  warp-cli --accept-tos tunnel protocol set MASQUE
-  # Critical: Local Proxy mode prevents WARP from replacing the server's
-  # default route. Only Shah Tunnel's explicit SOCKS5 carrier uses WARP.
-  warp-cli --accept-tos mode proxy
-  warp-cli --accept-tos proxy port 40000
-  warp-cli --accept-tos connect || true
+  # Configure every setting explicitly. Because this function is called in a
+  # recoverable `if !` block, errexit is not sufficient here: check each command
+  # and NEVER run connect unless Local Proxy mode was accepted.
+  if ! warp-cli --accept-tos tunnel protocol set MASQUE; then
+    echo "WARNING: WARP could not select MASQUE; leaving it disconnected." >&2
+    warp-cli disconnect >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! warp-cli --accept-tos mode proxy; then
+    echo "WARNING: WARP Local Proxy mode is unavailable; refusing a system-wide WARP connection." >&2
+    warp-cli disconnect >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! warp-cli --accept-tos proxy port 40000; then
+    echo "WARNING: WARP SOCKS5 proxy port could not be configured; leaving WARP disconnected." >&2
+    warp-cli disconnect >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  # Snapshot effective host routes. Local Proxy must not replace IPv4/IPv6
+  # egress, which also protects the return route for the active SSH session.
+  if ! command -v ip >/dev/null 2>&1; then
+    echo "WARNING: iproute2 is unavailable; refusing to connect WARP without route-safety checks." >&2
+    warp-cli disconnect >/dev/null 2>&1 || true
+    return 1
+  fi
+  local route4_before route6_before route4_after route6_after ssh_peer route_ssh_before route_ssh_after
+  route4_before="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"||$i=="dev"||$i=="src"||$i=="table") printf "%s %s ",$i,$(i+1)}')"
+  route6_before="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"||$i=="dev"||$i=="src"||$i=="table") printf "%s %s ",$i,$(i+1)}')"
+  ssh_peer=""
+  route_ssh_before=""
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    ssh_peer="${SSH_CONNECTION%% *}"
+    route_ssh_before="$(ip route get "$ssh_peer" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"||$i=="dev"||$i=="src"||$i=="table") printf "%s %s ",$i,$(i+1)}')"
+  fi
+  if ! warp-cli --accept-tos connect; then
+    echo "WARNING: WARP could not connect in Local Proxy mode; leaving it disconnected." >&2
+    warp-cli disconnect >/dev/null 2>&1 || true
+    return 1
+  fi
   for _ in $(seq 1 30); do
     status_out="$(warp-cli status 2>&1 || true)"
     if grep -Eiq '^Status update:[[:space:]]*Connected' <<<"$status_out"; then
@@ -685,18 +758,34 @@ install_cloudflare_warp() {
     sleep 2
   done
   if grep -Eiq '^Status update:[[:space:]]*Connected' <<<"$status_out"; then
+    route4_after="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"||$i=="dev"||$i=="src"||$i=="table") printf "%s %s ",$i,$(i+1)}')"
+    route6_after="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"||$i=="dev"||$i=="src"||$i=="table") printf "%s %s ",$i,$(i+1)}')"
+    route_ssh_after="$route_ssh_before"
+    if [[ -n "$route_ssh_before" ]]; then
+      route_ssh_after="$(ip route get "$ssh_peer" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"||$i=="dev"||$i=="src"||$i=="table") printf "%s %s ",$i,$(i+1)}')"
+    fi
+    if { [[ -n "$route4_before" && "$route4_after" != "$route4_before" ]] ||
+         [[ -n "$route6_before" && "$route6_after" != "$route6_before" ]] ||
+         [[ -n "$route_ssh_before" && "$route_ssh_after" != "$route_ssh_before" ]]; }; then
+      echo "WARNING: WARP changed an effective host route; disconnecting it to protect SSH and ordinary traffic." >&2
+      warp-cli disconnect >/dev/null 2>&1 || true
+      return 1
+    fi
     if curl --silent --show-error --fail --connect-timeout 5 --max-time 12 \
       --socks5-hostname 127.0.0.1:40000 \
       https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qx 'warp=on'; then
       echo "Cloudflare WARP is connected in MASQUE Local Proxy mode on 127.0.0.1:40000." >&2
       echo "Only explicitly configured Shah Tunnel carrier connections will use WARP; SSH and other server traffic remain on the normal route." >&2
     else
-      echo "WARNING: WARP is connected, but its local SOCKS5 proxy did not pass the warp=on test." >&2
-      echo "WARP-dependent tunnel paths must remain disabled until the proxy test succeeds." >&2
+      echo "WARNING: WARP is connected, but its local SOCKS5 proxy did not pass the warp=on test; disconnecting WARP." >&2
+      warp-cli disconnect >/dev/null 2>&1 || true
+      return 1
     fi
   else
-    echo "WARNING: Cloudflare WARP is installed and configured for MASQUE Local Proxy mode but is not connected:" >&2
+    echo "WARNING: WARP is installed and configured for MASQUE Local Proxy mode but is not connected:" >&2
     printf '%s\n' "$status_out" >&2
+    warp-cli disconnect >/dev/null 2>&1 || true
+    return 1
   fi
 }
 

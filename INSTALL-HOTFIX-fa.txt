@@ -1,0 +1,9 @@
+اصلاح فوری نصب نسخه 2.2.2
+
+راه کوتاه: فایل ShahTunnel-2.2.2-S1T-START-HOTFIX.sh را در GitHub با نام S1T-START.sh در ریشه مخزن ShahNetLab/ShahTunnel جایگزین کنید. فایل‌های main.go و go.mod را تغییر ندهید. سپس نصب را دوباره اجرا کنید:
+
+bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
+
+اگر بسته کامل را آپلود می‌کنید، محتوای ZIP با حفظ ساختار پوشه‌ها در ریشه مخزن جایگزین شود.
+
+در صورت عدم دسترسی سرور به pkg.cloudflareclient.com، نصب اصلی شاه‌تونل ادامه می‌یابد اما WARP آماده نخواهد شد؛ مسیر WARP تا نصب موفق cloudflare-warp قابل استفاده نیست.
