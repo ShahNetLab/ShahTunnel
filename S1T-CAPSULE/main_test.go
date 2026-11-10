@@ -1095,14 +1095,22 @@ func TestAgentExternalPathConfigValidation(t *testing.T) {
 	if err := validateConfig(base); err != nil {
 		t.Fatalf("valid option 8 SOCKS5 Agent config rejected: %v", err)
 	}
-	warpProxy := base
-	warpProxy.ExternalPaths = []AgentExternalPath{{ID: "warp", Method: "warp", Address: "127.0.0.1:40000"}}
-	warpProxy.SelectedExternalPath = "warp"
-	if got := externalPathKind(warpProxy.ExternalPaths[0]); got != "socks5" {
-		t.Fatalf("new WARP path kind = %q; want socks5", got)
+	warpDevice := base
+	warpDevice.ExternalPaths = []AgentExternalPath{{ID: "warp", Method: "warp"}}
+	warpDevice.SelectedExternalPath = "warp"
+	if got := externalPathKind(warpDevice.ExternalPaths[0]); got != "system" {
+		t.Fatalf("WARP device path kind = %q; want system", got)
 	}
-	if err := validateConfig(warpProxy); err != nil {
-		t.Fatalf("valid WARP local-proxy config rejected: %v", err)
+	if err := validateConfig(warpDevice); err != nil {
+		t.Fatalf("valid WARP device-mode config rejected: %v", err)
+	}
+	// Upgrade an existing 2.2.3 app-scoped SOCKS config to the correct
+	// WARP device path; do not keep the obsolete local proxy address.
+	legacyWarp := warpDevice
+	legacyWarp.ExternalPaths = []AgentExternalPath{{ID: "warp", Method: "warp", Address: "127.0.0.1:40000"}}
+	legacyWarp = normalizeConfig(legacyWarp)
+	if legacyWarp.ExternalPaths[0].Address != "" || externalPathKind(legacyWarp.ExternalPaths[0]) != "system" {
+		t.Fatalf("2.2.3 WARP profile was not migrated: %+v", legacyWarp.ExternalPaths[0])
 	}
 
 	missingSelected := base
@@ -1138,11 +1146,11 @@ func TestReplaceConfiguredExternalPathPreservesAgentSettings(t *testing.T) {
 		ExternalPaths:        []AgentExternalPath{{ID: "masque", Method: "masque", Address: "127.0.0.1:40001"}},
 		SelectedExternalPath: "masque",
 	}
-	updated, err := replaceConfiguredExternalPath(cfg, "masque", AgentExternalPath{ID: "warp", Method: "warp", Address: "127.0.0.1:40000"})
+	updated, err := replaceConfiguredExternalPath(cfg, "masque", AgentExternalPath{ID: "warp", Method: "warp"})
 	if err != nil {
 		t.Fatalf("replace external path: %v", err)
 	}
-	if updated.SelectedExternalPath != "warp" || len(updated.ExternalPaths) != 1 || updated.ExternalPaths[0].Address != "127.0.0.1:40000" {
+	if updated.SelectedExternalPath != "warp" || len(updated.ExternalPaths) != 1 || updated.ExternalPaths[0].Method != "warp" || updated.ExternalPaths[0].Address != "" {
 		t.Fatalf("replacement path not applied: %+v", updated.ExternalPaths)
 	}
 	if updated.Token != cfg.Token || updated.Fingerprint != cfg.Fingerprint || updated.HubAddr != cfg.HubAddr || updated.TLSServerName != cfg.TLSServerName || updated.TunnelChannels != cfg.TunnelChannels || updated.Ports[0] != cfg.Ports[0] {
@@ -1836,5 +1844,59 @@ func TestListenAddressConflictDetection(t *testing.T) {
 		if got := listenAddressesConflict(tc.a, tc.b); got != tc.want {
 			t.Errorf("listenAddressesConflict(%q, %q) = %v; want %v", tc.a, tc.b, got, tc.want)
 		}
+	}
+}
+
+func TestParsePhysicalDefaultRoute(t *testing.T) {
+	route, err := parsePhysicalDefaultRoute("-4", "default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route.Gateway != "192.0.2.1" || route.Device != "eth0" || route.Source != "192.0.2.10" {
+		t.Fatalf("unexpected parsed physical route: %+v", route)
+	}
+	if _, err := parsePhysicalDefaultRoute("-4", "default dev CloudflareWARP proto static\n"); err == nil {
+		t.Fatal("virtual WARP route was accepted as the physical default")
+	}
+}
+
+func TestWARPDeviceEgressPolicyByTransportMode(t *testing.T) {
+	warp := AgentExternalPath{ID: "warp", Method: "warp"}
+	tor := AgentExternalPath{ID: "tor", Method: "tor", Address: "127.0.0.1:9050"}
+	cfg := Config{Role: "agent", Transport: transportNewMethods, ExternalPaths: []AgentExternalPath{warp, tor}, SelectedExternalPath: "warp"}
+	if !configRequiresCloudflareWarp(cfg) {
+		t.Fatal("option 8 with selected WARP path must enable device egress")
+	}
+	cfg.SelectedExternalPath = "tor"
+	if configRequiresCloudflareWarp(cfg) {
+		t.Fatal("option 8 selecting Tor must not enable device-level WARP")
+	}
+	cfg.Transport = transportFullAdaptive
+	if !configRequiresCloudflareWarp(cfg) {
+		t.Fatal("option 9 with a configured WARP candidate must enable WARP egress")
+	}
+	cfg.Transport = transportAdaptive
+	if configRequiresCloudflareWarp(cfg) {
+		t.Fatal("legacy option 7 must not inherit global WARP egress")
+	}
+}
+
+func TestWARPSettingsModeDetection(t *testing.T) {
+	tests := []struct {
+		name       string
+		settings   string
+		wantDevice bool
+	}{
+		{name: "local proxy", settings: "(user set) Mode: WarpProxy on port 40000", wantDevice: false},
+		{name: "device warp doh", settings: "(user set) Mode: Warp+doh", wantDevice: true},
+		{name: "device warp", settings: "(default) Mode: Warp", wantDevice: true},
+		{name: "no mode reported", settings: "WARP tunnel protocol: MASQUE", wantDevice: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := warpSettingsIsDeviceMode(tt.settings); got != tt.wantDevice {
+				t.Fatalf("warpSettingsIsDeviceMode() = %v, want %v", got, tt.wantDevice)
+			}
+		})
 	}
 }

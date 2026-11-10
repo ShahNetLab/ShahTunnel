@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "2.2.3"
+	version                          = "2.2.4"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -94,16 +94,18 @@ type PortMapping struct {
 	Target string `json:"target,omitempty"` // Agent local target
 }
 
-// AgentExternalPath describes an Agent-side egress path. New WARP/MASQUE
-// profiles use Cloudflare WARP local-proxy mode (SOCKS5), so only Shah Tunnel
-// sockets use that path and the host default route/SSH remain direct. Existing
-// 2.2.0 configs with no Address retain their legacy system-route behavior.
+// AgentExternalPath describes an Agent-side egress path. Cloudflare WARP uses
+// device mode for option 8/9 so both the Agent carrier and local target-service
+// egress use WARP. The SSH route guard and SO_MARK direct fallback keep SSH and
+// legacy native carrier sockets on the physical VPS route. Other external
+// transports continue to use their configured local SOCKS5/TCP gateway.
 //
 // Method mapping:
 //
-//	masque, warp, warp_on_warp -> SOCKS5 at Address (or legacy OS route)
+//	warp                       -> Cloudflare device route (MASQUE)
+//	masque, warp_on_warp       -> local SOCKS5 gateway at Address
 //	tor, psiphon               -> local SOCKS5 proxy at Address
-//	backhaul                  -> local raw-TCP forward at Address
+//	backhaul                   -> local raw-TCP forward at Address
 type AgentExternalPath struct {
 	ID        string `json:"id"`
 	Method    string `json:"method"`
@@ -552,9 +554,11 @@ func validExternalPathMethod(method string) bool {
 
 func externalPathKind(path AgentExternalPath) string {
 	switch strings.ToLower(strings.TrimSpace(path.Method)) {
-	case "masque", "warp", "warp_on_warp":
-		// Address marks the safe, app-scoped local SOCKS5 mode. An empty
-		// Address identifies a legacy 2.2.0 system-route configuration.
+	case "warp":
+		// WARP is a device-level MASQUE route so the local target service's
+		// internet egress is also changed, not only the Agent->Hub carrier.
+		return "system"
+	case "masque", "warp_on_warp":
 		if strings.TrimSpace(path.Address) != "" {
 			return "socks5"
 		}
@@ -2100,17 +2104,22 @@ func connectAndRunAgentHTTPConnectAuto(cfg Config, channel int) error {
 }
 
 // dialAgentExternalPath opens the raw TCP socket to the Hub through one
-// preconfigured Agent-side egress path. New WARP/MASQUE paths use a local
-// SOCKS5 proxy; legacy profiles may still bind to a preconfigured interface.
-// Tor/Psiphon use SOCKS5, and Backhaul uses a local raw-TCP forward.
+// preconfigured Agent-side egress path. Cloudflare WARP uses its device-level
+// MASQUE route so the Agent carrier and the local target service share WARP
+// egress. Direct/fallback carriers are SO_MARKed to retain the VPS physical
+// route. MASQUE gateways, WARP-on-WARP, Tor and Psiphon use SOCKS5; Backhaul
+// uses a local raw-TCP forward.
 func dialAgentExternalPath(ctx context.Context, cfg Config, path *AgentExternalPath, target string) (net.Conn, error) {
 	if path == nil {
-		d := net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
+		d := makeDirectRouteDialer()
 		return d.DialContext(ctx, "tcp", target)
 	}
 	switch externalPathKind(*path) {
 	case "system":
 		d := net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
+		if !strings.EqualFold(path.Method, "warp") {
+			d.Control = directRouteControl()
+		}
 		if path.Interface != "" {
 			if _, err := net.InterfaceByName(path.Interface); err != nil {
 				return nil, fmt.Errorf("Agent route %s requires interface %q: %w", path.ID, path.Interface, err)
@@ -2133,7 +2142,7 @@ func dialAgentExternalPath(ctx context.Context, cfg Config, path *AgentExternalP
 		if err != nil {
 			return nil, err
 		}
-		d := net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
+		d := makeDirectRouteDialer()
 		return d.DialContext(ctx, "tcp", forwardAddr)
 	default:
 		return nil, fmt.Errorf("Agent external path %q has unsupported method %q", path.ID, path.Method)
@@ -2818,6 +2827,9 @@ func validAuth(line, token string) bool { return authProtocol(line, token) != ""
 
 func runAgent(cfg Config) error {
 	cfg = normalizeConfig(cfg)
+	if err := ensureAgentNetworkRuntime(cfg); err != nil {
+		return fmt.Errorf("Agent network policy check failed: %w", err)
+	}
 	pin, err := normalizeFingerprint(cfg.Fingerprint)
 	if err != nil {
 		return err
@@ -3001,10 +3013,14 @@ func connectAndRunAgentFullAdaptive(cfg Config, pin []byte, channel int) error {
 	}
 	preferredPath := "direct"
 	if len(cfg.ExternalPaths) > 0 {
-		// When the operator selected external paths for option 9, start there.
-		// The direct route remains a fallback after the selected path's four
-		// native carriers have failed.
+		// Start with the explicitly selected external path when present; the
+		// direct physical route remains a fallback after all external candidates.
 		preferredPath = cfg.ExternalPaths[0].ID
+		if cfg.SelectedExternalPath != "" {
+			if _, ok := findExternalPath(cfg.ExternalPaths, cfg.SelectedExternalPath); ok {
+				preferredPath = cfg.SelectedExternalPath
+			}
+		}
 	}
 	if v, ok := agentPreferredPath.Load(channel); ok {
 		if saved, ok := v.(string); ok && saved != "" {
@@ -3144,6 +3160,15 @@ func normalizeConfig(c Config) Config {
 		c.ExternalPaths[i].Address = strings.TrimSpace(c.ExternalPaths[i].Address)
 		c.ExternalPaths[i].Interface = strings.TrimSpace(c.ExternalPaths[i].Interface)
 		c.ExternalPaths[i].Username = strings.TrimSpace(c.ExternalPaths[i].Username)
+		// Upgrade 2.2.3's app-scoped WARP address to the intended device-mode
+		// path. The local SOCKS port remains available only in Proxy mode; it
+		// cannot change Xray/user egress by itself.
+		if strings.EqualFold(c.ExternalPaths[i].Method, "warp") {
+			c.ExternalPaths[i].Address = ""
+			c.ExternalPaths[i].Interface = ""
+			c.ExternalPaths[i].Username = ""
+			c.ExternalPaths[i].Password = ""
+		}
 	}
 	c.SelectedExternalPath = strings.TrimSpace(c.SelectedExternalPath)
 	// Upgrade existing Agent profiles to the current independent-lane performance profile.
@@ -3615,8 +3640,8 @@ func ensureTunnelTemplateUnit() error {
 	}
 	unit := `[Unit]
 Description=Shah Tunnel authenticated reverse TCP tunnel (%i)
-Wants=network-online.target
-After=network-online.target
+Wants=network-online.target shah-tunnel-warp-ssh-bypass.service
+After=network-online.target shah-tunnel-warp-ssh-bypass.service warp-svc.service
 StartLimitIntervalSec=60
 StartLimitBurst=10
 [Service]
@@ -3644,10 +3669,11 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
-ReadWritePaths=/etc/ravanreverse
+ReadWritePaths=/etc/ravanreverse /etc/shah-tunnel
 [Install]
 WantedBy=multi-user.target
 `
@@ -3747,6 +3773,11 @@ func deleteOneTunnel() error {
 		return fmt.Errorf("remove tunnel configuration: %w", err)
 	}
 	_ = os.Remove(runtimeStatsPath())
+	if cfg.Role == "agent" {
+		if err := releaseManagedWarpIfUnused(selected.Path); err != nil {
+			return fmt.Errorf("tunnel was deleted, but WARP could not be safely returned to local-proxy mode: %w", err)
+		}
+	}
 	uiSuccess("Tunnel '" + selected.Name + "' was deleted. Other tunnel configurations were preserved.")
 	return nil
 }
@@ -4083,97 +4114,6 @@ func runWarpCLI(args ...string) (string, error) {
 	return string(out), nil
 }
 
-// configureCloudflareWarpProxy uses WARP's local-proxy mode. The WARP client
-// exposes a loopback SOCKS5 endpoint; only Shah Tunnel sockets use it. Full
-// device mode is deliberately not used because it can reroute SSH and all
-// unrelated server traffic through WARP.
-func configureCloudflareWarpProxy() error {
-	if _, err := exec.LookPath("warp-cli"); err != nil {
-		return errors.New("warp-cli is not installed; rerun the Shah Tunnel installer or install Cloudflare WARP first")
-	}
-	if out, err := exec.Command("systemctl", "enable", "--now", "warp-svc").CombinedOutput(); err != nil {
-		return fmt.Errorf("could not enable/start warp-svc: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-	regOut, regErr := runWarpCLI("registration", "show")
-	regText := strings.ToLower(regOut)
-	registered := strings.Contains(regText, "account type") || strings.Contains(regText, "device id") || strings.Contains(regText, "registration id")
-	missingRegistration := strings.Contains(regText, "registration missing") || strings.Contains(regText, "missing registration") || strings.Contains(regText, "not registered") || strings.Contains(regText, "does not exist") || strings.Contains(regText, "no registration")
-	if missingRegistration {
-		uiInfo("Cloudflare registration is required. The next command accepts Cloudflare's Terms and Privacy Policy.")
-		if !wizardYesNo("Accept Cloudflare Terms and Privacy Policy and register this server? (y/N)", "n") {
-			return errors.New("Cloudflare registration was not approved; WARP path was not enabled")
-		}
-		if _, err := runWarpCLI("registration", "new"); err != nil {
-			return fmt.Errorf("Cloudflare WARP registration failed: %w", err)
-		}
-	} else if regErr != nil {
-		return fmt.Errorf("could not safely inspect the existing Cloudflare registration; leaving it unchanged: %w", regErr)
-	} else if !registered {
-		return fmt.Errorf("Cloudflare registration status was not recognized; leaving it unchanged: %s", strings.TrimSpace(regOut))
-	}
-	// Disconnect first so a previously active full-device route is removed
-	// before proxy mode is applied. This is a best-effort command on a fresh host.
-	_, _ = runWarpCLI("disconnect")
-	if _, err := runWarpCLI("mode", "proxy"); err != nil {
-		return fmt.Errorf("could not set WARP local-proxy mode: %w", err)
-	}
-	if _, err := runWarpCLI("proxy", "port", "40000"); err != nil {
-		return fmt.Errorf("could not set WARP SOCKS5 port: %w", err)
-	}
-	// Cloudflare's local-proxy mode is the app-scoped mode. Keep it on
-	// MASQUE; WireGuard/full-device mode can rewrite system routes and is
-	// deliberately not enabled for a server that must preserve SSH.
-	if _, err := runWarpCLI("tunnel", "protocol", "set", "MASQUE"); err != nil {
-		return fmt.Errorf("could not set WARP local-proxy transport to MASQUE: %w", err)
-	}
-	if _, err := runWarpCLI("connect"); err != nil {
-		return fmt.Errorf("could not connect WARP local proxy: %w", err)
-	}
-	deadline := time.Now().Add(25 * time.Second)
-	for time.Now().Before(deadline) {
-		if isTCPListenerReady("127.0.0.1:40000", 700*time.Millisecond) {
-			if err := verifyCloudflareWarpProxyEgress(); err != nil {
-				return err
-			}
-			uiSuccess("WARP SOCKS5 proxy passed its Cloudflare egress check at 127.0.0.1:40000; SSH and unrelated traffic use the normal route.")
-			return nil
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return errors.New("WARP did not open its local SOCKS5 listener on 127.0.0.1:40000; check warp-cli status and journalctl -u warp-svc")
-}
-
-func verifyCloudflareWarpProxyEgress() error {
-	curlPath, err := exec.LookPath("curl")
-	if err != nil {
-		return errors.New("curl is required to verify the WARP SOCKS5 egress path")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 22*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, curlPath, "--fail", "--silent", "--show-error", "--max-time", "18", "--proxy", "socks5h://127.0.0.1:40000", "https://www.cloudflare.com/cdn-cgi/trace")
-	out, err := cmd.CombinedOutput()
-	if ctx.Err() != nil {
-		return errors.New("WARP SOCKS5 egress test timed out; the path was not saved")
-	}
-	if err != nil {
-		return fmt.Errorf("WARP SOCKS5 egress test failed; the path was not saved: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-	trace := strings.ToLower(string(out))
-	if !strings.Contains(trace, "warp=on") && !strings.Contains(trace, "warp=plus") {
-		return fmt.Errorf("Cloudflare trace did not confirm WARP (expected warp=on or warp=plus); path was not saved: %s", strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-func isTCPListenerReady(address string, timeout time.Duration) bool {
-	conn, err := net.DialTimeout("tcp", address, timeout)
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
-}
-
 // verifySOCKS5ProxyHandshake prevents a profile from being saved with a
 // merely syntactically valid but absent/non-SOCKS listener (for example the
 // old default MASQUE port 127.0.0.1:40001 when no gateway is installed).
@@ -4231,7 +4171,7 @@ func verifySOCKS5ProxyHandshake(address, username, password string) error {
 func wizardAskAgentExternalPath(existing []AgentExternalPath) (AgentExternalPath, error) {
 	fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "AGENT EXTERNAL TUNNEL PATH"))
 	fmt.Printf("  %s\n", "1) MASQUE — use a preconfigured local MASQUE-to-SOCKS5 gateway")
-	fmt.Printf("  %s\n", "2) Cloudflare WARP — app-scoped local SOCKS5 proxy (MASQUE)")
+	fmt.Printf("  %s\n", "2) Cloudflare WARP — device MASQUE egress with SSH/direct-route guard")
 	fmt.Printf("  %s\n", "3) WARP on WARP — use a preconfigured second WARP SOCKS5 endpoint")
 	fmt.Printf("  %s\n", "4) TOR — connect through a local SOCKS5 proxy")
 	fmt.Printf("  %s\n", "5) Psiphon — connect through its local SOCKS5 proxy")
@@ -4282,20 +4222,19 @@ func wizardAskAgentExternalPath(existing []AgentExternalPath) (AgentExternalPath
 		uiSuccess("The preconfigured MASQUE SOCKS5 gateway answered its handshake.")
 		uiInfo("This entry is a local SOCKS5 gateway backed by a MASQUE client; Shah Tunnel does not start a standalone MASQUE client.")
 	case "warp":
-		if wizardYesNo("Configure Cloudflare WARP in app-scoped local-proxy mode now? (Y/n)", "y") {
-			if err := configureCloudflareWarpProxy(); err != nil {
-				return path, err
-			}
-		} else {
-			if !isTCPListenerReady("127.0.0.1:40000", 1200*time.Millisecond) {
-				return path, errors.New("WARP local proxy is not listening at 127.0.0.1:40000; configure WARP proxy mode first")
-			}
-			if err := verifyCloudflareWarpProxyEgress(); err != nil {
-				return path, err
-			}
-			uiInfo("Using the verified WARP local SOCKS5 proxy. The system default route remains outside this proxy.")
+		if _, err := exec.LookPath("warp-cli"); err != nil {
+			return path, errors.New("Cloudflare WARP is not installed; run the installer on the Agent host first")
 		}
-		path.Address = "127.0.0.1:40000"
+		// Protect the active SSH route before starting warp-svc: Always On may
+		// reconnect a previously saved device-WARP profile at daemon startup.
+		if err := ensureWarpSSHGuard(); err != nil {
+			return path, err
+		}
+		if err := ensureCloudflareWarpRegistered(true); err != nil {
+			return path, err
+		}
+		path.Address = ""
+		uiInfo("WARP will use full-device MASQUE only when this Agent tunnel starts. SSH replies and direct fallback transports are protected by the physical-route guard.")
 	case "warp_on_warp":
 		path.Address = strings.TrimSpace(wizardAsk("Second WARP-chain SOCKS5 endpoint", "127.0.0.1:40002"))
 		if err := validateTCPAddress("WARP-on-WARP SOCKS5 endpoint", path.Address); err != nil {
@@ -4829,11 +4768,47 @@ func tunnelIsActive() bool {
 }
 
 // ensureTunnelRunning enables and manages only the currently selected profile.
+func ensureLegacyAgentWarpDropIn() error {
+	dir := "/etc/systemd/system/ravanreverse.service.d"
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create legacy service drop-in directory: %w", err)
+	}
+	content := `[Unit]
+Wants=shah-tunnel-warp-ssh-bypass.service
+After=shah-tunnel-warp-ssh-bypass.service warp-svc.service
+[Service]
+CapabilityBoundingSet=
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+`
+	path := filepath.Join(dir, "20-shah-tunnel-warp-routing.conf")
+	if err := atomicWriteFile(path, []byte(content), 0644); err != nil {
+		return fmt.Errorf("write legacy Agent WARP capability drop-in: %w", err)
+	}
+	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+		return fmt.Errorf("systemd daemon-reload for legacy Agent WARP policy: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func ensureTunnelRunning(restartActive bool) error {
 	if !isRoot() {
 		return errors.New("run as root")
 	}
 	service := currentServiceName()
+	if cfg, loadErr := loadConfig(); loadErr == nil && cfg.Role == "agent" {
+		if err := assertAgentProfileNetworkCompatibility(cfg); err != nil {
+			return err
+		}
+		if err := prepareAgentNetwork(cfg); err != nil {
+			return fmt.Errorf("could not prepare the Agent network safely: %w", err)
+		}
+		if filepath.Clean(configPath) == filepath.Clean(legacyConfigPath) {
+			if err := ensureLegacyAgentWarpDropIn(); err != nil {
+				return err
+			}
+		}
+	}
 	if filepath.Clean(configPath) != filepath.Clean(legacyConfigPath) {
 		if err := ensureTunnelTemplateUnit(); err != nil {
 			return err
@@ -5174,8 +5149,20 @@ func uninstall() error {
 	if err := removeRestartScheduleFiles(); err != nil {
 		return fmt.Errorf("remove Shah Tunnel restart schedule: %w", err)
 	}
+	// Restore a non-global WARP mode before removing the SSH bypass rules.
+	if _, warpErr := exec.LookPath("warp-cli"); warpErr == nil && warpNeedsProxyRestore() {
+		if warpErr := configureCloudflareWarpProxyMode(); warpErr != nil {
+			return fmt.Errorf("could not return WARP to local-proxy mode before uninstall; SSH route guard was kept: %w", warpErr)
+		}
+	}
+	if err := runWarpSSHGuardCommand("remove"); err != nil {
+		return fmt.Errorf("could not safely remove the Shah Tunnel physical-route guard; guard files and service unit were kept: %w", err)
+	}
+	_ = exec.Command("systemctl", "disable", "--now", warpGuardUnitName).Run()
 
-	for _, unitPath := range []string{"/etc/systemd/system/ravanreverse.service", "/etc/systemd/system/ravanreverse@.service"} {
+	_ = os.Remove("/etc/systemd/system/ravanreverse.service.d/20-shah-tunnel-warp-routing.conf")
+	_ = os.Remove("/etc/systemd/system/ravanreverse.service.d")
+	for _, unitPath := range []string{"/etc/systemd/system/ravanreverse.service", "/etc/systemd/system/ravanreverse@.service", warpGuardUnitPath} {
 		if err := os.Remove(unitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove service unit %s: %w", unitPath, err)
 		}
@@ -5186,7 +5173,7 @@ func uninstall() error {
 	for service := range services {
 		_ = exec.Command("systemctl", "reset-failed", service).Run()
 	}
-	for _, path := range []string{"/etc/ravanreverse", "/usr/local/bin/ravanreverse", "/usr/local/bin/shah-tunnel", "/var/backups/ravanreverse", "/var/log/ravanreverse"} {
+	for _, path := range []string{"/etc/ravanreverse", "/etc/shah-tunnel/warp-route-guard.json", warpManagedPath, "/usr/local/bin/ravanreverse", "/usr/local/bin/shah-tunnel", "/var/backups/ravanreverse", "/var/log/ravanreverse"} {
 		if err := os.RemoveAll(path); err != nil {
 			return fmt.Errorf("remove %s: %w", path, err)
 		}
@@ -5766,9 +5753,12 @@ func menu() {
 		case "3":
 			if chooseTunnel("Select the tunnel to stop (number or name)") {
 				service := currentServiceName()
+				stoppedConfig, _ := loadConfig()
 				err = runSystemctl("stop", service)
 				if err == nil && tunnelIsActive() {
 					err = fmt.Errorf("service %s is still active after stop", service)
+				} else if err == nil && stoppedConfig.Role == "agent" {
+					err = releaseManagedWarpIfUnused(configPath)
 				}
 			}
 		case "4":
@@ -5826,6 +5816,16 @@ func main() {
 		if err := repairAgentExternalPath(); err != nil {
 			log.Fatal(err)
 		}
+	case "warp-ssh-guard":
+		if !ensureRoot() {
+			os.Exit(1)
+		}
+		if len(os.Args) != 3 {
+			log.Fatal("usage: ravanreverse warp-ssh-guard install|remove")
+		}
+		if err := runWarpSSHGuardCommand(os.Args[2]); err != nil {
+			log.Fatal(err)
+		}
 	case "menu":
 		menu()
 	case "run":
@@ -5864,7 +5864,7 @@ func main() {
 	case "version", "--version", "-v":
 		fmt.Printf("Shah Tunnel %s (%s)\n", version, runtimeArch())
 	default:
-		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|repair-external|run [--config PATH]|uninstall|version]\n", version)
+		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|repair-external|warp-ssh-guard install|remove|run [--config PATH]|uninstall|version]\n", version)
 	}
 }
 
