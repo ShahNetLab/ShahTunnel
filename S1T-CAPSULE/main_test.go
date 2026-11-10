@@ -13,7 +13,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -294,7 +293,7 @@ func handleTestSOCKS5Client(client net.Conn, overrideTarget string) {
 	<-copyDone
 }
 
-func TestMode8ConnectsThroughAgentSOCKS5ExternalPath(t *testing.T) {
+func TestOption8ConnectsThroughAgentSOCKS5ExternalPath(t *testing.T) {
 	certDir := t.TempDir()
 	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
 	fingerprint, err := generateCertificate(certPath, keyPath)
@@ -342,7 +341,7 @@ func TestMode8ConnectsThroughAgentSOCKS5ExternalPath(t *testing.T) {
 		SelectedExternalPath: "tor",
 	}
 	if err := validateConfig(cfg); err != nil {
-		t.Fatalf("validate mode 8 Agent config: %v", err)
+		t.Fatalf("validate option 8 Agent config: %v", err)
 	}
 	agentDone := make(chan error, 1)
 	go func() { agentDone <- connectAndRunAgent(cfg, pin, 77) }()
@@ -351,7 +350,7 @@ func TestMode8ConnectsThroughAgentSOCKS5ExternalPath(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if h.sessionCount() != 1 {
-		t.Fatal("mode 8 did not establish an authenticated Hub lane through the selected SOCKS5 external path")
+		t.Fatal("option 8 did not establish an authenticated Hub lane through the selected SOCKS5 external path")
 	}
 	h.mu.RLock()
 	var active *hubSession
@@ -377,7 +376,7 @@ func TestMode8ConnectsThroughAgentSOCKS5ExternalPath(t *testing.T) {
 	}
 }
 
-func TestMode9FallsBackToConfiguredExternalPath(t *testing.T) {
+func TestOption9FallsBackToConfiguredExternalPath(t *testing.T) {
 	certDir := t.TempDir()
 	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
 	fingerprint, err := generateCertificate(certPath, keyPath)
@@ -438,7 +437,7 @@ func TestMode9FallsBackToConfiguredExternalPath(t *testing.T) {
 		ExternalPaths:  []AgentExternalPath{{ID: "tor", Method: "tor", Address: proxy.Addr().String()}},
 	}
 	if err := validateConfig(cfg); err != nil {
-		t.Fatalf("validate mode 8 Agent config: %v", err)
+		t.Fatalf("validate option 9 Agent config: %v", err)
 	}
 	agentDone := make(chan error, 1)
 	go func() { agentDone <- connectAndRunAgent(cfg, pin, channel) }()
@@ -447,13 +446,13 @@ func TestMode9FallsBackToConfiguredExternalPath(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if h.sessionCount() != 1 {
-		t.Fatal("mode 8 did not reach the Hub through the SOCKS5 external path after direct-route attempts failed")
+		t.Fatal("option 9 did not reach the Hub through the SOCKS5 external path after direct-route attempts failed")
 	}
 	if got, ok := agentPreferredPath.Load(channel); !ok || got != "tor" {
-		t.Fatalf("mode 8 did not remember the successful external route: got=%v present=%v", got, ok)
+		t.Fatalf("option 9 did not remember the successful external route: got=%v present=%v", got, ok)
 	}
 	if got, ok := agentPreferredTransport.Load(channel); !ok || got != transportTCP {
-		t.Fatalf("mode 8 did not remember the successful TCP/TLS carrier: got=%v present=%v", got, ok)
+		t.Fatalf("option 9 did not remember the successful TCP/TLS carrier: got=%v present=%v", got, ok)
 	}
 	h.mu.RLock()
 	var active *hubSession
@@ -975,47 +974,35 @@ func testAgentFallbackOverHTTP1(t *testing.T, agentMode string) {
 	}
 }
 
-func TestRequireCloudflareWARPConnectedFailsClosed(t *testing.T) {
-	binDir := t.TempDir()
-	warpCLI := filepath.Join(binDir, "warp-cli")
-	writeCLI := func(body string) {
-		t.Helper()
-		if err := os.WriteFile(warpCLI, []byte("#!/bin/sh\n"+body+"\n"), 0700); err != nil {
-			t.Fatal(err)
+func TestTransportMenuNumberingPreservesLegacyAndAddsOptions(t *testing.T) {
+	oldReader := stdinReader
+	oldStep := wizardStep
+	defer func() {
+		stdinReader = oldReader
+		wizardStep = oldStep
+	}()
+
+	want := map[string]string{
+		"1": transportTCP,
+		"2": transportWebSocket,
+		"3": transportHTTP2,
+		"4": transportHTTP1,
+		"5": transportHTTPConnectAuto,
+		"6": transportAuto,
+		"7": transportAdaptive,
+		"8": transportNewMethods,
+		"9": transportFullAdaptive,
+	}
+	for choice, expected := range want {
+		stdinReader = bufio.NewReader(strings.NewReader(choice + "\n"))
+		wizardStep = 0
+		got, err := wizardAskTransport("Transport")
+		if err != nil {
+			t.Fatalf("menu choice %s: %v", choice, err)
 		}
-	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	writeCLI("printf 'Status update: Connected\\nNetwork: healthy\\n'")
-	if err := requireCloudflareWARPConnected(context.Background()); err != nil {
-		t.Fatalf("healthy WARP status rejected: %v", err)
-	}
-
-	writeCLI("printf 'Status update: Disconnected\\nNetwork: healthy\\n'")
-	if err := requireCloudflareWARPConnected(context.Background()); err == nil {
-		t.Fatal("disconnected WARP status was accepted; route must fail closed")
-	}
-
-	writeCLI("printf 'Status update: Connected\\nNetwork: degraded\\n'")
-	if err := requireCloudflareWARPConnected(context.Background()); err == nil {
-		t.Fatal("unhealthy WARP status was accepted; route must fail closed")
-	}
-}
-
-func TestTransportMenuChoiceMappingKeepsLegacyMode7(t *testing.T) {
-	tests := []struct{ choice, want string }{
-		{"1", transportTCP}, {"2", transportWebSocket}, {"3", transportHTTP2},
-		{"4", transportHTTP1}, {"5", transportHTTPConnectAuto}, {"6", transportAuto},
-		{"7", transportAdaptive}, {"8", transportNewMethods}, {"9", transportFullAdaptive},
-	}
-	for _, tc := range tests {
-		got, err := transportModeForMenuChoice(tc.choice)
-		if err != nil || got != tc.want {
-			t.Fatalf("menu choice %s mapped to %q, %v; want %q", tc.choice, got, err, tc.want)
+		if got != expected {
+			t.Fatalf("menu choice %s = %q; want %q", choice, got, expected)
 		}
-	}
-	if _, err := transportModeForMenuChoice("10"); err == nil {
-		t.Fatal("out-of-range transport selection was accepted")
 	}
 }
 
@@ -1030,12 +1017,7 @@ func TestTransportConfigDefaultsAndPolicy(t *testing.T) {
 		t.Fatal("transport allow policy does not enforce expected modes")
 	}
 	if !validTransportMode(transportAdaptive) || !transportAllowed(transportAdaptive, transportTCP) || !transportAllowed(transportAdaptive, transportWebSocket) {
-		t.Fatal("legacy option 7 must allow the original adaptive native transport set")
-	}
-	for _, observed := range []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1} {
-		if !transportAllowed(transportAdaptive, observed) {
-			t.Fatalf("legacy option 7 rejected implemented transport %q", observed)
-		}
+		t.Fatal("adaptive mode must allow both implemented transports")
 	}
 	if !validTransportMode(transportHTTP2) || !transportAllowed(transportAdaptive, transportHTTP2) || !transportAllowed(transportHTTP2, transportHTTP2) {
 		t.Fatal("HTTP/2 CONNECT must be a real, selectable transport")
@@ -1047,19 +1029,22 @@ func TestTransportConfigDefaultsAndPolicy(t *testing.T) {
 		t.Fatal("HTTP CONNECT fallback must allow HTTP/2 and HTTP/1.1 only")
 	}
 	if !validTransportMode(transportNewMethods) || !transportAllowed(transportNewMethods, transportTCP) {
-		t.Fatal("mode 8 must accept the Agent external-path TCP/TLS carrier")
+		t.Fatal("option 8 must accept the Agent external-path TCP/TLS carrier")
+	}
+	if !validTransportMode(transportAdaptive) || !transportAllowed(transportAdaptive, transportTCP) || !transportAllowed(transportAdaptive, transportWebSocket) || !transportAllowed(transportAdaptive, transportHTTP2) || !transportAllowed(transportAdaptive, transportHTTP1) {
+		t.Fatal("option 7 must keep all four original native transports")
 	}
 	for _, observed := range []string{transportWebSocket, transportHTTP2, transportHTTP1} {
 		if transportAllowed(transportNewMethods, observed) {
-			t.Fatalf("mode 8 must not accept native transport %q", observed)
+			t.Fatalf("option 8 must not accept native transport %q", observed)
 		}
 	}
 	if !validTransportMode(transportFullAdaptive) {
-		t.Fatal("mode 9 must be a valid transport policy")
+		t.Fatal("option 9 must be a valid transport policy")
 	}
 	for _, observed := range []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1} {
 		if !transportAllowed(transportFullAdaptive, observed) {
-			t.Fatalf("mode 9 must accept native transport %q", observed)
+			t.Fatalf("option 9 must accept native transport %q", observed)
 		}
 	}
 	if transportAllowed(transportHTTPConnectAuto, transportTCP) || transportAllowed(transportHTTPConnectAuto, transportWebSocket) {
@@ -1089,12 +1074,22 @@ func TestAgentExternalPathConfigValidation(t *testing.T) {
 		SelectedExternalPath: "tor",
 	}
 	if err := validateConfig(base); err != nil {
-		t.Fatalf("valid mode 8 SOCKS5 Agent config rejected: %v", err)
+		t.Fatalf("valid option 8 SOCKS5 Agent config rejected: %v", err)
 	}
+	warpProxy := base
+	warpProxy.ExternalPaths = []AgentExternalPath{{ID: "warp", Method: "warp", Address: "127.0.0.1:40000"}}
+	warpProxy.SelectedExternalPath = "warp"
+	if got := externalPathKind(warpProxy.ExternalPaths[0]); got != "socks5" {
+		t.Fatalf("new WARP path kind = %q; want socks5", got)
+	}
+	if err := validateConfig(warpProxy); err != nil {
+		t.Fatalf("valid WARP local-proxy config rejected: %v", err)
+	}
+
 	missingSelected := base
 	missingSelected.SelectedExternalPath = "missing"
 	if err := validateConfig(missingSelected); err == nil {
-		t.Fatal("mode 8 accepted an unknown selected external path")
+		t.Fatal("option 8 accepted an unknown selected external path")
 	}
 	missingProxy := base
 	missingProxy.ExternalPaths = []AgentExternalPath{{ID: "tor", Method: "tor"}}
@@ -1105,7 +1100,7 @@ func TestAgentExternalPathConfigValidation(t *testing.T) {
 	full.Transport = transportFullAdaptive
 	full.SelectedExternalPath = ""
 	if err := validateConfig(full); err != nil {
-		t.Fatalf("valid mode 9 Agent config rejected: %v", err)
+		t.Fatalf("valid option 9 Agent config rejected: %v", err)
 	}
 }
 
@@ -1126,47 +1121,6 @@ func TestBackhaulForwardAddressPreservesAdjacentTransportPorts(t *testing.T) {
 	}
 }
 
-func TestCloudflareWARPConfigDefaultsToLocalProxy(t *testing.T) {
-	cfg := Config{Role: "agent", Transport: transportNewMethods, ExternalPaths: []AgentExternalPath{{ID: "warp", Method: "warp"}}, SelectedExternalPath: "warp"}
-	if err := validateAgentExternalPaths(cfg); err != nil {
-		t.Fatalf("WARP path without explicit address should use the built-in local proxy: %v", err)
-	}
-	if got := externalPathKind("warp"); got != "socks5" {
-		t.Fatalf("WARP path kind = %q; want socks5", got)
-	}
-}
-
-func TestCloudflareWARPUsesDedicatedSOCKS5Proxy(t *testing.T) {
-	target, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer target.Close()
-	proxy := startTestSOCKS5Proxy(t, "")
-	accepted := make(chan net.Conn, 1)
-	go func() {
-		c, acceptErr := target.Accept()
-		if acceptErr == nil {
-			accepted <- c
-		}
-	}()
-	path := &AgentExternalPath{ID: "warp", Method: "warp", Address: proxy.Addr().String()}
-	conn, err := dialAgentExternalPath(context.Background(), Config{}, path, target.Addr().String())
-	if err != nil {
-		t.Fatalf("dial through dedicated WARP SOCKS5 proxy: %v", err)
-	}
-	_ = conn.Close()
-	select {
-	case c := <-accepted:
-		_ = c.Close()
-	case <-time.After(2 * time.Second):
-		t.Fatal("target did not receive connection through the WARP SOCKS5 proxy")
-	}
-	if got := externalPathKind("warp"); got != "socks5" {
-		t.Fatalf("WARP external path kind = %q; want socks5", got)
-	}
-}
-
 func TestSystemExternalPathBindsToSelectedInterface(t *testing.T) {
 	if _, err := net.InterfaceByName("lo"); err != nil {
 		t.Skip("loopback interface is unavailable")
@@ -1183,7 +1137,7 @@ func TestSystemExternalPathBindsToSelectedInterface(t *testing.T) {
 			accepted <- conn
 		}
 	}()
-	path := &AgentExternalPath{ID: "masque-test", Method: "masque", Interface: "lo"}
+	path := &AgentExternalPath{ID: "warp-test", Method: "warp", Interface: "lo"}
 	conn, err := dialAgentExternalPath(context.Background(), Config{}, path, listener.Addr().String())
 	if err != nil {
 		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
@@ -1200,41 +1154,25 @@ func TestSystemExternalPathBindsToSelectedInterface(t *testing.T) {
 	}
 }
 
-func TestFullAdaptiveCandidatesDistributeAllConfiguredRoutesAcrossLanes(t *testing.T) {
+func TestFullAdaptivePathCandidatesIncludeDirectAndConfiguredRoutes(t *testing.T) {
 	cfg := Config{ExternalPaths: []AgentExternalPath{
 		{ID: "warp", Method: "warp"},
 		{ID: "tor", Method: "tor", Address: "127.0.0.1:9050"},
-		{ID: "backhaul", Method: "backhaul", Address: "127.0.0.1:19443"},
-		{ID: "psiphon", Method: "psiphon", Address: "127.0.0.1:1080"},
-		{ID: "masque", Method: "masque"},
-		{ID: "warp2", Method: "warp_on_warp"},
 	}}
-	lane1 := fullAdaptiveCandidates(cfg, 1, "", transportTCP)
-	lane5 := fullAdaptiveCandidates(cfg, 5, "", transportTCP)
-	if len(lane1) != 10 || len(lane5) != len(lane1) {
-		t.Fatalf("full adaptive candidates lane1=%d lane5=%d; want 10 each", len(lane1), len(lane5))
+	got := fullAdaptivePathCandidates(cfg, "tor")
+	if len(got) != 3 || got[0] == nil || got[0].ID != "tor" || got[1] != nil || got[2] == nil || got[2].ID != "warp" {
+		t.Fatalf("full adaptive routes = %#v; want preferred tor, direct, warp", got)
 	}
-	if lane1[0].pathID != "direct" || lane1[0].transport != transportTCP {
-		t.Fatalf("lane 1 starts with %#v; want direct TCP/TLS", lane1[0])
-	}
-	if lane5[0].pathID != "warp" || lane5[0].transport != transportTCP {
-		t.Fatalf("lane 5 starts with %#v; want WARP TCP/TLS", lane5[0])
-	}
-	seen := make(map[string]bool)
-	for lane := 1; lane <= 12; lane++ {
-		candidates := fullAdaptiveCandidates(cfg, lane, "", transportTCP)
-		key := candidates[0].pathID + "/" + candidates[0].transport
-		seen[key] = true
-	}
-	for _, want := range []string{"direct/tcp_tls", "direct/websocket_tls", "direct/http2_connect", "direct/http1_connect", "warp/tcp_tls", "tor/tcp_tls", "backhaul/tcp_tls", "psiphon/tcp_tls", "masque/tcp_tls", "warp2/tcp_tls"} {
-		if !seen[want] {
-			t.Fatalf("initial lanes did not keep candidate %q active; got %v", want, seen)
-		}
-	}
-	// A lane returns to its last successful candidate first after a reconnect.
-	preferred := fullAdaptiveCandidates(cfg, 3, "tor", transportTCP)
-	if preferred[0].pathID != "tor" || preferred[0].transport != transportTCP {
-		t.Fatalf("preferred lane candidate = %#v; want tor/TCP first", preferred[0])
+}
+
+func TestOption9StartsWithConfiguredExternalPath(t *testing.T) {
+	cfg := Config{ExternalPaths: []AgentExternalPath{
+		{ID: "warp", Method: "warp", Address: "127.0.0.1:40000"},
+		{ID: "tor", Method: "tor", Address: "127.0.0.1:9050"},
+	}}
+	got := fullAdaptivePathCandidates(cfg, cfg.ExternalPaths[0].ID)
+	if len(got) != 3 || got[0] == nil || got[0].ID != "warp" || got[1] != nil || got[2] == nil || got[2].ID != "tor" {
+		t.Fatalf("option 9 first route order = %#v; want selected WARP, direct fallback, Tor", got)
 	}
 }
 
@@ -1625,7 +1563,7 @@ func TestShahTunnelRouteDiagram(t *testing.T) {
 		"NETWORK ROUTE  /  TCP FORWARDING",
 		"CLIENT ── TCP ──▶ HUB ═ TLS 1.3 + TOKEN AUTH ═▶ AGENT",
 		"PATHS: TCP/TLS | WS/TLS | H2 CONNECT | H1 CONNECT",
-		"OPTIONS 7/8: EXTERNAL + ADAPTIVE FAILOVER",
+		"OPTIONS 7/8/9: NATIVE / EXTERNAL / COMBINED FAILOVER",
 		"CERT PINNING • TOKEN AUTH • TLS 1.3",
 	}
 	if len(shahTunnelRouteArt) != 7 {

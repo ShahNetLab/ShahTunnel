@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "2.2.2"
+	version                          = "2.2.1"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -94,13 +94,14 @@ type PortMapping struct {
 	Target string `json:"target,omitempty"` // Agent local target
 }
 
-// AgentExternalPath describes a network path which is prepared outside Shah
-// Tunnel on the Agent host. Shah Tunnel does not install or manage WARP, Tor,
-// Psiphon, or Backhaul; it uses their already-running route/proxy/forwarder.
+// AgentExternalPath describes an Agent-side egress path. New WARP/MASQUE
+// profiles use Cloudflare WARP local-proxy mode (SOCKS5), so only Shah Tunnel
+// sockets use that path and the host default route/SSH remain direct. Existing
+// 2.2.0 configs with no Address retain their legacy system-route behavior.
 //
 // Method mapping:
 //
-//	masque, warp_on_warp -> OS routing; warp -> local WARP SOCKS5 proxy
+//	masque, warp, warp_on_warp -> SOCKS5 at Address (or legacy OS route)
 //	tor, psiphon               -> local SOCKS5 proxy at Address
 //	backhaul                  -> local raw-TCP forward at Address
 type AgentExternalPath struct {
@@ -126,8 +127,8 @@ type Config struct {
 	CertFile      string `json:"cert_file,omitempty"`
 	KeyFile       string `json:"key_file,omitempty"`
 	Fingerprint   string `json:"fingerprint,omitempty"`
-	// ExternalPaths are optional Agent-side egress paths, already established
-	// by external clients. They are tried only by modes 8 and 9.
+	// ExternalPaths are optional Agent-side egress paths. They are used by the
+	// external-only and combined adaptive modes (menu options 8 and 9).
 	ExternalPaths        []AgentExternalPath `json:"external_paths,omitempty"`
 	SelectedExternalPath string              `json:"selected_external_path,omitempty"`
 	// TunnelChannels controls the number of independent authenticated TCP/TLS lanes
@@ -549,11 +550,16 @@ func validExternalPathMethod(method string) bool {
 	}
 }
 
-func externalPathKind(method string) string {
-	switch strings.ToLower(strings.TrimSpace(method)) {
-	case "masque", "warp_on_warp":
+func externalPathKind(path AgentExternalPath) string {
+	switch strings.ToLower(strings.TrimSpace(path.Method)) {
+	case "masque", "warp", "warp_on_warp":
+		// Address marks the safe, app-scoped local SOCKS5 mode. An empty
+		// Address identifies a legacy 2.2.0 system-route configuration.
+		if strings.TrimSpace(path.Address) != "" {
+			return "socks5"
+		}
 		return "system"
-	case "warp", "tor", "psiphon":
+	case "tor", "psiphon":
 		return "socks5"
 	case "backhaul":
 		return "tcp_forward"
@@ -589,7 +595,7 @@ func validateAgentExternalPaths(c Config) error {
 		if !validExternalPathMethod(path.Method) {
 			return fmt.Errorf("external Agent path %q has unsupported method %q", path.ID, path.Method)
 		}
-		switch externalPathKind(path.Method) {
+		switch externalPathKind(path) {
 		case "system":
 			// A blank interface means the external client has installed the active
 			// OS route. Supplying an interface pins the socket to that device.
@@ -600,10 +606,8 @@ func validateAgentExternalPaths(c Config) error {
 				return fmt.Errorf("external Agent path %q must not set proxy address or credentials", path.ID)
 			}
 		case "socks5":
-			if !(strings.EqualFold(path.Method, "warp") && strings.TrimSpace(path.Address) == "") {
-				if err := validateTCPAddress("SOCKS5 proxy for external Agent path "+path.ID, path.Address); err != nil {
-					return err
-				}
+			if err := validateTCPAddress("SOCKS5 proxy for external Agent path "+path.ID, path.Address); err != nil {
+				return err
 			}
 			if (path.Username == "") != (path.Password == "") {
 				return fmt.Errorf("external Agent path %q must set both SOCKS5 username and password, or neither", path.ID)
@@ -2095,45 +2099,21 @@ func connectAndRunAgentHTTPConnectAuto(cfg Config, channel int) error {
 	return connectAndRunAgentWithPathTransport(cfg, nil, channel, transportHTTPConnectAuto, nil)
 }
 
-// requireCloudflareWARPConnected prevents a configured WARP path from silently
-// falling back to the Agent's ordinary public route when WARP is disconnected.
-func requireCloudflareWARPConnected(parent context.Context) error {
-	cli, err := exec.LookPath("warp-cli")
-	if err != nil {
-		return errors.New("warp-cli is not installed; run the Shah Tunnel installer on an Ubuntu/Debian Agent")
-	}
-	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, cli, "status").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("warp-cli status failed: %w", err)
-	}
-	status := strings.ToLower(string(out))
-	if !strings.Contains(status, "status update: connected") || !strings.Contains(status, "network: healthy") {
-		return errors.New("Cloudflare WARP is not Connected with a healthy network")
-	}
-	return nil
-}
-
 // dialAgentExternalPath opens the raw TCP socket to the Hub through one
-// preconfigured Agent-side egress path. The external client itself is managed
-// by the operator: system routes for WARP/MASQUE, SOCKS5 for Tor/Psiphon, or a
-// local raw-TCP forward exposed by Backhaul.
+// preconfigured Agent-side egress path. New WARP/MASQUE paths use a local
+// SOCKS5 proxy; legacy profiles may still bind to a preconfigured interface.
+// Tor/Psiphon use SOCKS5, and Backhaul uses a local raw-TCP forward.
 func dialAgentExternalPath(ctx context.Context, cfg Config, path *AgentExternalPath, target string) (net.Conn, error) {
 	if path == nil {
 		d := net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
 		return d.DialContext(ctx, "tcp", target)
 	}
-	switch externalPathKind(path.Method) {
+	switch externalPathKind(*path) {
 	case "system":
 		d := net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
 		if path.Interface != "" {
-			iface, err := net.InterfaceByName(path.Interface)
-			if err != nil {
+			if _, err := net.InterfaceByName(path.Interface); err != nil {
 				return nil, fmt.Errorf("Agent route %s requires interface %q: %w", path.ID, path.Interface, err)
-			}
-			if iface.Flags&net.FlagUp == 0 {
-				return nil, fmt.Errorf("Agent route %s interface %q is not UP", path.ID, path.Interface)
 			}
 			d.Control = func(network, address string, raw syscall.RawConn) error {
 				var socketErr error
@@ -2145,22 +2125,9 @@ func dialAgentExternalPath(ctx context.Context, cfg Config, path *AgentExternalP
 				return socketErr
 			}
 		}
-		method := strings.ToLower(strings.TrimSpace(path.Method))
-		if method == "warp_on_warp" {
-			if err := requireCloudflareWARPConnected(ctx); err != nil {
-				return nil, fmt.Errorf("Agent route %s is unavailable: %w", path.ID, err)
-			}
-			if path.Interface == "" {
-				return nil, errors.New("WARP on WARP requires an explicitly configured nested-route interface")
-			}
-		}
 		return d.DialContext(ctx, "tcp", target)
 	case "socks5":
-		proxy := path.Address
-		if strings.EqualFold(path.Method, "warp") && strings.TrimSpace(proxy) == "" {
-			proxy = "127.0.0.1:40000"
-		}
-		return dialSOCKS5(ctx, proxy, target, path.Username, path.Password)
+		return dialSOCKS5(ctx, path.Address, target, path.Username, path.Password)
 	case "tcp_forward":
 		forwardAddr, err := backhaulForwardAddress(cfg.HubAddr, path.Address, target)
 		if err != nil {
@@ -2951,8 +2918,8 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 		if !ok {
 			return errors.New("selected Agent external path is not configured")
 		}
-		// Mode 8 intentionally uses one selected Agent route and the Hub's
-		// authenticated TCP/TLS carrier. It does not silently switch routes.
+		// Option 8 intentionally uses one selected Agent external path and the
+		// Hub's authenticated TCP/TLS carrier. It does not silently switch routes.
 		return connectAndRunAgentWithPathTransport(cfg, pin, channel, transportTCP, &path)
 	case transportFullAdaptive:
 		return connectAndRunAgentFullAdaptive(cfg, pin, channel)
@@ -2996,51 +2963,33 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 	return lastErr
 }
 
-type fullAdaptiveCandidate struct {
-	path      *AgentExternalPath
-	pathID    string
-	transport string
-}
-
-// fullAdaptiveCandidates builds every supported old/new combination for mode 9.
-// The four native transports use the direct OS route; each configured external
-// Agent path uses the authenticated TCP/TLS carrier. The candidate order is
-// rotated per lane so multiple paths are active concurrently instead of every
-// lane piling onto the first direct route.
-func fullAdaptiveCandidates(cfg Config, channel int, preferredPath, preferredTransport string) []fullAdaptiveCandidate {
-	out := make([]fullAdaptiveCandidate, 0, 4+len(cfg.ExternalPaths))
-	transports := adaptiveTransportCandidates(preferredTransport)
-	for _, transport := range transports {
-		out = append(out, fullAdaptiveCandidate{path: nil, pathID: "direct", transport: transport})
-	}
+func fullAdaptivePathCandidates(cfg Config, preferred string) []*AgentExternalPath {
+	all := make([]*AgentExternalPath, 0, len(cfg.ExternalPaths)+1)
 	for i := range cfg.ExternalPaths {
 		p := cfg.ExternalPaths[i]
-		path := p
-		out = append(out, fullAdaptiveCandidate{path: &path, pathID: p.ID, transport: transportTCP})
+		all = append(all, &p)
 	}
-	if len(out) <= 1 {
-		return out
-	}
-
-	start := -1
-	if preferredPath != "" {
-		for i, candidate := range out {
-			if candidate.pathID == preferredPath && candidate.transport == preferredTransport {
-				start = i
+	out := make([]*AgentExternalPath, 0, len(all)+1)
+	if preferred != "" && preferred != "direct" {
+		for _, p := range all {
+			if p.ID == preferred {
+				out = append(out, p)
 				break
 			}
 		}
 	}
-	if start < 0 {
-		start = (channel - 1) % len(out)
-		if start < 0 {
-			start = 0
+	// Direct mode represents the native OS route and is always part of option 9.
+	out = append(out, nil)
+	for _, p := range all {
+		if p.ID == preferred {
+			continue
 		}
+		out = append(out, p)
 	}
-	rotated := make([]fullAdaptiveCandidate, 0, len(out))
-	rotated = append(rotated, out[start:]...)
-	rotated = append(rotated, out[:start]...)
-	return rotated
+	if preferred == "direct" {
+		return out
+	}
+	return out
 }
 
 func connectAndRunAgentFullAdaptive(cfg Config, pin []byte, channel int) error {
@@ -3050,24 +2999,42 @@ func connectAndRunAgentFullAdaptive(cfg Config, pin []byte, channel int) error {
 			preferredTransport = saved
 		}
 	}
-	preferredPath := ""
+	preferredPath := "direct"
+	if len(cfg.ExternalPaths) > 0 {
+		// When the operator selected external paths for option 9, start there.
+		// The direct route remains a fallback after the selected path's four
+		// native carriers have failed.
+		preferredPath = cfg.ExternalPaths[0].ID
+	}
 	if v, ok := agentPreferredPath.Load(channel); ok {
 		if saved, ok := v.(string); ok && saved != "" {
 			preferredPath = saved
 		}
 	}
-	candidates := fullAdaptiveCandidates(cfg, channel, preferredPath, preferredTransport)
+	paths := fullAdaptivePathCandidates(cfg, preferredPath)
+	transports := adaptiveTransportCandidates(preferredTransport)
 	var lastErr error
-	for _, candidate := range candidates {
-		if err := connectAndRunAgentWithPathTransport(cfg, pin, channel, candidate.transport, candidate.path); err != nil {
-			lastErr = err
-			log.Printf("tunnel lane %d: route %s with %s failed or closed: %v", channel, candidate.pathID, candidate.transport, err)
-			continue
+	attempt := 0
+	for _, path := range paths {
+		pathID := "direct"
+		if path != nil {
+			pathID = path.ID
 		}
-		return nil
+		for _, transport := range transports {
+			attempt++
+			if err := connectAndRunAgentWithPathTransport(cfg, pin, channel, transport, path); err != nil {
+				lastErr = err
+				log.Printf("tunnel lane %d: route %s with %s failed or closed: %v", channel, pathID, transport, err)
+				continue
+			}
+			return nil
+		}
 	}
 	if lastErr == nil {
-		lastErr = errors.New("full adaptive mode has no usable path/transport candidates")
+		lastErr = net.ErrClosed
+	}
+	if attempt == 0 {
+		return errors.New("full adaptive mode has no usable path/transport candidates")
 	}
 	return lastErr
 }
@@ -3920,7 +3887,7 @@ var shahTunnelRouteArt = func() []string {
 		line("NETWORK ROUTE  /  TCP FORWARDING"),
 		line("CLIENT ── TCP ──▶ HUB ═ TLS 1.3 + TOKEN AUTH ═▶ AGENT"),
 		line("PATHS: TCP/TLS | WS/TLS | H2 CONNECT | H1 CONNECT"),
-		line("OPTIONS 7/8: EXTERNAL + ADAPTIVE FAILOVER"),
+		line("OPTIONS 7/8/9: NATIVE / EXTERNAL / COMBINED FAILOVER"),
 		line("CERT PINNING • TOKEN AUTH • TLS 1.3"),
 		"  ╰" + strings.Repeat("─", shahTunnelRouteWidth) + "╯",
 	}
@@ -4059,8 +4026,20 @@ func wizardAsk(prompt, def string) string {
 	return readAnswer(def)
 }
 
-func transportModeForMenuChoice(choice string) (string, error) {
-	switch strings.TrimSpace(choice) {
+func wizardAskTransport(prompt string) (string, error) {
+	fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "OUTER TUNNEL TRANSPORT"))
+	fmt.Printf("  %s\n", paint(ansiGreen, "1) TCP/TLS — implemented"))
+	fmt.Printf("  %s\n", paint(ansiGreen, "2) WebSocket/TLS — implemented"))
+	fmt.Printf("  %s\n", paint(ansiGreen, "3) HTTP/2 CONNECT — implemented on control port + 1"))
+	fmt.Printf("  %s\n", paint(ansiGreen, "4) HTTP/1.1 CONNECT/TLS — implemented on control port + 2"))
+	fmt.Printf("  %s\n", paint(ansiGreen, "5) HTTP CONNECT fallback — HTTP/2, then HTTP/1.1"))
+	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
+	fmt.Printf("  %s\n", paint(ansiPinkGlow+ansiBold, "7) FULL ADAPTIVE FAILOVER — all 4 implemented transports"))
+	fmt.Printf("  %s\n", paint(ansiPinkGlow, "8) EXTERNAL TUNNEL — MASQUE / WARP / WARP on WARP / TOR / Psiphon"))
+	fmt.Printf("  %s\n", paint(ansiPinkGlow+ansiBold, "9) FULL ADAPTIVE FAILOVER — all old + external transports"))
+	fmt.Printf("  %s\n", paint(ansiDim, "  Hub must allow the selected Agent mode. Option 7 keeps the original four native transports."))
+	choice := wizardAsk(prompt+" (1-9)", "7")
+	switch choice {
 	case "1":
 		return transportTCP, nil
 	case "2":
@@ -4074,44 +4053,139 @@ func transportModeForMenuChoice(choice string) (string, error) {
 	case "6":
 		return transportAuto, nil
 	case "7":
-		// Preserve the original FULL ADAPTIVE behaviour: the four native transports only.
 		return transportAdaptive, nil
 	case "8":
-		// New Agent-side external routes carried over the authenticated TCP/TLS carrier.
 		return transportNewMethods, nil
 	case "9":
-		// Combined native transports and every configured Agent-side external route.
 		return transportFullAdaptive, nil
 	default:
 		return "", errors.New("invalid transport selection; enter a number from 1 to 9")
 	}
 }
 
-func wizardAskTransport(prompt string) (string, error) {
-	fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "OUTER TUNNEL TRANSPORT"))
-	fmt.Printf("  %s\n", paint(ansiGreen, "1) TCP/TLS — implemented"))
-	fmt.Printf("  %s\n", paint(ansiGreen, "2) WebSocket/TLS — implemented"))
-	fmt.Printf("  %s\n", paint(ansiGreen, "3) HTTP/2 CONNECT — implemented on control port + 1"))
-	fmt.Printf("  %s\n", paint(ansiGreen, "4) HTTP/1.1 CONNECT/TLS — implemented on control port + 2"))
-	fmt.Printf("  %s\n", paint(ansiGreen, "5) HTTP CONNECT fallback — HTTP/2, then HTTP/1.1"))
-	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
-	fmt.Printf("  %s\n", paint(ansiPinkGlow+ansiBold, "7) FULL ADAPTIVE FAILOVER — all 4 implemented transports"))
-	fmt.Printf("  %s\n", paint(ansiPinkGlow, "8) NEW TUNNEL PROTOCOLS — MASQUE, Cloudflare WARP, WARP on WARP, TOR, Psiphon, Backhaul"))
-	fmt.Printf("  %s\n", paint(ansiPinkGlow+ansiBold, "9) FULL ADAPTIVE FAILOVER — all old + new protocols"))
-	fmt.Printf("  %s\n", paint(ansiDim, "  Hub selects what it accepts. External clients and routes are prepared on the Agent."))
-	choice := wizardAsk(prompt+" (1-9)", "9")
-	return transportModeForMenuChoice(choice)
+var errBackToTransport = errors.New("return to transport selection")
+
+func runWarpCLI(args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	// Keep terms acceptance explicit for every WARP CLI invocation.
+	if len(args) == 0 || args[0] != "--accept-tos" {
+		args = append([]string{"--accept-tos"}, args...)
+	}
+	cmd := exec.CommandContext(ctx, "warp-cli", args...)
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return string(out), fmt.Errorf("warp-cli %s timed out", strings.Join(args, " "))
+	}
+	if err != nil {
+		return string(out), fmt.Errorf("warp-cli %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
+}
+
+// configureCloudflareWarpProxy uses WARP's local-proxy mode. The WARP client
+// exposes a loopback SOCKS5 endpoint; only Shah Tunnel sockets use it. Full
+// device mode is deliberately not used because it can reroute SSH and all
+// unrelated server traffic through WARP.
+func configureCloudflareWarpProxy() error {
+	if _, err := exec.LookPath("warp-cli"); err != nil {
+		return errors.New("warp-cli is not installed; rerun the Shah Tunnel installer or install Cloudflare WARP first")
+	}
+	if out, err := exec.Command("systemctl", "start", "warp-svc").CombinedOutput(); err != nil {
+		return fmt.Errorf("could not start warp-svc: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	regOut, regErr := runWarpCLI("registration", "show")
+	regText := strings.ToLower(regOut)
+	registered := strings.Contains(regText, "account type") || strings.Contains(regText, "device id") || strings.Contains(regText, "registration id")
+	missingRegistration := strings.Contains(regText, "registration missing") || strings.Contains(regText, "missing registration") || strings.Contains(regText, "not registered") || strings.Contains(regText, "does not exist") || strings.Contains(regText, "no registration")
+	if missingRegistration {
+		uiInfo("Cloudflare registration is required. The next command accepts Cloudflare's Terms and Privacy Policy.")
+		if !wizardYesNo("Accept Cloudflare Terms and Privacy Policy and register this server? (y/N)", "n") {
+			return errors.New("Cloudflare registration was not approved; WARP path was not enabled")
+		}
+		if _, err := runWarpCLI("registration", "new"); err != nil {
+			return fmt.Errorf("Cloudflare WARP registration failed: %w", err)
+		}
+	} else if regErr != nil {
+		return fmt.Errorf("could not safely inspect the existing Cloudflare registration; leaving it unchanged: %w", regErr)
+	} else if !registered {
+		return fmt.Errorf("Cloudflare registration status was not recognized; leaving it unchanged: %s", strings.TrimSpace(regOut))
+	}
+	// Disconnect first so a previously active full-device route is removed
+	// before proxy mode is applied. This is a best-effort command on a fresh host.
+	_, _ = runWarpCLI("disconnect")
+	if _, err := runWarpCLI("mode", "proxy"); err != nil {
+		return fmt.Errorf("could not set WARP local-proxy mode: %w", err)
+	}
+	if _, err := runWarpCLI("proxy", "port", "40000"); err != nil {
+		return fmt.Errorf("could not set WARP SOCKS5 port: %w", err)
+	}
+	// Cloudflare's local-proxy mode is the app-scoped mode. Keep it on
+	// MASQUE; WireGuard/full-device mode can rewrite system routes and is
+	// deliberately not enabled for a server that must preserve SSH.
+	if _, err := runWarpCLI("tunnel", "protocol", "set", "MASQUE"); err != nil {
+		return fmt.Errorf("could not set WARP local-proxy transport to MASQUE: %w", err)
+	}
+	if _, err := runWarpCLI("connect"); err != nil {
+		return fmt.Errorf("could not connect WARP local proxy: %w", err)
+	}
+	deadline := time.Now().Add(25 * time.Second)
+	for time.Now().Before(deadline) {
+		if isTCPListenerReady("127.0.0.1:40000", 700*time.Millisecond) {
+			if err := verifyCloudflareWarpProxyEgress(); err != nil {
+				return err
+			}
+			uiSuccess("WARP SOCKS5 proxy passed its Cloudflare egress check at 127.0.0.1:40000; SSH and unrelated traffic use the normal route.")
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return errors.New("WARP did not open its local SOCKS5 listener on 127.0.0.1:40000; check warp-cli status and journalctl -u warp-svc")
+}
+
+func verifyCloudflareWarpProxyEgress() error {
+	curlPath, err := exec.LookPath("curl")
+	if err != nil {
+		return errors.New("curl is required to verify the WARP SOCKS5 egress path")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 22*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, curlPath, "--fail", "--silent", "--show-error", "--max-time", "18", "--proxy", "socks5h://127.0.0.1:40000", "https://www.cloudflare.com/cdn-cgi/trace")
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return errors.New("WARP SOCKS5 egress test timed out; the path was not saved")
+	}
+	if err != nil {
+		return fmt.Errorf("WARP SOCKS5 egress test failed; the path was not saved: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	trace := strings.ToLower(string(out))
+	if !strings.Contains(trace, "warp=on") && !strings.Contains(trace, "warp=plus") {
+		return fmt.Errorf("Cloudflare trace did not confirm WARP (expected warp=on or warp=plus); path was not saved: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func isTCPListenerReady(address string, timeout time.Duration) bool {
+	conn, err := net.DialTimeout("tcp", address, timeout)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 func wizardAskAgentExternalPath(existing []AgentExternalPath) (AgentExternalPath, error) {
 	fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "AGENT EXTERNAL TUNNEL PATH"))
-	fmt.Printf("  %s\n", "1) MASQUE — use the already configured Agent OS route/interface")
-	fmt.Printf("  %s\n", "2) Cloudflare WARP — use the dedicated local SOCKS5 proxy (127.0.0.1:40000)")
-	fmt.Printf("  %s\n", "3) WARP on WARP — use the already prepared nested WARP route/interface")
+	fmt.Printf("  %s\n", "1) MASQUE — use a preconfigured local MASQUE-to-SOCKS5 gateway")
+	fmt.Printf("  %s\n", "2) Cloudflare WARP — app-scoped local SOCKS5 proxy (MASQUE)")
+	fmt.Printf("  %s\n", "3) WARP on WARP — use a preconfigured second WARP SOCKS5 endpoint")
 	fmt.Printf("  %s\n", "4) TOR — connect through a local SOCKS5 proxy")
 	fmt.Printf("  %s\n", "5) Psiphon — connect through its local SOCKS5 proxy")
-	fmt.Printf("  %s\n", "6) Backhaul — connect through its local raw-TCP forward")
-	choice := wizardAsk("Select prepared Agent path (1-6)", "2")
+	fmt.Printf("  %s\n", paint(ansiDim, "6) Back — return to OUTER TUNNEL TRANSPORT"))
+	choice := wizardAsk("Select external path (1-6)", "1")
+	if choice == "6" {
+		return AgentExternalPath{}, errBackToTransport
+	}
 	path := AgentExternalPath{}
 	switch choice {
 	case "1":
@@ -4124,10 +4198,8 @@ func wizardAskAgentExternalPath(existing []AgentExternalPath) (AgentExternalPath
 		path.Method, path.ID = "tor", "tor"
 	case "5":
 		path.Method, path.ID = "psiphon", "psiphon"
-	case "6":
-		path.Method, path.ID = "backhaul", "backhaul"
 	default:
-		return path, errors.New("invalid Agent external path; enter a number from 1 to 6")
+		return path, errors.New("invalid external path; enter a number from 1 to 6")
 	}
 	baseID := path.ID
 	for n := 2; ; n++ {
@@ -4144,22 +4216,38 @@ func wizardAskAgentExternalPath(existing []AgentExternalPath) (AgentExternalPath
 	if _, exists := findExternalPath(existing, path.ID); exists {
 		return path, fmt.Errorf("external path ID %q is already used; choose a different ID", path.ID)
 	}
-	switch externalPathKind(path.Method) {
-	case "system":
-		path.Interface = strings.TrimSpace(wizardAsk("Linux interface carrying this route (blank uses the Agent OS routing table)", ""))
-		if path.Interface != "" && (len(path.Interface) > 15 || strings.ContainsAny(path.Interface, " \t\r\n/\\")) {
-			return path, errors.New("invalid Linux network interface name")
+	switch path.Method {
+	case "masque":
+		path.Address = strings.TrimSpace(wizardAsk("Local MASQUE gateway SOCKS5 address (must already be running)", "127.0.0.1:40001"))
+		if err := validateTCPAddress("MASQUE gateway SOCKS5 endpoint", path.Address); err != nil {
+			return path, err
 		}
-		uiInfo("Cloudflare WARP uses MASQUE Local Proxy mode; only this tunnel carrier uses WARP. WARP on WARP requires a separately prepared nested route.")
-	case "socks5":
+		uiInfo("This entry is a local SOCKS5 gateway backed by a MASQUE client; Shah Tunnel does not start a standalone MASQUE client.")
+	case "warp":
+		if wizardYesNo("Configure Cloudflare WARP in app-scoped local-proxy mode now? (Y/n)", "y") {
+			if err := configureCloudflareWarpProxy(); err != nil {
+				return path, err
+			}
+		} else {
+			if !isTCPListenerReady("127.0.0.1:40000", 1200*time.Millisecond) {
+				return path, errors.New("WARP local proxy is not listening at 127.0.0.1:40000; configure WARP proxy mode first")
+			}
+			if err := verifyCloudflareWarpProxyEgress(); err != nil {
+				return path, err
+			}
+			uiInfo("Using the verified WARP local SOCKS5 proxy. The system default route remains outside this proxy.")
+		}
+		path.Address = "127.0.0.1:40000"
+	case "warp_on_warp":
+		path.Address = strings.TrimSpace(wizardAsk("Second WARP-chain SOCKS5 endpoint", "127.0.0.1:40002"))
+		if err := validateTCPAddress("WARP-on-WARP SOCKS5 endpoint", path.Address); err != nil {
+			return path, err
+		}
+		uiInfo("This endpoint must be provided by a separately running second WARP proxy/chain. Shah Tunnel will not create a second Cloudflare registration on top of the first.")
+	case "tor", "psiphon":
 		defaultProxy := "127.0.0.1:9050"
-		if path.Method == "warp" {
-			defaultProxy = "127.0.0.1:40000"
-		} else if path.Method == "psiphon" {
-			// Psiphon deployments often use a dynamically selected local port.
-			// Require the operator to enter the actual endpoint rather than
-			// assuming one universal default.
-			defaultProxy = ""
+		if path.Method == "psiphon" {
+			defaultProxy = "127.0.0.1:1080"
 		}
 		path.Address = strings.TrimSpace(wizardAsk("Local SOCKS5 proxy address", defaultProxy))
 		if err := validateTCPAddress("SOCKS5 proxy", path.Address); err != nil {
@@ -4169,17 +4257,7 @@ func wizardAskAgentExternalPath(existing []AgentExternalPath) (AgentExternalPath
 		if path.Username != "" {
 			path.Password = wizardAsk("SOCKS5 password", "")
 		}
-		if path.Method == "warp" {
-			uiInfo("WARP Local Proxy: only Shah Tunnel carrier connections use 127.0.0.1:40000; other server traffic and SSH stay on the normal route.")
-		} else {
-			uiInfo("Shah Tunnel will open the Hub connection through this SOCKS5 proxy, with remote DNS for hostnames.")
-		}
-	case "tcp_forward":
-		path.Address = strings.TrimSpace(wizardAsk("Backhaul local raw-TCP forward address (IP:PORT)", ""))
-		if err := validateTCPAddress("Backhaul local TCP forward", path.Address); err != nil {
-			return path, err
-		}
-		uiInfo("Backhaul must expose raw TCP forwarding to the Hub control port; mode 9 also needs control+1 and control+2 forwards for HTTP/2 and HTTP/1.1 CONNECT candidates.")
+		uiInfo("Shah Tunnel will open the Hub connection through this SOCKS5 proxy, with remote DNS for hostnames.")
 	}
 	return path, nil
 }
@@ -4311,12 +4389,12 @@ func setup() error {
 		if err != nil {
 			return err
 		}
-		if c.Transport == transportAdaptive {
-			uiInfo("Mode 7 preserves the original full adaptive policy: all four implemented native transports only.")
-		} else if c.Transport == transportNewMethods {
-			uiInfo("Mode 8 accepts the Agent's authenticated TCP/TLS carrier. Configure the selected external route on the Agent host.")
+		if c.Transport == transportNewMethods {
+			uiInfo("Hub will accept the Agent's authenticated TCP/TLS carrier only. Configure option 8 and its external path on the Agent host.")
+		} else if c.Transport == transportAdaptive {
+			uiInfo("Hub will accept the four original native transports. Select option 7 on the Agent too.")
 		} else if c.Transport == transportFullAdaptive {
-			uiInfo("Mode 9 accepts all four old native transports. Agent lanes are distributed across native and configured external paths; failed lanes retry the remaining candidates. Select mode 9 on the Agent too.")
+			uiInfo("Hub will accept all four native transports; the Agent can combine them with external paths. Select option 9 on the Agent too.")
 		} else {
 			uiInfo("Allow TCP on the control port, control+1 for HTTP/2 CONNECT, and control+2 for HTTP/1.1 CONNECT as selected. Select the same transport policy on both endpoints.")
 		}
@@ -4377,33 +4455,50 @@ func setup() error {
 		c.Role = "agent"
 		c.TunnelChannels = defaultTunnelChannels
 		c.HubAddr = wizardAsk("Reachable Iran Hub address as IP:PORT or hostname:PORT (control port)", "")
-		c.Transport, err = wizardAskTransport("Agent transport mode (must be allowed by Hub)")
-		if err != nil {
-			return err
-		}
-		if c.Transport == transportNewMethods {
-			path, pathErr := wizardAskAgentExternalPath(nil)
-			if pathErr != nil {
-				return pathErr
+		for {
+			c.Transport, err = wizardAskTransport("Agent transport mode (must be allowed by Hub)")
+			if err != nil {
+				return err
 			}
-			c.ExternalPaths = append(c.ExternalPaths, path)
-			c.SelectedExternalPath = path.ID
-		} else if c.Transport == transportFullAdaptive {
-			if wizardYesNo("Configure one or more prepared external Agent paths now? (Y/n)", "y") {
-				for len(c.ExternalPaths) < 6 {
-					path, pathErr := wizardAskAgentExternalPath(c.ExternalPaths)
-					if pathErr != nil {
-						return pathErr
-					}
-					c.ExternalPaths = append(c.ExternalPaths, path)
-					if len(c.ExternalPaths) >= 6 || !wizardYesNo("Add another external Agent path? (y/N)", "n") {
-						break
+			if c.Transport != transportFullAdaptive {
+				c.ExternalPaths = nil
+				c.SelectedExternalPath = ""
+			}
+			if c.Transport == transportNewMethods {
+				path, pathErr := wizardAskAgentExternalPath(nil)
+				if errors.Is(pathErr, errBackToTransport) {
+					continue
+				}
+				if pathErr != nil {
+					return pathErr
+				}
+				c.ExternalPaths = append(c.ExternalPaths, path)
+				c.SelectedExternalPath = path.ID
+			} else if c.Transport == transportFullAdaptive {
+				if wizardYesNo("Configure one or more external Agent paths now? (Y/n)", "y") {
+					for len(c.ExternalPaths) < maxExternalAgentPaths {
+						path, pathErr := wizardAskAgentExternalPath(c.ExternalPaths)
+						if errors.Is(pathErr, errBackToTransport) {
+							c.Transport = ""
+							break
+						}
+						if pathErr != nil {
+							return pathErr
+						}
+						c.ExternalPaths = append(c.ExternalPaths, path)
+						if len(c.ExternalPaths) >= maxExternalAgentPaths || !wizardYesNo("Add another external Agent path? (y/N)", "n") {
+							break
+						}
 					}
 				}
+				if c.Transport == "" {
+					continue
+				}
+				if len(c.ExternalPaths) == 0 {
+					uiInfo("No external paths configured. Option 9 will try all four native transports over the direct Agent route.")
+				}
 			}
-			if len(c.ExternalPaths) == 0 {
-				uiInfo("No external paths configured. Mode 9 will still try all four native transports over the Agent OS route.")
-			}
+			break
 		}
 		if transportModeAllowsHTTP2(c.Transport) {
 			uiInfo("HTTP/2 CONNECT uses TCP port " + nextPortLabel(c.HubAddr) + ". Open it in the Hub firewall if selected.")
