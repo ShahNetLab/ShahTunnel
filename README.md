@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>V2.2.4 · Secure Reverse TCP Relay · External Paths + Adaptive Failover</strong></p>
+<p align="center"><strong>V2.2.5 · Secure Reverse TCP Relay · External Paths + Adaptive Failover</strong></p>
 <p align="center">A reverse TCP relay that carries public client connections through a Hub to mapped target services via authenticated Agent lanes. The private Hub↔Agent channel uses TLS 1.3, SHA-256 certificate pinning and adaptive recovery across four native transports and preconfigured Agent-side external network paths.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
@@ -98,4 +98,4 @@ On supported Debian/Ubuntu APT systems, the installer also installs the official
 
 ### WARP installation on restricted networks
 
-The installer uses bounded timeouts when retrieving Cloudflare's official signing key. If `pkg.cloudflareclient.com` is unreachable from the VPS network, WARP package setup is skipped with a clear warning and the Shah Tunnel core installation continues; no routes are changed during installation. WARP paths remain unavailable until the official client is installed. At tunnel start, WARP device mode is refused if nftables, a physical default route, or the SSH route guard cannot be prepared safely.
+The installer uses bounded timeouts when retrieving Cloudflare's official signing key. If `pkg.cloudflareclient.com` is unreachable from the VPS network, WARP package setup is skipped with a clear warning and the Shah Tunnel core installation continues; no routes are changed during installation. WARP paths remain unavailable until the official client is installed. At tunnel start, WARP device mode is refused if nftables, a physical default route, or the SSH route guard cannot be prepared safely. A not-yet-created numeric FIB table is treated as empty and is instantiated when Shah Tunnel adds its physical default route; existing routes or policy rules that reference the reserved table IDs are left untouched and cause a safe refusal.
