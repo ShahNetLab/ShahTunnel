@@ -293,6 +293,25 @@ func handleTestSOCKS5Client(client net.Conn, overrideTarget string) {
 	<-copyDone
 }
 
+func TestVerifySOCKS5ProxyHandshake(t *testing.T) {
+	proxy := startTestSOCKS5Proxy(t, "")
+	if err := verifySOCKS5ProxyHandshake(proxy.Addr().String(), "", ""); err != nil {
+		t.Fatalf("valid SOCKS5 endpoint rejected: %v", err)
+	}
+}
+
+func TestVerifySOCKS5ProxyHandshakeRejectsMissingEndpoint(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	_ = listener.Close()
+	if err := verifySOCKS5ProxyHandshake(address, "", ""); err == nil {
+		t.Fatal("missing SOCKS5 endpoint was accepted")
+	}
+}
+
 func TestOption8ConnectsThroughAgentSOCKS5ExternalPath(t *testing.T) {
 	certDir := t.TempDir()
 	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
@@ -1101,6 +1120,33 @@ func TestAgentExternalPathConfigValidation(t *testing.T) {
 	full.SelectedExternalPath = ""
 	if err := validateConfig(full); err != nil {
 		t.Fatalf("valid option 9 Agent config rejected: %v", err)
+	}
+}
+
+func TestReplaceConfiguredExternalPathPreservesAgentSettings(t *testing.T) {
+	cfg := Config{
+		Name:                 "s",
+		Version:              version,
+		Role:                 "agent",
+		Transport:            transportNewMethods,
+		HubAddr:              "91.223.61.40:9443",
+		TLSServerName:        "shahl.f82.ir",
+		Token:                strings.Repeat("a", 64),
+		Fingerprint:          strings.Repeat("b", 64),
+		TunnelChannels:       12,
+		Ports:                []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
+		ExternalPaths:        []AgentExternalPath{{ID: "masque", Method: "masque", Address: "127.0.0.1:40001"}},
+		SelectedExternalPath: "masque",
+	}
+	updated, err := replaceConfiguredExternalPath(cfg, "masque", AgentExternalPath{ID: "warp", Method: "warp", Address: "127.0.0.1:40000"})
+	if err != nil {
+		t.Fatalf("replace external path: %v", err)
+	}
+	if updated.SelectedExternalPath != "warp" || len(updated.ExternalPaths) != 1 || updated.ExternalPaths[0].Address != "127.0.0.1:40000" {
+		t.Fatalf("replacement path not applied: %+v", updated.ExternalPaths)
+	}
+	if updated.Token != cfg.Token || updated.Fingerprint != cfg.Fingerprint || updated.HubAddr != cfg.HubAddr || updated.TLSServerName != cfg.TLSServerName || updated.TunnelChannels != cfg.TunnelChannels || updated.Ports[0] != cfg.Ports[0] {
+		t.Fatal("external path repair changed unrelated Agent settings")
 	}
 }
 

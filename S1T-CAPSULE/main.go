@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "2.2.1"
+	version                          = "2.2.2"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -4091,8 +4091,8 @@ func configureCloudflareWarpProxy() error {
 	if _, err := exec.LookPath("warp-cli"); err != nil {
 		return errors.New("warp-cli is not installed; rerun the Shah Tunnel installer or install Cloudflare WARP first")
 	}
-	if out, err := exec.Command("systemctl", "start", "warp-svc").CombinedOutput(); err != nil {
-		return fmt.Errorf("could not start warp-svc: %w: %s", err, strings.TrimSpace(string(out)))
+	if out, err := exec.Command("systemctl", "enable", "--now", "warp-svc").CombinedOutput(); err != nil {
+		return fmt.Errorf("could not enable/start warp-svc: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	regOut, regErr := runWarpCLI("registration", "show")
 	regText := strings.ToLower(regOut)
@@ -4174,6 +4174,60 @@ func isTCPListenerReady(address string, timeout time.Duration) bool {
 	return true
 }
 
+// verifySOCKS5ProxyHandshake prevents a profile from being saved with a
+// merely syntactically valid but absent/non-SOCKS listener (for example the
+// old default MASQUE port 127.0.0.1:40001 when no gateway is installed).
+// It validates only the local SOCKS5 greeting/authentication; the real Hub
+// connection is still tested by the Agent runtime and never changes host routes.
+func verifySOCKS5ProxyHandshake(address, username, password string) error {
+	d := net.Dialer{Timeout: 3 * time.Second}
+	conn, err := d.Dial("tcp", address)
+	if err != nil {
+		return fmt.Errorf("SOCKS5 endpoint %s is not reachable: %w", address, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	methods := []byte{0x05, 0x01, 0x00}
+	if username != "" {
+		methods = []byte{0x05, 0x02, 0x00, 0x02}
+	}
+	if err := writeFull(conn, methods); err != nil {
+		return fmt.Errorf("SOCKS5 greeting failed at %s: %w", address, err)
+	}
+	var selected [2]byte
+	if _, err := io.ReadFull(conn, selected[:]); err != nil {
+		return fmt.Errorf("SOCKS5 handshake failed at %s: %w", address, err)
+	}
+	if selected[0] != 0x05 || selected[1] == 0xff {
+		return fmt.Errorf("endpoint %s is not an available SOCKS5 proxy (method=%d)", address, selected[1])
+	}
+	switch selected[1] {
+	case 0x00:
+		return nil
+	case 0x02:
+		if username == "" || len(username) > 255 || len(password) > 255 {
+			return fmt.Errorf("SOCKS5 endpoint %s requires credentials; configure username and password", address)
+		}
+		auth := []byte{0x01, byte(len(username))}
+		auth = append(auth, []byte(username)...)
+		auth = append(auth, byte(len(password)))
+		auth = append(auth, []byte(password)...)
+		if err := writeFull(conn, auth); err != nil {
+			return fmt.Errorf("SOCKS5 authentication write failed at %s: %w", address, err)
+		}
+		var reply [2]byte
+		if _, err := io.ReadFull(conn, reply[:]); err != nil {
+			return fmt.Errorf("SOCKS5 authentication reply failed at %s: %w", address, err)
+		}
+		if reply[0] != 0x01 || reply[1] != 0x00 {
+			return fmt.Errorf("SOCKS5 endpoint %s rejected the configured credentials", address)
+		}
+		return nil
+	default:
+		return fmt.Errorf("SOCKS5 endpoint %s selected unsupported authentication method %d", address, selected[1])
+	}
+}
+
 func wizardAskAgentExternalPath(existing []AgentExternalPath) (AgentExternalPath, error) {
 	fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "AGENT EXTERNAL TUNNEL PATH"))
 	fmt.Printf("  %s\n", "1) MASQUE — use a preconfigured local MASQUE-to-SOCKS5 gateway")
@@ -4182,7 +4236,7 @@ func wizardAskAgentExternalPath(existing []AgentExternalPath) (AgentExternalPath
 	fmt.Printf("  %s\n", "4) TOR — connect through a local SOCKS5 proxy")
 	fmt.Printf("  %s\n", "5) Psiphon — connect through its local SOCKS5 proxy")
 	fmt.Printf("  %s\n", paint(ansiDim, "6) Back — return to OUTER TUNNEL TRANSPORT"))
-	choice := wizardAsk("Select external path (1-6)", "1")
+	choice := wizardAsk("Select external path (1-6)", "2")
 	if choice == "6" {
 		return AgentExternalPath{}, errBackToTransport
 	}
@@ -4222,6 +4276,10 @@ func wizardAskAgentExternalPath(existing []AgentExternalPath) (AgentExternalPath
 		if err := validateTCPAddress("MASQUE gateway SOCKS5 endpoint", path.Address); err != nil {
 			return path, err
 		}
+		if err := verifySOCKS5ProxyHandshake(path.Address, "", ""); err != nil {
+			return path, fmt.Errorf("MASQUE gateway is not ready: %w. Select option 2 for automatic Cloudflare WARP setup, or start the MASQUE-to-SOCKS5 gateway first", err)
+		}
+		uiSuccess("The preconfigured MASQUE SOCKS5 gateway answered its handshake.")
 		uiInfo("This entry is a local SOCKS5 gateway backed by a MASQUE client; Shah Tunnel does not start a standalone MASQUE client.")
 	case "warp":
 		if wizardYesNo("Configure Cloudflare WARP in app-scoped local-proxy mode now? (Y/n)", "y") {
@@ -4243,6 +4301,10 @@ func wizardAskAgentExternalPath(existing []AgentExternalPath) (AgentExternalPath
 		if err := validateTCPAddress("WARP-on-WARP SOCKS5 endpoint", path.Address); err != nil {
 			return path, err
 		}
+		if err := verifySOCKS5ProxyHandshake(path.Address, "", ""); err != nil {
+			return path, fmt.Errorf("second WARP SOCKS5 endpoint is not ready: %w", err)
+		}
+		uiSuccess("The second WARP SOCKS5 endpoint answered its handshake.")
 		uiInfo("This endpoint must be provided by a separately running second WARP proxy/chain. Shah Tunnel will not create a second Cloudflare registration on top of the first.")
 	case "tor", "psiphon":
 		defaultProxy := "127.0.0.1:9050"
@@ -4257,9 +4319,166 @@ func wizardAskAgentExternalPath(existing []AgentExternalPath) (AgentExternalPath
 		if path.Username != "" {
 			path.Password = wizardAsk("SOCKS5 password", "")
 		}
+		if err := verifySOCKS5ProxyHandshake(path.Address, path.Username, path.Password); err != nil {
+			return path, fmt.Errorf("selected SOCKS5 service is not ready: %w", err)
+		}
+		uiSuccess("The selected SOCKS5 proxy answered its handshake.")
 		uiInfo("Shah Tunnel will open the Hub connection through this SOCKS5 proxy, with remote DNS for hostnames.")
 	}
 	return path, nil
+}
+
+// replaceConfiguredExternalPath changes one Agent-side egress path while
+// preserving every unrelated Hub, token, certificate, mapping and lane field.
+func replaceConfiguredExternalPath(c Config, oldID string, next AgentExternalPath) (Config, error) {
+	if c.Role != "agent" {
+		return c, errors.New("external path repair is available only for Agent profiles")
+	}
+	if c.Transport != transportNewMethods && c.Transport != transportFullAdaptive {
+		return c, errors.New("external path repair requires Agent transport option 8 or 9")
+	}
+	if !validMappingID(next.ID) || !validExternalPathMethod(next.Method) {
+		return c, errors.New("replacement external path has an invalid ID or method")
+	}
+	index := -1
+	for i := range c.ExternalPaths {
+		if c.ExternalPaths[i].ID == oldID && oldID != "" {
+			index = i
+			break
+		}
+	}
+	if oldID != "" && index < 0 {
+		return c, fmt.Errorf("external path %q was not found", oldID)
+	}
+	for i, path := range c.ExternalPaths {
+		if i != index && path.ID == next.ID {
+			return c, fmt.Errorf("external path ID %q is already used", next.ID)
+		}
+	}
+	if index >= 0 {
+		c.ExternalPaths[index] = next
+	} else {
+		if c.Transport != transportFullAdaptive {
+			return c, errors.New("option 8 must replace its selected external path")
+		}
+		c.ExternalPaths = append(c.ExternalPaths, next)
+	}
+	if c.Transport == transportNewMethods || c.SelectedExternalPath == oldID || c.SelectedExternalPath == "" {
+		c.SelectedExternalPath = next.ID
+	}
+	c = normalizeConfig(c)
+	if err := validateConfig(c); err != nil {
+		return c, err
+	}
+	return c, nil
+}
+
+// repairAgentExternalPath interactively repairs an existing profile in place.
+// It writes a private backup and rolls back the config if the service cannot
+// restart, avoiding the need to delete/recreate a tunnel or re-enter secrets.
+func repairAgentExternalPath() error {
+	if !chooseTunnel("Select the Agent tunnel to repair") {
+		return nil
+	}
+	c, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if c.Role != "agent" {
+		return errors.New("the selected profile is not an Agent")
+	}
+	if c.Transport != transportNewMethods && c.Transport != transportFullAdaptive {
+		return errors.New("select an Agent configured with option 8 or 9")
+	}
+	oldID := c.SelectedExternalPath
+	if c.Transport == transportFullAdaptive {
+		if len(c.ExternalPaths) == 0 {
+			uiInfo("No external path exists yet. A new one will be added; all four old transports remain enabled.")
+			oldID = ""
+		} else {
+			defaultIndex := 1
+			for i, path := range c.ExternalPaths {
+				if path.ID == c.SelectedExternalPath {
+					defaultIndex = i + 1
+					break
+				}
+			}
+			fmt.Println(paint(ansiCyan+ansiBold, "\n  CONFIGURED EXTERNAL PATHS"))
+			for i, path := range c.ExternalPaths {
+				marker := ""
+				if path.ID == c.SelectedExternalPath {
+					marker = "  [preferred]"
+				}
+				fmt.Printf("  [%d] %-16s %-12s %s%s\n", i+1, path.ID, path.Method, path.Address, marker)
+			}
+			choice := wizardAsk("Select external path to replace", strconv.Itoa(defaultIndex))
+			index, parseErr := strconv.Atoi(choice)
+			if parseErr != nil || index < 1 || index > len(c.ExternalPaths) {
+				return errors.New("invalid external path selection")
+			}
+			oldID = c.ExternalPaths[index-1].ID
+		}
+	}
+	remaining := make([]AgentExternalPath, 0, len(c.ExternalPaths))
+	for _, path := range c.ExternalPaths {
+		if path.ID != oldID {
+			remaining = append(remaining, path)
+		}
+	}
+	wizardStep = 0
+	next, err := wizardAskAgentExternalPath(remaining)
+	if err != nil {
+		return err
+	}
+	updated, err := replaceConfiguredExternalPath(c, oldID, next)
+	if err != nil {
+		return err
+	}
+	uiInfo(fmt.Sprintf("Replacement: %s via %s at %s. Existing token, fingerprint, Hub address, mappings and channel count remain unchanged.", next.ID, next.Method, next.Address))
+	if !wizardYesNo("Apply this path change to the selected profile? (Y/n)", "y") {
+		return errors.New("repair cancelled; existing configuration was not changed")
+	}
+	original, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("read original config for backup: %w", err)
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return err
+	}
+	backupPath := configPath + ".bak-before-external-repair-" + time.Now().Format("20060102-150405")
+	if err := os.WriteFile(backupPath, original, info.Mode().Perm()); err != nil {
+		return fmt.Errorf("create config backup: %w", err)
+	}
+	_ = os.Chmod(backupPath, 0600)
+	service := currentServiceName()
+	wasActive := tunnelIsActive()
+	if wasActive {
+		if err := runSystemctl("stop", service); err != nil {
+			return fmt.Errorf("could not stop %s; original config was preserved: %w", service, err)
+		}
+	}
+	if err := saveConfig(updated); err != nil {
+		if wasActive {
+			_ = runSystemctl("start", service)
+		}
+		return fmt.Errorf("save repaired profile: %w; original backup: %s", err, backupPath)
+	}
+	if wasActive {
+		if err := ensureTunnelRunning(true); err != nil {
+			rollbackErr := os.WriteFile(configPath, original, 0600)
+			_ = runSystemctl("start", service)
+			if rollbackErr != nil {
+				return fmt.Errorf("restart failed (%v) and automatic config rollback failed (%v); original backup is %s", err, rollbackErr, backupPath)
+			}
+			return fmt.Errorf("restart failed; original config was restored and previous service restart attempted. Backup: %s; cause: %w", backupPath, err)
+		}
+	}
+	uiSuccess("External path updated safely. Backup: " + backupPath)
+	if !wasActive {
+		uiInfo("The tunnel was stopped before repair and remains stopped. Start it from the menu when ready.")
+	}
+	return nil
 }
 
 func wizardYesNo(prompt, def string) bool {
@@ -5600,6 +5819,13 @@ func main() {
 		if err := setup(); err != nil {
 			log.Fatal(err)
 		}
+	case "repair-external":
+		if !ensureRoot() {
+			os.Exit(1)
+		}
+		if err := repairAgentExternalPath(); err != nil {
+			log.Fatal(err)
+		}
 	case "menu":
 		menu()
 	case "run":
@@ -5638,7 +5864,7 @@ func main() {
 	case "version", "--version", "-v":
 		fmt.Printf("Shah Tunnel %s (%s)\n", version, runtimeArch())
 	default:
-		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|run [--config PATH]|uninstall|version]\n", version)
+		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|repair-external|run [--config PATH]|uninstall|version]\n", version)
 	}
 }
 
