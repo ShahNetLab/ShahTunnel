@@ -3,8 +3,8 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>V2.2.2 · Secure Reverse TCP Relay · Legacy + New Protocol Failover</strong></p>
-<p align="center">A reverse TCP relay that carries public client connections through a Hub to mapped target services via authenticated Agent lanes. The private Hub↔Agent channel uses TLS 1.3, SHA-256 certificate pinning and independent lane recovery. Option 7 preserves the original four native transports; option 8 adds Agent-side external paths; option 9 combines both sets.</p>
+<p align="center"><strong>V2.2.1 · Secure Reverse TCP Relay · External Paths + Adaptive Failover</strong></p>
+<p align="center">A reverse TCP relay that carries public client connections through a Hub to mapped target services via authenticated Agent lanes. The private Hub↔Agent channel uses TLS 1.3, SHA-256 certificate pinning and adaptive recovery across four native transports and preconfigured Agent-side external network paths.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
 ## Network flow
@@ -16,14 +16,14 @@
 ## Features
 
 - **Four implemented transports:** TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT and HTTP/1.1 CONNECT/TLS.
-- **Adaptive recovery:** option 7 preserves the old four-transport policy. Option 9 distributes independent lanes across the four direct/native transport variants and each configured Agent external route, so healthy routes can be active concurrently. With the default 12 lanes, the four native variants plus up to six external routes can each receive a lane. If a lane's route fails, that lane rotates through the remaining candidates and reconnects with jittered backoff. A broken active TCP stream is re-established; its existing application session cannot be migrated seamlessly to another socket.
+- **Automatic recovery:** reconnect with jittered backoff; options 7 and 9 adaptively select the last successful native transport and (for option 9) external route per lane.
 - **Security:** TLS 1.3 for the private Hub↔Agent channel, token authentication and SHA-256 certificate pinning.
 - **Concurrency:** twelve independent lanes by default, bounded queues and load-aware session selection.
 - **Management:** interactive CLI, systemd integration, status and logs, installer and local verification script.
 
 ## Transport menu
 
-Choose the same transport or strategy on both Hub and Agent.
+Choose the same transport policy on both Hub and Agent. Options 1–7 retain their original meaning; options 8 and 9 add external routing without replacing the old transports.
 
 | Option | Transport / strategy | Behaviour |
 |---|---|---|
@@ -33,34 +33,30 @@ Choose the same transport or strategy on both Hub and Agent.
 | `4` | HTTP/1.1 CONNECT/TLS | CONNECT stream over TLS on control port + 2. |
 | `5` | HTTP CONNECT fallback | Tries HTTP/2 CONNECT, then HTTP/1.1 CONNECT if setup fails. |
 | `6` | Automatic fallback | TCP/TLS, then WebSocket/TLS. |
-| `7` | **FULL ADAPTIVE FAILOVER — legacy** | Preserves the original adaptive mode: only the four implemented native transports (TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT and HTTP/1.1 CONNECT). It does not add Agent external paths. |
-| `8` | **NEW TUNNEL PROTOCOLS** | Uses one selected, prepared Agent-side path: MASQUE / Cloudflare WARP / WARP on WARP / Tor / Psiphon / Backhaul. The authenticated carrier to the Hub is TCP/TLS. |
-| `9` | **FULL ADAPTIVE FAILOVER — all old + new** | Combines the four native transports with every configured Agent external path. Each lane tries candidates and reconnects through the next available candidate after a failure. The direct OS route is tried as well. |
+| `7` | FULL ADAPTIVE FAILOVER — legacy | Preserves the original four implemented transports and fails over among them. |
+| `8` | EXTERNAL TUNNEL | Uses one selected Agent-side external path with the authenticated TCP/TLS carrier. |
+| `9` | FULL ADAPTIVE FAILOVER — all | Tries all four native transports over configured external paths and the direct route; selected external path is tried first, with direct/native fallbacks. |
 
-The Hub controls which carrier/transport modes it accepts. Configure external clients and routes on the Agent. Options 7–9 must be selected consistently on both endpoints.
-
-**Upgrade compatibility:** existing `agent_external_tcp` profiles continue to use their one selected external Agent path (now option 8). Existing `full_adaptive` profiles keep their combined adaptive behavior (now option 9). The installer does not rewrite or remove existing tunnel profiles.
 ### Hub firewall ports
 
 If the Hub control port is `9443`:
 
-- `9443/TCP`: native TCP/TLS and WebSocket/TLS.
-- `9444/TCP`: HTTP/2 CONNECT (options 3, 5, 7 and 9).
-- `9445/TCP`: HTTP/1.1 CONNECT (options 4, 5, 7 and 9).
+- `9443/TCP`: TCP/TLS and WebSocket/TLS; also required by external-only option 8.
+- `9444/TCP`: HTTP/2 CONNECT in options 3, 5, 7 and 9.
+- `9445/TCP`: HTTP/1.1 CONNECT in options 4, 5, 7 and 9.
 
-Open only the ports needed by the selected mode. Mode 8 needs only the control port because its external-path carrier is TCP/TLS. Modes 7 and 9 can use all four native transports and therefore need the control port, control+1 and control+2.
+Option 8 uses only the authenticated TCP/TLS carrier, so it needs the control port. Option 7 keeps the original four native transports. Option 9 can use all four native transports and therefore needs the control port, control+1 and control+2. Open only the ports required by the selected transports.
 
 ### Agent-side external paths
 
-External paths are configured on the outside Agent. On Ubuntu/Debian, the main Shah Tunnel installer automatically installs the official Cloudflare WARP package and configures its tunnel protocol to MASQUE. A first-time WARP registration/connection is completed only after an interactive acceptance of Cloudflare's Terms of Service and Privacy Policy. Tor, Psiphon and Backhaul clients, and any nested WARP-on-WARP route, must be installed/configured separately by the Agent operator. Add prepared paths in the Agent setup wizard:
+The installer adds the official Cloudflare WARP package on supported Debian/Ubuntu APT systems, but it does not register or connect WARP during installation. The Agent wizard offers these external paths:
 
-- **MASQUE:** uses a prepared Agent-side OS route/interface. It can be the Cloudflare WARP interface configured to use MASQUE, or another MASQUE-capable route prepared by the operator.
-- **Cloudflare WARP:** the installer configures MASQUE Local Proxy mode with a SOCKS5 listener at `127.0.0.1:40000`. Only Shah Tunnel's Hub carrier uses this proxy; SSH, Xray, VLESS, and ordinary server traffic keep the normal host route.
-- **WARP on WARP:** requires a separately prepared nested route and explicitly configured interface; it is not created automatically.
-- **Tor and Psiphon:** enter the client’s local SOCKS5 address (Tor defaults to `127.0.0.1:9050`; Psiphon requires its actual configured local endpoint). Shah Tunnel sends the Hub connection through SOCKS5 and uses proxy-side DNS for hostnames.
-- **Backhaul:** enter the local raw-TCP forward exposed by the Backhaul client. Option 8 uses the forward for the Hub control port; option 9 also needs corresponding control+1 and control+2 forwards if HTTP/2 or HTTP/1.1 CONNECT candidates are to be used.
+- **MASQUE:** connect through a preconfigured local MASQUE gateway exposed as a SOCKS5 endpoint (default `127.0.0.1:40001`). Shah Tunnel does not start a standalone MASQUE client.
+- **Cloudflare WARP:** configure Cloudflare's app-scoped local SOCKS5 proxy at `127.0.0.1:40000`, using MASQUE. Only Shah Tunnel sockets use this proxy; SSH, the host default route, IPv4/IPv6 routing and unrelated services stay on the normal system route. Do not enable full-device WARP for this use case.
+- **WARP on WARP:** use a separately prepared second SOCKS5 chain endpoint (default `127.0.0.1:40002`). Shah Tunnel does not register a second Cloudflare client or create a second WARP tunnel by itself.
+- **Tor/Psiphon:** enter the local SOCKS5 proxy address. Defaults are `127.0.0.1:9050` for Tor and `127.0.0.1:1080` for Psiphon; adjust them to the actual client settings. Destination hostnames are resolved by the proxy.
 
-Option 7 is deliberately isolated from new external methods and retains the original four-transport adaptive behavior. Option 8 uses one selected new Agent path with a TCP/TLS carrier. Option 9 distributes lanes across all four native candidates and all configured external paths, keeping healthy candidates active concurrently when enough lanes are configured. If a route fails, its lane retries the remaining candidates. Failover is per lane and occurs after a connection fails; it does not migrate an already-open TCP stream without reconnecting. The Hub controls accepted transports; the Agent manages external-client setup and health.
+Option 7 is the original four-transport adaptive mode. Option 8 selects one external path and uses the authenticated TCP/TLS carrier. Option 9 combines all four native transports with the configured external paths; it starts with the first configured external path, then tries the direct route and other configured paths. Each lane remembers its last successful route and transport. A failed outer connection is re-established on another candidate; an already-active TCP flow is not migrated seamlessly and may reconnect. The Hub must be configured with the corresponding mode.
 
 ## Multiple tunnel profiles and upload throughput
 
@@ -74,46 +70,18 @@ ShahTunnel is a general-purpose TCP relay. Configure it only for servers and ser
 
 The server information display may make outbound HTTPS requests to public IP and GeoIP providers (including ipify, icanhazip, checkip.amazonaws.com, ipinfo.io, ip.sb, ipapi.co and ipwho.is) to determine the server's public IPv4 address and country. These providers can observe the server's public IP and request metadata; the GeoIP lookups do not include the tunnel token or tunnel payload.
 
-For upgrade compatibility, the installed systemd unit and configuration directory still use the legacy names `ravanreverse.service` and `/etc/ravanreverse`; the installer also provides the `shah-tunnel` command as a symlink. These are local compatibility names, not third-party download destinations. Do not rename them manually on an existing server; a future rename would need an explicit migration.
-
-## Cloudflare WARP Local Proxy and SSH safety
-
-On Ubuntu/Debian, the installer installs the official Cloudflare WARP client if needed, detects the distribution codename, and configures MASQUE in Local Proxy mode with a SOCKS5 listener at `127.0.0.1:40000`. Registration and first connection require explicit acceptance of Cloudflare's Terms of Service and Privacy Policy. If the live signing-key URL is unreachable, the installer automatically uses the bundled current Cloudflare public key after checking its pinned fingerprint and expiry. It then tries Cloudflare's APT repository; if that host is unreachable from an Iranian VPS, it automatically tries the official Cloudflare Linux package-download host. Only if both official delivery paths are unreachable is WARP skipped safely while Shah Tunnel installation continues; the WARP path remains unavailable until the client is installed successfully. Before connecting, the installer requires successful MASQUE, Local Proxy, and proxy-port commands. After connecting, it compares effective IPv4, IPv6, and (when available) SSH-peer routes against their pre-connect values and disconnects WARP if any route changes. It tests the local SOCKS5 path and requires `warp=on` before reporting the WARP carrier ready.
-
-Local Proxy mode does not replace the host default route. Only Shah Tunnel's selected WARP carrier uses the local SOCKS5 proxy; SSH, Xray, VLESS, other native transports, downloads, and ordinary server traffic keep the normal route. The installer also removes the obsolete Shah Tunnel SSH-bypass unit and only the specific policy rules created by that previous helper. Tor, Psiphon, and Backhaul still require their own client/forwarder setup.
 ## Install
 
-Run as root on Linux amd64 or arm64 with systemd and HTTPS access to the official Go download hosts. For a downloaded source ZIP, run the local installer from its extracted folder:
+Extract the ZIP and run the installer from its folder as root:
 
 ```bash
 sudo bash S1T-START.sh
 ```
 
-The local installer builds the exact source tree next to the script. To install directly from the repository's published `main` branch instead, use:
+After this updated version has been published to the repository's `main` branch, the one-command installer is:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 ```
 
-The installer downloads the Go `1.26.1` toolchain, trying regional mirrors first and then official distribution hosts. If a transfer is interrupted, it retains a separate partial file per mirror and resumes only from that same mirror with HTTP Range where supported. This avoids mixing partial responses from different hosts. It verifies the pinned SHA-256 checksum before using the archive; unverified archives are never accepted. When a local source tree is present, the installer builds that exact tree; when invoked remotely with no local tree, it downloads the source archive from the `main` branch. In both cases it compiles `S1T-CAPSULE` locally for the server architecture with CGO disabled. It does not use GitHub Release assets or install the Go toolchain permanently. The installer prepares Cloudflare WARP in MASQUE Local Proxy mode before downloading the source and Go toolchain. The host default route is not changed; SSH, downloads, Xray, and ordinary server traffic stay on the normal route. If the operator declines Cloudflare terms, both official Cloudflare package-delivery paths are unreachable, or WARP cannot connect, WARP setup stops with a warning and the Shah Tunnel installation continues over the ordinary route when the Go and GitHub download hosts are reachable; the WARP path is unavailable in that case. No global SSH policy-routing workaround is installed; Local Proxy mode does not change SSH routing. The built binary's application version and target architecture are checked before installation. An existing binary is backed up before replacement, and an already-active service is not restarted during installation to avoid dropping live tunnel sessions.
-
-## Build and tests
-
-The verification helper requires Go 1.26.1 to already be installed locally; it will not download a toolchain. From the repository root:
-
-```bash
-./VERIFY-ALL-TRANSPORTS.sh
-```
-
-Or run the main checks directly:
-
-```bash
-gofmt -w S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go
-go test -race -count=20 ./S1T-CAPSULE
-go vet ./S1T-CAPSULE
-mkdir -p dist
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-amd64 ./S1T-CAPSULE
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-arm64 ./S1T-CAPSULE
-(cd dist && sha256sum shah-tunnel-linux-amd64 > shah-tunnel-linux-amd64.sha256)
-(cd dist && sha256sum shah-tunnel-linux-arm64 > shah-tunnel-linux-arm64.sha256)
-```
+On supported Debian/Ubuntu APT systems, the installer also installs the official Cloudflare WARP package. It does not register or connect WARP during installation. WARP is configured in app-scoped local-proxy mode only when selected in the Agent wizard, so unrelated server traffic and SSH do not need to use WARP.

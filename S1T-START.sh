@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 2.2.2 installer.
+# Shah Tunnel 2.2.1 installer.
 # Downloads the pinned Go toolchain, verifies its SHA-256, fetches the source,
 # and builds the binary on the target server. No GitHub Release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="2.2.2"
+VERSION="2.2.1"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -23,7 +23,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 1
 fi
 command -v systemctl >/dev/null 2>&1 || { echo "systemd/systemctl is required." >&2; exit 1; }
-for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod tar gzip mktemp rm sleep python3 wc sed tail sort xargs find seq; do
+for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod tar gzip mktemp rm sleep python3 wc sed tail sort xargs find; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "Required command missing: $cmd" >&2; exit 1; }
 done
 TMP="$(mktemp -d /tmp/s1t-install.XXXXXX)"
@@ -76,6 +76,70 @@ curl_download() {
   PHASE_HAS_DOWNLOAD=1
   rm -f "$headers" "$log"
 }
+# Install the official Cloudflare WARP client without registering or connecting it.
+# The Agent wizard later configures WARP in local-proxy mode, which avoids
+# changing the host default route and prevents SSH/unrelated traffic leakage.
+install_cloudflare_warp() {
+  if command -v warp-cli >/dev/null 2>&1; then
+    echo "Cloudflare WARP already installed; keeping its existing registration and configuration."
+    warp-cli --version || true
+    return 0
+  fi
+  if ! command -v apt-get >/dev/null 2>&1 || ! command -v dpkg >/dev/null 2>&1; then
+    echo "Cloudflare WARP auto-install is supported by this installer on Debian/Ubuntu (APT) only; skipping package setup."
+    return 0
+  fi
+  local distro codename arch
+  . /etc/os-release
+  distro="${ID:-unknown}"
+  codename="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+  if [[ "$distro" != "ubuntu" && "$distro" != "debian" ]]; then
+    echo "Cloudflare WARP auto-install skipped: unsupported APT distribution '${distro}'."
+    return 0
+  fi
+  if [[ ! "$codename" =~ ^[a-z0-9]+$ ]]; then
+    echo "Cloudflare WARP auto-install skipped: could not determine a safe repository codename."
+    return 1
+  fi
+  arch="$(dpkg --print-architecture 2>/dev/null || true)"
+  if [[ "$arch" != "amd64" && "$arch" != "arm64" ]]; then
+    echo "Cloudflare WARP auto-install skipped: unsupported package architecture '${arch}'."
+    return 0
+  fi
+  echo "Installing Cloudflare WARP client from Cloudflare's official APT repository (${codename}/${arch})."
+  if ! apt-get update; then
+    echo "APT package index update failed before adding the Cloudflare repository."
+    return 1
+  fi
+  if ! apt-get install -y curl gpg ca-certificates; then
+    echo "Could not install Cloudflare WARP prerequisites."
+    return 1
+  fi
+  install -d -o root -g root -m 0755 /usr/share/keyrings
+  if ! curl -fsSL --proto '=https' --proto-redir '=https' https://pkg.cloudflareclient.com/pubkey.gpg \
+      | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg; then
+    echo "Could not download or install Cloudflare's APT signing key."
+    return 1
+  fi
+  chmod 0644 /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+  printf 'deb [arch=%s signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' "$arch" "$codename" \
+      > /etc/apt/sources.list.d/cloudflare-client.list
+  if ! apt-get update; then
+    echo "Cloudflare APT repository update failed."
+    return 1
+  fi
+  if ! apt-get install -y cloudflare-warp; then
+    echo "Could not install the cloudflare-warp package."
+    return 1
+  fi
+  if ! command -v warp-cli >/dev/null 2>&1; then
+    echo "cloudflare-warp package finished but warp-cli was not found."
+    return 1
+  fi
+  warp-cli --version
+  echo "Cloudflare WARP package installed. It was NOT registered or connected; no server routes, IPv4/IPv6 defaults, or SSH paths were changed."
+}
+
 # Download a large file while retaining partial bytes between mirror attempts.
 # Unlike curl_download(), this helper must NEVER remove the destination file on
 # failure, because the next mirror may resume at the existing byte offset.
@@ -379,7 +443,7 @@ build_from_official_go_toolchain() {
   go_bin=""
   go_root=""
 
-  phase_start 2 "Download verified Go toolchain and source"
+  phase_start 1 "Download verified Go toolchain and source"
   local cache_archive="$GO_CACHE_DIR/$go_archive"
   local toolchain_path="${STATE_DIR}/toolchains/go${GO_VERSION}-${TARGET_ARCH}"
   local toolchain_new="${toolchain_path}.new"
@@ -556,371 +620,15 @@ build_from_official_go_toolchain() {
   return 0
 }
 
-remove_legacy_warp_ssh_bypass() {
-  # Older builds installed a global-route workaround. Remove only rules that
-  # this helper created (SSH source ports, priorities 80..140, lookup main).
-  local family port line pref ports_file="/etc/shah-tunnel/warp-ssh-ports"
-  if [[ -r "$ports_file" ]] && command -v ip >/dev/null 2>&1; then
-    while read -r port; do
-      [[ "$port" =~ ^[0-9]+$ ]] || continue
-      for family in -4 -6; do
-        while IFS= read -r line; do
-          pref="${line%%:*}"
-          [[ "$pref" =~ ^[0-9]+$ ]] || continue
-          if (( pref >= 80 && pref <= 140 )) && grep -Eq "ipproto tcp sport ${port}([[:space:]]|$).*lookup main|lookup main.*ipproto tcp sport ${port}([[:space:]]|$)" <<<"$line"; then
-            ip "$family" rule del priority "$pref" ipproto tcp sport "$port" lookup main 2>/dev/null || true
-          fi
-        done < <(ip "$family" rule show 2>/dev/null || true)
-      done
-    done < "$ports_file"
-  fi
-  systemctl disable --now shah-tunnel-warp-ssh-bypass.service >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/shah-tunnel-warp-ssh-bypass.service
-  rm -f /usr/local/sbin/shah-tunnel-warp-ssh-bypass
-  rm -f /etc/systemd/system/warp-svc.service.d/10-shah-tunnel-ssh-bypass.conf
-  rmdir /etc/systemd/system/warp-svc.service.d 2>/dev/null || true
-  rm -f "$ports_file"
-  systemctl daemon-reload
-}
-
-CLOUDFLARE_WARP_FALLBACK_VERSION="2026.8.2115.0"
-CLOUDFLARE_WARP_KEY_FINGERPRINT="C068A2B5771775193CBE1F2F6E2DD2174FA1C3BA"
-
-cloudflare_warp_prepare_repository_key() {
-  local key_asc="$1" key_tmp="$2" fingerprint expiry now
-  # Prefer Cloudflare's live endpoint. If this hostname is filtered on an
-  # Iranian VPS, use the current public key fetched from that same official
-  # endpoint during release preparation. Its full fingerprint is pinned below.
-  if ! curl -fLsS --retry 1 --retry-delay 1 --connect-timeout 6 --max-time 18 \
-      https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_asc" 2>/dev/null || [[ ! -s "$key_asc" ]]; then
-    echo "Cloudflare key host is unreachable; using the pinned current Cloudflare signing key." >&2
-    cat > "$key_asc" <<'CLOUDFLARE_WARP_PUBLIC_KEY'
------BEGIN PGP PUBLIC KEY BLOCK-----
-
-mQINBGGr2jUBEADHaae1uIKW4JI/E32IR9EJSswkOuZl1J+XXH32U2u3DGtzGuei
-dNXyeQ7AWHp5bM2wO7jGRqH/IwiDVHzp6gmJ8r/SFrE+iljNA71LVXY7FjaOGmKC
-pZnzl3mlY9zsRgmM+oEbTedg2k1jfeHWiYJfTk4efDUGNqF4D62GBFLpOheeXtNU
-DHuZjcRBFKO3wjt3wPpuUx+/NoHrxWK2HZxL6cHUHxmqOHlemGAvZug0pkeAWaAb
-YYmlwsi9/KbnZ22poCfubCebeLIIC4GrQd5ZdJn3efa1ps41gHG/s0RpoQvC128x
-ZQDfdjskuXA0IlDUwzGK2qeY2PEbHpPAH02cm2JrO0NkVBO/4tJ3QkrBRdkOoS1C
-PZRFkzaamA7kZb03wHHLqMZ4lpw+Aa4w0jihndQUvxi9HQVmzjYW1HeQXHmVPdNc
-MT6Y/XxFUFfz65zpZy6s5e8250yIaiNtTuvpcXebmkx0uM4naQFjSJTTlrNeXM/L
-67JppgInRXwlaevNBTm24HhJy0zef1Gpnt6xJDtCX2qNg0GhbuJXbFhgSF1Ct7eY
-tZsfx6UbEXdkwEtcrIAXIqrVjenqcvh8w47I06rqKEoiMliQxh/WrIjTDCsIq/LB
-ki820eS6GsJ5N2JmZ2CQ7Kt+y/Gx9uMDmUcCnHY10vX+Va66/GKMX+vbKQARAQAB
-tDZDbG91ZGZsYXJlIFBhY2thZ2UgUmVwb3NpdG9yeSA8c3VwcG9ydEBjbG91ZGZs
-YXJlLmNvbT6JAlIEEwEIADwCGwMFCwkIBwIDIgIBBhUKCQgLAgQWAgMBAh4HAheA
-FiEEwGiitXcXdRk8vh8vbi3SF0+hw7oFAmi5UcQACgkQbi3SF0+hw7pmgBAAudow
-XU2c8W2t2R6letWslBDd9M13ME9r8b4do/bN2av1xoXHNk1bTPC//1O+JWJPzzHG
-EwRd1XK1U53umPgSQ21RXSWba71iYdfVUnbPBwbmbv4Cp/7kTwMBJsoPxAzyWGkT
-p/u5joDS9KU/85vZeTUNLHrxfuDhMH2elzHYAPsBkqxPosEcgnTmMFZ/4ueZwIn4
-s3sFGUl1kiFhqVn7f2g+PbSC5UI367+mx9Gcw/Ti7NXeYQFrlaMJePpYbmvkdjC2
-Kz+3CVhd+qOSq65bDHI+bW/sqRXmqdUc+lwkCyBhgtrZdTa6e5GFcubagn6U5FQ3
-X1Inv2VDPhiTUKj8S5oTQDErdKyRSlqTj7ZibuXetvsFascJVnsEEQH/lsHUGk7N
-i281X63qRCn+Iv2wB7tAnH1upifl9tS5ouWhu5MVFJUJ9cJPo+naSksf6M0DROLp
-YFX+33IqDDE2bGbQwBUX0TqHOW6Pl/oWnS18EnNvqIRhzVYX/obJvA6sFVF0k4hp
-zEkGCdpAzh/6P27ZvnN8cjlDMgB3c1HdPLQbjZnQ0JbZ6lzyNorwx8rRmxLpgMZd
-k6veLbWGG1tW8oPuuKWfgYVD00BMmJpyNqs2D30njtbkdZ1cRUyqhxS9BZw88Qb0
-TbOm+GteogZ9IbLvjaxCwaojBBzZqXrwGAa4Fso=
-=cDDg
------END PGP PUBLIC KEY BLOCK-----
-CLOUDFLARE_WARP_PUBLIC_KEY
-  fi
-
-  if ! gpg --batch --show-keys "$key_asc" >/dev/null 2>&1; then
-    echo "ERROR: Cloudflare signing key is not a valid OpenPGP key; refusing to install WARP." >&2
-    return 1
-  fi
-  fingerprint="$(gpg --batch --with-colons --show-keys "$key_asc" 2>/dev/null | awk -F: '$1=="fpr" {print toupper($10); exit}')"
-  expiry="$(gpg --batch --with-colons --show-keys "$key_asc" 2>/dev/null | awk -F: '$1=="pub" {print $7; exit}')"
-  now="$(date +%s)"
-  if [[ "$fingerprint" != "$CLOUDFLARE_WARP_KEY_FINGERPRINT" ]]; then
-    echo "ERROR: Cloudflare signing-key fingerprint mismatch; refusing to install WARP." >&2
-    return 1
-  fi
-  if [[ -n "$expiry" && "$expiry" =~ ^[0-9]+$ ]] && (( expiry <= now )); then
-    echo "ERROR: Cloudflare signing key is expired; refusing to install WARP." >&2
-    return 1
-  fi
-  if ! gpg --batch --yes --dearmor --output "$key_tmp" "$key_asc" || [[ ! -s "$key_tmp" ]]; then
-    echo "ERROR: Could not convert the verified Cloudflare signing key." >&2
-    return 1
-  fi
-  return 0
-}
-
-cloudflare_warp_install_official_download() {
-  local arch platform url deb package version package_arch
-  arch="$(dpkg --print-architecture 2>/dev/null || true)"
-  case "$arch" in
-    amd64) platform="ubuntu" ;;
-    arm64) platform="ubuntu-arm" ;;
-    *) echo "WARNING: No Cloudflare Ubuntu download mapping for architecture ${arch:-unknown}." >&2; return 1 ;;
-  esac
-  deb="$TMP/cloudflare-warp-official.deb"
-  # These are Cloudflare's own stable-download endpoints. They are a fallback
-  # for Iranian VPS networks where pkg.cloudflareclient.com is unreachable.
-  local urls=(
-    "https://downloads.cloudflareclient.com/v1/download/${platform}/version/${CLOUDFLARE_WARP_FALLBACK_VERSION}"
-    "https://downloads.cloudflareclient.com/v1/download/${platform}/ga"
-  )
-  for url in "${urls[@]}"; do
-    echo "Trying Cloudflare official Linux package download: ${url}" >&2
-    if ! curl_download "$url" "$deb" --retry 2 --retry-delay 2 --connect-timeout 12 --max-time 300; then
-      rm -f "$deb"
-      continue
-    fi
-    if ! command -v dpkg-deb >/dev/null 2>&1; then
-      echo "WARNING: dpkg-deb is unavailable; cannot verify the downloaded package metadata." >&2
-      rm -f "$deb"
-      return 1
-    fi
-    package="$(dpkg-deb -f "$deb" Package 2>/dev/null || true)"
-    version="$(dpkg-deb -f "$deb" Version 2>/dev/null || true)"
-    package_arch="$(dpkg-deb -f "$deb" Architecture 2>/dev/null || true)"
-    if [[ "$package" != "cloudflare-warp" || ( "$package_arch" != "$arch" && "$package_arch" != "all" ) || -z "$version" ]]; then
-      echo "WARNING: Download endpoint did not return a matching cloudflare-warp package; rejecting it." >&2
-      rm -f "$deb"
-      continue
-    fi
-    echo "Cloudflare package verified: ${package} ${version} (${package_arch}). Installing..." >&2
-    if DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y "$deb"; then
-      rm -f "$deb"
-      echo "Cloudflare WARP installed from Cloudflare's official download service." >&2
-      return 0
-    fi
-    echo "WARNING: Official package downloaded, but Ubuntu dependencies could not be installed." >&2
-    rm -f "$deb"
-  done
-  return 1
-}
-
-install_cloudflare_warp() {
-  # /etc/os-release defines VERSION globally when sourced. Keep the product
-  # version local and unchanged so Ubuntu's marketing version cannot overwrite
-  # the Shah Tunnel version used by binary verification.
-  local VERSION="${VERSION}"
-  local distro codename key_tmp key_asc repo_file reg_out answer status_out terms_file key_ready
-  local apt_opts=(-o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10)
-  if ! command -v apt-get >/dev/null 2>&1; then
-    echo "WARNING: Automatic Cloudflare WARP installation is supported by this installer on Ubuntu/Debian only." >&2
-    return 0
-  fi
-  . /etc/os-release
-  distro="${ID:-unknown}"
-  codename="${VERSION_CODENAME:-}"
-  case "$distro" in
-    ubuntu|debian) ;;
-    *)
-      echo "WARNING: Cloudflare WARP auto-install skipped on unsupported apt distro: $distro" >&2
-      return 0
-      ;;
-  esac
-  if [[ -z "$codename" ]]; then
-    echo "ERROR: Could not determine the OS codename; refusing to add an incorrect Cloudflare repository." >&2
-    return 1
-  fi
-  repo_file="/etc/apt/sources.list.d/cloudflare-client.list"
-  terms_file="/etc/shah-tunnel/cloudflare-terms-consented"
-  if ! command -v warp-cli >/dev/null 2>&1; then
-    echo "Installing Cloudflare WARP automatically for ${distro} ${codename}..." >&2
-    local -a missing_pkgs=()
-    command -v gpg >/dev/null 2>&1 || missing_pkgs+=(gpg)
-    [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing_pkgs+=(ca-certificates)
-    command -v ip >/dev/null 2>&1 || missing_pkgs+=(iproute2)
-    if ((${#missing_pkgs[@]})); then
-      if ! apt-get "${apt_opts[@]}" update; then
-        echo "WARNING: APT dependency indexes could not be refreshed; WARP installation is skipped safely." >&2
-        return 1
-      fi
-      if ! DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y curl "${missing_pkgs[@]}"; then
-        echo "WARNING: Required WARP prerequisites could not be installed; WARP installation is skipped safely." >&2
-        return 1
-      fi
-    fi
-
-    install -d -o root -g root -m 0755 /usr/share/keyrings
-    key_tmp="$TMP/cloudflare-warp-archive-keyring.gpg"
-    key_asc="$TMP/cloudflare-warp-pubkey.gpg.asc"
-    key_ready=0
-    # Official live key first; a pinned copy of the current official key is
-    # used automatically when Iran routing blocks the pkg.cloudflareclient.com hostname.
-    if cloudflare_warp_prepare_repository_key "$key_asc" "$key_tmp"; then
-      key_ready=1
-    fi
-
-    if [[ "$key_ready" -eq 1 ]]; then
-      install -o root -g root -m 0644 "$key_tmp" /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-      printf 'deb [arch=%s signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' \
-        "$(dpkg --print-architecture)" "$codename" > "$TMP/cloudflare-client.list"
-
-      # Only persist the repository after its own index refresh succeeds.
-      if apt-get "${apt_opts[@]}" \
-          -o Dir::Etc::sourcelist="$TMP/cloudflare-client.list" \
-          -o Dir::Etc::sourceparts="-" \
-          -o APT::Get::List-Cleanup=0 update; then
-        install -o root -g root -m 0644 "$TMP/cloudflare-client.list" "$repo_file"
-        if ! DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y cloudflare-warp; then
-          echo "WARNING: Cloudflare APT package installation failed; switching to Cloudflare's official package download." >&2
-          rm -f "$repo_file"
-          if ! cloudflare_warp_install_official_download; then return 1; fi
-        fi
-      else
-        echo "WARNING: pkg.cloudflareclient.com is unreachable from this VPS; trying Cloudflare's official download service." >&2
-        rm -f "$repo_file"
-        if ! cloudflare_warp_install_official_download; then
-          echo "WARNING: Cloudflare's official download endpoints are also unreachable. WARP setup cannot complete on this network." >&2
-          return 1
-        fi
-      fi
-    else
-      echo "WARNING: Cloudflare APT signing key could not be downloaded from Iran; trying Cloudflare's official package download service." >&2
-      if ! cloudflare_warp_install_official_download; then
-        echo "WARNING: Cloudflare package repository and official download service are both unreachable. WARP setup cannot complete on this network." >&2
-        return 1
-      fi
-    fi
-  else
-    echo "Cloudflare WARP already installed; keeping its existing registration and configuration." >&2
-  fi
-  command -v warp-cli >/dev/null 2>&1 || { echo "WARNING: cloudflare-warp package installed but warp-cli is missing; WARP setup is skipped safely." >&2; return 1; }
-  if ! warp-cli --version; then
-    echo "WARNING: warp-cli could not communicate with its installation; WARP setup is skipped safely." >&2
-    return 1
-  fi
-
-  # Remove only the obsolete Shah Tunnel global-route SSH workaround.
-  # WARP Local Proxy mode keeps the host default route untouched.
-  remove_legacy_warp_ssh_bypass
-  # Disconnect a previously active system-wide WARP session before changing
-  # its mode; never allow a failed proxy-mode command to be followed by connect.
-  warp-cli disconnect >/dev/null 2>&1 || true
-  if systemctl list-unit-files warp-svc.service --no-legend 2>/dev/null | grep -q 'warp-svc.service'; then
-    if ! systemctl enable --now warp-svc.service >/dev/null; then
-      echo "WARNING: warp-svc.service could not be started; WARP setup is skipped safely." >&2
-      return 1
-    fi
-  else
-    echo "WARNING: cloudflare-warp is present but warp-svc.service is missing; WARP setup is skipped safely." >&2
-    return 1
-  fi
-  warp-cli disconnect >/dev/null 2>&1 || true
-
-  # Cloudflare terms are accepted only after an explicit interactive approval.
-  if [[ ! -s "$terms_file" ]]; then
-    echo "Cloudflare Terms of Service and Privacy Policy must be accepted before WARP registration/configuration." >&2
-    if [[ ! -r /dev/tty ]]; then
-      echo "No interactive terminal is available; WARP is installed but remains unregistered/disconnected." >&2
-      return 0
-    fi
-    read -r -p "Accept Cloudflare Terms of Service and Privacy Policy for this server? [y/N] " answer </dev/tty
-    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-      echo "Cloudflare terms were not accepted; WARP remains installed but disconnected." >&2
-      return 0
-    fi
-    printf 'accepted-on %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP/cloudflare-terms-consented"
-    install -d -o root -g root -m 0700 /etc/shah-tunnel
-    install -o root -g root -m 0600 "$TMP/cloudflare-terms-consented" "$terms_file"
-  fi
-
-  reg_out="$(warp-cli registration show 2>&1 || true)"
-  if [[ -z "$reg_out" ]] || grep -Eiq 'not registered|no registration|unregistered' <<<"$reg_out"; then
-    if ! warp-cli --accept-tos registration new; then
-      echo "WARNING: WARP registration failed; leaving it disconnected." >&2
-      warp-cli disconnect >/dev/null 2>&1 || true
-      return 1
-    fi
-  fi
-  # Configure every setting explicitly. Because this function is called in a
-  # recoverable `if !` block, errexit is not sufficient here: check each command
-  # and NEVER run connect unless Local Proxy mode was accepted.
-  if ! warp-cli --accept-tos tunnel protocol set MASQUE; then
-    echo "WARNING: WARP could not select MASQUE; leaving it disconnected." >&2
-    warp-cli disconnect >/dev/null 2>&1 || true
-    return 1
-  fi
-  if ! warp-cli --accept-tos mode proxy; then
-    echo "WARNING: WARP Local Proxy mode is unavailable; refusing a system-wide WARP connection." >&2
-    warp-cli disconnect >/dev/null 2>&1 || true
-    return 1
-  fi
-  if ! warp-cli --accept-tos proxy port 40000; then
-    echo "WARNING: WARP SOCKS5 proxy port could not be configured; leaving WARP disconnected." >&2
-    warp-cli disconnect >/dev/null 2>&1 || true
-    return 1
-  fi
-
-  # Snapshot effective host routes. Local Proxy must not replace IPv4/IPv6
-  # egress, which also protects the return route for the active SSH session.
-  if ! command -v ip >/dev/null 2>&1; then
-    echo "WARNING: iproute2 is unavailable; refusing to connect WARP without route-safety checks." >&2
-    warp-cli disconnect >/dev/null 2>&1 || true
-    return 1
-  fi
-  local route4_before route6_before route4_after route6_after ssh_peer route_ssh_before route_ssh_after
-  route4_before="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"||$i=="dev"||$i=="src"||$i=="table") printf "%s %s ",$i,$(i+1)}')"
-  route6_before="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"||$i=="dev"||$i=="src"||$i=="table") printf "%s %s ",$i,$(i+1)}')"
-  ssh_peer=""
-  route_ssh_before=""
-  if [[ -n "${SSH_CONNECTION:-}" ]]; then
-    ssh_peer="${SSH_CONNECTION%% *}"
-    route_ssh_before="$(ip route get "$ssh_peer" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"||$i=="dev"||$i=="src"||$i=="table") printf "%s %s ",$i,$(i+1)}')"
-  fi
-  if ! warp-cli --accept-tos connect; then
-    echo "WARNING: WARP could not connect in Local Proxy mode; leaving it disconnected." >&2
-    warp-cli disconnect >/dev/null 2>&1 || true
-    return 1
-  fi
-  for _ in $(seq 1 30); do
-    status_out="$(warp-cli status 2>&1 || true)"
-    if grep -Eiq '^Status update:[[:space:]]*Connected' <<<"$status_out"; then
-      break
-    fi
-    sleep 2
-  done
-  if grep -Eiq '^Status update:[[:space:]]*Connected' <<<"$status_out"; then
-    route4_after="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"||$i=="dev"||$i=="src"||$i=="table") printf "%s %s ",$i,$(i+1)}')"
-    route6_after="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"||$i=="dev"||$i=="src"||$i=="table") printf "%s %s ",$i,$(i+1)}')"
-    route_ssh_after="$route_ssh_before"
-    if [[ -n "$route_ssh_before" ]]; then
-      route_ssh_after="$(ip route get "$ssh_peer" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"||$i=="dev"||$i=="src"||$i=="table") printf "%s %s ",$i,$(i+1)}')"
-    fi
-    if { [[ -n "$route4_before" && "$route4_after" != "$route4_before" ]] ||
-         [[ -n "$route6_before" && "$route6_after" != "$route6_before" ]] ||
-         [[ -n "$route_ssh_before" && "$route_ssh_after" != "$route_ssh_before" ]]; }; then
-      echo "WARNING: WARP changed an effective host route; disconnecting it to protect SSH and ordinary traffic." >&2
-      warp-cli disconnect >/dev/null 2>&1 || true
-      return 1
-    fi
-    if curl --silent --show-error --fail --connect-timeout 5 --max-time 12 \
-      --socks5-hostname 127.0.0.1:40000 \
-      https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qx 'warp=on'; then
-      echo "Cloudflare WARP is connected in MASQUE Local Proxy mode on 127.0.0.1:40000." >&2
-      echo "Only explicitly configured Shah Tunnel carrier connections will use WARP; SSH and other server traffic remain on the normal route." >&2
-    else
-      echo "WARNING: WARP is connected, but its local SOCKS5 proxy did not pass the warp=on test; disconnecting WARP." >&2
-      warp-cli disconnect >/dev/null 2>&1 || true
-      return 1
-    fi
-  else
-    echo "WARNING: WARP is installed and configured for MASQUE Local Proxy mode but is not connected:" >&2
-    printf '%s\n' "$status_out" >&2
-    warp-cli disconnect >/dev/null 2>&1 || true
-    return 1
-  fi
-}
-
-# Prepare WARP in Local Proxy mode; do not change the host default route.
-phase_start 1 "Installing Cloudflare WARP Local Proxy"
-if ! install_cloudflare_warp; then
-  echo "WARNING: Cloudflare WARP auto-setup failed. Continuing with Shah Tunnel; WARP-dependent Agent paths will stay unavailable until WARP is healthy." >&2
-fi
 if ! build_from_official_go_toolchain; then
   echo "Installation stopped: no verified ShahTunnel binary was built." >&2
   echo "Go archives must match the pinned SHA-256; ShahTunnel is built locally without GitHub Release assets." >&2
   exit 1
 fi
-phase_start 3 "Installing Shah Tunnel"
+phase_start 2 "Installing binary and configuring service"
+if ! install_cloudflare_warp; then
+  echo "WARNING: Shah Tunnel can still be installed, but Cloudflare WARP package setup did not complete. Review the message above and install WARP separately." >&2
+fi
 install -d -o root -g root -m 0700 /etc/ravanreverse
 install -d -o root -g root -m 0700 /etc/ravanreverse/tunnels
 install -d -o root -g root -m 0755 /usr/local/bin

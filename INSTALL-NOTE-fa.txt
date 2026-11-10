@@ -1,8 +1,19 @@
-یادداشت نصب — Shah Tunnel 2.2.2 / Iran WARP fallback
+Shah Tunnel 2.2.1
 
-نصب‌کننده Go 1.26.1 را با بررسی SHA-256 دریافت می‌کند و سورس را روی سرور می‌سازد. روی Ubuntu/Debian برای WARP:
-1) کلید رسمی Cloudflare از URL اصلی دریافت می‌شود؛ اگر این میزبان در ایران Timeout بدهد، کلید همراه با fingerprint ثابت و بررسی انقضا به‌صورت خودکار به کار می‌رود.
-2) مخزن APT رسمی امتحان می‌شود.
-3) اگر مخزن در دسترس نباشد، بستهٔ رسمی از downloads.cloudflareclient.com به‌صورت خودکار دریافت و metadata آن بررسی می‌شود.
+تغییرات منوی انتقال:
+- گزینه‌های ۱ تا ۶ بدون تغییر در رفتار قبلی حفظ شده‌اند.
+- گزینه ۷: FULL ADAPTIVE FAILOVER بین چهار انتقال قدیمی.
+- گزینه ۸: انتخاب یک مسیر خارجی؛ MASQUE gateway، Cloudflare WARP، WARP on WARP، Tor یا Psiphon.
+- گزینه ۹: ترکیب چهار انتقال قدیمی با مسیرهای خارجی و Failover خودکار هر Lane.
 
-هیچ mirror ثالثی برای کلید یا بسته استفاده نمی‌شود. در صورت مسدودبودن هر دو میزبان رسمی Cloudflare، WARP نصب نمی‌شود، اما نصب Shah Tunnel ادامه می‌یابد. WARP پس از نصب در حالت MASQUE Local Proxy تنظیم می‌شود تا مسیر پیش‌فرض سرور و SSH تغییر نکند.
+Cloudflare WARP در نصب‌کننده فقط روی Debian/Ubuntu پشتیبانی‌شده نصب می‌شود و هنگام نصب نه ثبت‌نام و نه متصل می‌شود. هنگام انتخاب WARP در Wizard، حالت پراکسی محلی SOCKS5 با MASQUE روی 127.0.0.1:40000 تنظیم و با درخواست واقعی Cloudflare بررسی می‌شود. فقط اتصال‌های Shah Tunnel از این پراکسی عبور می‌کنند؛ مسیر پیش‌فرض سیستم و SSH از WARP عبور داده نمی‌شوند.
+
+MASQUE مستقل و WARP on WARP به یک SOCKS5 gateway ازپیش‌آماده‌شده نیاز دارند. Shah Tunnel کلاینت مستقل MASQUE یا ثبت‌نام دوم Cloudflare را به‌صورت خودکار ایجاد نمی‌کند.
+
+برای اجرای نسخه داخل ZIP، فایل‌ها را استخراج کنید و از پوشه اصلی با دسترسی root اجرا کنید:
+  sudo bash S1T-START.sh
+
+دستور زیر فقط پس از انتشار فایل‌های همین نسخه در شاخه main مخزن GitHub، نسخه 2.2.1 را نصب می‌کند:
+  bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
+
+این ZIP به‌تنهایی فایل‌های مخزن GitHub را تغییر نمی‌دهد.
