@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 2.2.1 installer.
+# Shah Tunnel 2.1.0 installer.
 # Downloads the pinned Go toolchain, verifies its SHA-256, fetches the source,
 # and builds the binary on the target server. No GitHub Release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="2.2.1"
+VERSION="2.1.0"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -23,7 +23,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 1
 fi
 command -v systemctl >/dev/null 2>&1 || { echo "systemd/systemctl is required." >&2; exit 1; }
-for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod tar gzip mktemp rm sleep python3 wc sed tail sort xargs find seq; do
+for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod tar gzip mktemp rm sleep python3 wc sed tail sort xargs find; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "Required command missing: $cmd" >&2; exit 1; }
 done
 TMP="$(mktemp -d /tmp/s1t-install.XXXXXX)"
@@ -379,7 +379,7 @@ build_from_official_go_toolchain() {
   go_bin=""
   go_root=""
 
-  phase_start 2 "Download verified Go toolchain and source"
+  phase_start 1 "Download verified Go toolchain and source"
   local cache_archive="$GO_CACHE_DIR/$go_archive"
   local toolchain_path="${STATE_DIR}/toolchains/go${GO_VERSION}-${TARGET_ARCH}"
   local toolchain_new="${toolchain_path}.new"
@@ -556,246 +556,12 @@ build_from_official_go_toolchain() {
   return 0
 }
 
-install_warp_ssh_bypass() {
-  local helper="/usr/local/sbin/shah-tunnel-warp-ssh-bypass"
-  local unit="/etc/systemd/system/shah-tunnel-warp-ssh-bypass.service"
-  local warp_dropin="/etc/systemd/system/warp-svc.service.d/10-shah-tunnel-ssh-bypass.conf"
-  local ports_file="/etc/shah-tunnel/warp-ssh-ports"
-  install -d -o root -g root -m 0755 /usr/local/sbin /etc/shah-tunnel
-  {
-    printf '%s\n' '22'
-    if command -v sshd >/dev/null 2>&1; then
-      sshd -T 2>/dev/null | awk '$1 == "port" && $2 ~ /^[0-9]+$/ { print $2 }' || true
-    fi
-    if [[ -n "${SSH_CONNECTION:-}" ]]; then
-      local ssh_server_port
-      ssh_server_port="$(awk '{print $4}' <<<"$SSH_CONNECTION")"
-      [[ "$ssh_server_port" =~ ^[0-9]+$ ]] && (( ssh_server_port >= 1 && ssh_server_port <= 65535 )) && printf '%s\n' "$ssh_server_port"
-    fi
-  } | sort -un > "$TMP/warp-ssh-ports"
-  install -o root -g root -m 0600 "$TMP/warp-ssh-ports" "$ports_file"
-  cat > "$TMP/warp-ssh-bypass" <<'WARPSSH'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-IP="$(command -v ip)"
-PORTS_FILE="/etc/shah-tunnel/warp-ssh-ports"
-[[ -r "$PORTS_FILE" ]] || exit 0
-ensure_rule() {
-  local family="$1" port="$2" rules pref
-  rules="$($IP "$family" rule show 2>/dev/null || true)"
-  if grep -Eq "ipproto tcp sport ${port}([[:space:]]|$).*lookup main|lookup main.*ipproto tcp sport ${port}([[:space:]]|$)" <<<"$rules"; then
-    return 0
-  fi
-  for pref in $(seq 80 140); do
-    if ! grep -Eq "^[[:space:]]*${pref}:" <<<"$rules"; then
-      if "$IP" "$family" rule add priority "$pref" ipproto tcp sport "$port" lookup main 2>/dev/null; then
-        "$IP" "$family" route flush cache 2>/dev/null || true
-        return 0
-      fi
-    fi
-  done
-  return 1
-}
-failed=0
-while read -r port; do
-  [[ "$port" =~ ^[0-9]+$ ]] || continue
-  (( port >= 1 && port <= 65535 )) || continue
-  ensure_rule -4 "$port" || failed=1
-  if "$IP" -6 route show table main default 2>/dev/null | grep -q .; then
-    ensure_rule -6 "$port" || failed=1
-  fi
-done < "$PORTS_FILE"
-if (( failed )); then
-  echo "Could not install all SSH direct-route policy rules; refusing to claim SSH is protected." >&2
-  exit 1
-fi
-WARPSSH
-  install -o root -g root -m 0750 "$TMP/warp-ssh-bypass" "$helper"
-  cat > "$TMP/warp-ssh-unit" <<'WARPUNIT'
-[Unit]
-Description=Install direct SSH reply routing before Cloudflare WARP
-Wants=network-online.target
-After=network-online.target
-Before=warp-svc.service
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/shah-tunnel-warp-ssh-bypass
-RemainAfterExit=yes
-[Install]
-WantedBy=multi-user.target
-WARPUNIT
-  install -o root -g root -m 0644 "$TMP/warp-ssh-unit" "$unit"
-  install -d -o root -g root -m 0755 "$(dirname "$warp_dropin")"
-  cat > "$TMP/warp-svc-dropin" <<'WARPDEPENDENCY'
-[Unit]
-Requires=shah-tunnel-warp-ssh-bypass.service
-After=shah-tunnel-warp-ssh-bypass.service
-WARPDEPENDENCY
-  install -o root -g root -m 0644 "$TMP/warp-svc-dropin" "$warp_dropin"
-  if ! "$helper"; then
-    echo "WARNING: SSH direct-route rules could not be installed; WARP will not be newly connected." >&2
-    return 1
-  fi
-  systemctl daemon-reload
-  systemctl enable shah-tunnel-warp-ssh-bypass.service >/dev/null
-  systemctl restart shah-tunnel-warp-ssh-bypass.service
-}
-
-verify_ssh_direct_route() {
-  [[ -n "${SSH_CONNECTION:-}" ]] || return 0
-  local peer client_port server_port family route
-  read -r peer client_port _ server_port <<<"$SSH_CONNECTION"
-  [[ -n "$peer" && "$client_port" =~ ^[0-9]+$ && "$server_port" =~ ^[0-9]+$ ]] || return 0
-  family="-4"
-  [[ "$peer" == *:* ]] && family="-6"
-  route="$(ip "$family" route get "$peer" ipproto tcp sport "$server_port" dport "$client_port" 2>&1 || true)"
-  if [[ -z "$route" || "$route" == *CloudflareWARP* || "$route" == *"table 65743"* ]]; then
-    echo "WARNING: SSH reply route is not verified as direct: ${route:-no route result}" >&2
-    return 1
-  fi
-  echo "SSH reply route verified outside CloudflareWARP: $route" >&2
-}
-
-install_cloudflare_warp() {
-  local distro codename key_tmp repo_file reg_out answer status_out trace_out terms_file
-  local apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
-  if ! command -v apt-get >/dev/null 2>&1; then
-    echo "WARNING: Automatic Cloudflare WARP installation is supported by this installer on Ubuntu/Debian only." >&2
-    return 0
-  fi
-  . /etc/os-release
-  distro="${ID:-unknown}"
-  codename="${VERSION_CODENAME:-}"
-  case "$distro" in
-    ubuntu|debian) ;;
-    *)
-      echo "WARNING: Cloudflare WARP auto-install skipped on unsupported apt distro: $distro" >&2
-      return 0
-      ;;
-  esac
-  if [[ -z "$codename" ]]; then
-    echo "ERROR: Could not determine the OS codename; refusing to add an incorrect Cloudflare repository." >&2
-    return 1
-  fi
-  repo_file="/etc/apt/sources.list.d/cloudflare-client.list"
-  terms_file="/etc/shah-tunnel/cloudflare-terms-consented"
-  if ! command -v warp-cli >/dev/null 2>&1; then
-    echo "Installing Cloudflare WARP automatically for ${distro} ${codename}..." >&2
-    local -a missing_pkgs=()
-    command -v gpg >/dev/null 2>&1 || missing_pkgs+=(gpg)
-    [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing_pkgs+=(ca-certificates)
-    command -v ip >/dev/null 2>&1 || missing_pkgs+=(iproute2)
-    if ((${#missing_pkgs[@]})); then
-      apt-get "${apt_opts[@]}" update || echo "WARNING: One or more configured APT mirrors are unavailable; trying with cached package indexes." >&2
-      DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y curl "${missing_pkgs[@]}"
-    fi
-    install -d -o root -g root -m 0755 /usr/share/keyrings
-    key_tmp="$TMP/cloudflare-warp-archive-keyring.gpg"
-    curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 12 --max-time 60 \
-      https://pkg.cloudflareclient.com/pubkey.gpg -o "$TMP/cloudflare-warp-pubkey.gpg.asc"
-    gpg --batch --yes --dearmor --output "$key_tmp" "$TMP/cloudflare-warp-pubkey.gpg.asc"
-    install -o root -g root -m 0644 "$key_tmp" /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    printf 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' "$codename" > "$TMP/cloudflare-client.list"
-    install -o root -g root -m 0644 "$TMP/cloudflare-client.list" "$repo_file"
-
-    # Refresh all mirrors first. If a provider mirror such as mirror.hetzner.com
-    # is unreachable, refresh Cloudflare's repository on its own as a fallback.
-    if ! apt-get "${apt_opts[@]}" update; then
-      echo "WARNING: Full APT update failed; refreshing only the official Cloudflare repository." >&2
-      apt-get "${apt_opts[@]}" -o Dir::Etc::sourcelist="$repo_file" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup=0 update
-    fi
-    DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y cloudflare-warp
-  else
-    echo "Cloudflare WARP already installed; keeping its existing registration and configuration." >&2
-  fi
-  command -v warp-cli >/dev/null 2>&1 || { echo "ERROR: cloudflare-warp package installed but warp-cli is missing." >&2; return 1; }
-  warp-cli --version
-
-  # Install and verify the SSH bypass before starting/enabling the WARP daemon.
-  # The helper applies the policy rules immediately; its systemd unit keeps
-  # them present on later boots as well.
-  if ! install_warp_ssh_bypass; then
-    local before_status
-    before_status="$(warp-cli status 2>&1 || true)"
-    if grep -Eiq '^Status update:[[:space:]]*Connected' <<<"$before_status"; then
-      echo "SSH route protection failed while WARP was already connected; disconnecting WARP for safety." >&2
-      warp-cli disconnect || true
-    fi
-    echo "Cloudflare WARP is installed, but connection/configuration was skipped to protect SSH access." >&2
-    return 0
-  fi
-  if systemctl list-unit-files warp-svc.service --no-legend 2>/dev/null | grep -q 'warp-svc.service'; then
-    systemctl enable --now warp-svc.service >/dev/null
-  else
-    echo "ERROR: cloudflare-warp is present but warp-svc.service is missing; refusing to configure an unmanaged WARP process." >&2
-    return 1
-  fi
-
-  # Cloudflare terms are accepted only after an explicit interactive approval.
-  if [[ ! -s "$terms_file" ]]; then
-    echo "Cloudflare Terms of Service and Privacy Policy must be accepted before WARP registration/configuration." >&2
-    if [[ ! -r /dev/tty ]]; then
-      echo "No interactive terminal is available; WARP is installed but remains unregistered/disconnected." >&2
-      return 0
-    fi
-    read -r -p "Accept Cloudflare Terms of Service and Privacy Policy for this server? [y/N] " answer </dev/tty
-    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-      echo "Cloudflare terms were not accepted; WARP remains installed but disconnected." >&2
-      return 0
-    fi
-    printf 'accepted-on %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP/cloudflare-terms-consented"
-    install -o root -g root -m 0600 "$TMP/cloudflare-terms-consented" "$terms_file"
-  fi
-
-  reg_out="$(warp-cli registration show 2>&1 || true)"
-  if [[ -z "$reg_out" ]] || grep -Eiq 'not registered|no registration|unregistered' <<<"$reg_out"; then
-    warp-cli --accept-tos registration new
-  fi
-  warp-cli --accept-tos tunnel protocol set MASQUE
-  status_out="$(warp-cli status 2>&1 || true)"
-  if ! grep -Eiq '^Status update:[[:space:]]*Connected' <<<"$status_out"; then
-    warp-cli --accept-tos connect || true
-  fi
-  # WARP connection establishment is asynchronous on Linux; wait for the
-  # daemon to report a healthy route before declaring the external path ready.
-  for _ in $(seq 1 30); do
-    status_out="$(warp-cli status 2>&1 || true)"
-    if grep -Eiq '^Status update:[[:space:]]*Connected' <<<"$status_out" && grep -Eiq '^Network:[[:space:]]*healthy' <<<"$status_out"; then
-      break
-    fi
-    sleep 2
-  done
-  if grep -Eiq '^Status update:[[:space:]]*Connected' <<<"$status_out" && grep -Eiq '^Network:[[:space:]]*healthy' <<<"$status_out"; then
-    if verify_ssh_direct_route; then
-      trace_out="$(curl -4 -fsS --connect-timeout 8 --max-time 15 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
-      if grep -qx 'warp=on' <<<"$trace_out"; then
-        echo "Cloudflare WARP is connected using MASQUE; warp=on verified and SSH reply traffic remains on the main route." >&2
-      else
-        echo "WARNING: WARP reports healthy but the public trace did not confirm warp=on; keep option 8/9 WARP paths disabled until verified." >&2
-      fi
-    else
-      echo "SSH route verification failed. Disconnecting WARP to avoid locking out the administrator." >&2
-      warp-cli disconnect || true
-    fi
-  else
-    echo "WARNING: Cloudflare WARP was installed and configured for MASQUE but is not currently healthy:" >&2
-    printf '%s\n' "$status_out" >&2
-  fi
-}
-
-# Set up WARP first so the subsequent source and verified Go downloads can
-# use the newly prepared egress route. SSH bypass rules are installed before
-# WARP starts and are attached as a boot dependency.
-phase_start 1 "Installing Cloudflare WARP and protecting SSH"
-if ! install_cloudflare_warp; then
-  echo "WARNING: Cloudflare WARP auto-setup failed. Continuing with Shah Tunnel; WARP-dependent Agent paths will stay unavailable until WARP is healthy." >&2
-fi
 if ! build_from_official_go_toolchain; then
   echo "Installation stopped: no verified ShahTunnel binary was built." >&2
   echo "Go archives must match the pinned SHA-256; ShahTunnel is built locally without GitHub Release assets." >&2
   exit 1
 fi
-phase_start 3 "Installing Shah Tunnel"
+phase_start 2 "Installing binary and configuring service"
 install -d -o root -g root -m 0700 /etc/ravanreverse
 install -d -o root -g root -m 0700 /etc/ravanreverse/tunnels
 install -d -o root -g root -m 0755 /usr/local/bin
