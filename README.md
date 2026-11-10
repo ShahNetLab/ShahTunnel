@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>V2.2.1 · Secure Reverse TCP Relay · External Paths + Adaptive Failover</strong></p>
+<p align="center"><strong>V2.2.2 · Secure Reverse TCP Relay · External Paths + Adaptive Failover</strong></p>
 <p align="center">A reverse TCP relay that carries public client connections through a Hub to mapped target services via authenticated Agent lanes. The private Hub↔Agent channel uses TLS 1.3, SHA-256 certificate pinning and adaptive recovery across four native transports and preconfigured Agent-side external network paths.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
@@ -49,14 +49,22 @@ Option 8 uses only the authenticated TCP/TLS carrier, so it needs the control po
 
 ### Agent-side external paths
 
-The installer adds the official Cloudflare WARP package on supported Debian/Ubuntu APT systems, but it does not register or connect WARP during installation. The Agent wizard offers these external paths:
+The installer adds the official Cloudflare WARP package on supported Debian/Ubuntu APT systems, but it does not register or connect WARP during installation. The Agent wizard offers these external paths. The default selection is option `2` (Cloudflare WARP), not the preconfigured MASQUE gateway:
 
-- **MASQUE:** connect through a preconfigured local MASQUE gateway exposed as a SOCKS5 endpoint (default `127.0.0.1:40001`). Shah Tunnel does not start a standalone MASQUE client.
+- **MASQUE:** connect through a preconfigured local MASQUE gateway exposed as a SOCKS5 endpoint (default `127.0.0.1:40001`). The wizard checks that this preconfigured SOCKS5 gateway answers before saving the profile. Shah Tunnel does not start a standalone MASQUE client.
 - **Cloudflare WARP:** configure Cloudflare's app-scoped local SOCKS5 proxy at `127.0.0.1:40000`, using MASQUE. Only Shah Tunnel sockets use this proxy; SSH, the host default route, IPv4/IPv6 routing and unrelated services stay on the normal system route. Do not enable full-device WARP for this use case.
 - **WARP on WARP:** use a separately prepared second SOCKS5 chain endpoint (default `127.0.0.1:40002`). Shah Tunnel does not register a second Cloudflare client or create a second WARP tunnel by itself.
 - **Tor/Psiphon:** enter the local SOCKS5 proxy address. Defaults are `127.0.0.1:9050` for Tor and `127.0.0.1:1080` for Psiphon; adjust them to the actual client settings. Destination hostnames are resolved by the proxy.
 
 Option 7 is the original four-transport adaptive mode. Option 8 selects one external path and uses the authenticated TCP/TLS carrier. Option 9 combines all four native transports with the configured external paths; it starts with the first configured external path, then tries the direct route and other configured paths. Each lane remembers its last successful route and transport. A failed outer connection is re-established on another candidate; an already-active TCP flow is not migrated seamlessly and may reconnect. The Hub must be configured with the corresponding mode.
+
+For an existing Agent profile that was saved with an unavailable MASQUE endpoint such as `127.0.0.1:40001`, upgrade the binary on the outside host and run:
+
+```bash
+ravanreverse repair-external
+```
+
+Select the Agent profile and choose option `2` (Cloudflare WARP). The command replaces only the selected external path, creates a private backup first, preserves the token, fingerprint, Hub address, mappings and lane count, and restarts the profile only when it was already active.
 
 ## Multiple tunnel profiles and upload throughput
 
