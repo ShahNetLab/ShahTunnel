@@ -3,9 +3,13 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>V2.2.6 · Secure Reverse TCP Relay · External Paths + Adaptive Failover</strong></p>
+<p align="center"><strong>V2.2.7 · Secure Reverse TCP Relay · External Paths + Adaptive Failover</strong></p>
 <p align="center">A reverse TCP relay that carries public client connections through a Hub to mapped target services via authenticated Agent lanes. The private Hub↔Agent channel uses TLS 1.3, SHA-256 certificate pinning and adaptive recovery across four native transports and preconfigured Agent-side external network paths.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
+
+## 2.2.7 maintenance fix
+
+The WARP SSH route guard now detects its own already-installed `ip rule` entries across the complete rule token list. Re-running/restarting the oneshot guard is idempotent, while a different rule occupying the same policy priority is still rejected. A regression test reproduces the duplicate-rule response from iproute2.
 
 ## Network flow
 
