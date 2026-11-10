@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>V2.2.5 · Secure Reverse TCP Relay · External Paths + Adaptive Failover</strong></p>
+<p align="center"><strong>V2.2.6 · Secure Reverse TCP Relay · External Paths + Adaptive Failover</strong></p>
 <p align="center">A reverse TCP relay that carries public client connections through a Hub to mapped target services via authenticated Agent lanes. The private Hub↔Agent channel uses TLS 1.3, SHA-256 certificate pinning and adaptive recovery across four native transports and preconfigured Agent-side external network paths.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
@@ -58,7 +58,7 @@ The installer adds the official Cloudflare WARP package on supported Debian/Ubun
 
 Option 7 is the original four-transport adaptive mode. Before it starts, Shah Tunnel returns any Shah-managed device WARP session to Local Proxy mode so the old native transports do not inherit WARP routing. Option 8 selects one external path and uses the authenticated TCP/TLS carrier. When that path is Cloudflare WARP, device-level MASQUE is enabled so the local target service's internet egress—and therefore VPN clients' visible IPv4/IPv6 egress—also uses WARP. Option 9 combines all four native transports with the configured external paths; the selected external path is tried first, then the physical direct route and other candidates. Direct/native fallback sockets are explicitly marked to use the physical VPS route while the WARP path uses WARP. Each lane remembers its last successful route and transport. A failed outer connection is re-established on another candidate; an already-active TCP flow is not migrated seamlessly and may reconnect. The Hub must be configured with the corresponding mode.
 
-**WARP scope:** When option 8 selects WARP, or option 9 contains a WARP candidate, device-level WARP is active on the Agent host. Consequently, unmarked host traffic—including the local target service's outbound traffic—uses WARP. SSH replies and direct failover sockets are routed over the physical VPS link. Other independently running applications on that VPS may also use WARP during this mode; do not run unrelated services that must remain on the physical egress at the same time. Agent profiles with conflicting WARP and non-WARP egress policies cannot run simultaneously.
+**WARP scope:** When option 8 selects WARP, or option 9 contains a WARP candidate, device-level WARP is active on the Agent host. Consequently, unmarked host traffic—including the local target service's outbound traffic—uses WARP. SSH replies and direct failover sockets are routed over the physical VPS link. Other independently running applications on that VPS may also use WARP during this mode. A direct/legacy Agent and a WARP Agent therefore cannot safely run together on the same VPS when their client egress must remain different. Shah Tunnel checks this before collecting the Hub token and again before saving; a conflict aborts setup without changing or stopping the existing tunnel. To keep both client egress policies separate, use a separate VPS or separately network-isolated target/Xray instances. Do not remove this guard to force both profiles to start.
 
 For an existing Agent profile that was saved with an unavailable MASQUE endpoint such as `127.0.0.1:40001`, upgrade the binary on the outside host and run:
 
