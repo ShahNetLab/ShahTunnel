@@ -1959,3 +1959,38 @@ func TestWARPSettingsModeDetection(t *testing.T) {
 		})
 	}
 }
+
+func TestAgentNetworkPoliciesCompatibility(t *testing.T) {
+	legacy := Config{Role: "agent", Transport: transportAdaptive}
+	warp8 := Config{
+		Role:                 "agent",
+		Transport:            transportNewMethods,
+		ExternalPaths:        []AgentExternalPath{{ID: "warp", Method: "warp"}},
+		SelectedExternalPath: "warp",
+	}
+	warp9 := Config{
+		Role:          "agent",
+		Transport:     transportFullAdaptive,
+		ExternalPaths: []AgentExternalPath{{ID: "warp", Method: "warp"}},
+	}
+	warp9NoWarp := Config{Role: "agent", Transport: transportFullAdaptive, ExternalPaths: []AgentExternalPath{{ID: "tor", Method: "tor", Address: "127.0.0.1:9050"}}}
+
+	if agentNetworkPoliciesCompatible(legacy, warp8) {
+		t.Fatal("legacy Agent and WARP device-mode Agent must not share one host")
+	}
+	if agentNetworkPoliciesCompatible(warp8, legacy) {
+		t.Fatal("WARP device-mode Agent and legacy Agent must not share one host")
+	}
+	if !agentNetworkPoliciesCompatible(legacy, Config{Role: "agent", Transport: transportTCP}) {
+		t.Fatal("two non-WARP Agent profiles should be compatible")
+	}
+	if !agentNetworkPoliciesCompatible(warp8, warp9) {
+		t.Fatal("two WARP device-mode Agent profiles should share the same host policy")
+	}
+	if !agentNetworkPoliciesCompatible(legacy, warp9NoWarp) {
+		t.Fatal("option 9 without a WARP candidate must remain compatible with legacy mode")
+	}
+	if !agentNetworkPoliciesCompatible(Config{Role: "hub", Transport: transportAdaptive}, warp8) {
+		t.Fatal("Hub profiles must not be treated as local Agent egress conflicts")
+	}
+}

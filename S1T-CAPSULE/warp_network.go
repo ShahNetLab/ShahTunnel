@@ -971,12 +971,24 @@ func warpStatusConnected() bool {
 	return false
 }
 
+// agentNetworkPoliciesCompatible reports whether two Agent profiles can safely
+// share one host. Cloudflare WARP's device mode changes the VPS-wide default
+// egress, including traffic from local target services; it is not scoped to a
+// Shah Tunnel systemd unit. Different WARP policies must therefore never run
+// concurrently on the same host unless target applications have separate
+// network isolation outside Shah Tunnel.
+func agentNetworkPoliciesCompatible(a, b Config) bool {
+	if a.Role != "agent" || b.Role != "agent" {
+		return true
+	}
+	return configRequiresCloudflareWarp(a) == configRequiresCloudflareWarp(b)
+}
+
 func assertAgentProfileNetworkCompatibility(c Config) error {
 	profiles, err := listTunnelProfiles()
 	if err != nil {
 		return err
 	}
-	wantWarp := configRequiresCloudflareWarp(c)
 	for _, p := range profiles {
 		if filepath.Clean(p.Path) == filepath.Clean(configPath) {
 			continue
@@ -992,8 +1004,9 @@ func assertAgentProfileNetworkCompatibility(c Config) error {
 		if json.Unmarshal(b, &other) != nil || other.Role != "agent" {
 			continue
 		}
-		if configRequiresCloudflareWarp(normalizeConfig(other)) != wantWarp {
-			return fmt.Errorf("Agent tunnel %q is already running with a different WARP egress policy; stop that Agent before starting this one so its old transport and client egress are not changed", p.Name)
+		other = normalizeConfig(other)
+		if !agentNetworkPoliciesCompatible(c, other) {
+			return fmt.Errorf("cannot start Agent profile %q while Agent profile %q is active: option 8/9 with Cloudflare WARP changes the VPS-wide client egress, not only this tunnel. The running profile was not stopped or modified. Keep the existing tunnel unchanged and use native option 7 on this VPS, or place the WARP profile and its target service on a separate VPS/isolated Xray instance", c.Name, p.Name)
 		}
 	}
 	return nil

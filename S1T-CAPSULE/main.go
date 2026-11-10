@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "2.2.5"
+	version                          = "2.2.6"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -4658,6 +4658,11 @@ func setup() error {
 			}
 			break
 		}
+		// Check host-wide WARP compatibility before asking for secrets or saving
+		// a new profile. Device-mode WARP affects the whole VPS, not one unit.
+		if err := assertAgentProfileNetworkCompatibility(c); err != nil {
+			return fmt.Errorf("setup stopped before credentials or a new profile were saved: %w", err)
+		}
 		if transportModeAllowsHTTP2(c.Transport) {
 			uiInfo("HTTP/2 CONNECT uses TCP port " + nextPortLabel(c.HubAddr) + ". Open it in the Hub firewall if selected.")
 		}
@@ -4689,6 +4694,9 @@ func setup() error {
 		c = normalizeConfig(c)
 		if err = validateConfig(c); err != nil {
 			return err
+		}
+		if err = assertAgentProfileNetworkCompatibility(c); err != nil {
+			return fmt.Errorf("profile was not saved because the host-wide egress policy changed during setup: %w", err)
 		}
 		if err = saveConfig(c); err != nil {
 			return err
