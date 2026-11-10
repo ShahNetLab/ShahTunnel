@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1904,6 +1905,49 @@ func TestMissingFIBTableOutput(t *testing.T) {
 				t.Fatalf("missingFIBTableOutput(%q, %q) = %v, want %v", tt.family, tt.output, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPolicyFieldsContainScansAllRuleTokens(t *testing.T) {
+	fields := []string{"10:", "from", "all", "fwmark", "0x5348/0xffffffff", "lookup", "42420"}
+	if !policyFieldsContain(fields, "fwmark", "0x5348") {
+		t.Fatal("fwmark after leading rule tokens was not detected")
+	}
+	if !policyFieldsContain(fields, "lookup", "42420") {
+		t.Fatal("lookup table after leading rule tokens was not detected")
+	}
+	if policyFieldsContain(fields, "lookup", "42421") {
+		t.Fatal("a different lookup table was reported as present")
+	}
+	if policyFieldsContain(fields, "to", "198.51.100.4/32") {
+		t.Fatal("an absent match field was reported as present")
+	}
+}
+
+func TestAddIPRuleIsIdempotentForExactExistingRule(t *testing.T) {
+	dir := t.TempDir()
+	ipScript := `#!/bin/sh
+if [ "$1" = "-4" ] && [ "$2" = "rule" ] && [ "$3" = "add" ]; then
+  echo "RTNETLINK answers: File exists" >&2
+  exit 2
+fi
+if [ "$1" = "-4" ] && [ "$2" = "rule" ] && [ "$3" = "show" ]; then
+  echo "10: from all fwmark 0x5348/0xffffffff lookup 42420"
+  exit 0
+fi
+exit 1
+`
+	ipPath := filepath.Join(dir, "ip")
+	if err := os.WriteFile(ipPath, []byte(ipScript), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	if err := addIPRule("-4", "priority", "10", "fwmark", "0x5348/0xffffffff", "lookup", "42420"); err != nil {
+		t.Fatalf("exact existing guard rule should be accepted idempotently: %v", err)
+	}
+	if err := addIPRule("-4", "priority", "10", "fwmark", "0x5348/0xffffffff", "lookup", "42421"); err == nil {
+		t.Fatal("a different lookup table at the same priority must remain a conflict")
 	}
 }
 

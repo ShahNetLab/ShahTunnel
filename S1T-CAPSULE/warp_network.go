@@ -448,6 +448,26 @@ func applyPhysicalRoute(family string, route *physicalDefaultRoute, table int) e
 	return nil
 }
 
+// policyFieldsContain searches the complete ip rule token list. Some iproute2
+// versions append fwmark/lookup fields after several other tokens; returning
+// false at the first unrelated token breaks idempotent guard restarts.
+func policyFieldsContain(fields []string, key, value string) bool {
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] != key {
+			continue
+		}
+		got, want := fields[i+1], value
+		if key == "fwmark" {
+			got = strings.TrimSuffix(got, "/0xffffffff")
+			want = strings.TrimSuffix(want, "/0xffffffff")
+		}
+		if got == want {
+			return true
+		}
+	}
+	return false
+}
+
 func addIPRule(family string, args ...string) error {
 	ip, err := exec.LookPath("ip")
 	if err != nil {
@@ -483,21 +503,7 @@ func addIPRule(family string, args ...string) error {
 		if len(f) < 2 || strings.TrimSuffix(f[0], ":") != priority {
 			continue
 		}
-		contains := func(key, value string) bool {
-			for i := 0; i+1 < len(f); i++ {
-				if f[i] == key {
-					got := f[i+1]
-					if key == "fwmark" {
-						got = strings.TrimSuffix(got, "/0xffffffff")
-						value = strings.TrimSuffix(value, "/0xffffffff")
-					}
-					return got == value
-				}
-				return false
-			}
-			return false
-		}
-		if contains("lookup", lookup) && matchKind != "" && contains(matchKind, matchValue) {
+		if policyFieldsContain(f, "lookup", lookup) && matchKind != "" && policyFieldsContain(f, matchKind, matchValue) {
 			return nil
 		}
 	}

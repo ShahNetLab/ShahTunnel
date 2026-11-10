@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "2.2.6"
+	version                          = "2.2.7"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
