@@ -1860,6 +1860,65 @@ func TestParsePhysicalDefaultRoute(t *testing.T) {
 	}
 }
 
+func TestMissingFIBTableOutput(t *testing.T) {
+	tests := []struct {
+		name   string
+		family string
+		output string
+		want   bool
+	}{
+		{
+			name:   "new IPv4 table is an expected empty state",
+			family: "-4",
+			output: "Error: ipv4: FIB table does not exist.\nDump terminated\n",
+			want:   true,
+		},
+		{
+			name:   "new IPv6 table is an expected empty state",
+			family: "-6",
+			output: "Error: ipv6: FIB table does not exist.\nDump terminated\n",
+			want:   true,
+		},
+		{
+			name:   "wrong address family is not suppressed",
+			family: "-4",
+			output: "Error: ipv6: FIB table does not exist.\nDump terminated\n",
+			want:   false,
+		},
+		{
+			name:   "permission error is not suppressed",
+			family: "-4",
+			output: "RTNETLINK answers: Operation not permitted",
+			want:   false,
+		},
+		{
+			name:   "unknown family is not suppressed",
+			family: "-x",
+			output: "Error: ipv4: FIB table does not exist.",
+			want:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := missingFIBTableOutput(tt.family, tt.output); got != tt.want {
+				t.Fatalf("missingFIBTableOutput(%q, %q) = %v, want %v", tt.family, tt.output, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPolicyRuleUsesPrivateRouteTable(t *testing.T) {
+	if !policyRuleUsesTable("100: from all fwmark 0x5348 lookup 42420\n", warpIPv4Table) {
+		t.Fatal("an existing RPDB lookup of table 42420 was not detected")
+	}
+	if !policyRuleUsesTable("101: from all to 2001:db8::1 lookup 42421\n", warpIPv6Table) {
+		t.Fatal("an existing RPDB lookup of table 42421 was not detected")
+	}
+	if policyRuleUsesTable("100: from all lookup main\n101: from all lookup 4242\n", warpIPv4Table) {
+		t.Fatal("an unrelated policy table was reported as a conflict")
+	}
+}
+
 func TestWARPDeviceEgressPolicyByTransportMode(t *testing.T) {
 	warp := AgentExternalPath{ID: "warp", Method: "warp"}
 	tor := AgentExternalPath{ID: "tor", Method: "tor", Address: "127.0.0.1:9050"}

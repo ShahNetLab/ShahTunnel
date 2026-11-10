@@ -238,6 +238,55 @@ func discoverWarpGuardConfig() (warpGuardConfig, error) {
 	return cfg, nil
 }
 
+// missingFIBTableOutput recognizes the one non-zero exit that is expected
+// before Shah Tunnel creates its private route tables. iproute2 returns exit
+// status 2 (rather than an empty result) when a numeric FIB table has never
+// been instantiated. Do not suppress unrelated iproute2/netlink failures.
+func missingFIBTableOutput(family, output string) bool {
+	familyName := ""
+	switch family {
+	case "-4":
+		familyName = "ipv4"
+	case "-6":
+		familyName = "ipv6"
+	default:
+		return false
+	}
+	return strings.Contains(strings.ToLower(output), familyName+": fib table does not exist")
+}
+
+// showPhysicalRouteTable returns an empty table for a never-created FIB while
+// preserving every other command failure. This allows the first route replace
+// to instantiate the table naturally, without adding temporary policy rules or
+// touching the host's main/default routes.
+func showPhysicalRouteTable(ip, family string, table int) (string, error) {
+	tableText := strconv.Itoa(table)
+	out, err := runOutput(5*time.Second, ip, family, "route", "show", "table", tableText)
+	if err == nil {
+		return out, nil
+	}
+	if missingFIBTableOutput(family, out) {
+		return "", nil
+	}
+	return "", err
+}
+
+// policyRuleUsesTable detects an existing RPDB rule that already refers to a
+// private table. An empty/uncreated FIB can still be owned by another service
+// through a policy rule, so it must not be claimed by Shah Tunnel.
+func policyRuleUsesTable(rules string, table int) bool {
+	wanted := strconv.Itoa(table)
+	for _, line := range strings.Split(rules, "\n") {
+		fields := strings.Fields(line)
+		for i := 0; i+1 < len(fields); i++ {
+			if (fields[i] == "lookup" || fields[i] == "table") && fields[i+1] == wanted {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func ensurePrivateWarpRouteTablesAvailable() error {
 	ip, err := exec.LookPath("ip")
 	if err != nil {
@@ -247,7 +296,7 @@ func ensurePrivateWarpRouteTablesAvailable() error {
 		family string
 		table  int
 	}{{"-4", warpIPv4Table}, {"-6", warpIPv6Table}} {
-		out, err := runOutput(5*time.Second, ip, item.family, "route", "show", "table", strconv.Itoa(item.table))
+		out, err := showPhysicalRouteTable(ip, item.family, item.table)
 		if err != nil {
 			return fmt.Errorf("inspect dedicated physical-route table %d: %w", item.table, err)
 		}
@@ -257,6 +306,9 @@ func ensurePrivateWarpRouteTablesAvailable() error {
 		out, err = runOutput(5*time.Second, ip, item.family, "rule", "show")
 		if err != nil {
 			return fmt.Errorf("inspect %s policy rules: %w", item.family, err)
+		}
+		if policyRuleUsesTable(out, item.table) {
+			return fmt.Errorf("policy rules already reference dedicated physical-route table %d for %s; refusing to claim a table used by another service", item.table, item.family)
 		}
 		for _, line := range strings.Split(out, "\n") {
 			f := strings.Fields(strings.TrimSpace(line))
@@ -364,7 +416,7 @@ func applyPhysicalRoute(family string, route *physicalDefaultRoute, table int) e
 		return err
 	}
 	tableText := strconv.Itoa(table)
-	existing, err := runOutput(5*time.Second, ip, family, "route", "show", "table", tableText)
+	existing, err := showPhysicalRouteTable(ip, family, table)
 	if err != nil {
 		return fmt.Errorf("inspect physical-route table %s: %w", tableText, err)
 	}
@@ -540,7 +592,7 @@ func removeOwnedPhysicalRouteTable(family string, route *physicalDefaultRoute, t
 		return err
 	}
 	tableText := strconv.Itoa(table)
-	out, err := runOutput(5*time.Second, ip, family, "route", "show", "table", tableText)
+	out, err := showPhysicalRouteTable(ip, family, table)
 	if err != nil {
 		return err
 	}
