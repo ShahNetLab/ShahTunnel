@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL | شاه تونل</h1>
-<p align="center"><strong>V2.2.2 · تونل معکوس TCP · مسیرهای خارجی و بازیابی تطبیقی</strong></p>
+<p align="center"><strong>V2.2.3 · تونل معکوس TCP · مسیرهای خارجی و بازیابی تطبیقی</strong></p>
 <p align="center">شاه‌تونل اتصال‌های عمومی TCP را از طریق Hub و مسیرهای احراز هویت‌شدهٔ Agent به سرویس‌های مقصد نگاشت‌شده هدایت می‌کند. ارتباط خصوصی Hub↔Agent از TLS 1.3، تثبیت اثرانگشت SHA-256 و بازیابی تطبیقی میان چهار انتقال داخلی و مسیرهای خارجیِ ازپیش‌آماده‌شده روی Agent پشتیبانی می‌کند.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
@@ -94,3 +94,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S
 ```
 
 در Debian/Ubuntu پشتیبانی‌شده با APT، نصب‌کننده بستهٔ رسمی Cloudflare WARP را نیز نصب می‌کند؛ اما هنگام نصب آن را ثبت‌نام یا متصل نمی‌کند. WARP فقط هنگام انتخاب در Wizard سمت Agent و در حالت پراکسی محلیِ مخصوص برنامه تنظیم می‌شود تا SSH و ترافیک عادی سرور از WARP عبور نکنند.
+
+### نصب WARP در شبکه‌های محدود
+
+نصب‌کننده برای دریافت کلید رسمی Cloudflare از timeout محدود استفاده می‌کند. اگر `pkg.cloudflareclient.com` از شبکه VPS در دسترس نباشد، نصب WARP با پیام مشخص رد می‌شود و نصب هسته Shah Tunnel ادامه می‌یابد؛ SSH و route پیش‌فرض تغییر نمی‌کنند. در این حالت قابلیت‌های وابسته به WARP تا نصب موفق کلاینت WARP فعال نیستند.

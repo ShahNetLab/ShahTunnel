@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>V2.2.2 · Secure Reverse TCP Relay · External Paths + Adaptive Failover</strong></p>
+<p align="center"><strong>V2.2.3 · Secure Reverse TCP Relay · External Paths + Adaptive Failover</strong></p>
 <p align="center">A reverse TCP relay that carries public client connections through a Hub to mapped target services via authenticated Agent lanes. The private Hub↔Agent channel uses TLS 1.3, SHA-256 certificate pinning and adaptive recovery across four native transports and preconfigured Agent-side external network paths.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
@@ -93,3 +93,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S
 ```
 
 On supported Debian/Ubuntu APT systems, the installer also installs the official Cloudflare WARP package. It does not register or connect WARP during installation. WARP is configured in app-scoped local-proxy mode only when selected in the Agent wizard, so unrelated server traffic and SSH do not need to use WARP.
+
+### WARP installation on restricted networks
+
+The installer uses bounded timeouts when retrieving Cloudflare's official signing key. If `pkg.cloudflareclient.com` is unreachable from the VPS network, WARP setup is skipped with a clear warning and the Shah Tunnel core installation continues. The installer does not change the host's default route or SSH path. WARP-dependent paths remain unavailable until the official WARP client is installed successfully.

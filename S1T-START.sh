@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 2.2.2 installer.
+# Shah Tunnel 2.2.3 installer.
 # Downloads the pinned Go toolchain, verifies its SHA-256, fetches the source,
 # and builds the binary on the target server. No GitHub Release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="2.2.2"
+VERSION="2.2.3"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -116,20 +116,45 @@ install_cloudflare_warp() {
     return 1
   fi
   install -d -o root -g root -m 0755 /usr/share/keyrings
-  if ! curl -fsSL --proto '=https' --proto-redir '=https' https://pkg.cloudflareclient.com/pubkey.gpg \
-      | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg; then
-    echo "Could not download or install Cloudflare's APT signing key."
+  local key_download="${TMP}/cloudflare-warp-pubkey.gpg"
+  local key_output="/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg"
+  local key_new="${key_output}.new.$$"
+
+  # Iran/filtered VPS networks may silently stall on pkg.cloudflareclient.com.
+  # Bound every network step and let the core Shah Tunnel install continue if
+  # the official WARP repository cannot be reached. Never leave a half key.
+  echo "Fetching Cloudflare's official signing key (8s connect timeout, 25s total)..."
+  if ! curl -fLsS --proto '=https' --proto-redir '=https' \
+      --connect-timeout 8 --max-time 25 --retry 1 --retry-delay 1 \
+      https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_download"; then
+    echo "WARNING: pkg.cloudflareclient.com is unreachable from this VPS network."
+    echo "WARP installation is skipped; Shah Tunnel installation will continue without changing network routes."
+    rm -f "$key_new" "$key_download"
     return 1
   fi
-  chmod 0644 /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-  printf 'deb [arch=%s signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' "$arch" "$codename" \
+  if [[ ! -s "$key_download" ]] || ! gpg --yes --dearmor --output "$key_new" "$key_download"; then
+    echo "WARNING: Cloudflare signing key was empty or invalid; WARP installation is skipped."
+    rm -f "$key_new" "$key_download"
+    return 1
+  fi
+  install -o root -g root -m 0644 "$key_new" "$key_output"
+  rm -f "$key_new" "$key_download"
+  printf 'deb [arch=%s signed-by=%s] https://pkg.cloudflareclient.com/ %s main\n' "$arch" "$key_output" "$codename" \
       > /etc/apt/sources.list.d/cloudflare-client.list
-  if ! apt-get update; then
-    echo "Cloudflare APT repository update failed."
+  echo "Updating Cloudflare package index (bounded network timeouts)..."
+  if ! apt-get -o Acquire::http::Timeout=18 -o Acquire::https::Timeout=18 \
+      -o Acquire::Retries=1 update; then
+    echo "WARNING: Cloudflare APT repository is unreachable; WARP installation is skipped."
+    rm -f /etc/apt/sources.list.d/cloudflare-client.list
     return 1
   fi
-  if ! apt-get install -y cloudflare-warp; then
-    echo "Could not install the cloudflare-warp package."
+  echo "Installing Cloudflare WARP package (bounded network timeouts)..."
+  if ! apt-get -o Acquire::http::Timeout=18 -o Acquire::https::Timeout=18 \
+      -o Acquire::Retries=1 install -y cloudflare-warp; then
+    echo "WARNING: cloudflare-warp package could not be downloaded/installed."
+    echo "Removing the incomplete Cloudflare APT source to avoid breaking later system updates."
+    rm -f /etc/apt/sources.list.d/cloudflare-client.list
+    echo "Shah Tunnel installation will continue; WARP-dependent paths remain unavailable until WARP is installed."
     return 1
   fi
   if ! command -v warp-cli >/dev/null 2>&1; then
