@@ -4,7 +4,7 @@
 
 <h1 align="center">SHAH TUNNEL | شاه تونل</h1>
 <p align="center"><strong>V3.0.0 · تونل معکوس TCP · بازیابی تطبیقی چندلایه</strong></p>
-<p align="center">شاه‌تونل اتصال‌های عمومی TCP را از طریق Hub و مسیرهای احراز هویت‌شدهٔ Agent به سرویس‌های مقصد نگاشت‌شده هدایت می‌کند. در نسخهٔ ۳، علاوه بر چهار انتقال داخلی قبلی، مسیر خروجی Agent می‌تواند از SOCKS5 رسمی Psiphon یا از WARP فعال با پروتکل MASQUE / WireGuard عبور کند.</p>
+<p align="center">شاه‌تونل اتصال‌های عمومی TCP را از طریق Hub و مسیرهای احراز هویت‌شدهٔ Agent به سرویس‌های مقصد نگاشت‌شده هدایت می‌کند. در نسخهٔ ۳، علاوه بر چهار انتقال داخلی قبلی، مسیر خروجی Agent می‌تواند از SOCKS5 رسمی Psiphon یا از WARP با پروتکل MASQUE / WireGuard عبور کند؛ حالت پراکسی محلی WARP با MASQUE نیز پشتیبانی می‌شود.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · 🇮🇷 فارسی</p>
 
 ## مسیر شبکه | Network Flow
@@ -39,16 +39,22 @@
 
 ### نکتهٔ مهم دربارهٔ WARP و SSH
 
-کلاینت لینوکس Cloudflare WARP یک تونل سطح سیستم است. ShahTunnel در گزینه‌های MASQUE/WARP فقط موارد زیر را بررسی می‌کند: وجود `warp-cli`، وضعیت Connected، پروتکل ثبت‌شده در `warp-cli settings` و خروجی واقعی `warp=on`. خود برنامه **هیچ‌وقت** `warp-cli connect`، تغییر پروتکل، `disconnect` یا تغییر route سیستم را اجرا نمی‌کند؛ بنابراین برای شروع این گزینه لازم است WARP از قبل توسط مدیر سرور فعال شده باشد. وضعیت، پروتکل و خروجی واقعی WARP پیش از هر تلاش اتصال مجدد نیز دوباره بررسی می‌شوند تا هنگام قطع WARP، اتصال بی‌صدا از مسیر عادی میزبان خارج نشود.
+شاه‌تونل دو حالت WARP را برای Agent پشتیبانی می‌کند. در حالت تونل سراسری، مسیر شبکهٔ میزبان باید از قبل از WARP عبور کند؛ برنامه وضعیت `warp-cli`، پروتکل فعال و خروجی واقعی `warp=on` را بررسی می‌کند. در حالت پراکسی محلی (`Mode: WarpProxy on port 40000`)، برنامه پورت پراکسی loopback را از `warp-cli settings` تشخیص می‌دهد، مسیر را با trace کلادفلر آزمایش می‌کند و اتصال HTTP CONNECT به Hub را از `127.0.0.1:<port>` عبور می‌دهد. این حالت با MASQUE پشتیبانی می‌شود؛ پراکسی محلی Cloudflare با WireGuard سازگار نیست. در این روش فقط کانال‌های خروجی Agent از WARP عبور می‌کنند و SSH، شنونده‌های ورودی و default route میزبان دست‌نخورده می‌مانند. برنامه **هیچ‌وقت** `warp-cli connect`، تغییر پروتکل، `disconnect` یا تغییر route سیستم را اجرا نمی‌کند. WARP باید پیش از اجرای سرویس Agent متصل باشد. این بررسی‌ها پیش از هر اتصال مجدد نیز تکرار می‌شوند و در گزینهٔ ۸، خرابی WARP باعث استفادهٔ پنهانی از مسیر مستقیم نمی‌شود.
 
-فعال‌کردن WARP ممکن است default route سرور را تغییر دهد و نشست SSH را قطع کند. فرمان‌های زیر را از کنسول ارائه‌دهنده یا با دسترسی جایگزین/خارج از باند اجرا و اتصال SSH را جداگانه آزمایش کنید؛ از یک نشست SSH تنها برای تغییر مسیر پیش‌فرض استفاده نکنید:
+اگر Local Proxy از قبل فعال است، حالت آن را تغییر ندهید؛ `WarpProxy` را روشن نگه دارید و از پورت نمایش‌داده‌شده در تنظیمات استفاده کنید (در بسیاری از نصب‌ها `40000` است). بررسی فقط‌خواندنی:
+
+```bash
+curl -fsS --proxy http://127.0.0.1:40000 https://api.cloudflare.com/cdn-cgi/trace | grep '^warp=on$'
+```
+
+فعال‌کردن حالت تونل سراسری WARP ممکن است default route سرور را تغییر دهد و نشست SSH را قطع کند. فرمان‌های زیر را فقط از کنسول ارائه‌دهنده یا با دسترسی جایگزین/خارج از باند اجرا کنید؛ از یک نشست SSH تنها برای تغییر مسیر پیش‌فرض استفاده نکنید:
 
 ```bash
 warp-cli tunnel protocol set MASQUE
 warp-cli connect
 warp-cli status
 warp-cli settings | grep -i protocol
-curl -fsS https://www.cloudflare.com/cdn-cgi/trace | grep '^warp=on$'
+curl -fsS https://api.cloudflare.com/cdn-cgi/trace | grep '^warp=on$'
 ```
 
 برای WireGuard به جای MASQUE از `warp-cli tunnel protocol set WireGuard` استفاده کنید. راهنمای رسمی: [نصب WARP در Linux](https://developers.cloudflare.com/warp-client/get-started/linux/) و [حالت‌های WARP](https://developers.cloudflare.com/warp-client/warp-modes/).
@@ -70,7 +76,7 @@ curl -fsS https://www.cloudflare.com/cdn-cgi/trace | grep '^warp=on$'
 ## جزئیات Failover و محدودیت‌های لایه
 
 - در گزینهٔ ۹، اگر WARP متصل باشد، مسیر فعال MASQUE یا WireGuard ابتدا با بررسی وضعیت، تنظیم پروتکل و خروجی زندهٔ `warp=on` راستی‌آزمایی می‌شود؛ سپس چهار انتقال داخلی روی آن امتحان می‌شود. در صورت شکست یا قطع WARP، مسیر Psiphon SOCKS5 و بعد Direct امتحان می‌شود. اگر WARP فعال نباشد، آخرین مسیر موفق Direct/Psiphon اولویت دارد و در شروع ترتیب Direct و سپس Psiphon است.
-- MASQUE و WireGuard دو پروتکل خروجی Cloudflare WARP هستند و توسط سرویس `warp-svc` در سطح سیستم مدیریت می‌شوند؛ آن‌ها پراکسی مستقل per-socket نیستند. ShahTunnel بدون ریسک‌کردن مسیر SSH، پروتکل WARP را وسط کار عوض نمی‌کند. اگر WARP فعال باشد، مسیر فعلی سیستم به‌عنوان یک مسیر مجزا راستی‌آزمایی می‌شود؛ مطمئن شوید IP هاب در فهرست استثناهای Split Tunnel قرار نگرفته باشد.
+- در حالت تونل سراسری، مسیر سیستم WARP به‌عنوان یک مسیر مجزا راستی‌آزمایی می‌شود؛ مطمئن شوید IP هاب در فهرست استثناهای Split Tunnel قرار نگرفته باشد. در حالت Local Proxy، هر کانال از پراکسی HTTP CONNECT روی loopback عبور می‌کند. Local Proxy فقط با MASQUE قابل استفاده است. اگر مسیر WARP در گزینهٔ ۹ خراب شود، مسیر بعدی طبق Failover انتخاب می‌شود.
 - Psiphon در این پیاده‌سازی با SOCKS5 برای جریان TCP استفاده می‌شود؛ این لایه، انتقال UDP مستقل فراهم نمی‌کند.
 - قطع هر lane مستقل بازیابی می‌شود؛ laneهای سالم و سرویس SSH دست‌کاری یا restart نمی‌شوند.
 
@@ -82,7 +88,13 @@ curl -fsS https://www.cloudflare.com/cdn-cgi/trace | grep '^warp=on$'
 
 ## نصب و ارتقا
 
-روی Linux amd64 یا arm64 دارای systemd با کاربر root اجرا کنید:
+نصب سریع از شاخهٔ عمومی `main` (روی Linux amd64 یا arm64 دارای systemd و با کاربر root):
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
+```
+
+برای نصب یا ارتقا از سورسی که قبلاً دانلود کرده‌اید:
 
 ```bash
 sudo bash S1T-START.sh
@@ -104,4 +116,4 @@ sudo systemctl restart 'ravanreverse@PROFILE.service'
 ./VERIFY-ALL-TRANSPORTS.sh
 ```
 
-این اسکریپت تست‌های انتقال‌های داخلی، آزمون SOCKS5، بررسی static و ساخت باینری‌های amd64/arm64 را انجام می‌دهد. تست WARP واقعی به کلاینت متصل و اینترنت فعال نیاز دارد؛ در محیط build آفلاین به‌عنوان تست زنده اجرا نمی‌شود.
+این اسکریپت تست انتقال‌های داخلی، آزمون پراکسی SOCKS5 و WARP Local Proxy با HTTP CONNECT، بررسی static و ساخت باینری‌های amd64/arm64 را انجام می‌دهد. تست WARP واقعی به کلاینت متصل و اینترنت فعال نیاز دارد؛ در محیط build آفلاین به‌عنوان تست زنده اجرا نمی‌شود.

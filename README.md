@@ -4,7 +4,7 @@
 
 <h1 align="center">SHAH TUNNEL</h1>
 <p align="center"><strong>V3.0.0 · Secure Reverse TCP Relay · Multi-layer Adaptive Recovery</strong></p>
-<p align="center">ShahTunnel relays public TCP connections through a Hub and authenticated Agent lanes to mapped local services. Version 3 adds real Agent-side Psiphon SOCKS5 egress and validation for an already-connected Cloudflare WARP tunnel using MASQUE or WireGuard.</p>
+<p align="center">ShahTunnel relays public TCP connections through a Hub and authenticated Agent lanes to mapped local services. Version 3 supports Agent-side Psiphon SOCKS5 egress and Cloudflare WARP over MASQUE, including both WARP system-tunnel mode and the local HTTP proxy mode, plus WireGuard system-tunnel mode.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
 ## Network flow
@@ -39,16 +39,22 @@ Options 1–7 retain their previous behaviour and numbering. Options 8 and 9 are
 
 ### WARP, MASQUE, and SSH safety
 
-On Linux, Cloudflare WARP is a system-level tunnel. For option 8, ShahTunnel verifies `warp-cli` presence, Connected status, the protocol reported by `warp-cli settings`, and a live `warp=on` egress check. ShahTunnel **never** runs `warp-cli connect`, changes the WARP protocol, disconnects WARP, or modifies system routes. WARP must already be active before the Agent service starts. The same status, protocol, and live egress checks are repeated before each reconnect, so a lost WARP tunnel does not silently fall back to the ordinary host route.
+ShahTunnel supports two WARP layouts for the Agent. In system-tunnel mode, the host route must already carry traffic through WARP; ShahTunnel verifies `warp-cli` status, the selected protocol, and a live `warp=on` check before connecting. In Local Proxy mode (`Mode: WarpProxy on port 40000`), ShahTunnel detects the loopback proxy port from `warp-cli settings`, verifies the proxy using Cloudflare trace, and opens an HTTP CONNECT stream to the Hub through `127.0.0.1:<port>`. This supports the MASQUE protocol; Cloudflare Local Proxy mode does not support WireGuard. The Agent therefore sends only its Hub control lanes through WARP, while SSH, inbound listeners, and the host default route remain untouched. ShahTunnel **never** runs `warp-cli connect`, changes the WARP protocol, disconnects WARP, or modifies system routes. WARP must already be connected before the Agent service starts. These checks are repeated before every reconnect, and a failed WARP path fails closed for option 8 rather than silently using the direct host route.
 
-Enabling WARP can change the server's default route and interrupt SSH. Run the commands below only from a provider console or with a tested out-of-band recovery path; do not switch the default route from your only SSH session:
+For an existing Local Proxy installation, do not switch modes: keep `WarpProxy` enabled and use the configured port (the default shown in many installations is `40000`). A read-only check is:
+
+```bash
+curl -fsS --proxy http://127.0.0.1:40000 https://api.cloudflare.com/cdn-cgi/trace | grep '^warp=on$'
+```
+
+Enabling the full system-tunnel mode can change the server's default route and interrupt SSH. Run the commands below only from a provider console or with a tested out-of-band recovery path; do not switch the default route from your only SSH session:
 
 ```bash
 warp-cli tunnel protocol set MASQUE
 warp-cli connect
 warp-cli status
 warp-cli settings | grep -i protocol
-curl -fsS https://www.cloudflare.com/cdn-cgi/trace | grep '^warp=on$'
+curl -fsS https://api.cloudflare.com/cdn-cgi/trace | grep '^warp=on$'
 ```
 
 For WireGuard, use `warp-cli tunnel protocol set WireGuard` instead. See Cloudflare's [Linux setup](https://developers.cloudflare.com/warp-client/get-started/linux/) and [WARP modes](https://developers.cloudflare.com/warp-client/warp-modes/).
@@ -70,7 +76,7 @@ Keep all three open for adaptive options 7–9. WARP/MASQUE and Psiphon do not a
 ## Failover details and layer boundaries
 
 - Option 9 tries the four inner TCP transports over a connected WARP tunnel (MASQUE or WireGuard) when detected, then Psiphon SOCKS5 and Direct. If WARP is not connected, the order is Direct then Psiphon. WARP status, protocol, and live `warp=on` egress are checked before every WARP attempt; each lane remembers its last successful inner transport and egress path.
-- MASQUE and WireGuard are Cloudflare WARP tunnel protocols managed by `warp-svc` at the system level; they are not independent per-socket proxies. ShahTunnel does not switch WARP protocols while running because doing so could interrupt SSH and all other host traffic. When WARP is active, its current system route is treated as a separately verified candidate; ensure the Hub IP is not excluded by the WARP split-tunnel policy. If the WARP tunnel drops, ShahTunnel skips it and moves to the next configured route.
+- MASQUE and WireGuard are Cloudflare WARP tunnel protocols managed by `warp-svc` at the system level; they are not independent per-socket proxies. ShahTunnel does not switch WARP protocols while running because doing so could interrupt SSH and all other host traffic. When WARP is active in system-tunnel mode, its current system route is treated as a separately verified candidate; ensure the Hub IP is not excluded by the WARP split-tunnel policy. When WARP is in Local Proxy mode, each lane uses the detected loopback HTTP CONNECT proxy instead. Local Proxy requires MASQUE. If a WARP candidate fails, option 9 moves to the next configured egress route.
 - Psiphon is integrated as a SOCKS5 TCP proxy in this release; this path does not provide an independent UDP transport.
 - Each lane reconnects independently. Healthy lanes and the SSH service are not restarted or modified.
 
@@ -82,7 +88,13 @@ The per-stream in-flight window remains 64 frames of up to 64 KiB. Actual throug
 
 ## Install and upgrade
 
-Run as root on Linux amd64 or arm64 with systemd:
+Quick install from the public `main` branch (run as root on Linux amd64 or arm64 with systemd):
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
+```
+
+To install or upgrade from an already downloaded source checkout instead:
 
 ```bash
 sudo bash S1T-START.sh
@@ -104,4 +116,4 @@ sudo systemctl restart 'ravanreverse@PROFILE.service'
 ./VERIFY-ALL-TRANSPORTS.sh
 ```
 
-The helper runs inner-transport tests, a real local SOCKS5 TCP-dial integration test, static analysis, and amd64/arm64 builds. Live WARP validation requires an active WARP client and Internet connectivity; it is not run as a live test in an offline build environment.
+The helper runs inner-transport tests, local SOCKS5 and WARP HTTP CONNECT integration tests, static analysis, and amd64/arm64 builds. Live WARP validation requires an active WARP client and Internet connectivity; it is not run as a live test in an offline build environment.

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Local verification helper. It reuses an existing Go 1.26.1 toolchain and never downloads one.
+# Local verification helper. It reuses an existing Go 1.26.11 toolchain and never downloads one.
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-GO_VERSION="1.26.1"
+GO_VERSION="1.26.11"
 GO_HOME="$ROOT/.toolchains/go${GO_VERSION}"
 GO_BIN=""
 
@@ -24,7 +24,7 @@ version_is_pinned() {
   [[ "$v" == *"go${GO_VERSION}"* ]]
 }
 
-# Reuse only an exact Go 1.26.1 binary. An older/newer system toolchain is not used.
+# Reuse only an exact Go 1.26.11 binary. An older/newer system toolchain is not used.
 for candidate in "$GO_HOME/bin/go" "/usr/local/lib/shah-tunnel/toolchains/go${GO_VERSION}-${TARGET_ARCH}/bin/go" "/usr/local/lib/shah-tunnel/go-${GO_VERSION}/bin/go" "$(command -v go 2>/dev/null || true)"; do
   if [[ -n "$candidate" ]] && version_is_pinned "$candidate"; then
     GO_BIN="$candidate"
@@ -60,9 +60,14 @@ bash -n VERIFY-ALL-TRANSPORTS.sh
 [[ -s docs/img/ShahTunnel-Network-Flow-v3-fa.svg ]] || fail "Persian v3 Network Flow diagram is missing."
 grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/psiphon' S1T-START.sh || fail "Psiphon systemd data-directory permission is missing."
 grep -Fq 'func detectActiveWarpUnderlay() string' S1T-CAPSULE/main.go || fail "Adaptive WARP protocol detection is missing."
+grep -Fq 'func warpProxyAddressFromSettings(settings string)' S1T-CAPSULE/main.go || fail "Cloudflare Local Proxy detection is missing."
+grep -Fq 'func dialHTTPConnectContext(' S1T-CAPSULE/main.go || fail "WARP Local Proxy HTTP CONNECT dialer is missing."
+grep -Fq 'TestWarpProxyAddressFromSettings' S1T-CAPSULE/main_test.go || fail "WARP Local Proxy parsing tests are missing."
+grep -Fq 'TestDialHTTPConnectContext' S1T-CAPSULE/main_test.go || fail "WARP Local Proxy CONNECT tests are missing."
+grep -Fq 'TestDialAgentUnderlayUsesDetectedWarpLocalProxy' S1T-CAPSULE/main_test.go || fail "WARP Local Proxy Agent integration coverage is missing."
 grep -Fq 'TestAdaptiveUnderlayCandidatesDetectWARPAndFailOver' S1T-CAPSULE/main_test.go || fail "WARP failover coverage is missing."
 grep -Fq 'TestOptionNineSwitchesFromFailedDirectPathToPsiphonSOCKS5' S1T-CAPSULE/main_test.go || fail "Option 9 SOCKS5 failover coverage is missing."
-pass "Shell syntax, v3 Network Flow diagrams, Psiphon systemd permissions, and WARP/Psiphon failover coverage"
+pass "Shell syntax, v3 Network Flow diagrams, Psiphon systemd permissions, WARP Local Proxy detection/CONNECT, and WARP/Psiphon failover coverage"
 
 printf '\n== 4/7: Transport loopback suite ==\n'
 "$GO_BIN" test -count=20 ./S1T-CAPSULE || fail "Automated transport tests failed."

@@ -2,17 +2,21 @@
 ================
 
 - گزینه‌های 1 تا 7 در انتخاب‌گر انتقال همان رفتار و شماره‌گذاری قبلی را حفظ می‌کنند.
-- گزینه 8 به انتخاب‌گر انتقال اضافه شده است: Cloudflare WARP با پروتکل MASQUE، WARP با WireGuard یا Psiphon از طریق SOCKS5.
-- گزینه 9 چهار انتقال داخلی را روی WARP فعال (MASQUE/WireGuard)، Psiphon و Direct امتحان می‌کند؛ WARP قبل از استفاده راستی‌آزمایی می‌شود و در صورت قطع، مسیر Psiphon و سپس Direct جایگزین می‌شود. بدون WARP، آخرین مسیر موفق Direct/Psiphon در اولویت است.
+- گزینه 8 به انتخاب‌گر انتقال اضافه شده است: Cloudflare WARP با MASQUE (تونل سراسری یا پراکسی محلی WarpProxy)، WARP با WireGuard یا Psiphon از طریق SOCKS5.
+- گزینه 9 چهار انتقال داخلی را روی WARP فعال (MASQUE/WireGuard و در MASQUE حالت WarpProxy)، Psiphon و Direct امتحان می‌کند؛ هر مسیر پیش از استفاده راستی‌آزمایی می‌شود و در صورت قطع، مسیر بعدی جایگزین می‌شود. بدون WARP، آخرین مسیر موفق Direct/Psiphon در اولویت است.
 - Hub فقط انتقال‌های داخلی را می‌پذیرد؛ انتخاب MASQUE/WARP/Psiphon در نقش Agent انجام می‌شود.
 - Psiphon با ConsoleClient رسمی، فایل JSON کلاینت و SOCKS5 لوکال پیاده شده است. باینری Psiphon داخل این بسته نیست؛ از مخزن رسمی Psiphon دریافت شود. نصب‌کننده فقط مسیر داده Psiphon در /var/lib/shah-tunnel/psiphon را به مجوز نوشتن systemd اضافه می‌کند و ProtectSystem=strict را حفظ می‌کند.
-- برای WARP/MASQUE وضعیت Connected، پروتکل فعال و خروجی زنده warp=on بررسی می‌شود. ShahTunnel این موارد را هنگام اتصال مجدد هم بررسی می‌کند؛ هرگز route را تغییر نمی‌دهد و WARP را خودکار connect/disconnect نمی‌کند.
+- برای WARP/MASQUE وضعیت Connected و پروتکل فعال بررسی می‌شود. هر دو حالت تونل سراسری و Local Proxy پشتیبانی می‌شوند؛ در حالت Local Proxy پورت loopback از warp-cli settings تشخیص داده شده و اتصال Hub با HTTP CONNECT از آن عبور می‌کند. ShahTunnel هرگز route را تغییر نمی‌دهد و WARP را خودکار connect/disconnect نمی‌کند.
 - گزینه 8 منوی اصلی مدیریت همچنان حذف کامل نصب است؛ گزینه 8 جدید فقط داخل انتخاب‌گر انتقال کاربرد دارد.
 - Network Flow به نسخه 3 به‌روزرسانی شده و مرز لایه انتقال داخلی/مسیر خروجی را مشخص می‌کند.
 
 نکتهٔ SSH:
 فعال کردن WARP ممکن است مسیر پیش‌فرض سیستم را تغییر دهد. آن را از کنسول ارائه‌دهنده یا با دسترسی جایگزین آزمایش کنید؛ فقط با یک نشست SSH اقدام به تغییر default route نکنید.
 
-تست‌ها شامل عبور واقعی نشست‌های TCP/TLS، WebSocket/TLS، HTTP/2 و HTTP/1.1 از SOCKS5 محلی، failover مسیر خروجی، `go vet` و build برای amd64/arm64 هستند. تست زنده WARP به کلاینت فعال و اینترنت نیاز دارد.
+تست‌ها شامل عبور نشست‌های TCP/TLS، WebSocket/TLS، HTTP/2 و HTTP/1.1، پراکسی SOCKS5 و WARP Local Proxy با HTTP CONNECT، failover مسیر خروجی، `go vet` و build برای amd64/arm64 هستند. تست زنده WARP به کلاینت فعال و اینترنت نیاز دارد.
 
 نصب‌کننده سرویس فعال ShahTunnel را خودکار restart نمی‌کند تا نشست‌ها قطع نشوند. پس از آماده‌بودن برای وقفه کوتاه تونل، فقط سرویس مربوط به ShahTunnel را restart کنید؛ sshd دست‌کاری نمی‌شود.
+
+
+نصب سریع از GitHub (Linux amd64/arm64 با systemd):
+bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
