@@ -266,6 +266,7 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 	bindings := make([]XrayWarpBinding, 0, len(mappings))
 	newInbounds := make([]any, 0, len(mappings))
 	newRules := make([]any, 0, len(mappings))
+	newInboundTags := make([]string, 0, len(mappings))
 	portToBinding := map[int]XrayWarpBinding{}
 	for _, mapping := range mappings {
 		host, portText, err := net.SplitHostPort(strings.TrimSpace(mapping.Target))
@@ -321,6 +322,7 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 		clone["listen"] = "127.0.0.1"
 		clone["port"] = port
 		newInbounds = append(newInbounds, clone)
+		newInboundTags = append(newInboundTags, inTag)
 		newRules = append(newRules, map[string]any{"type": "field", "inboundTag": []any{inTag}, "outboundTag": outTag})
 		b := XrayWarpBinding{MappingID: mapping.ID, OriginalTarget: mapping.Target, WarpTarget: net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), InboundTag: inTag}
 		portToBinding[sourcePort] = b
@@ -335,10 +337,17 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 	root["inbounds"] = newInbounds
 	delete(root, "api")
 	delete(root, "metrics")
-	root["outbounds"] = append(outbounds, map[string]any{
-		"tag": outTag, "protocol": "socks",
-		"settings": map[string]any{"servers": []any{map[string]any{"address": "127.0.0.1", "port": mustPortNumber(proxyAddress)}}},
-	})
+	dnsOutbound, dnsRules, err := configureXrayWarpDNS(root, shortID, outTag, newInboundTags, usedTags)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	root["outbounds"] = append(outbounds,
+		map[string]any{
+			"tag": outTag, "protocol": "socks",
+			"settings": map[string]any{"servers": []any{map[string]any{"address": "127.0.0.1", "port": mustPortNumber(proxyAddress)}}},
+		},
+		dnsOutbound,
+	)
 	routing, ok := root["routing"].(map[string]any)
 	if !ok {
 		routing = map[string]any{}
@@ -348,12 +357,82 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 	if !ok && routing["rules"] != nil {
 		return nil, nil, "", errors.New("Xray routing.rules is not an array")
 	}
-	routing["rules"] = append(newRules, rules...)
+	// DNS hijack must precede the general cloned-inbound WARP rule. The
+	// internal DNS requests are separately tagged by dns.tag and are sent
+	// through the same WARP SOCKS5 outbound to avoid filtered/system DNS.
+	routing["rules"] = append(append(dnsRules, newRules...), rules...)
 	result, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
 		return nil, nil, "", err
 	}
 	return append(result, '\n'), bindings, outTag, nil
+}
+
+// configureXrayWarpDNS mirrors the known-good isolated WARP DNS setup:
+// client DNS on port 53 is handed to Xray's DNS module, and the module's own
+// DoH requests are routed through the per-profile WARP SOCKS5 outbound.
+// This modifies only the generated sidecar config, never the X-UI source JSON.
+func configureXrayWarpDNS(root map[string]any, shortID, warpOutboundTag string, inboundTags []string, usedTags map[string]bool) (map[string]any, []any, error) {
+	dnsConfig, ok := root["dns"].(map[string]any)
+	if !ok {
+		if root["dns"] != nil {
+			return nil, nil, errors.New("Xray dns section is not an object")
+		}
+		dnsConfig = map[string]any{}
+		root["dns"] = dnsConfig
+	}
+	dnsInboundTag, _ := dnsConfig["tag"].(string)
+	dnsInboundTag = strings.TrimSpace(dnsInboundTag)
+	if dnsInboundTag == "" {
+		dnsInboundTag = "s1t-warp-" + shortID + "-dns-in"
+		dnsConfig["tag"] = dnsInboundTag
+	}
+	dnsOutboundTag := "s1t-warp-" + shortID + "-dns-out"
+	if usedTags[dnsOutboundTag] || dnsOutboundTag == warpOutboundTag {
+		return nil, nil, fmt.Errorf("Xray DNS outbound tag %q already exists; refusing to overwrite it", dnsOutboundTag)
+	}
+	if len(inboundTags) == 0 {
+		return nil, nil, errors.New("no cloned inbound tags available for WARP DNS routing")
+	}
+
+	// Use provider IPs directly so the resolver hostname itself cannot create
+	// a bootstrap DNS loop. DoH is TCP/TLS and works through SOCKS5 CONNECT.
+	dnsConfig["servers"] = []any{
+		"https://1.1.1.1/dns-query",
+		"https://8.8.8.8/dns-query",
+	}
+	dnsConfig["queryStrategy"] = "UseIPv4"
+
+	dnsOutbound := map[string]any{
+		"tag":      dnsOutboundTag,
+		"protocol": "dns",
+		"settings": map[string]any{},
+	}
+	dnsRules := []any{
+		map[string]any{
+			"type":        "field",
+			"inboundTag":  stringSliceToAny(inboundTags),
+			"network":     "tcp,udp",
+			"port":        "53",
+			"outboundTag": dnsOutboundTag,
+			"ruleTag":     "s1t-warp-" + shortID + "-dns-hijack",
+		},
+		map[string]any{
+			"type":        "field",
+			"inboundTag":  []any{dnsInboundTag},
+			"outboundTag": warpOutboundTag,
+			"ruleTag":     "s1t-warp-" + shortID + "-dns-egress",
+		},
+	}
+	return dnsOutbound, dnsRules, nil
+}
+
+func stringSliceToAny(values []string) []any {
+	out := make([]any, len(values))
+	for i, value := range values {
+		out[i] = value
+	}
+	return out
 }
 
 func mustPortNumber(address string) int {
@@ -587,6 +666,13 @@ func removeXrayWarpSidecar(meta *XrayWarpIntegration) error {
 }
 
 func applyXrayWarpEgressToSelectedTunnel() error {
+	return applyXrayWarpEgress(true, true)
+}
+
+// applyXrayWarpEgress installs the isolated sidecar. During a new Agent setup,
+// restartAgent is false so setup starts the Agent once after its local target
+// has been switched; from the manager menu it restarts only the selected Agent.
+func applyXrayWarpEgress(restartAgent, confirm bool) error {
 	if !isRoot() {
 		return errors.New("run the manager as root to safely create the dedicated Xray service")
 	}
@@ -613,13 +699,14 @@ func applyXrayWarpEgressToSelectedTunnel() error {
 	if err := verifyWarpUnderlay("MASQUE"); err != nil {
 		return err
 	}
-	fmt.Println()
-	uiWarn("ShahTunnel will run a separate Xray sidecar containing only cloned loopback inbounds for this profile.")
-	uiWarn("The X-UI-managed Xray config and service are not modified or restarted; other profiles, including option 7, remain Direct.")
-	uiWarn("Only this Agent profile and its dedicated Xray sidecar will restart. Active sessions on this profile briefly disconnect; SSH and host routes are not changed.")
-	if !askYN("Apply isolated WARP egress to this tunnel now? (y/N)", "n") {
-		uiInfo("No changes made.")
-		return nil
+	if confirm {
+		fmt.Println()
+		uiWarn("A private Xray sidecar will isolate only this Agent profile.")
+		uiWarn("X-UI, other profiles and option 7 stay Direct; SSH and host routes are untouched.")
+		if !askYN("Enable WARP for this Agent tunnel? (y/N)", "n") {
+			uiInfo("No changes made.")
+			return nil
+		}
 	}
 
 	oldProfile, err := os.ReadFile(configPath)
@@ -714,14 +801,20 @@ func applyXrayWarpEgressToSelectedTunnel() error {
 		rollbackSidecar()
 		return fmt.Errorf("save isolated Agent targets: %w", err)
 	}
-	service := currentServiceName()
-	if err = runSystemctl("restart", service); err != nil {
-		_ = atomicReplaceFile(configPath, oldProfile, 0600)
-		_ = runSystemctl("restart", service)
-		rollbackSidecar()
-		return fmt.Errorf("restart ShahTunnel profile %s failed; previous Agent config was restored: %w", service, err)
+	if restartAgent {
+		service := currentServiceName()
+		if err = runSystemctl("restart", service); err != nil {
+			_ = atomicReplaceFile(configPath, oldProfile, 0600)
+			_ = runSystemctl("restart", service)
+			rollbackSidecar()
+			return fmt.Errorf("restart ShahTunnel profile %s failed; previous Agent config was restored: %w", service, err)
+		}
 	}
-	uiSuccess("Per-tunnel WARP egress is active in a separate Xray service. Only this profile's cloned inbound uses WARP SOCKS5.")
+	if restartAgent {
+		uiSuccess("Per-tunnel WARP egress is active. DNS is routed through WARP automatically for this profile.")
+	} else {
+		uiSuccess("Per-tunnel WARP and DNS are prepared automatically; the new Agent will start on this route.")
+	}
 	uiInfo("Dedicated Xray service: " + sidecarService)
 	uiInfo("X-UI's original config and service were not modified or restarted.")
 	uiInfo("Other Xray inbounds and option 7 profiles remain Direct.")
@@ -744,5 +837,32 @@ func removeXrayWarpIntegration(cfg *Config) error {
 		}
 	}
 	cfg.XrayWARP = nil
+	return nil
+}
+
+// autoApplyXrayWarpForNewAgent enables isolated WARP during Agent creation
+// whenever the administrator already has Cloudflare Local Proxy (WarpProxy)
+// active. System-wide WARP is deliberately not converted or re-routed.
+func autoApplyXrayWarpForNewAgent() error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.Role != "agent" || cfg.Underlay != underlayMASQUE || cfg.XrayWARP != nil {
+		return nil
+	}
+	_, isProxy, proxyErr := warpProxyAddressFromCLI()
+	if proxyErr != nil {
+		uiWarn("Per-tunnel WARP was not auto-enabled because Local Proxy mode could not be verified; the Agent profile remains in its selected egress mode.")
+		return nil
+	}
+	if !isProxy {
+		uiInfo("WARP Local Proxy is not active; no system routes were changed. Per-tunnel WARP can be enabled later after Local Proxy is available.")
+		return nil
+	}
+	uiInfo("Cloudflare Local Proxy detected. Enabling isolated WARP and WARP-routed DNS automatically before Agent startup…")
+	if err := applyXrayWarpEgress(false, false); err != nil {
+		return fmt.Errorf("Agent profile was saved, but automatic per-tunnel WARP setup failed: %w", err)
+	}
 	return nil
 }

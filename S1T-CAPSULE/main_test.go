@@ -2132,6 +2132,7 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
   "outbounds": [
     {"tag":"direct","protocol":"freedom"}
   ],
+  "dns": {"tag":"dns_inbound","servers":["https://freedns.controld.com/p2","quic+local://p2.freedns.controld.com"],"queryStrategy":"UseIP"},
   "routing": {"domainStrategy":"AsIs","rules":[{"type":"field","domain":["geosite:category-ads-all"],"outboundTag":"block"}]}
 }`)
 	originalCopy := append([]byte(nil), original...)
@@ -2184,10 +2185,41 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 	if !warpFound || !directFound {
 		t.Fatalf("sidecar must preserve original outbound set and add WARP outbound: %#v", outbounds)
 	}
+	dnsConfig := got["dns"].(map[string]any)
+	if dnsConfig["queryStrategy"] != "UseIPv4" {
+		t.Fatalf("sidecar DNS queryStrategy=%v; want UseIPv4", dnsConfig["queryStrategy"])
+	}
+	dnsServers := dnsConfig["servers"].([]any)
+	if len(dnsServers) != 2 || dnsServers[0] != "https://1.1.1.1/dns-query" || dnsServers[1] != "https://8.8.8.8/dns-query" {
+		t.Fatalf("sidecar DNS servers were not normalized: %#v", dnsServers)
+	}
+	outboundsWithDNS := got["outbounds"].([]any)
+	dnsOutboundTag := "s1t-warp-warp-profile-dns-out"
+	dnsOutboundFound := false
+	for _, raw := range outboundsWithDNS {
+		x := raw.(map[string]any)
+		if x["tag"] == dnsOutboundTag && x["protocol"] == "dns" {
+			dnsOutboundFound = true
+		}
+	}
+	if !dnsOutboundFound {
+		t.Fatalf("sidecar DNS outbound %q is missing", dnsOutboundTag)
+	}
 	rules := got["routing"].(map[string]any)["rules"].([]any)
-	first := rules[0].(map[string]any)
+	if len(rules) < 3 {
+		t.Fatalf("sidecar has too few routing rules for isolated DNS: %#v", rules)
+	}
+	dnsHijack := rules[0].(map[string]any)
+	if dnsHijack["outboundTag"] != dnsOutboundTag || dnsHijack["port"] != "53" || dnsHijack["network"] != "tcp,udp" {
+		t.Fatalf("client DNS is not intercepted before the default WARP route: %#v", dnsHijack)
+	}
+	dnsEgress := rules[1].(map[string]any)
+	if dnsEgress["inboundTag"].([]any)[0] != "dns_inbound" || dnsEgress["outboundTag"] != outTag {
+		t.Fatalf("internal DNS requests are not routed through WARP: %#v", dnsEgress)
+	}
+	first := rules[2].(map[string]any)
 	if first["outboundTag"] != outTag {
-		t.Fatalf("first routing rule does not target WARP: %#v", first)
+		t.Fatalf("cloned inbound default routing rule does not target WARP: %#v", first)
 	}
 	if len(cloneInbound["settings"].(map[string]any)["clients"].([]any)) != 1 {
 		t.Fatal("cloned inbound lost original client settings")

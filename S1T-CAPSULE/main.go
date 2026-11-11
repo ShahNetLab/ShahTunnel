@@ -4575,6 +4575,11 @@ func setup() error {
 	default:
 		return errors.New("invalid role; enter 1 for HUB, 2 for Agent, or 3 for Relay")
 	}
+	if c.Role == "agent" && c.Underlay == underlayMASQUE {
+		if err := autoApplyXrayWarpForNewAgent(); err != nil {
+			return err
+		}
+	}
 	fmt.Printf("\n  %s %s\n", paint(ansiGreen+ansiBold, "✓"), "Configuration saved: "+configPath)
 	uiInfo("Enabling the independent service and automatic startup after VPS reboot…")
 	if err := ensureTunnelRunning(true); err != nil {
@@ -5553,7 +5558,7 @@ func menu() {
 		menuItem("6", "⏰ Scheduled restart", "Restart active tunnels on interval")
 		menuItem("7", "🗑️ Delete one tunnel", "Delete this tunnel only")
 		menuItem("8", "💣 Complete uninstall", "Remove all tunnels")
-		menuItem("9", "🌐 Isolate WARP egress", "Only this Agent tunnel; other tunnels stay Direct")
+		menuItem("9", "🌐 WARP egress", "Selected Agent only")
 		menuItem("0", "🚪 Exit", "Close menu")
 		uiRule()
 		choice := ask("Select an operation", "0")
