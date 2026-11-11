@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 2.2.8 installer.
+# Shah Tunnel 2.2.9 installer.
 # Downloads the pinned Go toolchain, verifies its SHA-256, fetches the source,
 # and builds the binary on the target server. No GitHub Release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="2.2.8"
+VERSION="2.2.9"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -656,6 +656,9 @@ if ! install_cloudflare_warp; then
 fi
 install -d -o root -g root -m 0700 /etc/ravanreverse
 install -d -o root -g root -m 0700 /etc/ravanreverse/tunnels
+# This directory is referenced by ReadWritePaths in the systemd units.
+# Create it before any profile service is started to prevent 226/NAMESPACE.
+install -d -o root -g root -m 0755 /etc/shah-tunnel
 install -d -o root -g root -m 0755 /usr/local/bin
 install -d -o root -g root -m 0755 "$STATE_DIR"
 BIN="/usr/local/bin/ravanreverse"

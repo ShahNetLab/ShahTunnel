@@ -3,17 +3,24 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>V2.2.8 · Secure Reverse TCP Relay · Profile-Scoped External Paths</strong></p>
+<p align="center"><strong>V2.2.9 · Secure Reverse TCP Relay · Per-Profile WARP Xray Egress</strong></p>
 <p align="center">A reverse TCP relay that carries public client connections through a Hub to mapped target services via authenticated Agent lanes. The private Hub↔Agent channel uses TLS 1.3, SHA-256 certificate pinning and adaptive recovery across four native transports and preconfigured Agent-side external network paths.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
-## 2.2.8 profile-scoped external paths
+## 2.2.9 per-profile WARP egress for Xray clients
 
-- Cloudflare WARP now uses the official client Local Proxy listener (`127.0.0.1:40000`) as a SOCKS5 next-hop for the selected Agent profile. It never enables device-wide routing as part of a normal Shah Tunnel profile.
-- Native transports (options 1–7), other Agent profiles, SSH, and unrelated host applications retain their own normal routes. SOCKS-backed external paths are applied per Agent connection, not through global route or nftables changes.
-- If the host is already connected in full-device WARP mode, the interactive wizard asks before switching to Local Proxy. Declining leaves the existing WARP route and saved profile untouched. A non-interactive service start will not silently convert an unknown or device-wide WARP configuration.
-- The Hub carrier is the only traffic controlled by the Agent external path. The local target application (for example, Xray listening on `127.0.0.1:2083`) keeps its own outbound policy. To make VPN users' internet traffic exit through WARP, configure that Xray instance's own SOCKS5 outbound/routing separately or use an isolated target instance.
-- Existing pre-2.2.8 full-device WARP Agent profiles must be restarted interactively once to migrate. A still-running legacy full-device profile is detected and not stopped or modified automatically.
+- Option 8 still uses Cloudflare WARP Local Proxy (`127.0.0.1:40000`) for the Agent-to-Hub carrier.
+- When the Agent wizard asks whether VPN client traffic should also use WARP, it can prepare an isolated Xray sidecar from the currently running local Xray inbound. The original panel Xray config, process, listener and existing direct profiles are not edited or restarted.
+- The sidecar listens only on loopback, clones the selected Xray inbound (including users and TLS/Reality settings), and routes its client traffic through the WARP SOCKS5 outbound. Shah Tunnel refreshes this sidecar from the panel config before each sidecar start.
+- **Use a separate Hub profile for WARP clients.** Hub transport control port, mapping ID and public client port must be different from the existing direct Hub profile. Wizard defaults are control port +10, mapping ID `warp`, and public listener `0.0.0.0:8443`. Open the selected control port and public listener in the Iran firewall.
+- Clients that should use WARP must connect to the dedicated public WARP port (default `8443`). Existing clients on their old public port continue to use the direct Xray target and are not changed.
+- The Agent target must be a local Xray inbound on `127.0.0.1` or `::1`. The setup wizard locates the running Xray process/config, validates the cloned configuration with the same Xray binary, and refuses the profile if it cannot safely identify a unique inbound.
+- WARP sidecars use the WARP Local Proxy SOCKS5 endpoint, do not add a VPS-wide route, and do not change SSH or the original Xray listener. If the local WARP proxy is not healthy for both IPv4 and IPv6, setup stops before saving the profile.
+- This isolates TCP Xray client egress. Do not assume every UDP/QUIC flow is proxied by the Cloudflare Local Proxy; verify the actual protocol/egress required by your deployment.
+
+## Compatibility and safety
+
+Profiles without `target_egress: warp_xray` retain their original target and route. The sidecar is a separate Xray process bound to loopback and a dedicated local port; it never edits the panel's active config or restarts the panel's Xray service. A WARP Agent profile must use its own Hub control listener and public listener so Hub session selection cannot mix direct and WARP mappings. Existing direct tunnel profiles remain on their original Hub port, target port and Xray instance.
 
 ## Network flow
 
@@ -60,12 +67,12 @@ Option 8 uses only the authenticated TCP/TLS carrier, so it needs the control po
 The installer adds the official Cloudflare WARP package on supported Debian/Ubuntu APT systems, but it does not register or connect WARP during installation. The Agent wizard offers these external paths. The default selection is option `2` (Cloudflare WARP), not the preconfigured MASQUE gateway:
 
 - **MASQUE:** connect through a preconfigured local MASQUE gateway exposed as a SOCKS5 endpoint (default `127.0.0.1:40001`). The wizard checks that this preconfigured SOCKS5 gateway answers before saving the profile. Shah Tunnel does not start a standalone MASQUE client.
-- **Cloudflare WARP:** uses Cloudflare WARP Local Proxy (`127.0.0.1:40000`) over MASQUE as a SOCKS5 next-hop for this Agent profile’s Hub connections only. It does not enable full-device routing, change the VPS default route, or affect other tunnel profiles. The local target service keeps its existing egress policy; configure that application separately if its internet traffic must also use WARP.
+- **Cloudflare WARP:** uses Cloudflare WARP Local Proxy (`127.0.0.1:40000`) over MASQUE as a SOCKS5 next-hop for this Agent profile’s Hub connections only. It does not enable full-device routing, change the VPS default route, or affect other tunnel profiles. Optionally, the wizard creates a separate Xray sidecar for client egress. The original panel listener stays direct.
 - **WARP on WARP:** use a separately prepared second SOCKS5 chain endpoint (default `127.0.0.1:40002`). Shah Tunnel does not register a second Cloudflare client or create a second WARP tunnel by itself.
 - **Tor/Psiphon:** enter the local SOCKS5 proxy address. Defaults are `127.0.0.1:9050` for Tor and `127.0.0.1:1080` for Psiphon; adjust them to the actual client settings. Destination hostnames are resolved by the proxy.
 
 Option 7 is the original four-transport adaptive mode. Option 8 selects one external path and uses the authenticated TCP/TLS carrier. Option 9 combines the four native transports with configured external paths. SOCKS-backed paths, including WARP, are opened by the relevant Agent lane only; direct/native paths use ordinary direct sockets. Each lane remembers its last successful route and transport. A failed outer connection is re-established on another candidate; an already-active TCP flow is not migrated seamlessly and may reconnect. The Hub must be configured with the corresponding mode.
-**WARP scope:** 2.2.8 uses WARP Local Proxy instead of full-device mode. This removes the global-route conflict between native and WARP Agent profiles, so multiple independent tunnel profiles can run together without changing each other’s routes. WARP here secures the Agent-to-Hub carrier only. It does not automatically change the public IP used by a local Xray/VPN target service; that service needs its own WARP SOCKS5 outbound/routing configuration. Profiles created by older releases with WARP device mode must be restarted once after upgrading so they migrate to the local proxy path.
+**WARP scope:** 2.2.9 keeps the Agent carrier and optional isolated Xray client egress on separate SOCKS5-based paths. Full-device route changes are not used. Use a dedicated Hub profile and public client port for WARP Xray clients; old direct profiles remain unchanged.
 
 ### WARP installation on restricted networks
 
