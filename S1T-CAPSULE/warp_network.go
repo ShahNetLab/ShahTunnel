@@ -20,6 +20,7 @@ const (
 	warpGuardUnitPath   = "/etc/systemd/system/shah-tunnel-warp-ssh-bypass.service"
 	warpGuardUnitName   = "shah-tunnel-warp-ssh-bypass.service"
 	warpManagedPath     = "/etc/shah-tunnel/warp-device-managed"
+	warpSOCKSAddress    = "127.0.0.1:40000"
 	warpDirectMark      = 0x5348
 	warpIPv4Table       = 42420
 	warpIPv6Table       = 42421
@@ -726,17 +727,11 @@ func warpSettingsIsDeviceMode(settings string) bool {
 }
 
 func warpNeedsProxyRestore() bool {
-	if _, err := os.Stat(warpManagedPath); err == nil {
-		return true
-	}
-	settings := warpSettings()
-	if warpSettingsIsDeviceMode(settings) {
-		return true
-	}
-	// Also detect an already-connected device-mode client if a newer CLI
-	// formats its settings differently. An unregistered/disconnected package
-	// must not block legacy transports or uninstall.
-	return warpStatusConnected() && !strings.Contains(strings.ToLower(settings), "warpproxy")
+	// Only change WARP state automatically when this application explicitly
+	// marked the full-device session as its own. User-managed WARP settings are
+	// never rewritten as a side effect of stopping a tunnel or uninstalling.
+	_, err := os.Stat(warpManagedPath)
+	return err == nil
 }
 
 func verifyCloudflareWarpDeviceEgress() error {
@@ -809,7 +804,7 @@ func configureCloudflareWarpDevice(interactive bool) error {
 	deadline := time.Now().Add(35 * time.Second)
 	for time.Now().Before(deadline) {
 		status, _ := runWarpCLI("status")
-		if strings.Contains(strings.ToLower(status), "connected") && !warpIsProxyMode() {
+		if warpStatusOutputConnected(status) && !warpIsProxyMode() {
 			if err := verifyCloudflareWarpDeviceEgress(); err != nil {
 				return rollbackCloudflareWarpDevice(err)
 			}
@@ -822,44 +817,105 @@ func configureCloudflareWarpDevice(interactive bool) error {
 	return rollbackCloudflareWarpDevice(errors.New("Cloudflare WARP did not reach full-device Connected mode within 35 seconds; route profile was not accepted"))
 }
 
+// configureCloudflareWarpProxyMode keeps Cloudflare WARP in Local Proxy mode.
+// It never enables device-level routing. When migrating a connected legacy
+// device-mode client, the physical SSH guard is installed before disconnecting
+// the global route. The resulting SOCKS5 listener is shared safely by profiles;
+// each Agent only uses it for its own Hub carrier sockets.
 func configureCloudflareWarpProxyMode() error {
+	return configureCloudflareWarpProxyModeWithInteraction(false)
+}
+
+func configureCloudflareWarpProxyModeInteractive() error {
+	return configureCloudflareWarpProxyModeWithInteraction(true)
+}
+
+func configureCloudflareWarpProxyModeWithInteraction(interactive bool) error {
 	if _, err := exec.LookPath("warp-cli"); err != nil {
-		return nil
+		return errors.New("Cloudflare WARP is not installed")
 	}
-	if warpIsProxyMode() {
-		_ = os.Remove(warpManagedPath)
-		return nil
+
+	// Inspect the currently configured mode before making any change. A
+	// connected device-mode WARP session changes host-wide routing, so only an
+	// interactive operator who explicitly approves may convert it to Local
+	// Proxy. This conversion disconnects the global route first; no policy
+	// routing table or SSH guard is created for a profile-scoped SOCKS path.
+	settings := warpSettings()
+	status, statusErr := runWarpCLI("status")
+	connected := statusErr == nil && warpStatusOutputConnected(status)
+	deviceMode := warpSettingsIsDeviceMode(settings)
+	approvedDeviceModeSwitch := false
+	serviceActive := exec.Command("systemctl", "is-active", "--quiet", "warp-svc.service").Run() == nil
+	if deviceMode && !interactive {
+		return errors.New("Cloudflare WARP is configured in full-device mode. Open the Shah Tunnel menu and select the WARP path interactively to approve switching it to Local Proxy; no routes or WARP settings were changed")
 	}
-	// If an older release left device-level WARP selected, install the SSH
-	// guard before switching modes even when status currently says disconnected:
-	// Always On may reconnect between a status check and the mode change.
-	if err := ensureWarpSSHGuard(); err != nil {
-		return fmt.Errorf("cannot safely disable device WARP while SSH is unprotected: %w", err)
+	if !serviceActive && strings.TrimSpace(settings) == "" && !interactive {
+		return errors.New("WARP mode cannot be verified while warp-svc is stopped. Run the Agent WARP setup interactively once; Shah Tunnel will not start an unknown device-wide WARP profile at boot")
 	}
-	if err := ensureCloudflareWarpRegistered(false); err != nil {
-		status, _ := runWarpCLI("status")
-		if strings.Contains(strings.ToLower(err.Error()), "registration is required") && !strings.Contains(strings.ToLower(status), "connected") {
-			// No registration and no active WARP session means there is no global
-			// route left to undo. A connected or indeterminate state is a hard error.
-			return nil
+	if deviceMode && connected {
+		if !wizardYesNo("Cloudflare WARP is currently changing the entire VPS route. Switch it to Local Proxy so only this Agent's Hub connections use WARP? Other VPS applications will return to the normal direct route. Continue? (y/N)", "n") {
+			return errors.New("operator declined switching full-device WARP to Local Proxy; existing WARP routing was left unchanged")
 		}
-		return fmt.Errorf("cannot safely return WARP to local-proxy mode: %w", err)
+		approvedDeviceModeSwitch = true
 	}
-	_, _ = runWarpCLI("disconnect")
-	if _, err := runWarpCLI("mode", "proxy"); err != nil {
-		return fmt.Errorf("could not return WARP to local-proxy mode for legacy transport: %w", err)
+
+	if err := ensureCloudflareWarpRegistered(interactive); err != nil {
+		// A missing registration with no connected session is harmless: do not
+		// register a device implicitly from a systemd restart.
+		status, _ := runWarpCLI("status")
+		if strings.Contains(strings.ToLower(err.Error()), "registration is required") && !warpStatusOutputConnected(status) {
+			return err
+		}
+		return fmt.Errorf("cannot prepare Cloudflare WARP Local Proxy mode: %w", err)
 	}
+
+	settings = warpSettings()
+	status, statusErr = runWarpCLI("status")
+	connected = statusErr == nil && warpStatusOutputConnected(status)
+	if warpSettingsIsDeviceMode(settings) {
+		if connected {
+			// The second read catches an Always-On device profile that may have
+			// auto-connected when warp-svc started. Never silently take its route.
+			if !approvedDeviceModeSwitch {
+				if !interactive || !wizardYesNo("WARP auto-connected in full-device mode. Disconnect the VPS-wide route and continue with per-profile Local Proxy? (y/N)", "n") {
+					return errors.New("WARP remains in full-device mode; no route was changed by Shah Tunnel")
+				}
+				approvedDeviceModeSwitch = true
+			}
+			if _, err := runWarpCLI("disconnect"); err != nil {
+				return fmt.Errorf("could not disconnect full-device WARP before Local Proxy conversion: %w", err)
+			}
+		}
+		if _, err := runWarpCLI("mode", "proxy"); err != nil {
+			return fmt.Errorf("could not set Cloudflare WARP Local Proxy mode: %w", err)
+		}
+	} else if !strings.Contains(strings.ToLower(settings), "warpproxy") {
+		return fmt.Errorf("Cloudflare WARP mode could not be verified; settings were left unchanged: %s", strings.TrimSpace(settings))
+	}
+
 	if _, err := runWarpCLI("proxy", "port", "40000"); err != nil {
-		return fmt.Errorf("could not restore WARP proxy port: %w", err)
+		return fmt.Errorf("could not set WARP SOCKS5 proxy port 40000: %w", err)
 	}
 	if _, err := runWarpCLI("tunnel", "protocol", "set", "MASQUE"); err != nil {
-		return fmt.Errorf("could not restore WARP MASQUE transport: %w", err)
+		return fmt.Errorf("could not set WARP tunnel protocol to MASQUE: %w", err)
 	}
-	if _, err := runWarpCLI("connect"); err != nil {
-		return fmt.Errorf("could not reconnect WARP in local-proxy mode: %w", err)
+	if !warpStatusConnected() {
+		if _, err := runWarpCLI("connect"); err != nil {
+			return fmt.Errorf("could not connect WARP Local Proxy: %w", err)
+		}
 	}
-	_ = os.Remove(warpManagedPath)
-	return nil
+
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if warpStatusConnected() && warpIsProxyMode() {
+			if err := verifySOCKS5ProxyHandshake(warpSOCKSAddress, "", ""); err == nil {
+				_ = os.Remove(warpManagedPath)
+				return nil
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("Cloudflare WARP did not expose a healthy SOCKS5 listener at %s in Local Proxy mode", warpSOCKSAddress)
 }
 
 func configRequiresCloudflareWarp(c Config) bool {
@@ -881,11 +937,11 @@ func prepareAgentNetwork(c Config) error {
 		return nil
 	}
 	if configRequiresCloudflareWarp(c) {
-		return configureCloudflareWarpDevice(false)
-	}
-	if warpNeedsProxyRestore() {
 		return configureCloudflareWarpProxyMode()
 	}
+	// Do not change WARP state for native/Tor/Psiphon/etc. profiles. Older
+	// device-mode sessions are detected by compatibility checks and require
+	// an explicit migration rather than a hidden global route change.
 	return nil
 }
 
@@ -964,33 +1020,48 @@ func agentNetworkPreparation(c Config) error {
 	return prepareAgentNetwork(c)
 }
 
-func warpStatusConnected() bool {
-	out, err := runWarpCLI("status")
-	if err != nil {
-		return false
-	}
+func warpStatusOutputConnected(out string) bool {
 	for _, line := range strings.Split(strings.ToLower(out), "\n") {
-		if strings.Contains(line, "status update:") && strings.TrimSpace(strings.TrimPrefix(line, "status update:")) == "connected" {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "status update:") && strings.TrimSpace(strings.TrimPrefix(line, "status update:")) == "connected" {
 			return true
 		}
 	}
 	return false
 }
 
-// agentNetworkPoliciesCompatible reports whether two Agent profiles can safely
-// share one host. Cloudflare WARP's device mode changes the VPS-wide default
-// egress, including traffic from local target services; it is not scoped to a
-// Shah Tunnel systemd unit. Different WARP policies must therefore never run
-// concurrently on the same host unless target applications have separate
-// network isolation outside Shah Tunnel.
+func warpStatusConnected() bool {
+	out, err := runWarpCLI("status")
+	return err == nil && warpStatusOutputConnected(out)
+}
+
+// agentNetworkPoliciesCompatible is always true for current Agent profiles:
+// WARP is a SOCKS5 next-hop used by a profile's own Agent sockets, not a host
+// default route. Old device-mode profiles are handled separately below.
 func agentNetworkPoliciesCompatible(a, b Config) bool {
-	if a.Role != "agent" || b.Role != "agent" {
-		return true
+	return true
+}
+
+// legacyDeviceWarpConfig detects pre-2.2.8 profiles whose WARP path had no
+// Address because it implicitly enabled full-device WARP. A live instance of
+// such a profile must be restarted once on the new version before other
+// profiles can safely share the machine.
+func legacyDeviceWarpConfig(c Config) bool {
+	if c.Role != "agent" {
+		return false
 	}
-	return configRequiresCloudflareWarp(a) == configRequiresCloudflareWarp(b)
+	for _, path := range c.ExternalPaths {
+		if strings.EqualFold(strings.TrimSpace(path.Method), "warp") && strings.TrimSpace(path.Address) == "" {
+			return true
+		}
+	}
+	return false
 }
 
 func assertAgentProfileNetworkCompatibility(c Config) error {
+	if c.Role != "agent" {
+		return nil
+	}
 	profiles, err := listTunnelProfiles()
 	if err != nil {
 		return err
@@ -1006,21 +1077,23 @@ func assertAgentProfileNetworkCompatibility(c Config) error {
 		if readErr != nil {
 			continue
 		}
-		var other Config
-		if json.Unmarshal(b, &other) != nil || other.Role != "agent" {
+		var raw Config
+		if json.Unmarshal(b, &raw) != nil || raw.Role != "agent" {
 			continue
 		}
-		other = normalizeConfig(other)
-		if !agentNetworkPoliciesCompatible(c, other) {
-			return fmt.Errorf("cannot start Agent profile %q while Agent profile %q is active: option 8/9 with Cloudflare WARP changes the VPS-wide client egress, not only this tunnel. The running profile was not stopped or modified. Keep the existing tunnel unchanged and use native option 7 on this VPS, or place the WARP profile and its target service on a separate VPS/isolated Xray instance", c.Name, p.Name)
+		if legacyDeviceWarpConfig(raw) {
+			return fmt.Errorf("Agent profile %q is still running an older full-device WARP mode. Restart that profile once with Shah Tunnel 2.2.8 first; the active service was not stopped or changed", p.Name)
 		}
+	}
+	// A device-level WARP session not owned by a currently selected profile
+	// would still capture unrelated app traffic. Never start a direct profile
+	// under that global route; do not attempt to change a user's WARP settings.
+	if !configRequiresCloudflareWarp(c) && warpStatusConnected() && warpSettingsIsDeviceMode(warpSettings()) {
+		return errors.New("Cloudflare WARP is connected in full-device mode outside this profile. Disconnect or switch that external WARP client to Local Proxy mode before starting a direct Agent; Shah Tunnel will not change a global route")
 	}
 	return nil
 }
 
-// ensureAgentNetworkRuntime is the non-interactive guard used by systemd after
-// boot. The manager has already installed the physical-route guard before it
-// enabled device-level MASQUE. Never silently enable WARP here without it.
 func ensureAgentNetworkRuntime(c Config) error {
 	if c.Role != "agent" {
 		return nil
@@ -1028,32 +1101,13 @@ func ensureAgentNetworkRuntime(c Config) error {
 	if err := assertAgentProfileNetworkCompatibility(c); err != nil {
 		return err
 	}
-	if !configRequiresCloudflareWarp(c) {
-		_, warpErr := exec.LookPath("warp-cli")
-		if warpErr == nil && warpNeedsProxyRestore() {
-			return configureCloudflareWarpProxyMode()
+	if configRequiresCloudflareWarp(c) {
+		if err := configureCloudflareWarpProxyMode(); err != nil {
+			return fmt.Errorf("profile-scoped WARP SOCKS5 path is not ready: %w", err)
 		}
-		return nil
-	}
-	if _, err := os.Stat(warpGuardConfigPath); err != nil {
-		return errors.New("WARP egress was selected but the SSH physical-route guard is missing; start the tunnel once from the Shah Tunnel menu to install it safely")
-	}
-	if exec.Command("systemctl", "is-active", "--quiet", warpGuardUnitName).Run() != nil {
-		return errors.New("WARP egress was selected but the SSH route-guard service is not active; refusing to start WARP without SSH protection")
-	}
-	if warpIsProxyMode() {
-		return errors.New("WARP is still in Local Proxy mode; start the Agent from the Shah Tunnel manager to enable full-device egress safely")
-	}
-	if !warpStatusConnected() {
-		if _, err := runWarpCLI("connect"); err != nil {
-			return fmt.Errorf("WARP is not connected and could not reconnect: %w", err)
+		if err := verifySOCKS5ProxyHandshake(warpSOCKSAddress, "", ""); err != nil {
+			return fmt.Errorf("WARP Local Proxy is not reachable at %s: %w", warpSOCKSAddress, err)
 		}
-	}
-	if !warpStatusConnected() {
-		return errors.New("Cloudflare WARP did not reach Connected state")
-	}
-	if err := verifyCloudflareWarpDeviceEgress(); err != nil {
-		return err
 	}
 	return nil
 }

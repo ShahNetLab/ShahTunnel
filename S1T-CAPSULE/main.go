@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "2.2.7"
+	version                          = "2.2.8"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -94,16 +94,14 @@ type PortMapping struct {
 	Target string `json:"target,omitempty"` // Agent local target
 }
 
-// AgentExternalPath describes an Agent-side egress path. Cloudflare WARP uses
-// device mode for option 8/9 so both the Agent carrier and local target-service
-// egress use WARP. The SSH route guard and SO_MARK direct fallback keep SSH and
-// legacy native carrier sockets on the physical VPS route. Other external
-// transports continue to use their configured local SOCKS5/TCP gateway.
+// AgentExternalPath describes a per-profile Agent-to-Hub carrier path.
+// Every SOCKS-backed path, including Cloudflare WARP, is scoped to the socket
+// opened by this Agent profile. No external path changes the VPS default route.
+// Local target-service egress is controlled by that target service separately.
 //
 // Method mapping:
 //
-//	warp                       -> Cloudflare device route (MASQUE)
-//	masque, warp_on_warp       -> local SOCKS5 gateway at Address
+//	warp, masque, warp_on_warp -> local SOCKS5 gateway at Address
 //	tor, psiphon               -> local SOCKS5 proxy at Address
 //	backhaul                   -> local raw-TCP forward at Address
 type AgentExternalPath struct {
@@ -555,9 +553,10 @@ func validExternalPathMethod(method string) bool {
 func externalPathKind(path AgentExternalPath) string {
 	switch strings.ToLower(strings.TrimSpace(path.Method)) {
 	case "warp":
-		// WARP is a device-level MASQUE route so the local target service's
-		// internet egress is also changed, not only the Agent->Hub carrier.
-		return "system"
+		// Cloudflare WARP is never a device-wide/system route in current
+		// profiles. A missing legacy address is normalized to the local
+		// WARP SOCKS5 listener before dialing; fail closed if it is not.
+		return "socks5"
 	case "masque", "warp_on_warp":
 		if strings.TrimSpace(path.Address) != "" {
 			return "socks5"
@@ -570,6 +569,14 @@ func externalPathKind(path AgentExternalPath) string {
 	default:
 		return "invalid"
 	}
+}
+
+func externalPathSOCKSEndpoint(path AgentExternalPath) string {
+	address := strings.TrimSpace(path.Address)
+	if strings.EqualFold(strings.TrimSpace(path.Method), "warp") && address == "" {
+		return warpSOCKSAddress
+	}
+	return address
 }
 
 func findExternalPath(paths []AgentExternalPath, id string) (AgentExternalPath, bool) {
@@ -2104,11 +2111,12 @@ func connectAndRunAgentHTTPConnectAuto(cfg Config, channel int) error {
 }
 
 // dialAgentExternalPath opens the raw TCP socket to the Hub through one
-// preconfigured Agent-side egress path. Cloudflare WARP uses its device-level
-// MASQUE route so the Agent carrier and the local target service share WARP
-// egress. Direct/fallback carriers are SO_MARKed to retain the VPS physical
-// route. MASQUE gateways, WARP-on-WARP, Tor and Psiphon use SOCKS5; Backhaul
-// uses a local raw-TCP forward.
+// preconfigured Agent-side egress path. Cloudflare WARP uses its local SOCKS5
+// listener, scoped to this Agent carrier socket. It never changes the VPS
+// default route or the egress of another profile. Direct/fallback carriers
+// use the native route (or the legacy physical-route mark when present).
+// MASQUE, WARP-on-WARP, Tor and Psiphon use their configured SOCKS5 endpoint;
+// Backhaul uses a local raw-TCP forward.
 func dialAgentExternalPath(ctx context.Context, cfg Config, path *AgentExternalPath, target string) (net.Conn, error) {
 	if path == nil {
 		d := makeDirectRouteDialer()
@@ -2117,9 +2125,7 @@ func dialAgentExternalPath(ctx context.Context, cfg Config, path *AgentExternalP
 	switch externalPathKind(*path) {
 	case "system":
 		d := net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
-		if !strings.EqualFold(path.Method, "warp") {
-			d.Control = directRouteControl()
-		}
+		d.Control = directRouteControl()
 		if path.Interface != "" {
 			if _, err := net.InterfaceByName(path.Interface); err != nil {
 				return nil, fmt.Errorf("Agent route %s requires interface %q: %w", path.ID, path.Interface, err)
@@ -2136,7 +2142,11 @@ func dialAgentExternalPath(ctx context.Context, cfg Config, path *AgentExternalP
 		}
 		return d.DialContext(ctx, "tcp", target)
 	case "socks5":
-		return dialSOCKS5(ctx, path.Address, target, path.Username, path.Password)
+		proxyAddress := externalPathSOCKSEndpoint(*path)
+		if proxyAddress == "" {
+			return nil, fmt.Errorf("Agent external path %q has no local SOCKS5 endpoint", path.ID)
+		}
+		return dialSOCKS5(ctx, proxyAddress, target, path.Username, path.Password)
 	case "tcp_forward":
 		forwardAddr, err := backhaulForwardAddress(cfg.HubAddr, path.Address, target)
 		if err != nil {
@@ -3160,11 +3170,13 @@ func normalizeConfig(c Config) Config {
 		c.ExternalPaths[i].Address = strings.TrimSpace(c.ExternalPaths[i].Address)
 		c.ExternalPaths[i].Interface = strings.TrimSpace(c.ExternalPaths[i].Interface)
 		c.ExternalPaths[i].Username = strings.TrimSpace(c.ExternalPaths[i].Username)
-		// Upgrade 2.2.3's app-scoped WARP address to the intended device-mode
-		// path. The local SOCKS port remains available only in Proxy mode; it
-		// cannot change Xray/user egress by itself.
+		// 2.2.8 scopes Cloudflare WARP to a local SOCKS5 listener. Older
+		// device-mode profiles omitted Address; migrate them to the WARP
+		// Local Proxy endpoint without changing Hub credentials or mappings.
 		if strings.EqualFold(c.ExternalPaths[i].Method, "warp") {
-			c.ExternalPaths[i].Address = ""
+			if c.ExternalPaths[i].Address == "" {
+				c.ExternalPaths[i].Address = warpSOCKSAddress
+			}
 			c.ExternalPaths[i].Interface = ""
 			c.ExternalPaths[i].Username = ""
 			c.ExternalPaths[i].Password = ""
@@ -3640,8 +3652,8 @@ func ensureTunnelTemplateUnit() error {
 	}
 	unit := `[Unit]
 Description=Shah Tunnel authenticated reverse TCP tunnel (%i)
-Wants=network-online.target shah-tunnel-warp-ssh-bypass.service
-After=network-online.target shah-tunnel-warp-ssh-bypass.service warp-svc.service
+Wants=network-online.target
+After=network-online.target
 StartLimitIntervalSec=60
 StartLimitBurst=10
 [Service]
@@ -4171,7 +4183,7 @@ func verifySOCKS5ProxyHandshake(address, username, password string) error {
 func wizardAskAgentExternalPath(existing []AgentExternalPath) (AgentExternalPath, error) {
 	fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "AGENT EXTERNAL TUNNEL PATH"))
 	fmt.Printf("  %s\n", "1) MASQUE — use a preconfigured local MASQUE-to-SOCKS5 gateway")
-	fmt.Printf("  %s\n", "2) Cloudflare WARP — device MASQUE egress with SSH/direct-route guard")
+	fmt.Printf("  %s\n", "2) Cloudflare WARP — MASQUE through local SOCKS5 proxy (per-profile)")
 	fmt.Printf("  %s\n", "3) WARP on WARP — use a preconfigured second WARP SOCKS5 endpoint")
 	fmt.Printf("  %s\n", "4) TOR — connect through a local SOCKS5 proxy")
 	fmt.Printf("  %s\n", "5) Psiphon — connect through its local SOCKS5 proxy")
@@ -4225,16 +4237,8 @@ func wizardAskAgentExternalPath(existing []AgentExternalPath) (AgentExternalPath
 		if _, err := exec.LookPath("warp-cli"); err != nil {
 			return path, errors.New("Cloudflare WARP is not installed; run the installer on the Agent host first")
 		}
-		// Protect the active SSH route before starting warp-svc: Always On may
-		// reconnect a previously saved device-WARP profile at daemon startup.
-		if err := ensureWarpSSHGuard(); err != nil {
-			return path, err
-		}
-		if err := ensureCloudflareWarpRegistered(true); err != nil {
-			return path, err
-		}
-		path.Address = ""
-		uiInfo("WARP will use full-device MASQUE only when this Agent tunnel starts. SSH replies and direct fallback transports are protected by the physical-route guard.")
+		path.Address = warpSOCKSAddress
+		uiInfo("Cloudflare WARP uses its local SOCKS5 proxy for this Agent-to-Hub connection only. No VPS-wide routes, SSH path, existing tunnel, or other profile is changed. The local target service keeps its own internet egress policy.")
 	case "warp_on_warp":
 		path.Address = strings.TrimSpace(wizardAsk("Second WARP-chain SOCKS5 endpoint", "127.0.0.1:40002"))
 		if err := validateTCPAddress("WARP-on-WARP SOCKS5 endpoint", path.Address); err != nil {
@@ -4392,9 +4396,20 @@ func repairAgentExternalPath() error {
 	_ = os.Chmod(backupPath, 0600)
 	service := currentServiceName()
 	wasActive := tunnelIsActive()
+	if err := assertAgentProfileNetworkCompatibility(updated); err != nil {
+		return fmt.Errorf("repair stopped before changing the profile: %w", err)
+	}
 	if wasActive {
 		if err := runSystemctl("stop", service); err != nil {
 			return fmt.Errorf("could not stop %s; original config was preserved: %w", service, err)
+		}
+	}
+	if configRequiresCloudflareWarp(updated) {
+		if err := configureCloudflareWarpProxyModeInteractive(); err != nil {
+			if wasActive {
+				_ = runSystemctl("start", service)
+			}
+			return fmt.Errorf("WARP Local Proxy could not be prepared; original profile was preserved: %w", err)
 		}
 	}
 	if err := saveConfig(updated); err != nil {
@@ -4658,10 +4673,16 @@ func setup() error {
 			}
 			break
 		}
-		// Check host-wide WARP compatibility before asking for secrets or saving
-		// a new profile. Device-mode WARP affects the whole VPS, not one unit.
+		// Check that no older full-device WARP Agent is still active before
+		// preparing the profile-scoped local SOCKS5 path. New WARP profiles do
+		// not change the VPS default route or any other profile.
 		if err := assertAgentProfileNetworkCompatibility(c); err != nil {
 			return fmt.Errorf("setup stopped before credentials or a new profile were saved: %w", err)
+		}
+		if configRequiresCloudflareWarp(c) {
+			if err := configureCloudflareWarpProxyModeInteractive(); err != nil {
+				return fmt.Errorf("WARP Local Proxy could not be prepared; no new profile was saved: %w", err)
+			}
 		}
 		if transportModeAllowsHTTP2(c.Transport) {
 			uiInfo("HTTP/2 CONNECT uses TCP port " + nextPortLabel(c.HubAddr) + ". Open it in the Hub firewall if selected.")
@@ -4810,11 +4831,6 @@ func ensureTunnelRunning(restartActive bool) error {
 		}
 		if err := prepareAgentNetwork(cfg); err != nil {
 			return fmt.Errorf("could not prepare the Agent network safely: %w", err)
-		}
-		if filepath.Clean(configPath) == filepath.Clean(legacyConfigPath) {
-			if err := ensureLegacyAgentWarpDropIn(); err != nil {
-				return err
-			}
 		}
 	}
 	if filepath.Clean(configPath) != filepath.Clean(legacyConfigPath) {

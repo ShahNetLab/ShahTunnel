@@ -313,7 +313,7 @@ func TestVerifySOCKS5ProxyHandshakeRejectsMissingEndpoint(t *testing.T) {
 	}
 }
 
-func TestOption8ConnectsThroughAgentSOCKS5ExternalPath(t *testing.T) {
+func TestOption8ConnectsThroughAgentWARPProxy(t *testing.T) {
 	certDir := t.TempDir()
 	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
 	fingerprint, err := generateCertificate(certPath, keyPath)
@@ -357,8 +357,8 @@ func TestOption8ConnectsThroughAgentSOCKS5ExternalPath(t *testing.T) {
 		Fingerprint:          fingerprint,
 		TunnelChannels:       1,
 		Ports:                []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
-		ExternalPaths:        []AgentExternalPath{{ID: "tor", Method: "tor", Address: startTestSOCKS5Proxy(t, "").Addr().String()}},
-		SelectedExternalPath: "tor",
+		ExternalPaths:        []AgentExternalPath{{ID: "warp", Method: "warp", Address: startTestSOCKS5Proxy(t, "").Addr().String()}},
+		SelectedExternalPath: "warp",
 	}
 	if err := validateConfig(cfg); err != nil {
 		t.Fatalf("validate option 8 Agent config: %v", err)
@@ -388,6 +388,110 @@ func TestOption8ConnectsThroughAgentSOCKS5ExternalPath(t *testing.T) {
 	case <-agentDone:
 	case <-time.After(3 * time.Second):
 		t.Fatal("Agent did not stop after the test closed the tunnel lane")
+	}
+	select {
+	case <-acceptDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Hub accept loop did not stop")
+	}
+}
+
+func TestMultipleAgentProfilesUseIndependentExternalAndNativePaths(t *testing.T) {
+	certDir := t.TempDir()
+	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
+	fingerprint, err := generateCertificate(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("generate certificate: %v", err)
+	}
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("load certificate: %v", err)
+	}
+	pin, err := normalizeFingerprint(fingerprint)
+	if err != nil {
+		t.Fatalf("normalize fingerprint: %v", err)
+	}
+	const token = "d40a12d2a76f4f52a5aefc3a6b1f7e39d40a12d2a76f4f52a5aefc3a6b1f7e39"
+	hubListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hubListener.Close()
+	h := &hubServer{cfg: Config{Role: "hub", Transport: transportFullAdaptive, Token: token}, sessions: make(map[*hubSession]struct{})}
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for {
+			conn, acceptErr := hubListener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go h.serveAgent(conn, hubTLSConfig(cert))
+		}
+	}()
+
+	warpProxy := startTestSOCKS5Proxy(t, "")
+	torProxy := startTestSOCKS5Proxy(t, "")
+	base := Config{
+		Version:        version,
+		Role:           "agent",
+		HubAddr:        hubListener.Addr().String(),
+		TLSServerName:  "localhost",
+		Token:          token,
+		Fingerprint:    fingerprint,
+		TunnelChannels: 1,
+		Ports:          []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
+	}
+	profiles := []Config{
+		{
+			Version: version, Role: "agent", Transport: transportNewMethods, HubAddr: base.HubAddr,
+			TLSServerName: base.TLSServerName, Token: token, Fingerprint: fingerprint, TunnelChannels: 1,
+			Ports: base.Ports, ExternalPaths: []AgentExternalPath{{ID: "warp", Method: "warp", Address: warpProxy.Addr().String()}}, SelectedExternalPath: "warp",
+		},
+		{
+			Version: version, Role: "agent", Transport: transportNewMethods, HubAddr: base.HubAddr,
+			TLSServerName: base.TLSServerName, Token: token, Fingerprint: fingerprint, TunnelChannels: 1,
+			Ports: base.Ports, ExternalPaths: []AgentExternalPath{{ID: "tor", Method: "tor", Address: torProxy.Addr().String()}}, SelectedExternalPath: "tor",
+		},
+		{
+			Version: version, Role: "agent", Transport: transportTCP, HubAddr: base.HubAddr,
+			TLSServerName: base.TLSServerName, Token: token, Fingerprint: fingerprint, TunnelChannels: 1, Ports: base.Ports,
+		},
+	}
+
+	done := make([]chan error, len(profiles))
+	for i, cfg := range profiles {
+		if err := validateConfig(cfg); err != nil {
+			t.Fatalf("profile %d validation: %v", i+1, err)
+		}
+		done[i] = make(chan error, 1)
+		go func(ch chan error, cfg Config, channel int) { ch <- connectAndRunAgent(cfg, pin, channel) }(done[i], cfg, i+1)
+	}
+
+	deadline := time.Now().Add(6 * time.Second)
+	for h.sessionCount() < len(profiles) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := h.sessionCount(); got != len(profiles) {
+		t.Fatalf("active Hub sessions = %d, want %d concurrent independent profiles", got, len(profiles))
+	}
+
+	_ = hubListener.Close()
+	h.mu.RLock()
+	active := make([]*hubSession, 0, len(h.sessions))
+	for session := range h.sessions {
+		active = append(active, session)
+	}
+	h.mu.RUnlock()
+	for _, session := range active {
+		session.shutdown()
+	}
+	for i, ch := range done {
+		select {
+		case <-ch:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("Agent profile %d did not stop after Hub shutdown", i+1)
+		}
 	}
 	select {
 	case <-acceptDone:
@@ -1096,22 +1200,24 @@ func TestAgentExternalPathConfigValidation(t *testing.T) {
 	if err := validateConfig(base); err != nil {
 		t.Fatalf("valid option 8 SOCKS5 Agent config rejected: %v", err)
 	}
-	warpDevice := base
-	warpDevice.ExternalPaths = []AgentExternalPath{{ID: "warp", Method: "warp"}}
-	warpDevice.SelectedExternalPath = "warp"
-	if got := externalPathKind(warpDevice.ExternalPaths[0]); got != "system" {
-		t.Fatalf("WARP device path kind = %q; want system", got)
+	warpProfile := base
+	warpProfile.ExternalPaths = []AgentExternalPath{{ID: "warp", Method: "warp"}}
+	warpProfile.SelectedExternalPath = "warp"
+	if kind := externalPathKind(warpProfile.ExternalPaths[0]); kind != "socks5" {
+		t.Fatalf("un-normalized WARP path kind = %q; want socks5 (never device/system route)", kind)
 	}
-	if err := validateConfig(warpDevice); err != nil {
-		t.Fatalf("valid WARP device-mode config rejected: %v", err)
+	if endpoint := externalPathSOCKSEndpoint(warpProfile.ExternalPaths[0]); endpoint != warpSOCKSAddress {
+		t.Fatalf("legacy WARP path proxy endpoint = %q; want %q", endpoint, warpSOCKSAddress)
 	}
-	// Upgrade an existing 2.2.3 app-scoped SOCKS config to the correct
-	// WARP device path; do not keep the obsolete local proxy address.
-	legacyWarp := warpDevice
-	legacyWarp.ExternalPaths = []AgentExternalPath{{ID: "warp", Method: "warp", Address: "127.0.0.1:40000"}}
-	legacyWarp = normalizeConfig(legacyWarp)
-	if legacyWarp.ExternalPaths[0].Address != "" || externalPathKind(legacyWarp.ExternalPaths[0]) != "system" {
-		t.Fatalf("2.2.3 WARP profile was not migrated: %+v", legacyWarp.ExternalPaths[0])
+	warpProfile = normalizeConfig(warpProfile)
+	if got := externalPathKind(warpProfile.ExternalPaths[0]); got != "socks5" {
+		t.Fatalf("WARP path kind = %q; want socks5", got)
+	}
+	if warpProfile.ExternalPaths[0].Address != warpSOCKSAddress {
+		t.Fatalf("legacy WARP profile was not migrated to local proxy address: %+v", warpProfile.ExternalPaths[0])
+	}
+	if err := validateConfig(warpProfile); err != nil {
+		t.Fatalf("valid WARP Local Proxy config rejected: %v", err)
 	}
 
 	missingSelected := base
@@ -1151,7 +1257,7 @@ func TestReplaceConfiguredExternalPathPreservesAgentSettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replace external path: %v", err)
 	}
-	if updated.SelectedExternalPath != "warp" || len(updated.ExternalPaths) != 1 || updated.ExternalPaths[0].Method != "warp" || updated.ExternalPaths[0].Address != "" {
+	if updated.SelectedExternalPath != "warp" || len(updated.ExternalPaths) != 1 || updated.ExternalPaths[0].Method != "warp" || updated.ExternalPaths[0].Address != warpSOCKSAddress {
 		t.Fatalf("replacement path not applied: %+v", updated.ExternalPaths)
 	}
 	if updated.Token != cfg.Token || updated.Fingerprint != cfg.Fingerprint || updated.HubAddr != cfg.HubAddr || updated.TLSServerName != cfg.TLSServerName || updated.TunnelChannels != cfg.TunnelChannels || updated.Ports[0] != cfg.Ports[0] {
@@ -1192,7 +1298,7 @@ func TestSystemExternalPathBindsToSelectedInterface(t *testing.T) {
 			accepted <- conn
 		}
 	}()
-	path := &AgentExternalPath{ID: "warp-test", Method: "warp", Interface: "lo"}
+	path := &AgentExternalPath{ID: "masque-test", Method: "masque", Interface: "lo"}
 	conn, err := dialAgentExternalPath(context.Background(), Config{}, path, listener.Addr().String())
 	if err != nil {
 		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
@@ -1963,24 +2069,44 @@ func TestPolicyRuleUsesPrivateRouteTable(t *testing.T) {
 	}
 }
 
-func TestWARPDeviceEgressPolicyByTransportMode(t *testing.T) {
+func TestWARPProxyPathByTransportMode(t *testing.T) {
 	warp := AgentExternalPath{ID: "warp", Method: "warp"}
 	tor := AgentExternalPath{ID: "tor", Method: "tor", Address: "127.0.0.1:9050"}
 	cfg := Config{Role: "agent", Transport: transportNewMethods, ExternalPaths: []AgentExternalPath{warp, tor}, SelectedExternalPath: "warp"}
 	if !configRequiresCloudflareWarp(cfg) {
-		t.Fatal("option 8 with selected WARP path must enable device egress")
+		t.Fatal("option 8 with selected WARP path must prepare the local WARP SOCKS proxy")
 	}
 	cfg.SelectedExternalPath = "tor"
 	if configRequiresCloudflareWarp(cfg) {
-		t.Fatal("option 8 selecting Tor must not enable device-level WARP")
+		t.Fatal("option 8 selecting Tor must not require the WARP SOCKS proxy")
 	}
 	cfg.Transport = transportFullAdaptive
 	if !configRequiresCloudflareWarp(cfg) {
-		t.Fatal("option 9 with a configured WARP candidate must enable WARP egress")
+		t.Fatal("option 9 with a configured WARP candidate must prepare the local WARP SOCKS proxy")
 	}
 	cfg.Transport = transportAdaptive
 	if configRequiresCloudflareWarp(cfg) {
-		t.Fatal("legacy option 7 must not inherit global WARP egress")
+		t.Fatal("legacy option 7 must not need a WARP SOCKS proxy")
+	}
+}
+
+func TestWARPStatusConnectedDetection(t *testing.T) {
+	tests := []struct {
+		name   string
+		status string
+		want   bool
+	}{
+		{name: "connected", status: "Status update: Connected\nNetwork: healthy", want: true},
+		{name: "disconnected", status: "Status update: Disconnected", want: false},
+		{name: "connecting", status: "Status update: Connecting", want: false},
+		{name: "missing status", status: "Network: healthy", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := warpStatusOutputConnected(tt.status); got != tt.want {
+				t.Fatalf("warpStatusOutputConnected() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -2004,6 +2130,20 @@ func TestWARPSettingsModeDetection(t *testing.T) {
 	}
 }
 
+func TestLegacyDeviceWarpProfileDetection(t *testing.T) {
+	legacy := Config{Role: "agent", ExternalPaths: []AgentExternalPath{{ID: "warp", Method: "warp"}}}
+	if !legacyDeviceWarpConfig(legacy) {
+		t.Fatal("pre-2.2.8 WARP profile with no address was not detected")
+	}
+	current := normalizeConfig(legacy)
+	if legacyDeviceWarpConfig(current) {
+		t.Fatal("2.2.8 normalized WARP SOCKS profile was incorrectly detected as legacy device mode")
+	}
+	if current.ExternalPaths[0].Address != warpSOCKSAddress {
+		t.Fatalf("normalized WARP path address = %q, want %q", current.ExternalPaths[0].Address, warpSOCKSAddress)
+	}
+}
+
 func TestAgentNetworkPoliciesCompatibility(t *testing.T) {
 	legacy := Config{Role: "agent", Transport: transportAdaptive}
 	warp8 := Config{
@@ -2019,17 +2159,17 @@ func TestAgentNetworkPoliciesCompatibility(t *testing.T) {
 	}
 	warp9NoWarp := Config{Role: "agent", Transport: transportFullAdaptive, ExternalPaths: []AgentExternalPath{{ID: "tor", Method: "tor", Address: "127.0.0.1:9050"}}}
 
-	if agentNetworkPoliciesCompatible(legacy, warp8) {
-		t.Fatal("legacy Agent and WARP device-mode Agent must not share one host")
+	if !agentNetworkPoliciesCompatible(legacy, warp8) {
+		t.Fatal("a WARP SOCKS path and a direct Agent profile must share one host safely")
 	}
-	if agentNetworkPoliciesCompatible(warp8, legacy) {
-		t.Fatal("WARP device-mode Agent and legacy Agent must not share one host")
+	if !agentNetworkPoliciesCompatible(warp8, legacy) {
+		t.Fatal("a direct Agent and a WARP SOCKS path must share one host safely")
 	}
 	if !agentNetworkPoliciesCompatible(legacy, Config{Role: "agent", Transport: transportTCP}) {
 		t.Fatal("two non-WARP Agent profiles should be compatible")
 	}
 	if !agentNetworkPoliciesCompatible(warp8, warp9) {
-		t.Fatal("two WARP device-mode Agent profiles should share the same host policy")
+		t.Fatal("two WARP SOCKS Agent profiles should share one proxy safely")
 	}
 	if !agentNetworkPoliciesCompatible(legacy, warp9NoWarp) {
 		t.Fatal("option 9 without a WARP candidate must remain compatible with legacy mode")
