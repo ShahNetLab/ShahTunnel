@@ -88,11 +88,15 @@ The per-stream in-flight window remains 64 frames of up to 64 KiB. Actual throug
 
 ## Install and upgrade
 
-Quick install from the public `main` branch (run as root on Linux amd64 or arm64 with systemd):
+One-line online install/upgrade (run as root on Linux amd64 or arm64 with systemd):
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 ```
+
+This command downloads only the installer script from `raw.githubusercontent.com`. The installer then downloads the ShahTunnel **source archive** from the official repository at `codeload.github.com/ShahNetLab/ShahTunnel` (branch `main`), obtains the pinned Go toolchain from the official Go distribution endpoints, verifies its SHA-256, and compiles the Linux binary on the target VPS. The compiled binary is installed locally at `/usr/local/bin/ravanreverse`.
+
+**No ShahTunnel executable/binary is required in GitHub, a GitHub Release, or this source ZIP.** Only source code, tests, documentation, and the installer belong in the repository. The installer never downloads a prebuilt ShahTunnel binary.
 
 To install or upgrade from an already downloaded source checkout instead:
 
@@ -100,7 +104,7 @@ To install or upgrade from an already downloaded source checkout instead:
 sudo bash S1T-START.sh
 ```
 
-The installer builds version `3.0.0` from the local source tree, verifies the pinned Go toolchain with SHA-256, and backs up an existing binary. It does not restart an already-active service during upgrade, avoiding interruption of current sessions. Legacy service/config names `ravanreverse.service` and `/etc/ravanreverse` remain for compatibility.
+When run from a checkout, the installer builds from that local source tree. It backs up an existing executable and does not restart an already-active ShahTunnel service during upgrade, avoiding interruption of current sessions. Legacy service/config names `ravanreverse.service` and `/etc/ravanreverse` remain for compatibility.
 
 The running service keeps its old in-memory binary until you restart the selected ShahTunnel unit during a maintenance window. This interrupts that tunnel's forwarded sessions, but does not restart or modify `sshd`:
 

@@ -405,16 +405,19 @@ build_from_official_go_toolchain() {
       # Use parallel ranges first for mirrors that support them; if a mirror
       # lacks byte-range support, fall back to the resumable single-stream path.
       local -a download_sources=(
+        # Prefer the official Go distribution endpoints. If they are unreachable
+        # from the VPS, verified mirrors are allowed because every archive must
+        # still match the official, pinned SHA-256 above.
+        "google|${GO_BASE}"
+        "go-dev|${GO_FALLBACK_BASE}"
+        "google-storage|https://storage.googleapis.com/golang"
+        "google-cn|https://golang.google.cn/dl"
         "aliyun|https://mirrors.aliyun.com/golang"
         "nju|https://mirror.nju.edu.cn/golang"
         "ustc|https://mirrors.ustc.edu.cn/golang"
         "tsinghua|https://mirrors.tuna.tsinghua.edu.cn/golang"
         "tencent|https://mirrors.cloud.tencent.com/go"
         "163|https://mirrors.163.com/golang"
-        "google|https://dl.google.com/go"
-        "go-dev|https://go.dev/dl"
-        "google-storage|https://storage.googleapis.com/golang"
-        "google-cn|https://golang.google.cn/dl"
       )
       local source source_id base part_file bytes
       echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) using parallel range requests where supported..." >&2

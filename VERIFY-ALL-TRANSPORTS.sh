@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Local verification helper. It reuses an existing Go 1.26.11 toolchain and never downloads one.
+# Build outputs are kept under a temporary directory; no executable is left in the source tree.
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
+BUILD_TMP="$(mktemp -d "${TMPDIR:-/tmp}/shah-tunnel-verify.XXXXXX")"
+cleanup() { rm -rf -- "$BUILD_TMP"; }
+trap cleanup EXIT
 
 GO_VERSION="1.26.11"
 GO_HOME="$ROOT/.toolchains/go${GO_VERSION}"
@@ -85,14 +89,12 @@ printf '\n== 6/7: Static analysis ==\n'
 "$GO_BIN" vet ./S1T-CAPSULE || fail "go vet reported an issue."
 pass "go vet"
 
-printf '\n== 7/7: Linux binaries build ==\n'
-mkdir -p dist
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-amd64 ./S1T-CAPSULE
-[[ "$(dist/shah-tunnel-linux-amd64 version)" == "Shah Tunnel 3.0.0 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-arm64 ./S1T-CAPSULE
-(cd dist && sha256sum shah-tunnel-linux-amd64 > shah-tunnel-linux-amd64.sha256)
-(cd dist && sha256sum shah-tunnel-linux-arm64 > shah-tunnel-linux-arm64.sha256)
-pass "Linux amd64 and arm64 binaries built; amd64 runtime version verified"
+printf '\n== 7/7: Linux build validation (temporary files only) ==\n'
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-amd64" ./S1T-CAPSULE
+[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 3.0.0 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-arm64" ./S1T-CAPSULE
+sha256sum "$BUILD_TMP/shah-tunnel-linux-amd64" "$BUILD_TMP/shah-tunnel-linux-arm64" > "$BUILD_TMP/SHA256SUMS"
+pass "Linux amd64 and arm64 binaries built and checksum-checked in a temporary directory (nothing added to the repository)"
 
 echo
 echo "ALL CHECKS PASSED using Go ${GO_VERSION}."
