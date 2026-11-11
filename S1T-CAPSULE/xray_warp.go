@@ -329,7 +329,12 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 	if len(newInbounds) == 0 {
 		return nil, nil, "", errors.New("no new Xray inbound routes were created")
 	}
-	root["inbounds"] = append(inbounds, newInbounds...)
+	// Run the selected inbound clones in a dedicated Xray sidecar process.
+	// Never mutate the X-UI-managed config or restart its service: X-UI may
+	// regenerate config.json from its database during a service restart.
+	root["inbounds"] = newInbounds
+	delete(root, "api")
+	delete(root, "metrics")
 	root["outbounds"] = append(outbounds, map[string]any{
 		"tag": outTag, "protocol": "socks",
 		"settings": map[string]any{"servers": []any{map[string]any{"address": "127.0.0.1", "port": mustPortNumber(proxyAddress)}}},
@@ -394,25 +399,92 @@ func atomicReplaceFile(path string, data []byte, mode os.FileMode) error {
 	return os.Rename(name, path)
 }
 
-func backupXrayConfig(path string, data []byte, mode os.FileMode, profileID string) (string, error) {
-	backup := fmt.Sprintf("%s.s1t-backup-%s-%d", path, safeXrayTag(profileID), time.Now().UnixNano())
-	if err := os.WriteFile(backup, data, mode.Perm()); err != nil {
-		return "", err
-	}
-	return backup, nil
+func xrayWarpServiceName(profileID string) string {
+	return "shah-tunnel-xray-warp-" + tunnelID(profileID) + ".service"
 }
 
-func restartXrayAndWait(service string, ports []XrayWarpBinding) error {
-	out, err := exec.Command("systemctl", "restart", service).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("restart Xray service %s: %w: %s", service, err, strings.TrimSpace(string(out)))
+func xrayWarpDirectory(profileID string) string {
+	return filepath.Join("/etc/ravanreverse/xray-warp", tunnelID(profileID))
+}
+
+func systemdExecQuote(value string) string {
+	// systemd's ExecStart parser supports double-quoted arguments and C-style
+	// backslash escapes. Escape specifiers as well so paths cannot expand %i.
+	value = strings.ReplaceAll(value, "%", "%%")
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
+	value = strings.ReplaceAll(value, "\n", `\n`)
+	value = strings.ReplaceAll(value, "\r", `\r`)
+	return `"` + value + `"`
+}
+
+func renderXrayWarpUnit(runtime xrayRuntime, configPath, service string) ([]byte, error) {
+	if runtime.Binary == "" || runtime.CWD == "" || configPath == "" ||
+		filepath.Base(service) != service || !strings.HasSuffix(service, ".service") {
+		return nil, errors.New("invalid Xray WARP sidecar service parameters")
 	}
+	for _, value := range []string{runtime.Binary, runtime.CWD, configPath} {
+		if strings.ContainsAny(value, "\x00\n\r") {
+			return nil, errors.New("Xray runtime paths contain unsupported control characters")
+		}
+	}
+	unit := fmt.Sprintf(`[Unit]
+Description=ShahTunnel isolated WARP Xray (%s)
+After=network-online.target warp-svc.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=%s
+ExecStart=%s run -config %s
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
+`, strings.TrimSuffix(service, ".service"), systemdExecQuote(runtime.CWD), systemdExecQuote(runtime.Binary), systemdExecQuote(configPath))
+	return []byte(unit), nil
+}
+
+func xrayWarpUnitPath(service string) (string, error) {
+	if filepath.Base(service) != service || !strings.HasPrefix(service, "shah-tunnel-xray-warp-") || !strings.HasSuffix(service, ".service") {
+		return "", fmt.Errorf("refusing to manage non-ShahTunnel WARP unit %q", service)
+	}
+	return filepath.Join("/etc/systemd/system", service), nil
+}
+
+func xrayWarpConfigDirectory(configPath string) (string, error) {
+	clean := filepath.Clean(configPath)
+	root := filepath.Clean("/etc/ravanreverse/xray-warp") + string(os.PathSeparator)
+	if !strings.HasPrefix(clean, root) || filepath.Base(clean) != "config.json" {
+		return "", fmt.Errorf("refusing to remove Xray config outside ShahTunnel WARP directory: %q", configPath)
+	}
+	return filepath.Dir(clean), nil
+}
+
+func systemdReload() error {
+	out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("systemd daemon-reload: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func xrayWarpJournal(service string) string {
+	out, _ := exec.Command("journalctl", "-u", service, "-n", "35", "--no-pager", "-o", "cat").CombinedOutput()
+	return strings.TrimSpace(string(out))
+}
+
+func waitForXrayWarpInbounds(service string, bindings []XrayWarpBinding) error {
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		allReady := true
-		for _, binding := range ports {
-			conn, dialErr := net.DialTimeout("tcp", binding.WarpTarget, 400*time.Millisecond)
-			if dialErr != nil {
+		for _, binding := range bindings {
+			conn, err := net.DialTimeout("tcp", binding.WarpTarget, 400*time.Millisecond)
+			if err != nil {
 				allReady = false
 				break
 			}
@@ -421,14 +493,102 @@ func restartXrayAndWait(service string, ports []XrayWarpBinding) error {
 		if allReady {
 			return nil
 		}
+		if exec.Command("systemctl", "is-active", "--quiet", service).Run() != nil {
+			return fmt.Errorf("isolated Xray service %s is not active; journal: %s", service, xrayWarpJournal(service))
+		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	return errors.New("Xray restarted but one or more WARP-only loopback inbounds did not start")
+	return fmt.Errorf("isolated Xray service %s is active but its WARP-only loopback inbounds did not start; journal: %s", service, xrayWarpJournal(service))
+}
+
+func installXrayWarpSidecar(runtime xrayRuntime, profileID string, generated []byte, bindings []XrayWarpBinding) (string, string, error) {
+	service := xrayWarpServiceName(profileID)
+	unitPath, err := xrayWarpUnitPath(service)
+	if err != nil {
+		return "", "", err
+	}
+	configDir := xrayWarpDirectory(profileID)
+	configPath := filepath.Join(configDir, "config.json")
+	if _, err := os.Stat(unitPath); err == nil {
+		return "", "", fmt.Errorf("managed WARP Xray unit %s already exists; inspect or remove the previous profile integration first", service)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", "", err
+	}
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		return "", "", err
+	}
+	cleanup := func() {
+		_ = exec.Command("systemctl", "disable", "--now", service).Run()
+		_ = os.Remove(unitPath)
+		_ = os.RemoveAll(configDir)
+		_ = systemdReload()
+	}
+	if err := atomicReplaceFile(configPath, generated, 0600); err != nil {
+		cleanup()
+		return "", "", fmt.Errorf("write isolated Xray config: %w", err)
+	}
+	unit, err := renderXrayWarpUnit(runtime, configPath, service)
+	if err != nil {
+		cleanup()
+		return "", "", err
+	}
+	if err := os.WriteFile(unitPath, unit, 0644); err != nil {
+		cleanup()
+		return "", "", fmt.Errorf("write isolated Xray systemd unit: %w", err)
+	}
+	if err := systemdReload(); err != nil {
+		cleanup()
+		return "", "", err
+	}
+	out, err := exec.Command("systemctl", "enable", "--now", service).CombinedOutput()
+	if err != nil {
+		journal := xrayWarpJournal(service)
+		cleanup()
+		return "", "", fmt.Errorf("start isolated Xray service %s: %w: %s; journal: %s", service, err, strings.TrimSpace(string(out)), journal)
+	}
+	if err := waitForXrayWarpInbounds(service, bindings); err != nil {
+		journal := xrayWarpJournal(service)
+		cleanup()
+		return "", "", fmt.Errorf("%w; journal: %s", err, journal)
+	}
+	return configPath, service, nil
+}
+
+func removeXrayWarpSidecar(meta *XrayWarpIntegration) error {
+	if meta == nil {
+		return nil
+	}
+	unitPath, err := xrayWarpUnitPath(meta.Service)
+	if err != nil {
+		return fmt.Errorf("legacy WARP integration needs manual safe migration; refusing to stop or modify %q: %w", meta.Service, err)
+	}
+	configDir, err := xrayWarpConfigDirectory(meta.ConfigPath)
+	if err != nil {
+		return err
+	}
+	out, stopErr := exec.Command("systemctl", "disable", "--now", meta.Service).CombinedOutput()
+	if stopErr != nil {
+		state, _ := exec.Command("systemctl", "show", meta.Service, "-p", "LoadState", "--value").Output()
+		if strings.TrimSpace(string(state)) != "not-found" {
+			return fmt.Errorf("stop isolated Xray service %s: %w: %s", meta.Service, stopErr, strings.TrimSpace(string(out)))
+		}
+	}
+	if err := os.Remove(unitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.RemoveAll(configDir); err != nil {
+		return err
+	}
+	if err := systemdReload(); err != nil {
+		return err
+	}
+	_ = exec.Command("systemctl", "reset-failed", meta.Service).Run()
+	return nil
 }
 
 func applyXrayWarpEgressToSelectedTunnel() error {
 	if !isRoot() {
-		return errors.New("run the manager as root to safely back up and update Xray")
+		return errors.New("run the manager as root to safely create the dedicated Xray service")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
@@ -454,16 +614,20 @@ func applyXrayWarpEgressToSelectedTunnel() error {
 		return err
 	}
 	fmt.Println()
-	uiWarn("ShahTunnel will clone the selected Xray inbounds to loopback-only ports and route only those cloned inbounds through WARP SOCKS5.")
-	uiWarn("The original Xray inbounds and other ShahTunnel profiles (including option 7) remain Direct.")
-	uiWarn("Xray and this tunnel service will restart; active client sessions on this Xray instance will briefly disconnect. SSH and host routes are not changed.")
+	uiWarn("ShahTunnel will run a separate Xray sidecar containing only cloned loopback inbounds for this profile.")
+	uiWarn("The X-UI-managed Xray config and service are not modified or restarted; other profiles, including option 7, remain Direct.")
+	uiWarn("Only this Agent profile and its dedicated Xray sidecar will restart. Active sessions on this profile briefly disconnect; SSH and host routes are not changed.")
 	if !askYN("Apply isolated WARP egress to this tunnel now? (y/N)", "n") {
 		uiInfo("No changes made.")
 		return nil
 	}
 
+	oldProfile, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("read ShahTunnel profile for transaction: %w", err)
+	}
+
 	var runtime xrayRuntime
-	var originalXray []byte
 	for i, mapping := range cfg.Ports {
 		_, portText, splitErr := net.SplitHostPort(mapping.Target)
 		if splitErr != nil {
@@ -479,24 +643,27 @@ func applyXrayWarpEgressToSelectedTunnel() error {
 		}
 		if i == 0 {
 			runtime = rt
-		} else if filepath.Clean(runtime.ConfigPath) != filepath.Clean(rt.ConfigPath) || runtime.Service != rt.Service {
+		} else if filepath.Clean(runtime.ConfigPath) != filepath.Clean(rt.ConfigPath) || runtime.Binary != rt.Binary || runtime.CWD != rt.CWD {
 			return errors.New("all WARP-routed mappings in one tunnel must belong to the same Xray instance")
 		}
 	}
-	originalXray, err = os.ReadFile(runtime.ConfigPath)
+	originalXray, err := os.ReadFile(runtime.ConfigPath)
 	if err != nil {
-		return fmt.Errorf("read Xray config %s: %w", runtime.ConfigPath, err)
-	}
-	info, err := os.Stat(runtime.ConfigPath)
-	if err != nil {
-		return err
+		return fmt.Errorf("read Xray source config %s: %w", runtime.ConfigPath, err)
 	}
 	profileID := strings.TrimSuffix(filepath.Base(configPath), filepath.Ext(configPath))
 	generated, bindings, outTag, err := buildXrayWarpConfig(originalXray, profileID, proxy, cfg.Ports)
 	if err != nil {
 		return err
 	}
-	testFile, err := os.CreateTemp(filepath.Dir(runtime.ConfigPath), ".s1t-xray-test-*.json")
+
+	// Validate the sidecar config using the exact Xray executable and working
+	// directory used by the X-UI-managed process, without touching its config.
+	validateDir := xrayWarpDirectory(profileID)
+	if err := os.MkdirAll(validateDir, 0700); err != nil {
+		return fmt.Errorf("create Xray WARP state directory: %w", err)
+	}
+	testFile, err := os.CreateTemp(validateDir, ".config-test-*.json")
 	if err != nil {
 		return err
 	}
@@ -506,7 +673,7 @@ func applyXrayWarpEgressToSelectedTunnel() error {
 		_ = os.Remove(testPath)
 		return err
 	}
-	if err = testFile.Chmod(info.Mode().Perm()); err != nil {
+	if err = testFile.Chmod(0600); err != nil {
 		_ = testFile.Close()
 		_ = os.Remove(testPath)
 		return err
@@ -519,26 +686,17 @@ func applyXrayWarpEgressToSelectedTunnel() error {
 	if err = validateXrayConfig(runtime, testPath); err != nil {
 		return err
 	}
-	backup, err := backupXrayConfig(runtime.ConfigPath, originalXray, info.Mode(), profileID)
+
+	// Start a second, profile-scoped Xray process. X-UI can freely regenerate
+	// its own config.json; the isolated listener and its port remain separate.
+	sidecarConfig, sidecarService, err := installXrayWarpSidecar(runtime, profileID, generated, bindings)
 	if err != nil {
-		return fmt.Errorf("backup Xray config: %w", err)
+		return err
 	}
-	if err = atomicReplaceFile(runtime.ConfigPath, generated, info.Mode()); err != nil {
-		_ = os.Remove(backup)
-		return fmt.Errorf("write Xray config: %w", err)
-	}
-	if err = restartXrayAndWait(runtime.Service, bindings); err != nil {
-		_ = atomicReplaceFile(runtime.ConfigPath, originalXray, info.Mode())
-		_, restartErr := exec.Command("systemctl", "restart", runtime.Service).CombinedOutput()
-		return fmt.Errorf("Xray WARP activation failed; original config restored from backup %s (rollback restart error=%v): %w", backup, restartErr, err)
+	rollbackSidecar := func() {
+		_ = removeXrayWarpSidecar(&XrayWarpIntegration{ConfigPath: sidecarConfig, Service: sidecarService})
 	}
 
-	oldProfile, err := os.ReadFile(configPath)
-	if err != nil {
-		_ = atomicReplaceFile(runtime.ConfigPath, originalXray, info.Mode())
-		_, _ = exec.Command("systemctl", "restart", runtime.Service).CombinedOutput()
-		return fmt.Errorf("read ShahTunnel profile for transaction: %w", err)
-	}
 	byID := make(map[string]XrayWarpBinding, len(bindings))
 	for _, b := range bindings {
 		byID[b.MappingID] = b
@@ -546,26 +704,27 @@ func applyXrayWarpEgressToSelectedTunnel() error {
 	for i := range cfg.Ports {
 		b, ok := byID[cfg.Ports[i].ID]
 		if !ok {
-			continue
+			rollbackSidecar()
+			return fmt.Errorf("no isolated Xray binding was generated for mapping %q", cfg.Ports[i].ID)
 		}
 		cfg.Ports[i].Target = b.WarpTarget
 	}
-	cfg.XrayWARP = &XrayWarpIntegration{ConfigPath: runtime.ConfigPath, Service: runtime.Service, OutboundTag: outTag, Proxy: proxy, Bindings: bindings}
+	cfg.XrayWARP = &XrayWarpIntegration{ConfigPath: sidecarConfig, Service: sidecarService, OutboundTag: outTag, Proxy: proxy, Bindings: bindings}
 	if err = saveConfig(cfg); err != nil {
-		_ = atomicReplaceFile(runtime.ConfigPath, originalXray, info.Mode())
-		_, _ = exec.Command("systemctl", "restart", runtime.Service).CombinedOutput()
+		rollbackSidecar()
 		return fmt.Errorf("save isolated Agent targets: %w", err)
 	}
 	service := currentServiceName()
 	if err = runSystemctl("restart", service); err != nil {
 		_ = atomicReplaceFile(configPath, oldProfile, 0600)
-		_ = atomicReplaceFile(runtime.ConfigPath, originalXray, info.Mode())
-		_, _ = exec.Command("systemctl", "restart", runtime.Service).CombinedOutput()
-		return fmt.Errorf("restart ShahTunnel profile %s failed; previous Xray and tunnel configs were restored: %w", service, err)
+		_ = runSystemctl("restart", service)
+		rollbackSidecar()
+		return fmt.Errorf("restart ShahTunnel profile %s failed; previous Agent config was restored: %w", service, err)
 	}
-	uiSuccess("Per-tunnel WARP egress is active. Only this profile's cloned Xray inbound uses WARP SOCKS5.")
-	uiInfo("Xray backup: " + backup)
-	uiInfo("Other Xray inbounds and option 7 profiles remain unchanged.")
+	uiSuccess("Per-tunnel WARP egress is active in a separate Xray service. Only this profile's cloned inbound uses WARP SOCKS5.")
+	uiInfo("Dedicated Xray service: " + sidecarService)
+	uiInfo("X-UI's original config and service were not modified or restarted.")
+	uiInfo("Other Xray inbounds and option 7 profiles remain Direct.")
 	return nil
 }
 
@@ -574,83 +733,13 @@ func removeXrayWarpIntegration(cfg *Config) error {
 		return nil
 	}
 	meta := cfg.XrayWARP
-	data, err := os.ReadFile(meta.ConfigPath)
-	if err != nil {
-		return fmt.Errorf("read Xray config for WARP cleanup: %w", err)
-	}
-	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
-		return fmt.Errorf("parse Xray config for WARP cleanup: %w", err)
-	}
-	removeTags := map[string]bool{}
-	for _, b := range meta.Bindings {
-		removeTags[b.InboundTag] = true
-	}
-	inbounds, ok := root["inbounds"].([]any)
-	if !ok {
-		return errors.New("Xray inbounds is not an array")
-	}
-	keptInbounds := make([]any, 0, len(inbounds))
-	for _, raw := range inbounds {
-		x, _ := raw.(map[string]any)
-		tag, _ := x["tag"].(string)
-		if !removeTags[tag] {
-			keptInbounds = append(keptInbounds, raw)
-		}
-	}
-	root["inbounds"] = keptInbounds
-	routing, _ := root["routing"].(map[string]any)
-	if routing != nil {
-		if rules, ok := routing["rules"].([]any); ok {
-			kept := make([]any, 0, len(rules))
-			for _, raw := range rules {
-				x, _ := raw.(map[string]any)
-				out, _ := x["outboundTag"].(string)
-				if out != meta.OutboundTag {
-					kept = append(kept, raw)
-				}
-			}
-			routing["rules"] = kept
-		}
-	}
-	if outbounds, ok := root["outbounds"].([]any); ok {
-		kept := make([]any, 0, len(outbounds))
-		for _, raw := range outbounds {
-			x, _ := raw.(map[string]any)
-			tag, _ := x["tag"].(string)
-			if tag != meta.OutboundTag {
-				kept = append(kept, raw)
-			}
-		}
-		root["outbounds"] = kept
-	}
-	generated, err := json.MarshalIndent(root, "", "  ")
-	if err != nil {
-		return err
-	}
-	generated = append(generated, '\n')
-	st, err := os.Stat(meta.ConfigPath)
-	if err != nil {
-		return err
-	}
-	if _, err = backupXrayConfig(meta.ConfigPath, data, st.Mode(), "cleanup"); err != nil {
-		return err
-	}
-	if err = atomicReplaceFile(meta.ConfigPath, generated, st.Mode()); err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "systemctl", "restart", meta.Service)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		_ = atomicReplaceFile(meta.ConfigPath, data, st.Mode())
-		_, _ = exec.Command("systemctl", "restart", meta.Service).CombinedOutput()
-		return fmt.Errorf("restart Xray after removing isolated WARP route: %w: %s", err, strings.TrimSpace(string(out)))
+	if err := removeXrayWarpSidecar(meta); err != nil {
+		return fmt.Errorf("remove dedicated WARP Xray service: %w", err)
 	}
 	for i := range cfg.Ports {
-		for _, b := range meta.Bindings {
-			if cfg.Ports[i].ID == b.MappingID {
-				cfg.Ports[i].Target = b.OriginalTarget
+		for _, binding := range meta.Bindings {
+			if cfg.Ports[i].ID == binding.MappingID {
+				cfg.Ports[i].Target = binding.OriginalTarget
 			}
 		}
 	}

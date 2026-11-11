@@ -2124,6 +2124,8 @@ exit 1
 
 func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 	original := []byte(`{
+  "api":{"tag":"api","services":["HandlerService"]},
+  "metrics":{"listen":"127.0.0.1:11111"},
   "inbounds": [
     {"tag":"existing-vless","listen":"0.0.0.0","port":2083,"protocol":"vless","settings":{"clients":[{"id":"test-id"}]}}
   ],
@@ -2132,9 +2134,13 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
   ],
   "routing": {"domainStrategy":"AsIs","rules":[{"type":"field","domain":["geosite:category-ads-all"],"outboundTag":"block"}]}
 }`)
+	originalCopy := append([]byte(nil), original...)
 	generated, bindings, outTag, err := buildXrayWarpConfig(original, "warp-profile", "127.0.0.1:40000", []PortMapping{{ID: "main", Target: "127.0.0.1:2083"}})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !bytes.Equal(original, originalCopy) {
+		t.Fatal("source X-UI config bytes were mutated")
 	}
 	if len(bindings) != 1 || bindings[0].OriginalTarget != "127.0.0.1:2083" {
 		t.Fatalf("unexpected bindings: %#v", bindings)
@@ -2147,19 +2153,22 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 		t.Fatal(err)
 	}
 	inbounds := got["inbounds"].([]any)
-	if len(inbounds) != 2 {
-		t.Fatalf("inbound count=%d; want original + WARP clone", len(inbounds))
+	if len(inbounds) != 1 {
+		t.Fatalf("sidecar inbound count=%d; want only the WARP clone", len(inbounds))
 	}
-	originalInbound := inbounds[0].(map[string]any)
-	cloneInbound := inbounds[1].(map[string]any)
-	if originalInbound["port"].(float64) != 2083 || originalInbound["listen"] != "0.0.0.0" {
-		t.Fatalf("original inbound was modified: %#v", originalInbound)
-	}
+	cloneInbound := inbounds[0].(map[string]any)
 	if cloneInbound["listen"] != "127.0.0.1" || cloneInbound["tag"] != bindings[0].InboundTag {
 		t.Fatalf("clone is not private/tagged: %#v", cloneInbound)
 	}
+	if _, ok := got["api"]; ok {
+		t.Fatal("X-UI API section must not be copied into the isolated sidecar")
+	}
+	if _, ok := got["metrics"]; ok {
+		t.Fatal("metrics listener must not be duplicated by the isolated sidecar")
+	}
 	outbounds := got["outbounds"].([]any)
 	warpFound := false
+	directFound := false
 	for _, raw := range outbounds {
 		x := raw.(map[string]any)
 		if x["tag"] == outTag {
@@ -2168,17 +2177,57 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 				t.Fatalf("WARP outbound protocol=%v", x["protocol"])
 			}
 		}
+		if x["tag"] == "direct" {
+			directFound = true
+		}
 	}
-	if !warpFound {
-		t.Fatal("WARP SOCKS5 outbound not found")
+	if !warpFound || !directFound {
+		t.Fatalf("sidecar must preserve original outbound set and add WARP outbound: %#v", outbounds)
 	}
 	rules := got["routing"].(map[string]any)["rules"].([]any)
 	first := rules[0].(map[string]any)
 	if first["outboundTag"] != outTag {
 		t.Fatalf("first routing rule does not target WARP: %#v", first)
 	}
-	if len(originalInbound["settings"].(map[string]any)["clients"].([]any)) != 1 {
+	if len(cloneInbound["settings"].(map[string]any)["clients"].([]any)) != 1 {
 		t.Fatal("cloned inbound lost original client settings")
+	}
+}
+
+func TestRenderXrayWarpUnitRunsIndependentSidecar(t *testing.T) {
+	runtime := xrayRuntime{Binary: "/usr/local/x-ui/bin/xray-linux-amd64", CWD: "/usr/local/x-ui/bin", Service: "x-ui.service"}
+	service := xrayWarpServiceName("profile-s")
+	unit, err := renderXrayWarpUnit(runtime, "/etc/ravanreverse/xray-warp/profile-s/config.json", service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(unit)
+	for _, want := range []string{
+		"ExecStart=\"/usr/local/x-ui/bin/xray-linux-amd64\" run -config \"/etc/ravanreverse/xray-warp/profile-s/config.json\"",
+		"WorkingDirectory=\"/usr/local/x-ui/bin\"",
+		"Restart=on-failure",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("sidecar unit missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "systemctl restart x-ui") || strings.Contains(text, "x-ui.service") {
+		t.Fatalf("sidecar unit must not restart or manage X-UI: %s", text)
+	}
+	if strings.Contains(text, "ExecStart=/bin/sh") {
+		t.Fatal("sidecar unit must execute Xray directly, not through a shell")
+	}
+}
+
+func TestXrayWarpManagedPathsAreRestricted(t *testing.T) {
+	if _, err := xrayWarpUnitPath("x-ui.service"); err == nil {
+		t.Fatal("must not manage X-UI systemd unit")
+	}
+	if _, err := xrayWarpConfigDirectory("/usr/local/x-ui/bin/config.json"); err == nil {
+		t.Fatal("must not remove or alter X-UI config directory")
+	}
+	if dir, err := xrayWarpConfigDirectory("/etc/ravanreverse/xray-warp/profile-s/config.json"); err != nil || dir != "/etc/ravanreverse/xray-warp/profile-s" {
+		t.Fatalf("unexpected managed config directory %q, error=%v", dir, err)
 	}
 }
 
