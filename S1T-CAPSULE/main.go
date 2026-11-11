@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "2.2.8"
+	version                          = "2.2.9"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -89,9 +89,11 @@ var (
 var configPath = legacyConfigPath
 
 type PortMapping struct {
-	ID     string `json:"id"`
-	Listen string `json:"listen,omitempty"` // Hub public listener
-	Target string `json:"target,omitempty"` // Agent local target
+	ID           string `json:"id"`
+	Listen       string `json:"listen,omitempty"`        // Hub public listener
+	Target       string `json:"target,omitempty"`        // Agent local target; original Xray listener when TargetEgress is set
+	TargetEgress string `json:"target_egress,omitempty"` // optional per-mapping target egress: warp_xray
+	WarpTarget   string `json:"warp_target,omitempty"`   // private loopback Xray sidecar listener created for this mapping
 }
 
 // AgentExternalPath describes a per-profile Agent-to-Hub carrier path.
@@ -2840,6 +2842,15 @@ func runAgent(cfg Config) error {
 	if err := ensureAgentNetworkRuntime(cfg); err != nil {
 		return fmt.Errorf("Agent network policy check failed: %w", err)
 	}
+	for _, mapping := range cfg.Ports {
+		if err := validateXrayWarpServiceState(mapping, profileInstanceID()); err != nil {
+			return err
+		}
+	}
+	cfg, err := prepareAgentTargetOverrides(cfg)
+	if err != nil {
+		return err
+	}
 	pin, err := normalizeFingerprint(cfg.Fingerprint)
 	if err != nil {
 		return err
@@ -3321,6 +3332,12 @@ func validateConfig(c Config) error {
 			if err := validateTCPAddress("target for mapping "+p.ID, p.Target); err != nil {
 				return err
 			}
+			if err := validateXrayWarpMapping(p); err != nil {
+				return err
+			}
+			if p.TargetEgress == warpXrayEgress && !configRequiresCloudflareWarp(c) {
+				return fmt.Errorf("mapping %q selects Xray WARP egress but this Agent profile has no Cloudflare WARP external path", p.ID)
+			}
 		}
 		if _, err := normalizeFingerprint(c.Fingerprint); err != nil {
 			return err
@@ -3786,6 +3803,9 @@ func deleteOneTunnel() error {
 	}
 	_ = os.Remove(runtimeStatsPath())
 	if cfg.Role == "agent" {
+		if err := cleanupXrayWarpSidecars(strings.TrimSuffix(filepath.Base(selected.Path), filepath.Ext(selected.Path)), cfg.Ports); err != nil {
+			return fmt.Errorf("tunnel was stopped and its config removed, but one isolated Xray WARP service could not be cleaned up: %w", err)
+		}
 		if err := releaseManagedWarpIfUnused(selected.Path); err != nil {
 			return fmt.Errorf("tunnel was deleted, but WARP could not be safely returned to local-proxy mode: %w", err)
 		}
@@ -4180,6 +4200,75 @@ func verifySOCKS5ProxyHandshake(address, username, password string) error {
 	}
 }
 
+// verifyCloudflareWarpSOCKSEgress checks the actual local SOCKS5 route, not
+// only the SOCKS handshake. Both address families are tested because users
+// commonly validate VPN egress through an IPv6 test endpoint.
+func validateWARPIPResponse(body []byte, family string) error {
+	ip := net.ParseIP(strings.TrimSpace(string(body)))
+	if ip == nil {
+		return fmt.Errorf("WARP %s endpoint did not return a valid IP address: %q", family, strings.TrimSpace(string(body)))
+	}
+	switch family {
+	case "IPv4":
+		if ip.To4() == nil {
+			return fmt.Errorf("WARP IPv4 endpoint returned non-IPv4 address %q", ip.String())
+		}
+	case "IPv6":
+		if ip.To4() != nil || ip.To16() == nil {
+			return fmt.Errorf("WARP IPv6 endpoint returned non-IPv6 address %q", ip.String())
+		}
+	default:
+		return fmt.Errorf("unsupported WARP address family %q", family)
+	}
+	return nil
+}
+
+// verifyCloudflareWarpSOCKSEgress checks the actual client-visible egress.
+// The local WARP SOCKS listener is IPv4 loopback, so do not use curl -6:
+// force the destination family with IPv4-only/IPv6-only endpoints instead.
+func verifyCloudflareWarpSOCKSEgress() error {
+	curl, err := exec.LookPath("curl")
+	if err != nil {
+		return errors.New("curl is required to verify Cloudflare WARP SOCKS5 egress")
+	}
+	request := func(url string) ([]byte, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 22*time.Second)
+		defer cancel()
+		args := []string{
+			"--fail", "--silent", "--show-error", "--max-time", "18",
+			"--proxy", "socks5h://" + warpSOCKSAddress, "--noproxy", "", url,
+		}
+		out, runErr := exec.CommandContext(ctx, curl, args...).CombinedOutput()
+		if runErr != nil {
+			return nil, fmt.Errorf("%w: %s", runErr, strings.TrimSpace(string(out)))
+		}
+		return out, nil
+	}
+	trace, err := request("https://www.cloudflare.com/cdn-cgi/trace")
+	if err != nil {
+		return fmt.Errorf("WARP SOCKS5 trace check failed: %w", err)
+	}
+	traceText := strings.ToLower(string(trace))
+	if !strings.Contains(traceText, "warp=on") && !strings.Contains(traceText, "warp=plus") {
+		return fmt.Errorf("WARP SOCKS5 trace did not confirm WARP egress: %s", strings.TrimSpace(string(trace)))
+	}
+	ipv4, err := request("https://ipv4.icanhazip.com/")
+	if err != nil {
+		return fmt.Errorf("WARP IPv4 egress check failed: %w", err)
+	}
+	if err := validateWARPIPResponse(ipv4, "IPv4"); err != nil {
+		return err
+	}
+	ipv6, err := request("https://ipv6.icanhazip.com/")
+	if err != nil {
+		return fmt.Errorf("WARP IPv6 egress check failed: %w", err)
+	}
+	if err := validateWARPIPResponse(ipv6, "IPv6"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func wizardAskAgentExternalPath(existing []AgentExternalPath) (AgentExternalPath, error) {
 	fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "AGENT EXTERNAL TUNNEL PATH"))
 	fmt.Printf("  %s\n", "1) MASQUE — use a preconfigured local MASQUE-to-SOCKS5 gateway")
@@ -4563,7 +4652,12 @@ func setup() error {
 			return err
 		}
 		if c.Transport == transportNewMethods {
-			uiInfo("Hub will accept the Agent's authenticated TCP/TLS carrier only. Configure option 8 and its external path on the Agent host.")
+			if host, portText, splitErr := net.SplitHostPort(c.ControlListen); splitErr == nil {
+				if oldPort, convErr := strconv.Atoi(portText); convErr == nil && oldPort <= 65525 {
+					c.ControlListen = wizardAsk("Dedicated Hub control listener (use a new port; example 9458)", net.JoinHostPort(host, strconv.Itoa(oldPort+10)))
+				}
+			}
+			uiInfo("Hub accepts the Agent's authenticated TCP/TLS carrier. For WARP client egress, keep this as a separate Hub profile with a separate public client port; existing direct profiles remain unchanged.")
 		} else if c.Transport == transportAdaptive {
 			uiInfo("Hub will accept the four original native transports. Select option 7 on the Agent too.")
 		} else if c.Transport == transportFullAdaptive {
@@ -4577,10 +4671,14 @@ func setup() error {
 			defID := "main"
 			if i > 1 {
 				defID = fmt.Sprintf("port%d", i)
+			} else if c.Transport == transportNewMethods {
+				defID = "warp"
 			}
 			mappingID := wizardAsk(fmt.Sprintf("Mapping ID #%d (must match on the Agent)", i), defID)
 			listenDefault := "0.0.0.0:443"
-			if i > 1 {
+			if c.Transport == transportNewMethods && i == 1 {
+				listenDefault = "0.0.0.0:8443"
+			} else if i > 1 {
 				listenDefault = "0.0.0.0:" + strconv.Itoa(8443+i-2)
 			}
 			addr := wizardAsk(fmt.Sprintf("Public listen address for %s", mappingID), listenDefault)
@@ -4679,9 +4777,25 @@ func setup() error {
 		if err := assertAgentProfileNetworkCompatibility(c); err != nil {
 			return fmt.Errorf("setup stopped before credentials or a new profile were saved: %w", err)
 		}
+		agentXrayWARP := false
 		if configRequiresCloudflareWarp(c) {
 			if err := configureCloudflareWarpProxyModeInteractive(); err != nil {
 				return fmt.Errorf("WARP Local Proxy could not be prepared; no new profile was saved: %w", err)
+			}
+			if err := verifyCloudflareWarpSOCKSEgress(); err != nil {
+				return fmt.Errorf("WARP SOCKS5 egress verification failed; no new profile was saved: %w", err)
+			}
+			uiWarn("Option 8 by itself protects only Agent-to-Hub traffic. To change the public IP of VPN users, enable the isolated Xray WARP egress below. It creates a second Xray listener and leaves the panel's original Xray listener unchanged.")
+			agentXrayWARP = wizardYesNo("Also route VPN client traffic from this Xray target through WARP? (Y/n)", "y")
+			if agentXrayWARP {
+				uiWarn("IMPORTANT: configure a separate Iran HUB profile for this WARP path. Use a different control port and public client port; do not reuse the old HUB profile. Example: control 9458, mapping ID warp, public listener 0.0.0.0:8443. Existing direct tunnels remain on their old ports.")
+				if host, portText, splitErr := net.SplitHostPort(c.HubAddr); splitErr == nil {
+					if oldPort, convErr := strconv.Atoi(portText); convErr == nil && oldPort <= 65525 {
+						c.HubAddr = wizardAsk("NEW dedicated Iran HUB control address (new profile; do not reuse the old control port)", net.JoinHostPort(host, strconv.Itoa(oldPort+10)))
+					} else {
+						c.HubAddr = wizardAsk("NEW dedicated Iran HUB control address (new profile; do not reuse the old control port)", c.HubAddr)
+					}
+				}
 			}
 		}
 		if transportModeAllowsHTTP2(c.Transport) {
@@ -4697,17 +4811,25 @@ func setup() error {
 			defID := "main"
 			if i > 1 {
 				defID = fmt.Sprintf("port%d", i)
+			} else if agentXrayWARP {
+				defID = "warp"
 			}
-			mappingID := wizardAsk(fmt.Sprintf("Mapping ID #%d (must match the Hub)", i), defID)
+			mappingID := wizardAsk(fmt.Sprintf("Mapping ID #%d (must match the separate Iran HUB profile)", i), defID)
 			targetDefault := "127.0.0.1:443"
-			if i > 1 {
+			if agentXrayWARP && i == 1 {
+				targetDefault = "127.0.0.1:2083"
+			} else if i > 1 {
 				targetDefault = ""
 			}
 			target := wizardAsk(fmt.Sprintf("Local target for mapping %s on the outside server (IP:PORT)", mappingID), targetDefault)
 			if strings.TrimSpace(target) == "" {
 				return fmt.Errorf("target for mapping %q is required", mappingID)
 			}
-			c.Ports = append(c.Ports, PortMapping{ID: mappingID, Target: target})
+			mapping := PortMapping{ID: mappingID, Target: target}
+			if agentXrayWARP {
+				mapping.TargetEgress = warpXrayEgress
+			}
+			c.Ports = append(c.Ports, mapping)
 			if !wizardYesNo("Add another target mapping? (y/N)", "n") {
 				break
 			}
@@ -4716,10 +4838,33 @@ func setup() error {
 		if err = validateConfig(c); err != nil {
 			return err
 		}
+		if agentXrayWARP {
+			profileID := profileInstanceID()
+			preparedPorts, prepErr := prepareXrayWarpSidecars(profileID, c.Ports)
+			if prepErr != nil {
+				return fmt.Errorf("could not prepare isolated per-profile Xray WARP egress; original Xray and existing tunnels were not changed: %w", prepErr)
+			}
+			c.Ports = preparedPorts
+			if err = validateConfig(c); err != nil {
+				_ = cleanupXrayWarpSidecars(profileID, c.Ports)
+				return err
+			}
+			for _, mapping := range c.Ports {
+				if mapping.TargetEgress == warpXrayEgress {
+					uiSuccess(fmt.Sprintf("Mapping %s: isolated Xray WARP listener prepared at %s (original panel target %s is unchanged).", mapping.ID, mapping.WarpTarget, mapping.Target))
+				}
+			}
+		}
 		if err = assertAgentProfileNetworkCompatibility(c); err != nil {
+			if agentXrayWARP {
+				_ = cleanupXrayWarpSidecars(profileInstanceID(), c.Ports)
+			}
 			return fmt.Errorf("profile was not saved because the host-wide egress policy changed during setup: %w", err)
 		}
 		if err = saveConfig(c); err != nil {
+			if agentXrayWARP {
+				_ = cleanupXrayWarpSidecars(profileInstanceID(), c.Ports)
+			}
 			return err
 		}
 		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s; configured external paths=%d.", c.TunnelChannels, c.Transport, len(c.ExternalPaths)))
@@ -4831,6 +4976,9 @@ func ensureTunnelRunning(restartActive bool) error {
 		}
 		if err := prepareAgentNetwork(cfg); err != nil {
 			return fmt.Errorf("could not prepare the Agent network safely: %w", err)
+		}
+		if err := startXrayWarpSidecars(cfg, restartActive); err != nil {
+			return fmt.Errorf("could not start isolated Xray WARP egress; the Agent tunnel was not started: %w", err)
 		}
 	}
 	if filepath.Clean(configPath) != filepath.Clean(legacyConfigPath) {
@@ -5144,6 +5292,19 @@ func uninstall() error {
 	for _, profile := range profiles {
 		services[profile.Service] = true
 	}
+	// Include every generated isolated Xray WARP sidecar so uninstall stops
+	// only Shah Tunnel-owned companion services before removing their files.
+	if entries, err := os.ReadDir(xrayWarpRoot); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta.json") {
+				continue
+			}
+			meta, readErr := readXrayWarpMetadata(filepath.Join(xrayWarpRoot, entry.Name()))
+			if readErr == nil && strings.HasPrefix(meta.ServiceName, "shah-tunnel-xray-warp-") {
+				services[meta.ServiceName] = true
+			}
+		}
+	}
 	if out, err := exec.Command("systemctl", "list-units", "--all", "--plain", "--no-legend", "--no-pager", "ravanreverse@*.service").Output(); err == nil {
 		for _, line := range strings.Split(string(out), "\n") {
 			fields := strings.Fields(line)
@@ -5186,6 +5347,18 @@ func uninstall() error {
 
 	_ = os.Remove("/etc/systemd/system/ravanreverse.service.d/20-shah-tunnel-warp-routing.conf")
 	_ = os.Remove("/etc/systemd/system/ravanreverse.service.d")
+	for _, profile := range profiles {
+		profileID := tunnelID(profile.Name)
+		dropInPath := filepath.Join("/etc/systemd/system", "ravanreverse@"+profileID+".service.d", "40-shah-tunnel-xray-warp.conf")
+		_ = os.Remove(dropInPath)
+		_ = os.Remove(filepath.Dir(dropInPath))
+	}
+	for service := range services {
+		if strings.HasPrefix(service, "shah-tunnel-xray-warp-") {
+			unitPath := filepath.Join("/etc/systemd/system", service)
+			_ = os.Remove(unitPath)
+		}
+	}
 	for _, unitPath := range []string{"/etc/systemd/system/ravanreverse.service", "/etc/systemd/system/ravanreverse@.service", warpGuardUnitPath} {
 		if err := os.Remove(unitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove service unit %s: %w", unitPath, err)
@@ -5197,7 +5370,7 @@ func uninstall() error {
 	for service := range services {
 		_ = exec.Command("systemctl", "reset-failed", service).Run()
 	}
-	for _, path := range []string{"/etc/ravanreverse", "/etc/shah-tunnel/warp-route-guard.json", warpManagedPath, "/usr/local/bin/ravanreverse", "/usr/local/bin/shah-tunnel", "/var/backups/ravanreverse", "/var/log/ravanreverse"} {
+	for _, path := range []string{"/etc/ravanreverse", "/etc/shah-tunnel", warpManagedPath, "/usr/local/bin/ravanreverse", "/usr/local/bin/shah-tunnel", "/var/backups/ravanreverse", "/var/log/ravanreverse"} {
 		if err := os.RemoveAll(path); err != nil {
 			return fmt.Errorf("remove %s: %w", path, err)
 		}
@@ -5848,6 +6021,20 @@ func main() {
 			log.Fatal("usage: ravanreverse warp-ssh-guard install|remove")
 		}
 		if err := runWarpSSHGuardCommand(os.Args[2]); err != nil {
+			log.Fatal(err)
+		}
+	case "xray-warp-wait":
+		if !ensureRoot() {
+			os.Exit(1)
+		}
+		if err := runXrayWarpWaitCommand(); err != nil {
+			log.Fatal(err)
+		}
+	case "xray-warp-refresh":
+		if !ensureRoot() {
+			os.Exit(1)
+		}
+		if err := execXrayWarpRefreshCommand(os.Args[2:]); err != nil {
 			log.Fatal(err)
 		}
 	case "menu":
