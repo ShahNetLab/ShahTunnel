@@ -2867,82 +2867,15 @@ func dialAgentUnderlay(ctx context.Context, cfg Config, network, address string)
 			if cfg.Underlay != underlayMASQUE {
 				return nil, errors.New("Cloudflare WarpProxy mode only supports the MASQUE underlay; select MASQUE in ShahTunnel")
 			}
-			return dialHTTPConnectContext(ctx, proxyAddress, address)
+			// Cloudflare WarpProxy accepts HTTPS CONNECT and SOCKS5 clients.
+			// Use SOCKS5 for the raw TCP stream: it has no extra HTTP proxy
+			// response parser between the WARP proxy and the Hub TLS handshake.
+			// The proxy is loopback-only and no direct-route fallback is allowed.
+			return dialSOCKS5Context(ctx, proxyAddress, address)
 		}
 	}
 	d := net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
 	return d.DialContext(ctx, network, address)
-}
-
-// bufferedNetConn preserves any bytes net/http's buffered reader may have read
-// beyond the successful CONNECT response headers before TLS starts.
-type bufferedNetConn struct {
-	net.Conn
-	reader *bufio.Reader
-}
-
-func (c *bufferedNetConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
-
-// dialHTTPConnectContext opens a raw TCP stream through Cloudflare's local
-// HTTP CONNECT proxy. The endpoint must be loopback-only so an untrusted remote
-// proxy can never receive Hub connection attempts or tunnel credentials.
-func dialHTTPConnectContext(ctx context.Context, proxyAddress, targetAddress string) (net.Conn, error) {
-	if !isLoopbackProxyAddress(proxyAddress) {
-		return nil, errors.New("HTTP CONNECT proxy must be a loopback address")
-	}
-	if _, _, err := net.SplitHostPort(targetAddress); err != nil {
-		return nil, fmt.Errorf("invalid HTTP CONNECT destination %q: %w", targetAddress, err)
-	}
-	d := net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
-	conn, err := d.DialContext(ctx, "tcp", proxyAddress)
-	if err != nil {
-		return nil, fmt.Errorf("connect WARP local proxy %s: %w", proxyAddress, err)
-	}
-	fail := func(err error) (net.Conn, error) {
-		_ = conn.Close()
-		return nil, err
-	}
-	deadline := time.Now().Add(8 * time.Second)
-	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-		deadline = ctxDeadline
-	}
-	_ = conn.SetDeadline(deadline)
-	request := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\n\r\n", targetAddress, targetAddress)
-	if err := writeFull(conn, []byte(request)); err != nil {
-		return fail(fmt.Errorf("WARP HTTP CONNECT request: %w", err))
-	}
-	reader := bufio.NewReaderSize(conn, 4096)
-	statusLine, err := reader.ReadString('\n')
-	if err != nil {
-		return fail(fmt.Errorf("WARP HTTP CONNECT response: %w", err))
-	}
-	fields := strings.Fields(strings.TrimSpace(statusLine))
-	if len(fields) < 2 || !strings.HasPrefix(fields[0], "HTTP/") {
-		return fail(fmt.Errorf("invalid WARP HTTP CONNECT response %q", strings.TrimSpace(statusLine)))
-	}
-	statusCode, err := strconv.Atoi(fields[1])
-	if err != nil {
-		return fail(fmt.Errorf("invalid WARP HTTP CONNECT status %q", fields[1]))
-	}
-	headerBytes := len(statusLine)
-	for {
-		line, readErr := reader.ReadString('\n')
-		if readErr != nil {
-			return fail(fmt.Errorf("read WARP HTTP CONNECT headers: %w", readErr))
-		}
-		headerBytes += len(line)
-		if headerBytes > 16*1024 {
-			return fail(errors.New("WARP HTTP CONNECT response headers exceed 16 KiB"))
-		}
-		if line == "\r\n" || line == "\n" {
-			break
-		}
-	}
-	if statusCode != http.StatusOK {
-		return fail(fmt.Errorf("WARP HTTP CONNECT proxy rejected %s with HTTP %d", targetAddress, statusCode))
-	}
-	_ = conn.SetDeadline(time.Time{})
-	return &bufferedNetConn{Conn: conn, reader: reader}, nil
 }
 
 func dialSOCKS5Context(ctx context.Context, proxyAddress, targetAddress string) (net.Conn, error) {
@@ -2951,7 +2884,7 @@ func dialSOCKS5Context(ctx context.Context, proxyAddress, targetAddress string) 
 	}
 	proxyConn, err := (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, "tcp", proxyAddress)
 	if err != nil {
-		return nil, fmt.Errorf("connect Psiphon SOCKS5 proxy %s: %w", proxyAddress, err)
+		return nil, fmt.Errorf("connect SOCKS5 proxy %s: %w", proxyAddress, err)
 	}
 	fail := func(e error) (net.Conn, error) {
 		_ = proxyConn.Close()
@@ -2970,7 +2903,7 @@ func dialSOCKS5Context(ctx context.Context, proxyAddress, targetAddress string) 
 		return fail(fmt.Errorf("SOCKS5 method response: %w", err))
 	}
 	if method[0] != 0x05 || method[1] != 0x00 {
-		return fail(errors.New("Psiphon SOCKS5 proxy requires unsupported authentication or rejected no-auth mode"))
+		return fail(errors.New("SOCKS5 proxy requires unsupported authentication or rejected no-auth mode"))
 	}
 	host, portText, err := net.SplitHostPort(targetAddress)
 	if err != nil {
@@ -3005,7 +2938,7 @@ func dialSOCKS5Context(ctx context.Context, proxyAddress, targetAddress string) 
 		return fail(fmt.Errorf("SOCKS5 CONNECT response: %w", err))
 	}
 	if response[0] != 0x05 || response[1] != 0x00 {
-		return fail(fmt.Errorf("Psiphon SOCKS5 CONNECT rejected (reply=%d)", response[1]))
+		return fail(fmt.Errorf("SOCKS5 CONNECT rejected (reply=%d)", response[1]))
 	}
 	switch response[3] {
 	case 0x01:
@@ -3330,7 +3263,7 @@ func verifyWarpUnderlay(expectedProtocol string) error {
 			return fmt.Errorf("Cloudflare WARP local proxy %s is not accepting connections: %w", proxyAddress, dialErr)
 		}
 		_ = conn.Close()
-		log.Printf("Cloudflare WARP local proxy listener reachable (protocol=%s, proxy=%s); each lane will verify its real Hub HTTP CONNECT; system routes and SSH were not modified", expectedProtocol, proxyAddress)
+		log.Printf("Cloudflare WARP local proxy listener reachable (protocol=%s, proxy=%s); each lane will open its Hub stream through the local SOCKS5 proxy; system routes and SSH were not modified", expectedProtocol, proxyAddress)
 		return nil
 	}
 

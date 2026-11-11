@@ -1076,76 +1076,6 @@ func TestWarpProxyAddressFromSettings(t *testing.T) {
 	}
 }
 
-func TestDialHTTPConnectContext(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	serverErr := make(chan error, 1)
-	go func() {
-		conn, acceptErr := listener.Accept()
-		if acceptErr != nil {
-			serverErr <- acceptErr
-			return
-		}
-		defer conn.Close()
-		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-		reader := bufio.NewReader(conn)
-		requestLine, readErr := reader.ReadString('\n')
-		if readErr != nil {
-			serverErr <- readErr
-			return
-		}
-		if strings.TrimSpace(requestLine) != "CONNECT hub.example:9443 HTTP/1.1" {
-			serverErr <- fmt.Errorf("unexpected CONNECT request %q", strings.TrimSpace(requestLine))
-			return
-		}
-		for {
-			line, headerErr := reader.ReadString('\n')
-			if headerErr != nil {
-				serverErr <- headerErr
-				return
-			}
-			if line == "\r\n" || line == "\n" {
-				break
-			}
-		}
-		if _, writeErr := io.WriteString(conn, "HTTP/1.1 200 Connection established\r\nProxy-Agent: test\r\n\r\n"); writeErr != nil {
-			serverErr <- writeErr
-			return
-		}
-		payload := make([]byte, 4)
-		if _, readErr = io.ReadFull(reader, payload); readErr != nil {
-			serverErr <- readErr
-			return
-		}
-		_, writeErr := conn.Write(payload)
-		serverErr <- writeErr
-	}()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	proxyConn, err := dialHTTPConnectContext(ctx, listener.Addr().String(), "hub.example:9443")
-	if err != nil {
-		t.Fatalf("HTTP CONNECT dial failed: %v", err)
-	}
-	defer proxyConn.Close()
-	if _, err := proxyConn.Write([]byte("ping")); err != nil {
-		t.Fatalf("write through CONNECT tunnel: %v", err)
-	}
-	got := make([]byte, 4)
-	if _, err := io.ReadFull(proxyConn, got); err != nil {
-		t.Fatalf("read through CONNECT tunnel: %v", err)
-	}
-	if string(got) != "ping" {
-		t.Fatalf("tunneled payload = %q; want ping", got)
-	}
-	if err := <-serverErr; err != nil {
-		t.Fatalf("test proxy: %v", err)
-	}
-}
-
 func TestDialAgentUnderlayUsesDetectedWarpLocalProxy(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1173,32 +1103,52 @@ func TestDialAgentUnderlayUsesDetectedWarpLocalProxy(t *testing.T) {
 		}
 		defer conn.Close()
 		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-		reader := bufio.NewReader(conn)
-		line, readErr := reader.ReadString('\n')
-		if readErr != nil {
+
+		// Cloudflare WarpProxy SOCKS5 no-auth negotiation.
+		var greeting [3]byte
+		if _, readErr := io.ReadFull(conn, greeting[:]); readErr != nil {
 			serverErr <- readErr
 			return
 		}
-		if strings.TrimSpace(line) != "CONNECT hub.example:9443 HTTP/1.1" {
-			serverErr <- fmt.Errorf("unexpected proxy request %q", strings.TrimSpace(line))
+		if greeting != [3]byte{0x05, 0x01, 0x00} {
+			serverErr <- fmt.Errorf("unexpected SOCKS5 greeting %v", greeting)
 			return
 		}
-		for {
-			line, readErr = reader.ReadString('\n')
-			if readErr != nil {
-				serverErr <- readErr
-				return
-			}
-			if line == "\r\n" || line == "\n" {
-				break
-			}
-		}
-		if _, writeErr := io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n"); writeErr != nil {
+		if _, writeErr := conn.Write([]byte{0x05, 0x00}); writeErr != nil {
 			serverErr <- writeErr
 			return
 		}
+
+		var requestHead [4]byte
+		if _, readErr := io.ReadFull(conn, requestHead[:]); readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		if requestHead != [4]byte{0x05, 0x01, 0x00, 0x01} {
+			serverErr <- fmt.Errorf("unexpected SOCKS5 CONNECT header %v", requestHead)
+			return
+		}
+		var targetIP [4]byte
+		if _, readErr := io.ReadFull(conn, targetIP[:]); readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		var portBytes [2]byte
+		if _, readErr := io.ReadFull(conn, portBytes[:]); readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		if net.IP(targetIP[:]).String() != "37.32.12.244" || int(portBytes[0])<<8|int(portBytes[1]) != 9448 {
+			serverErr <- fmt.Errorf("unexpected SOCKS5 target %s:%d", net.IP(targetIP[:]), int(portBytes[0])<<8|int(portBytes[1]))
+			return
+		}
+		if _, writeErr := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x12, 0x34}); writeErr != nil {
+			serverErr <- writeErr
+			return
+		}
+
 		payload := make([]byte, 4)
-		if _, readErr = io.ReadFull(reader, payload); readErr != nil {
+		if _, readErr := io.ReadFull(conn, payload); readErr != nil {
 			serverErr <- readErr
 			return
 		}
@@ -1208,23 +1158,23 @@ func TestDialAgentUnderlayUsesDetectedWarpLocalProxy(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	conn, err := dialAgentUnderlay(ctx, Config{Underlay: underlayMASQUE}, "tcp", "hub.example:9443")
+	conn, err := dialAgentUnderlay(ctx, Config{Underlay: underlayMASQUE}, "tcp", "37.32.12.244:9448")
 	if err != nil {
-		t.Fatalf("MASQUE Agent did not use detected WarpProxy: %v", err)
+		t.Fatalf("MASQUE Agent did not use detected WarpProxy SOCKS5: %v", err)
 	}
 	defer conn.Close()
 	if _, err := conn.Write([]byte("warp")); err != nil {
-		t.Fatalf("write over WARP proxy: %v", err)
+		t.Fatalf("write over WARP SOCKS5 proxy: %v", err)
 	}
 	got := make([]byte, 4)
 	if _, err := io.ReadFull(conn, got); err != nil {
-		t.Fatalf("read over WARP proxy: %v", err)
+		t.Fatalf("read over WARP SOCKS5 proxy: %v", err)
 	}
 	if string(got) != "warp" {
-		t.Fatalf("WARP proxy payload = %q; want warp", got)
+		t.Fatalf("WARP SOCKS5 proxy payload = %q; want warp", got)
 	}
 	if err := <-serverErr; err != nil {
-		t.Fatalf("WARP local proxy: %v", err)
+		t.Fatalf("WARP local SOCKS5 proxy: %v", err)
 	}
 }
 
