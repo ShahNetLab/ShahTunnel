@@ -1,42 +1,102 @@
 <p align="center">
-  <img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel galactic network emblem" width="360" />
+  <img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel galactic emblem" width="330" />
 </p>
 
 <h1 align="center">SHAH TUNNEL 3.0.0</h1>
-<p align="center"><strong>Reverse TCP Tunnel · Adaptive Lanes · Isolated Egress</strong></p>
-<p align="center">A resilient, profile-based tunnel architecture: one Hub, multiple Agents, four inner transports, and independently managed outbound paths.</p>
+<p align="center"><strong>GALACTIC EDITION · PROFILE-ISOLATED REVERSE TCP TUNNEL</strong></p>
+<p align="center">One Hub. Multiple Agents. Adaptive lanes. Independent egress paths.</p>
 
-<p align="center"><a href="README-fa.md">فارسی</a> · <a href="#network-flow">Network Flow</a> · <a href="#install">Install</a></p>
+<p align="center">
+  <a href="README-fa.md">🇮🇷 فارسی</a> · <a href="#network-flow">🌌 Network Flow</a> · <a href="#tunnel-capabilities">⚡ Capabilities</a> · <a href="#install">🚀 Install</a>
+</p>
 
-## Network Flow
+## 🌌 Network Flow
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.svg" alt="ShahTunnel 3.0.0 network flow" width="100%" /></p>
+<table>
+<tr><td align="center"><strong>GALACTIC NETWORK ARCHITECTURE</strong><br/><sub>Secure reverse TCP relay · Four inner transports · Profile-scoped routing</sub></td></tr>
+<tr><td align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.svg" alt="ShahTunnel 3.0.0 Galactic Network Flow" width="100%" /></td></tr>
+</table>
 
-## The architecture
+## Tunnel capabilities
 
-ShahTunnel is built like a small orbital network. The **Hub** is the public rendezvous point; each **Agent** establishes authenticated outbound lanes and forwards traffic to its mapped local services. A tunnel is not a single fragile connection: independent lanes can recover without taking down healthy lanes or unrelated profiles.
+<table>
+<tr>
+<td width="50%" valign="top">
+<h3>🔵 ☑️ Hub–Agent relay</h3>
+<p>The Hub exposes the public TCP entry. Each Agent establishes authenticated outbound lanes to the Hub and forwards accepted streams to its mapped local services.</p>
+</td>
+<td width="50%" valign="top">
+<h3>🔵 ☑️ Adaptive inner transports</h3>
+<p>Each lane can use TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT, or HTTP/1.1 CONNECT/TLS. Recovery is lane-scoped so a failed lane does not require dropping healthy lanes.</p>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<h3>🔵 ☑️ Independent Agent egress</h3>
+<p>Agent transport can use Direct, Cloudflare WARP over MASQUE or WireGuard, or Psiphon through a local SOCKS5 endpoint, according to the selected egress mode.</p>
+</td>
+<td width="50%" valign="top">
+<h3>🔵 ☑️ Multi-profile isolation</h3>
+<p>Each ShahTunnel profile has its own configuration and systemd service. Starting, stopping, or recovering one profile is scoped to that profile.</p>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<h3>🔵 ☑️ Per-tunnel Xray WARP</h3>
+<p>A dedicated sidecar clones only the selected Xray inbound to a loopback port and sends that inbound through the local WARP SOCKS5 proxy. Other Xray inbounds remain on their original route.</p>
+</td>
+<td width="50%" valign="top">
+<h3>🔵 ☑️ Automatic DNS inside WARP</h3>
+<p>The sidecar intercepts client DNS on port 53, resolves through Cloudflare/Google DNS-over-HTTPS, and routes resolver traffic through the same WARP egress.</p>
+</td>
+</tr>
+</table>
 
-### Core capabilities
+## Tunnel transport matrix
 
-- **Four inner transports:** TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT, and HTTP/1.1 CONNECT/TLS.
-- **Adaptive transport:** lane-level recovery and transport selection while preserving the same authenticated Hub–Agent channel.
-- **Agent egress:** Direct, Cloudflare WARP over MASQUE or WireGuard, and Psiphon through a local SOCKS5 endpoint.
-- **Per-tunnel WARP for Xray:** a dedicated Xray sidecar clones only the selected inbound onto loopback and sends that profile through WARP SOCKS5.
-- **Automatic DNS path:** the isolated sidecar intercepts client DNS, uses Cloudflare/Google DoH, and routes resolver traffic through the same WARP egress.
-- **Profile isolation:** each tunnel has its own configuration and systemd service; other Xray inbounds and other ShahTunnel profiles remain unchanged.
+| Option | Transport / strategy | Tunnel behaviour |
+|:--:|---|---|
+| `1` | TCP/TLS | Native TLS-protected stream between Hub and Agent. |
+| `2` | WebSocket/TLS | Tunnel stream carried in WebSocket binary frames over TLS. |
+| `3` | HTTP/2 CONNECT | CONNECT stream over TLS on control port + 1. |
+| `4` | HTTP/1.1 CONNECT/TLS | CONNECT stream over TLS on control port + 2. |
+| `5` | HTTP CONNECT fallback | HTTP/2 first, then HTTP/1.1. |
+| `6` | Automatic fallback | TCP/TLS first, then WebSocket/TLS. |
+| `7` | Full Adaptive Failover | All four inner transports; each lane prefers its last successful transport. |
+| `8` | External egress | Select Agent egress: WARP/MASQUE, WARP/WireGuard, or Psiphon/SOCKS5. |
+| `9` | All-Protocol Adaptive | All four inner transports over the available egress candidates, with lane-level recovery. |
 
-### WARP isolation, without host-wide routing changes
+## 🌐 Per-tunnel WARP egress for Xray
 
-When a new Agent is created with MASQUE and Cloudflare Local Proxy (`WarpProxy`) is already active, ShahTunnel automatically prepares its per-tunnel Xray sidecar and DNS routing before the Agent starts. No manual JSON edits or shell commands are needed. For an existing Agent, use **Manager → [9] WARP egress**.
+<table>
+<tr><td>
+<h3>🔵 ☑️ Automatic setup for new Agents</h3>
+<p>When an Agent is created with MASQUE and Cloudflare Local Proxy (<code>WarpProxy</code>) is already active, ShahTunnel automatically prepares the dedicated Xray sidecar and its DNS path before starting the Agent. No manual JSON edit or follow-up shell command is required.</p>
+</td></tr>
+<tr><td>
+<h3>🔵 ☑️ Existing Agent profiles</h3>
+<p>For an existing Agent, use <strong>Manager → [9] WARP egress</strong>. ShahTunnel discovers the Xray inbound associated with the selected profile mapping, creates a loopback-only clone, and changes only that Agent profile's local target.</p>
+</td></tr>
+<tr><td>
+<h3>🔵 ☑️ Isolation and rollback boundaries</h3>
+<p>The X-UI-managed Xray configuration and original service are not edited or restarted. Other inbounds and profiles—including a profile using option 7—remain Direct. SSH and the host default route are not changed. The dedicated sidecar is removed with its ShahTunnel profile.</p>
+</td></tr>
+</table>
 
-Only the selected profile's cloned loopback inbound uses the local WARP SOCKS5 proxy. The X-UI-managed Xray configuration and service are not edited or restarted. Other inbounds—including profiles that remain Direct—are not moved. ShahTunnel does not change the host default route, restart SSH, or connect/disconnect WARP. If Local Proxy is not active, per-tunnel isolation is not silently replaced with system-wide routing.
+**WARP Local Proxy requirement:** per-tunnel Xray egress uses Cloudflare `WarpProxy` / MASQUE with a reachable local SOCKS5 listener. It is not the same as routing the whole server through system WARP. ShahTunnel does not connect or disconnect WARP, change the WARP protocol, or modify system routes. If the local proxy is not available, the isolated route is not silently replaced with a host-wide route.
 
-### Security and reliability
+## Security and reliability
 
-- TLS 1.3, token authentication, and SHA-256 certificate pinning for Hub–Agent authentication.
-- Independent tunnel profiles and systemd services.
-- Dedicated loopback-only Xray sidecars for selected WARP profiles.
-- Failures are scoped to the affected lane/profile; no global route manipulation is performed by the per-tunnel WARP feature.
+<table>
+<tr>
+<td width="50%" valign="top">🔵 ☑️ **TLS 1.3 and token authentication**<br/><sub>Authenticated Hub–Agent transport with SHA-256 certificate pinning.</sub></td>
+<td width="50%" valign="top">🔵 ☑️ **Lane-level recovery**<br/><sub>A failed lane can recover independently from healthy lanes.</sub></td>
+</tr>
+<tr>
+<td width="50%" valign="top">🔵 ☑️ **Profile-scoped services**<br/><sub>Separate settings and systemd units per tunnel profile.</sub></td>
+<td width="50%" valign="top">🔵 ☑️ **Host-route safety**<br/><sub>Per-tunnel WARP does not change the server default route or restart SSH.</sub></td>
+</tr>
+</table>
 
 ## Install
 
@@ -46,11 +106,9 @@ On a supported Linux server (amd64 or arm64) with systemd, run as root:
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 ```
 
-The installer downloads the source and builds the ShahTunnel binary on the target server. It does not depend on a prebuilt project binary in the repository.
+The installer downloads the source and builds the ShahTunnel binary on the target server.
 
-## Verify
-
-Run the included transport verification script from the source directory:
+## Verify transports
 
 ```bash
 ./VERIFY-ALL-TRANSPORTS.sh
@@ -58,4 +116,4 @@ Run the included transport verification script from the source directory:
 
 ---
 
-<p align="center"><strong>SHAH TUNNEL 3.0.0</strong><br/>One Hub. Many Agents. Independent paths. A network that keeps moving.</p>
+<p align="center"><strong>SHAH TUNNEL 3.0.0 · GALACTIC EDITION</strong><br/><sub>One Hub. Many Agents. Independent paths. A network that keeps moving.</sub></p>
