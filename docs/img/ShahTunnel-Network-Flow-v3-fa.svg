@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1080" viewBox="0 0 1600 1080" role="img" aria-labelledby="title desc">
+<title id="title">شاه‌تونل ۳٫۰٫۰ | معماری کهکشانی و جریان شبکه</title><desc id="desc">تونل معکوس TCP · مسیرهای تطبیقی · خروجی مستقل Agent · DNS از مسیر WARP</desc>
+<defs>
+ <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#081326"/><stop offset="1" stop-color="#122b45"/></linearGradient>
+ <linearGradient id="hub" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#193e66"/><stop offset="1" stop-color="#102b49"/></linearGradient>
+ <linearGradient id="agent" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#145447"/><stop offset="1" stop-color="#10362f"/></linearGradient>
+ <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%"><feDropShadow dx="0" dy="8" stdDeviation="11" flood-color="#000" flood-opacity=".30"/></filter>
+ <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#75c8e8"/></marker>
+ <marker id="arrow2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#69dfb2"/></marker>
+ <style>
+ text { font-family:'Noto Sans Arabic','DejaVu Sans',Arial,sans-serif; }
+ .title { font-size:38px;font-weight:800;fill:#f4f8ff; } .sub { font-size:20px;fill:#a8bed4; }
+ .box { filter:url(#shadow);stroke-width:2; } .client { fill:#29364e;stroke:#7892b8; } .hub { fill:url(#hub);stroke:#5da7e6; } .agent { fill:url(#agent);stroke:#56d9b0; }
+ .nodeTitle { font-size:26px;font-weight:800;fill:#f4f8ff; } .detail { font-size:17px;fill:#c2d3e4; } .section { font-size:21px;font-weight:800;fill:#d9edff; }
+ .transport { fill:#152d49;stroke:#528cbd;stroke-width:1.5; } .transportText { font-size:16px;font-weight:700;fill:#dceeff; }
+ .route { fill:#182f43;stroke:#6b9bb9;stroke-width:1.5; } .routeText { font-size:16px;font-weight:700;fill:#e6f4fb; }
+ .line { fill:none;stroke:#75c8e8;stroke-width:4;marker-end:url(#arrow); } .greenLine { fill:none;stroke:#69dfb2;stroke-width:4;marker-end:url(#arrow2); }
+ .pill { fill:#173f3a;stroke:#52b99a;stroke-width:1.3; } .pillText { font-size:17px;fill:#a9f1d7;font-weight:700; }
+ .note { font-size:18px;fill:#d9e6f2; } .warning { font-size:17px;fill:#ffd99a;font-weight:700; }
+ </style>
+</defs>
+<rect width="1600" height="1080" fill="url(#bg)"/>
+<circle cx="1400" cy="100" r="180" fill="#21507a" opacity=".13"/><circle cx="120" cy="930" r="240" fill="#1c8068" opacity=".08"/>
+<text x="800" y="74" class="title" text-anchor="middle">شاه‌تونل ۳٫۰٫۰ — جریان کامل شبکه</text><text x="800" y="113" class="sub" text-anchor="middle">تونل معکوس TCP با انتقال داخلی تطبیقی و مسیر خروجی Agent</text>
+<!-- external client -->
+<rect x="80" y="205" width="280" height="132" rx="20" class="box client"/>
+<text x="220" y="254" class="nodeTitle" text-anchor="middle">کاربر / سرویس عمومی</text><text x="220" y="289" class="detail" text-anchor="middle">ورودی عمومی TCP</text>
+<!-- Hub -->
+<rect x="470" y="190" width="650" height="165" rx="22" class="box hub"/>
+<text x="795" y="245" class="nodeTitle" text-anchor="middle">سرور Hub</text><text x="795" y="284" class="detail" text-anchor="middle">Listener عمومی TCP · احراز هویت توکن · مدیریت laneها</text>
+<rect x="660" y="305" width="270" height="32" rx="16" class="pill"/><text x="795" y="327" class="pillText" text-anchor="middle">9443 · 9444 · 9445 / TCP</text>
+<path d="M360 270 H470" class="line"/>
+<!-- Inner transport container -->
+<rect x="250" y="390" width="1100" height="150" rx="20" fill="#0d2239" stroke="#335c7d" stroke-width="1.5"/>
+<text x="285" y="422" class="section" text-anchor="start">انتقال‌های داخلی بین Hub و Agent</text>
+<rect x="275" y="438" width="245" height="54" rx="13" class="transport"/><text x="397" y="472" class="transportText" text-anchor="middle">۱. TCP/TLS</text><rect x="535" y="438" width="245" height="54" rx="13" class="transport"/><text x="657" y="472" class="transportText" text-anchor="middle">۲. WebSocket/TLS</text><rect x="795" y="438" width="245" height="54" rx="13" class="transport"/><text x="917" y="472" class="transportText" text-anchor="middle">۳. HTTP/2 CONNECT</text><rect x="1055" y="438" width="245" height="54" rx="13" class="transport"/><text x="1177" y="472" class="transportText" text-anchor="middle">۴. HTTP/1.1 CONNECT</text>
+<text x="800" y="522" class="detail" text-anchor="middle">TLS 1.3 + توکن + اثرانگشت SHA-256</text>
+<path d="M800 355 V390" class="line"/>
+<!-- Agent -->
+<rect x="470" y="565" width="650" height="142" rx="22" class="box agent"/>
+<text x="795" y="615" class="nodeTitle" text-anchor="middle">سرور Agent</text><text x="795" y="650" class="detail" text-anchor="middle">اتصال خروجی به Hub · بازیابی مستقل هر lane</text>
+<rect x="660" y="667" width="270" height="28" rx="14" class="pill"/><text x="795" y="687" class="pillText" text-anchor="middle">۴ مسیر مستقل</text>
+<path d="M800 540 V565" class="greenLine"/>
+<!-- local targets -->
+<rect x="1190" y="570" width="330" height="130" rx="20" class="box client"/>
+<text x="1355" y="618" class="nodeTitle" text-anchor="middle">سرویس‌های محلی مقصد</text><text x="1355" y="655" class="detail" text-anchor="middle">نگاشت ID به 127.0.0.1:PORT</text>
+<path d="M1120 635 H1190" class="greenLine"/>
+<!-- Egress -->
+<text x="285" y="755" class="section" text-anchor="start">لایه خروجی Agent (گزینه ۸ / ۹)</text>
+<path d="M795 707 V780" class="greenLine"/>
+<rect x="70" y="780" width="1460" height="128" rx="20" fill="#0d2239" stroke="#416780" stroke-width="1.5"/>
+<rect x="92" y="790" width="330" height="72" rx="14" class="route"/><text x="257" y="833" class="routeText" text-anchor="middle">مستقیم: TCP سیستم</text><rect x="454" y="790" width="330" height="72" rx="14" class="route"/><text x="619" y="833" class="routeText" text-anchor="middle">Cloudflare WARP / MASQUE / پراکسی محلی</text><rect x="816" y="790" width="330" height="72" rx="14" class="route"/><text x="981" y="833" class="routeText" text-anchor="middle">Cloudflare WARP / WireGuard</text><rect x="1178" y="790" width="330" height="72" rx="14" class="route"/><text x="1343" y="833" class="routeText" text-anchor="middle">Psiphon ConsoleClient → SOCKS5 loopback</text>
+<text x="800" y="940" class="note" text-anchor="middle">گزینه ۹: WARP (مسیر سیستم یا پراکسی HTTP CONNECT در MASQUE) سپس Psiphon و Direct؛ بدون WARP: Direct سپس Psiphon.</text>
+<text x="800" y="978" class="warning" text-anchor="middle">ایمنی SSH: برنامه route سیستم را تغییر نمی‌دهد و WARP را روشن/خاموش نمی‌کند.</text>
+<text x="800" y="1030" class="detail" text-anchor="middle">Agent اتصال TLS خروجی را به Hub آغاز می‌کند؛ دادهٔ عبوری دوطرفه است. DNS نیز در مسیر WARP اختصاصی همان پروفایل هدایت می‌شود.</text>
+</svg>
