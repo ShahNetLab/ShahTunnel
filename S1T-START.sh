@@ -6,7 +6,7 @@ set -Eeuo pipefail
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
 VERSION="3.0.0"
-GO_VERSION="1.26.11"
+GO_VERSION="1.26.10"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
 STATE_DIR="/usr/local/lib/shah-tunnel"
@@ -148,11 +148,13 @@ curl_download_parallel_ranges() {
       --max-filesize 1024 --connect-timeout 8 --max-time 12 \
       --dump-header "$headers" "$url" -o "$probe" 2>/dev/null; then
     rm -f "$headers" "$probe"
+    rm -rf "$workdir"
     return 1
   fi
   total="$(sed -nE 's/^[Cc]ontent-[Rr]ange:[[:space:]]*bytes[[:space:]]+0-0\/([0-9]+).*$/\1/p' "$headers" | tail -n 1)"
   if [[ ! "$total" =~ ^[0-9]+$ ]] || [[ "$(wc -c < "$probe" 2>/dev/null || echo 0)" -ne 1 ]]; then
     rm -f "$headers" "$probe"
+    rm -rf "$workdir"
     return 1
   fi
   rm -f "$headers" "$probe"
@@ -206,6 +208,9 @@ curl_download_parallel_ranges() {
     wait "$pid" || failed=1
   done
   if (( failed != 0 )); then
+    # Incomplete fragments are not resumable as a whole archive. Remove them
+    # before the caller falls back to a single stream, avoiding cache bloat.
+    rm -rf "$workdir"
     return 1
   fi
 
@@ -213,8 +218,8 @@ curl_download_parallel_ranges() {
   : > "$assembled"
   for ((i=0; i<chunk_count; i++)); do
     part="${workdir}/chunk-$(printf '%02d' "$i").part"
-    [[ -f "$part" ]] || { rm -f "$assembled"; return 1; }
-    cat "$part" >> "$assembled" || { rm -f "$assembled"; return 1; }
+    [[ -f "$part" ]] || { rm -f "$assembled"; rm -rf "$workdir"; return 1; }
+    cat "$part" >> "$assembled" || { rm -f "$assembled"; rm -rf "$workdir"; return 1; }
   done
   if [[ "$(wc -c < "$assembled")" -ne "$total" ]] ||
       ! printf '%s  %s\n' "$expected_sha" "$assembled" | sha256sum -c - >/dev/null 2>&1; then
@@ -223,6 +228,7 @@ curl_download_parallel_ranges() {
     return 1
   fi
   mv -f "$assembled" "$dest"
+  rm -rf "$workdir"
   return 0
 }
 
@@ -352,8 +358,8 @@ verify_binary() {
 }
 official_go_sha256() {
   case "$TARGET_ARCH" in
-    amd64) printf '%s' '9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec' ;;
-    arm64) printf '%s' '6c2f29b458b5add0835f18b776f69c8881a6d88428f1484a6da55755e620757e' ;;
+    amd64) printf '%s' 'ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5' ;;
+    arm64) printf '%s' '3f4227ce7b206a513e794f1393adb473a07b46e94d18bd15d1c684bbb7319797' ;;
     *) return 1 ;;
   esac
 }
@@ -404,20 +410,20 @@ build_from_official_go_toolchain() {
       rm -f "$cache_archive"
       # Use parallel ranges first for mirrors that support them; if a mirror
       # lacks byte-range support, fall back to the resumable single-stream path.
+      # Keep the China-accessible mirrors first, as in the original installer.
+      # The official hashes below are identical for every mirror; a mirror is
+      # never trusted unless the complete archive passes SHA-256 verification.
       local -a download_sources=(
-        # Prefer the official Go distribution endpoints. If they are unreachable
-        # from the VPS, verified mirrors are allowed because every archive must
-        # still match the official, pinned SHA-256 above.
-        "google|${GO_BASE}"
-        "go-dev|${GO_FALLBACK_BASE}"
-        "google-storage|https://storage.googleapis.com/golang"
-        "google-cn|https://golang.google.cn/dl"
         "aliyun|https://mirrors.aliyun.com/golang"
         "nju|https://mirror.nju.edu.cn/golang"
         "ustc|https://mirrors.ustc.edu.cn/golang"
         "tsinghua|https://mirrors.tuna.tsinghua.edu.cn/golang"
         "tencent|https://mirrors.cloud.tencent.com/go"
         "163|https://mirrors.163.com/golang"
+        "google|${GO_BASE}"
+        "go-dev|${GO_FALLBACK_BASE}"
+        "google-storage|https://storage.googleapis.com/golang"
+        "google-cn|https://golang.google.cn/dl"
       )
       local source source_id base part_file bytes
       echo "Downloading Go ${GO_VERSION} (${TARGET_ARCH}) using parallel range requests where supported..." >&2
@@ -443,11 +449,13 @@ build_from_official_go_toolchain() {
           break
         fi
         if [[ "$RANGE_DOWNLOAD_ATTEMPTED" == 1 ]]; then
-          echo "Parallel chunks were incomplete at ${source_id}; moving to the next mirror instead of restarting a slow full download." >&2
-          continue
+          # Range support can be flaky or rate-limited on some Iranian VPS routes.
+          # Retry the SAME mirror as a normal resumable stream before abandoning it.
+          echo "Parallel chunks were incomplete at ${source_id}; retrying this mirror with a resumable single stream..." >&2
+        else
+          echo "${source_id} has no usable byte-range response; trying a resumable single stream..." >&2
         fi
-        echo "${source_id} does not support a usable byte-range response; trying a time-limited single stream..." >&2
-        if curl_download_resumable "$url" "$part_file" 35 0 15; then
+        if curl_download_resumable "$url" "$part_file" 180 1 25; then
           if printf '%s  %s\n' "$go_sha" "$part_file" | sha256sum -c - >/dev/null 2>&1; then
             cp -f "$part_file" "$TMP/$go_archive"
             downloaded=1
