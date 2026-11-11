@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -2118,5 +2119,76 @@ exit 1
 	}
 	if !warpProtocolMatches(string(settings), "MASQUE") {
 		t.Fatalf("expected MASQUE settings after the remembered ToS flag, got %q", settings)
+	}
+}
+
+func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
+	original := []byte(`{
+  "inbounds": [
+    {"tag":"existing-vless","listen":"0.0.0.0","port":2083,"protocol":"vless","settings":{"clients":[{"id":"test-id"}]}}
+  ],
+  "outbounds": [
+    {"tag":"direct","protocol":"freedom"}
+  ],
+  "routing": {"domainStrategy":"AsIs","rules":[{"type":"field","domain":["geosite:category-ads-all"],"outboundTag":"block"}]}
+}`)
+	generated, bindings, outTag, err := buildXrayWarpConfig(original, "warp-profile", "127.0.0.1:40000", []PortMapping{{ID: "main", Target: "127.0.0.1:2083"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bindings) != 1 || bindings[0].OriginalTarget != "127.0.0.1:2083" {
+		t.Fatalf("unexpected bindings: %#v", bindings)
+	}
+	if bindings[0].WarpTarget == bindings[0].OriginalTarget {
+		t.Fatal("WARP clone must use a dedicated local port")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(generated, &got); err != nil {
+		t.Fatal(err)
+	}
+	inbounds := got["inbounds"].([]any)
+	if len(inbounds) != 2 {
+		t.Fatalf("inbound count=%d; want original + WARP clone", len(inbounds))
+	}
+	originalInbound := inbounds[0].(map[string]any)
+	cloneInbound := inbounds[1].(map[string]any)
+	if originalInbound["port"].(float64) != 2083 || originalInbound["listen"] != "0.0.0.0" {
+		t.Fatalf("original inbound was modified: %#v", originalInbound)
+	}
+	if cloneInbound["listen"] != "127.0.0.1" || cloneInbound["tag"] != bindings[0].InboundTag {
+		t.Fatalf("clone is not private/tagged: %#v", cloneInbound)
+	}
+	outbounds := got["outbounds"].([]any)
+	warpFound := false
+	for _, raw := range outbounds {
+		x := raw.(map[string]any)
+		if x["tag"] == outTag {
+			warpFound = true
+			if x["protocol"] != "socks" {
+				t.Fatalf("WARP outbound protocol=%v", x["protocol"])
+			}
+		}
+	}
+	if !warpFound {
+		t.Fatal("WARP SOCKS5 outbound not found")
+	}
+	rules := got["routing"].(map[string]any)["rules"].([]any)
+	first := rules[0].(map[string]any)
+	if first["outboundTag"] != outTag {
+		t.Fatalf("first routing rule does not target WARP: %#v", first)
+	}
+	if len(originalInbound["settings"].(map[string]any)["clients"].([]any)) != 1 {
+		t.Fatal("cloned inbound lost original client settings")
+	}
+}
+
+func TestBuildXrayWarpConfigRejectsNonLoopbackAndAmbiguousInbound(t *testing.T) {
+	base := []byte(`{"inbounds":[{"port":2083,"protocol":"vless"}],"outbounds":[{"protocol":"freedom"}]}`)
+	if _, _, _, err := buildXrayWarpConfig(base, "p", "127.0.0.1:40000", []PortMapping{{ID: "x", Target: "192.0.2.1:2083"}}); err == nil {
+		t.Fatal("non-loopback target must be rejected")
+	}
+	ambiguous := []byte(`{"inbounds":[{"port":2083,"protocol":"vless"},{"port":2083,"protocol":"vmess"}],"outbounds":[{"protocol":"freedom"}]}`)
+	if _, _, _, err := buildXrayWarpConfig(ambiguous, "p", "127.0.0.1:40000", []PortMapping{{ID: "x", Target: "127.0.0.1:2083"}}); err == nil {
+		t.Fatal("ambiguous port must be rejected")
 	}
 }

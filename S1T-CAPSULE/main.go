@@ -96,6 +96,21 @@ type PortMapping struct {
 	Target string `json:"target,omitempty"` // Agent local target
 }
 
+type XrayWarpBinding struct {
+	MappingID      string `json:"mapping_id"`
+	OriginalTarget string `json:"original_target"`
+	WarpTarget     string `json:"warp_target"`
+	InboundTag     string `json:"inbound_tag"`
+}
+
+type XrayWarpIntegration struct {
+	ConfigPath  string            `json:"config_path"`
+	Service     string            `json:"service"`
+	OutboundTag string            `json:"outbound_tag"`
+	Proxy       string            `json:"proxy"`
+	Bindings    []XrayWarpBinding `json:"bindings"`
+}
+
 type Config struct {
 	Name           string `json:"name,omitempty"`
 	Version        string `json:"version"`
@@ -117,8 +132,9 @@ type Config struct {
 	Fingerprint    string `json:"fingerprint,omitempty"`
 	// TunnelChannels controls the number of independent authenticated TCP/TLS lanes
 	// between Agent and Hub. Missing values on old configs are upgraded in memory to the current default.
-	TunnelChannels int           `json:"tunnel_channels,omitempty"`
-	Ports          []PortMapping `json:"ports,omitempty"`
+	TunnelChannels int                  `json:"tunnel_channels,omitempty"`
+	Ports          []PortMapping        `json:"ports,omitempty"`
+	XrayWARP       *XrayWarpIntegration `json:"xray_warp,omitempty"`
 }
 
 type RuntimeSnapshot struct {
@@ -3920,6 +3936,11 @@ func deleteOneTunnel() error {
 	if data, readErr := os.ReadFile(selected.Path); readErr == nil {
 		_ = json.Unmarshal(data, &cfg)
 	}
+	if cfg.XrayWARP != nil {
+		if err := removeXrayWarpIntegration(&cfg); err != nil {
+			return fmt.Errorf("tunnel stopped, but its isolated Xray WARP route could not be removed; tunnel profile was kept: %w", err)
+		}
+	}
 	if !selected.Legacy {
 		for _, certPath := range []string{cfg.CertFile, cfg.KeyFile} {
 			if certPath != "" && filepath.Clean(filepath.Dir(certPath)) == filepath.Clean(tunnelConfigDir) {
@@ -4937,6 +4958,20 @@ func uninstall() error {
 			return fmt.Errorf("service %s would not stop (state=%s); files were kept", service, state)
 		}
 	}
+	// Remove only Xray routes/inbounds that ShahTunnel previously created for
+	// per-profile WARP isolation. Unrelated Xray configuration is preserved.
+	for _, profile := range profiles {
+		data, readErr := os.ReadFile(profile.Path)
+		if readErr != nil {
+			continue
+		}
+		var profileConfig Config
+		if json.Unmarshal(data, &profileConfig) == nil && profileConfig.XrayWARP != nil {
+			if cleanupErr := removeXrayWarpIntegration(&profileConfig); cleanupErr != nil {
+				return fmt.Errorf("could not remove Xray WARP integration for profile %s; ShahTunnel files were kept: %w", profile.Name, cleanupErr)
+			}
+		}
+	}
 	if err := removeRestartScheduleFiles(); err != nil {
 		return fmt.Errorf("remove Shah Tunnel restart schedule: %w", err)
 	}
@@ -5518,6 +5553,7 @@ func menu() {
 		menuItem("6", "⏰ Scheduled restart", "Restart active tunnels on interval")
 		menuItem("7", "🗑️ Delete one tunnel", "Delete this tunnel only")
 		menuItem("8", "💣 Complete uninstall", "Remove all tunnels")
+		menuItem("9", "🌐 Isolate WARP egress", "Only this Agent tunnel; other tunnels stay Direct")
 		menuItem("0", "🚪 Exit", "Close menu")
 		uiRule()
 		choice := ask("Select an operation", "0")
@@ -5556,6 +5592,10 @@ func menu() {
 			}
 			if errors.Is(err, errUninstallCancelled) {
 				err = nil
+			}
+		case "9":
+			if chooseTunnel("Select the Agent tunnel to isolate through WARP") {
+				err = applyXrayWarpEgressToSelectedTunnel()
 			}
 		case "0":
 			return
