@@ -39,13 +39,17 @@ Options 1–7 retain their previous behaviour and numbering. Options 8 and 9 are
 
 ### WARP, MASQUE, and SSH safety
 
-ShahTunnel supports two WARP layouts for the Agent. In system-tunnel mode, the host route must already carry traffic through WARP; ShahTunnel verifies `warp-cli` status, the selected protocol, and a live `warp=on` check before connecting. In Local Proxy mode (`Mode: WarpProxy on port 40000`), ShahTunnel detects the loopback proxy port from `warp-cli settings`, verifies the proxy using Cloudflare trace, and opens an HTTP CONNECT stream to the Hub through `127.0.0.1:<port>`. This supports the MASQUE protocol; Cloudflare Local Proxy mode does not support WireGuard. The Agent therefore sends only its Hub control lanes through WARP, while SSH, inbound listeners, and the host default route remain untouched. ShahTunnel **never** runs `warp-cli connect`, changes the WARP protocol, disconnects WARP, or modifies system routes. WARP must already be connected before the Agent service starts. These checks are repeated before every reconnect, and a failed WARP path fails closed for option 8 rather than silently using the direct host route.
+ShahTunnel supports two WARP layouts for the Agent. In system-tunnel mode, the host route must already carry traffic through WARP; ShahTunnel verifies `warp-cli` status, the selected protocol, and a live `warp=on` check before connecting. In Local Proxy mode (`Mode: WarpProxy on port 40000`), ShahTunnel detects the loopback proxy port from `warp-cli settings` and checks that its local listener is reachable; each lane then verifies the real HTTP CONNECT to the Hub through `127.0.0.1:<port>`. An HTTP 404 from the optional Cloudflare trace endpoint no longer blocks the proxy, while a failed Hub CONNECT still fails closed without using the direct route. This supports the MASQUE protocol; Cloudflare Local Proxy mode does not support WireGuard. The Agent therefore sends only its Hub control lanes through WARP, while SSH, inbound listeners, and the host default route remain untouched. ShahTunnel **never** runs `warp-cli connect`, changes the WARP protocol, disconnects WARP, or modifies system routes. WARP must already be connected before the Agent service starts. These checks are repeated before every reconnect, and a failed WARP path fails closed for option 8 rather than silently using the direct host route.
 
 For an existing Local Proxy installation, do not switch modes: keep `WarpProxy` enabled and use the configured port (the default shown in many installations is `40000`). A read-only check is:
 
 ```bash
-curl -fsS --proxy http://127.0.0.1:40000 https://api.cloudflare.com/cdn-cgi/trace | grep '^warp=on$'
+sudo warp-cli status
+sudo warp-cli settings | grep -i -E 'Mode:|WARP tunnel protocol:'
+sudo ss -lntp | grep '127.0.0.1:40000'
 ```
+
+Note: Cloudflare's trace endpoint may return HTTP 404 from some WarpProxy egress locations; that response alone does not mean the proxy is broken. In Local Proxy mode, ShahTunnel checks the local listener and verifies each lane using its real HTTP CONNECT to the Hub instead of gating on the trace endpoint.
 
 Enabling the full system-tunnel mode can change the server's default route and interrupt SSH. Run the commands below only from a provider console or with a tested out-of-band recovery path; do not switch the default route from your only SSH session:
 

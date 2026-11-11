@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local verification helper. It reuses an existing Go 1.26.11 toolchain and never downloads one.
+# Local verification helper. It reuses an existing Go 1.26.1 toolchain and never downloads one.
 # Build outputs are kept under a temporary directory; no executable is left in the source tree.
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,7 +8,7 @@ BUILD_TMP="$(mktemp -d "${TMPDIR:-/tmp}/shah-tunnel-verify.XXXXXX")"
 cleanup() { rm -rf -- "$BUILD_TMP"; }
 trap cleanup EXIT
 
-GO_VERSION="1.26.11"
+GO_VERSION="1.26.1"
 GO_HOME="$ROOT/.toolchains/go${GO_VERSION}"
 GO_BIN=""
 
@@ -28,7 +28,7 @@ version_is_pinned() {
   [[ "$v" == *"go${GO_VERSION}"* ]]
 }
 
-# Reuse only an exact Go 1.26.11 binary. An older/newer system toolchain is not used.
+# Reuse only an exact Go 1.26.1 binary. An older/newer system toolchain is not used.
 for candidate in "$GO_HOME/bin/go" "/usr/local/lib/shah-tunnel/toolchains/go${GO_VERSION}-${TARGET_ARCH}/bin/go" "/usr/local/lib/shah-tunnel/go-${GO_VERSION}/bin/go" "$(command -v go 2>/dev/null || true)"; do
   if [[ -n "$candidate" ]] && version_is_pinned "$candidate"; then
     GO_BIN="$candidate"
