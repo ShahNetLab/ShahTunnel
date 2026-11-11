@@ -2204,7 +2204,7 @@ func TestRenderXrayWarpUnitRunsIndependentSidecar(t *testing.T) {
 	text := string(unit)
 	for _, want := range []string{
 		"ExecStart=\"/usr/local/x-ui/bin/xray-linux-amd64\" run -config \"/etc/ravanreverse/xray-warp/profile-s/config.json\"",
-		"WorkingDirectory=\"/usr/local/x-ui/bin\"",
+		"WorkingDirectory=/usr/local/x-ui/bin",
 		"Restart=on-failure",
 	} {
 		if !strings.Contains(text, want) {

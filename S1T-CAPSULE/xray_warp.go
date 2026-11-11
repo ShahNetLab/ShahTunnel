@@ -445,7 +445,7 @@ KillSignal=SIGINT
 
 [Install]
 WantedBy=multi-user.target
-`, strings.TrimSuffix(service, ".service"), systemdExecQuote(runtime.CWD), systemdExecQuote(runtime.Binary), systemdExecQuote(configPath))
+`, strings.TrimSuffix(service, ".service"), runtime.CWD, systemdExecQuote(runtime.Binary), systemdExecQuote(configPath))
 	return []byte(unit), nil
 }
 
