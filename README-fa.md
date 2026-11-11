@@ -4,8 +4,6 @@
 
 # شاه‌تونل ۳٫۰٫۰
 
-**GALACTIC EDITION · PROFILE-ISOLATED REVERSE TCP TUNNEL**
-
 [![نسخه](https://img.shields.io/badge/version-3.0.0-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 [![نسخه ابزار ساخت](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 ![سیستم‌عامل](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
@@ -17,6 +15,34 @@
 </div>
 
 ---
+
+<a id="network-flow"></a>
+## Network Flow | جریان شبکه
+
+<div dir="rtl">
+
+مسیر انتقال Hub به Agent و خروجی اینترنت اختیاری هر پروفایل مستقل از یکدیگرند: تونل، Mappingهای TCP را به مقصد محلی Agent می‌رساند؛ مسیر اختیاری Xray فقط Inbound انتخاب‌شده را از خروجی SOCKS5 وایرپ همان پروفایل عبور می‌دهد.
+
+</div>
+
+```text
+کاربر → پورت عمومی Hub → Laneهای احرازشده Agent → مقصد محلی Agent
+Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCKS5 وایرپ → اینترنت
+```
+
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه ShahTunnel 3.0.0" width="100%"></p>
+
+<div dir="rtl">
+
+برای حمایت از ShahTunnel و دریافت خبرها عضو کانال شوید؛ ربات برای عملیات Cloudflare است.
+
+</div>
+
+<p align="center">
+<a href="https://t.me/MediaZet"><img src="https://img.shields.io/badge/تلگرام-کانال%20%40MediaZet-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="عضویت در کانال تلگرام ShahTunnel"></a>
+&nbsp;
+<a href="https://t.me/cloudflare0_bot"><img src="https://img.shields.io/badge/تلگرام-ربات%20Cloudflare-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="ورود به ربات Cloudflare"></a>
+</p>
 
 <a id="capabilities"></a>
 
@@ -60,51 +86,6 @@
 | `Adaptive` | مسیر Failover خروجی Direct/Psiphon. |
 
 > **دو گزینه ۹ متفاوت هستند:** گزینه `9` در ویزارد ساخت تونل یعنی All-protocol adaptive؛ گزینه `9` در منوی اصلی مدیریت، خروجی WARP مستقل Xray را برای Agent انتخاب‌شده فعال می‌کند.
-
-## نصب
-
-ShahTunnel از معماری **Hub / Agent** استفاده می‌کند. برنامه را روی سرور Hub و هر Agent نصب کنید. در صورت نیاز، یک سرور سوم نیز می‌تواند نقش Relay داشته باشد.
-
-**پیش‌نیازها:** لینوکس `amd64` یا `arm64`، سرویس `systemd` و دسترسی root. نصب‌کننده ابزار Go نسخهٔ 1.26.1 را دریافت و با SHA-256 بررسی می‌کند، سپس باینری لینوکس را روی همان سرور می‌سازد.
-
-**۱. نصب روی هر سرور**
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
-```
-
-<div dir="rtl">
-
-پس از نصب، منوی مدیریت باز می‌شود. برای ورود دوباره:
-
-</div>
-
-```bash
-sudo shah-tunnel menu
-```
-
-<div dir="rtl">
-
-**۲. ساخت Hub**
-
-1. گزینه ساخت تونل جدید را انتخاب کنید و نقش **HUB** را بزنید.
-2. پورت کنترل را تعیین کنید (پیش‌فرض `0.0.0.0:9443`) و انتقال مورد قبول Hub را انتخاب کنید.
-3. نگاشت پورت‌های عمومی را بسازید. برای هر نگاشت یک شناسه مانند `main` یا `web` تعیین کنید.
-4. **توکن Agent** و **اثر انگشت SHA-256 گواهی** را ذخیره کنید؛ Agent باید دقیقاً از همین دو مقدار استفاده کند.
-
-**۳. ساخت Agent**
-
-1. روی سرور مقصد، تونل جدید بسازید و نقش **AGENT** را انتخاب کنید.
-2. آدرس Hub و پورت کنترل را وارد کنید و انتقال سازگار با Hub را برگزینید.
-3. توکن و اثر انگشت گواهی Hub را وارد کنید.
-4. همان شناسه‌های Mapping را بسازید و مقصد محلی هرکدام را وارد کنید؛ برای نمونه `127.0.0.1:443`.
-5. پروفایل را ذخیره کنید. ShahTunnel سرویس مستقل آن را فعال می‌کند و Laneهای قطع‌شده را به‌صورت خودکار دوباره متصل می‌کند.
-
-**۴. فایروال:** فقط پورت‌های لازم را باز کنید. Hub به پورت کنترل انتخاب‌شده، پورت CONNECT در صورت نیاز (`کنترل + ۱` برای HTTP/2 یا `کنترل + ۲` برای HTTP/1.1) و پورت‌های عمومی Mapping نیاز دارد. Agent اتصال خروجی را به Hub برقرار می‌کند و مقصدهای محلی در سمت Agent هستند.
-
-
-</div>
-
 
 ## خروجی WARP مستقل برای هر تونل Xray
 
@@ -156,6 +137,49 @@ sudo journalctl -u 'ravanreverse@PROFILE.service' -n 80 --no-pager
 - Sidecar اختصاصی WARP برای Inbound کپی‌شده روی Loopback گوش می‌دهد و جایگزین سرویس اصلی Xray تحت مدیریت X-UI نمی‌شود.
 - ShahTunnel را فقط روی سرورها و سرویس‌هایی استفاده کنید که مالک آن هستید یا مجوز مدیریتشان را دارید. [سیاست امنیتی](SECURITY.md).
 
+## نصب
+
+ShahTunnel از معماری **Hub / Agent** استفاده می‌کند. برنامه را روی سرور Hub و هر Agent نصب کنید. در صورت نیاز، یک سرور سوم نیز می‌تواند نقش Relay داشته باشد.
+
+**پیش‌نیازها:** لینوکس `amd64` یا `arm64`، سرویس `systemd` و دسترسی root. نصب‌کننده ابزار Go نسخهٔ 1.26.1 را دریافت و با SHA-256 بررسی می‌کند، سپس باینری لینوکس را روی همان سرور می‌سازد.
+
+**۱. نصب روی هر سرور**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
+```
+
+<div dir="rtl">
+
+پس از نصب، منوی مدیریت باز می‌شود. برای ورود دوباره:
+
+</div>
+
+```bash
+sudo shah-tunnel menu
+```
+
+<div dir="rtl">
+
+**۲. ساخت Hub**
+
+1. گزینه ساخت تونل جدید را انتخاب کنید و نقش **HUB** را بزنید.
+2. پورت کنترل را تعیین کنید (پیش‌فرض `0.0.0.0:9443`) و انتقال مورد قبول Hub را انتخاب کنید.
+3. نگاشت پورت‌های عمومی را بسازید. برای هر نگاشت یک شناسه مانند `main` یا `web` تعیین کنید.
+4. **توکن Agent** و **اثر انگشت SHA-256 گواهی** را ذخیره کنید؛ Agent باید دقیقاً از همین دو مقدار استفاده کند.
+
+**۳. ساخت Agent**
+
+1. روی سرور مقصد، تونل جدید بسازید و نقش **AGENT** را انتخاب کنید.
+2. آدرس Hub و پورت کنترل را وارد کنید و انتقال سازگار با Hub را برگزینید.
+3. توکن و اثر انگشت گواهی Hub را وارد کنید.
+4. همان شناسه‌های Mapping را بسازید و مقصد محلی هرکدام را وارد کنید؛ برای نمونه `127.0.0.1:443`.
+5. پروفایل را ذخیره کنید. ShahTunnel سرویس مستقل آن را فعال می‌کند و Laneهای قطع‌شده را به‌صورت خودکار دوباره متصل می‌کند.
+
+**۴. فایروال:** فقط پورت‌های لازم را باز کنید. Hub به پورت کنترل انتخاب‌شده، پورت CONNECT در صورت نیاز (`کنترل + ۱` برای HTTP/2 یا `کنترل + ۲` برای HTTP/1.1) و پورت‌های عمومی Mapping نیاز دارد. Agent اتصال خروجی را به Hub برقرار می‌کند و مقصدهای محلی در سمت Agent هستند.
+
+</div>
+
 ## عیب‌یابی
 
 </div>
@@ -171,30 +195,3 @@ sudo journalctl -u 'ravanreverse@PROFILE.service' -n 80 --no-pager
 ---
 
 <a id="network-flow"></a>
-
-## Network Flow | جریان شبکه
-
-<div dir="rtl">
-
-مسیر انتقال Hub به Agent و خروجی اینترنت اختیاری هر پروفایل مستقل از یکدیگرند: تونل، Mappingهای TCP را به مقصد محلی Agent می‌رساند؛ مسیر اختیاری Xray فقط Inbound انتخاب‌شده را از خروجی SOCKS5 وایرپ همان پروفایل عبور می‌دهد.
-
-</div>
-
-```text
-کاربر → پورت عمومی Hub → Laneهای احرازشده Agent → مقصد محلی Agent
-Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCKS5 وایرپ → اینترنت
-```
-
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه ShahTunnel 3.0.0" width="100%"></p>
-
-<div dir="rtl">
-
-برای حمایت از ShahTunnel و دریافت خبرها عضو کانال شوید؛ ربات برای عملیات Cloudflare است.
-
-</div>
-
-<p align="center">
-<a href="https://t.me/MediaZet"><img src="https://img.shields.io/badge/تلگرام-کانال%20%40MediaZet-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="عضویت در کانال تلگرام ShahTunnel"></a>
-&nbsp;
-<a href="https://t.me/cloudflare0_bot"><img src="https://img.shields.io/badge/تلگرام-ربات%20Cloudflare-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="ورود به ربات Cloudflare"></a>
-</p>
