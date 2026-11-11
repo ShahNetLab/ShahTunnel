@@ -7,6 +7,7 @@
 - Hub فقط انتقال‌های داخلی را می‌پذیرد؛ انتخاب MASQUE/WARP/Psiphon در نقش Agent انجام می‌شود.
 - Psiphon با ConsoleClient رسمی، فایل JSON کلاینت و SOCKS5 لوکال پیاده شده است. باینری Psiphon داخل این بسته نیست؛ از مخزن رسمی Psiphon دریافت شود. نصب‌کننده فقط مسیر داده Psiphon در /var/lib/shah-tunnel/psiphon را به مجوز نوشتن systemd اضافه می‌کند و ProtectSystem=strict را حفظ می‌کند.
 - برای WARP/MASQUE وضعیت Connected و پروتکل فعال بررسی می‌شود. هر دو حالت تونل سراسری و Local Proxy پشتیبانی می‌شوند؛ در حالت Local Proxy پورت loopback از warp-cli settings تشخیص داده شده و اتصال TCP هر کانال به Hub از طریق SOCKS5 آن عبور می‌کند. ShahTunnel هرگز route را تغییر نمی‌دهد و WARP را خودکار connect/disconnect نمی‌کند.
+- جداسازی خروجی WARP برای هر پروفایل Agent با عملیات مدیریت [9] انجام می‌شود: یک نمونه Xray مستقل با inboundهای کپی‌شده و فقط loopback ساخته می‌شود؛ فایل config.json و سرویس X-UI تغییر یا restart نمی‌شوند. فقط همان پروفایل از SOCKS5 محلی WARP استفاده می‌کند و سایر پروفایل‌ها Direct می‌مانند.
 - گزینه 8 منوی اصلی مدیریت همچنان حذف کامل نصب است؛ گزینه 8 جدید فقط داخل انتخاب‌گر انتقال کاربرد دارد.
 - Network Flow به نسخه 3 به‌روزرسانی شده و مرز لایه انتقال داخلی/مسیر خروجی را مشخص می‌کند.
 
