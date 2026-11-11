@@ -195,415 +195,6 @@ func TestTLSAgentTransportsInteroperateWithHub(t *testing.T) {
 	}
 }
 
-func startTestSOCKS5Proxy(t *testing.T, overrideTarget string) net.Listener {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen test SOCKS5 proxy: %v", err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		for {
-			client, acceptErr := ln.Accept()
-			if acceptErr != nil {
-				return
-			}
-			go handleTestSOCKS5Client(client, overrideTarget)
-		}
-	}()
-	return ln
-}
-
-func handleTestSOCKS5Client(client net.Conn, overrideTarget string) {
-	defer client.Close()
-	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
-	var greeting [2]byte
-	if _, err := io.ReadFull(client, greeting[:]); err != nil || greeting[0] != 5 {
-		return
-	}
-	methods := make([]byte, int(greeting[1]))
-	if _, err := io.ReadFull(client, methods); err != nil {
-		return
-	}
-	if err := writeFull(client, []byte{5, 0}); err != nil {
-		return
-	}
-	var request [4]byte
-	if _, err := io.ReadFull(client, request[:]); err != nil || request[0] != 5 || request[1] != 1 {
-		return
-	}
-	var host string
-	switch request[3] {
-	case 1:
-		b := make([]byte, 4)
-		if _, err := io.ReadFull(client, b); err != nil {
-			return
-		}
-		host = net.IP(b).String()
-	case 3:
-		var n [1]byte
-		if _, err := io.ReadFull(client, n[:]); err != nil {
-			return
-		}
-		b := make([]byte, int(n[0]))
-		if _, err := io.ReadFull(client, b); err != nil {
-			return
-		}
-		host = string(b)
-	case 4:
-		b := make([]byte, 16)
-		if _, err := io.ReadFull(client, b); err != nil {
-			return
-		}
-		host = net.IP(b).String()
-	default:
-		return
-	}
-	var portBytes [2]byte
-	if _, err := io.ReadFull(client, portBytes[:]); err != nil {
-		return
-	}
-	target := net.JoinHostPort(host, fmt.Sprintf("%d", int(portBytes[0])<<8|int(portBytes[1])))
-	// The test-only hostname is deliberately resolvable only by this proxy,
-	// proving that the Agent uses SOCKS5 remote DNS rather than local DNS.
-	if host == "hub.invalid" {
-		target = net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", int(portBytes[0])<<8|int(portBytes[1])))
-	}
-	if overrideTarget != "" {
-		target = overrideTarget
-	}
-	upstream, err := net.DialTimeout("tcp", target, 3*time.Second)
-	if err != nil {
-		_ = writeFull(client, []byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
-		return
-	}
-	defer upstream.Close()
-	if err := writeFull(client, []byte{5, 0, 0, 1, 127, 0, 0, 1, 0, 0}); err != nil {
-		return
-	}
-	_ = client.SetDeadline(time.Time{})
-	copyDone := make(chan struct{}, 1)
-	go func() {
-		_, _ = io.Copy(upstream, client)
-		if tcp, ok := upstream.(*net.TCPConn); ok {
-			_ = tcp.CloseWrite()
-		}
-		copyDone <- struct{}{}
-	}()
-	_, _ = io.Copy(client, upstream)
-	<-copyDone
-}
-
-func TestVerifySOCKS5ProxyHandshake(t *testing.T) {
-	proxy := startTestSOCKS5Proxy(t, "")
-	if err := verifySOCKS5ProxyHandshake(proxy.Addr().String(), "", ""); err != nil {
-		t.Fatalf("valid SOCKS5 endpoint rejected: %v", err)
-	}
-}
-
-func TestVerifySOCKS5ProxyHandshakeRejectsMissingEndpoint(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	address := listener.Addr().String()
-	_ = listener.Close()
-	if err := verifySOCKS5ProxyHandshake(address, "", ""); err == nil {
-		t.Fatal("missing SOCKS5 endpoint was accepted")
-	}
-}
-
-func TestOption8ConnectsThroughAgentWARPProxy(t *testing.T) {
-	certDir := t.TempDir()
-	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
-	fingerprint, err := generateCertificate(certPath, keyPath)
-	if err != nil {
-		t.Fatalf("generate certificate: %v", err)
-	}
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil {
-		t.Fatalf("load certificate: %v", err)
-	}
-	pin, err := normalizeFingerprint(fingerprint)
-	if err != nil {
-		t.Fatalf("normalize fingerprint: %v", err)
-	}
-	const token = "f40a12d2a76f4f52a5aefc3a6b1f7e39f40a12d2a76f4f52a5aefc3a6b1f7e39"
-	hubListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer hubListener.Close()
-	h := &hubServer{cfg: Config{Role: "hub", Transport: transportNewMethods, Token: token}, sessions: make(map[*hubSession]struct{})}
-	acceptDone := make(chan struct{})
-	go func() {
-		defer close(acceptDone)
-		for {
-			conn, acceptErr := hubListener.Accept()
-			if acceptErr != nil {
-				return
-			}
-			go h.serveAgent(conn, hubTLSConfig(cert))
-		}
-	}()
-
-	cfg := Config{
-		Version:              version,
-		Role:                 "agent",
-		Transport:            transportNewMethods,
-		HubAddr:              hubListener.Addr().String(),
-		TLSServerName:        "localhost",
-		Token:                token,
-		Fingerprint:          fingerprint,
-		TunnelChannels:       1,
-		Ports:                []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
-		ExternalPaths:        []AgentExternalPath{{ID: "warp", Method: "warp", Address: startTestSOCKS5Proxy(t, "").Addr().String()}},
-		SelectedExternalPath: "warp",
-	}
-	if err := validateConfig(cfg); err != nil {
-		t.Fatalf("validate option 8 Agent config: %v", err)
-	}
-	agentDone := make(chan error, 1)
-	go func() { agentDone <- connectAndRunAgent(cfg, pin, 77) }()
-	deadline := time.Now().Add(5 * time.Second)
-	for h.sessionCount() == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if h.sessionCount() != 1 {
-		t.Fatal("option 8 did not establish an authenticated Hub lane through the selected SOCKS5 external path")
-	}
-	h.mu.RLock()
-	var active *hubSession
-	for session := range h.sessions {
-		active = session
-		break
-	}
-	h.mu.RUnlock()
-	if active == nil {
-		t.Fatal("expected an active Hub session")
-	}
-	_ = hubListener.Close()
-	active.shutdown()
-	select {
-	case <-agentDone:
-	case <-time.After(3 * time.Second):
-		t.Fatal("Agent did not stop after the test closed the tunnel lane")
-	}
-	select {
-	case <-acceptDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Hub accept loop did not stop")
-	}
-}
-
-func TestMultipleAgentProfilesUseIndependentExternalAndNativePaths(t *testing.T) {
-	certDir := t.TempDir()
-	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
-	fingerprint, err := generateCertificate(certPath, keyPath)
-	if err != nil {
-		t.Fatalf("generate certificate: %v", err)
-	}
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil {
-		t.Fatalf("load certificate: %v", err)
-	}
-	pin, err := normalizeFingerprint(fingerprint)
-	if err != nil {
-		t.Fatalf("normalize fingerprint: %v", err)
-	}
-	const token = "d40a12d2a76f4f52a5aefc3a6b1f7e39d40a12d2a76f4f52a5aefc3a6b1f7e39"
-	hubListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer hubListener.Close()
-	h := &hubServer{cfg: Config{Role: "hub", Transport: transportFullAdaptive, Token: token}, sessions: make(map[*hubSession]struct{})}
-	acceptDone := make(chan struct{})
-	go func() {
-		defer close(acceptDone)
-		for {
-			conn, acceptErr := hubListener.Accept()
-			if acceptErr != nil {
-				return
-			}
-			go h.serveAgent(conn, hubTLSConfig(cert))
-		}
-	}()
-
-	warpProxy := startTestSOCKS5Proxy(t, "")
-	torProxy := startTestSOCKS5Proxy(t, "")
-	base := Config{
-		Version:        version,
-		Role:           "agent",
-		HubAddr:        hubListener.Addr().String(),
-		TLSServerName:  "localhost",
-		Token:          token,
-		Fingerprint:    fingerprint,
-		TunnelChannels: 1,
-		Ports:          []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
-	}
-	profiles := []Config{
-		{
-			Version: version, Role: "agent", Transport: transportNewMethods, HubAddr: base.HubAddr,
-			TLSServerName: base.TLSServerName, Token: token, Fingerprint: fingerprint, TunnelChannels: 1,
-			Ports: base.Ports, ExternalPaths: []AgentExternalPath{{ID: "warp", Method: "warp", Address: warpProxy.Addr().String()}}, SelectedExternalPath: "warp",
-		},
-		{
-			Version: version, Role: "agent", Transport: transportNewMethods, HubAddr: base.HubAddr,
-			TLSServerName: base.TLSServerName, Token: token, Fingerprint: fingerprint, TunnelChannels: 1,
-			Ports: base.Ports, ExternalPaths: []AgentExternalPath{{ID: "tor", Method: "tor", Address: torProxy.Addr().String()}}, SelectedExternalPath: "tor",
-		},
-		{
-			Version: version, Role: "agent", Transport: transportTCP, HubAddr: base.HubAddr,
-			TLSServerName: base.TLSServerName, Token: token, Fingerprint: fingerprint, TunnelChannels: 1, Ports: base.Ports,
-		},
-	}
-
-	done := make([]chan error, len(profiles))
-	for i, cfg := range profiles {
-		if err := validateConfig(cfg); err != nil {
-			t.Fatalf("profile %d validation: %v", i+1, err)
-		}
-		done[i] = make(chan error, 1)
-		go func(ch chan error, cfg Config, channel int) { ch <- connectAndRunAgent(cfg, pin, channel) }(done[i], cfg, i+1)
-	}
-
-	deadline := time.Now().Add(6 * time.Second)
-	for h.sessionCount() < len(profiles) && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if got := h.sessionCount(); got != len(profiles) {
-		t.Fatalf("active Hub sessions = %d, want %d concurrent independent profiles", got, len(profiles))
-	}
-
-	_ = hubListener.Close()
-	h.mu.RLock()
-	active := make([]*hubSession, 0, len(h.sessions))
-	for session := range h.sessions {
-		active = append(active, session)
-	}
-	h.mu.RUnlock()
-	for _, session := range active {
-		session.shutdown()
-	}
-	for i, ch := range done {
-		select {
-		case <-ch:
-		case <-time.After(3 * time.Second):
-			t.Fatalf("Agent profile %d did not stop after Hub shutdown", i+1)
-		}
-	}
-	select {
-	case <-acceptDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Hub accept loop did not stop")
-	}
-}
-
-func TestOption9FallsBackToConfiguredExternalPath(t *testing.T) {
-	certDir := t.TempDir()
-	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
-	fingerprint, err := generateCertificate(certPath, keyPath)
-	if err != nil {
-		t.Fatalf("generate certificate: %v", err)
-	}
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil {
-		t.Fatalf("load certificate: %v", err)
-	}
-	pin, err := normalizeFingerprint(fingerprint)
-	if err != nil {
-		t.Fatalf("normalize fingerprint: %v", err)
-	}
-	const token = "a40a12d2a76f4f52a5aefc3a6b1f7e39a40a12d2a76f4f52a5aefc3a6b1f7e39"
-	hubListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer hubListener.Close()
-	h := &hubServer{cfg: Config{Role: "hub", Transport: transportFullAdaptive, Token: token}, sessions: make(map[*hubSession]struct{})}
-	acceptDone := make(chan struct{})
-	go func() {
-		defer close(acceptDone)
-		for {
-			conn, acceptErr := hubListener.Accept()
-			if acceptErr != nil {
-				return
-			}
-			go h.serveAgent(conn, hubTLSConfig(cert))
-		}
-	}()
-
-	deadListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadHubAddr := deadListener.Addr().String()
-	_ = deadListener.Close()
-	proxy := startTestSOCKS5Proxy(t, hubListener.Addr().String())
-	channel := 78
-	agentPreferredPath.Delete(channel)
-	agentPreferredTransport.Delete(channel)
-	t.Cleanup(func() {
-		agentPreferredPath.Delete(channel)
-		agentPreferredTransport.Delete(channel)
-	})
-	cfg := Config{
-		Version:        version,
-		Role:           "agent",
-		Transport:      transportFullAdaptive,
-		HubAddr:        deadHubAddr,
-		TLSServerName:  "localhost",
-		Token:          token,
-		Fingerprint:    fingerprint,
-		TunnelChannels: 1,
-		Ports:          []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
-		ExternalPaths:  []AgentExternalPath{{ID: "tor", Method: "tor", Address: proxy.Addr().String()}},
-	}
-	if err := validateConfig(cfg); err != nil {
-		t.Fatalf("validate option 9 Agent config: %v", err)
-	}
-	agentDone := make(chan error, 1)
-	go func() { agentDone <- connectAndRunAgent(cfg, pin, channel) }()
-	deadline := time.Now().Add(8 * time.Second)
-	for h.sessionCount() == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if h.sessionCount() != 1 {
-		t.Fatal("option 9 did not reach the Hub through the SOCKS5 external path after direct-route attempts failed")
-	}
-	if got, ok := agentPreferredPath.Load(channel); !ok || got != "tor" {
-		t.Fatalf("option 9 did not remember the successful external route: got=%v present=%v", got, ok)
-	}
-	if got, ok := agentPreferredTransport.Load(channel); !ok || got != transportTCP {
-		t.Fatalf("option 9 did not remember the successful TCP/TLS carrier: got=%v present=%v", got, ok)
-	}
-	h.mu.RLock()
-	var active *hubSession
-	for session := range h.sessions {
-		active = session
-		break
-	}
-	h.mu.RUnlock()
-	if active == nil {
-		t.Fatal("expected an active Hub session")
-	}
-	// Stop the test Hub before closing the lane so adaptive recovery cannot
-	// immediately establish a second candidate against the same fixture.
-	_ = hubListener.Close()
-	active.shutdown()
-	select {
-	case <-agentDone:
-	case <-time.After(3 * time.Second):
-		t.Fatal("Agent did not stop after the test closed the tunnel lane")
-	}
-	select {
-	case <-acceptDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Hub accept loop did not stop")
-	}
-}
-
 func TestTransportFallbackModesInteroperateWhenHubOnlyAllowsWebSocket(t *testing.T) {
 	certDir := t.TempDir()
 	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
@@ -810,12 +401,11 @@ func TestHTTP1CONNECTBidirectionalStream(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); _ = server.ServeTLS(h1Listener, "", "") }()
 	t.Cleanup(func() { _ = server.Close(); <-done })
-	cfg := Config{Role: "agent", Transport: transportHTTP1, HubAddr: control.Addr().String(), TLSServerName: "localhost", Token: token, Fingerprint: fingerprint, TunnelChannels: 1}
-	proxy := startTestSOCKS5Proxy(t, h1Listener.Addr().String())
-	path := &AgentExternalPath{ID: "tor", Method: "tor", Address: proxy.Addr().String()}
-	conn, err := dialHTTP1ConnectViaPath(cfg, path)
+	proxyAddress := startTestSOCKS5Relay(t, h1Listener.Addr().String())
+	cfg := Config{Role: "agent", Transport: transportHTTP1, Underlay: underlayPsiphon, PsiphonProxy: proxyAddress, HubAddr: control.Addr().String(), TLSServerName: "localhost", Token: token, Fingerprint: fingerprint, TunnelChannels: 1}
+	conn, err := dialHTTP1Connect(cfg)
 	if err != nil {
-		t.Fatalf("dial HTTP/1.1 CONNECT through external SOCKS5 path: %v", err)
+		t.Fatalf("dial HTTP/1.1 CONNECT: %v", err)
 	}
 	defer conn.Close()
 	payload := bytes.Repeat([]byte("ShahTunnel-H1-CONNECT-"), 4096)
@@ -883,12 +473,11 @@ func TestHTTP2ConnectBidirectionalStream(t *testing.T) {
 	go func() { defer close(serveDone); _ = server.ServeTLS(h2Listener, "", "") }()
 	t.Cleanup(func() { _ = server.Close(); <-serveDone })
 
-	cfg := Config{Role: "agent", Transport: transportHTTP2, HubAddr: baseAddr, TLSServerName: "localhost", Token: token, Fingerprint: fingerprint, TunnelChannels: 1}
-	proxy := startTestSOCKS5Proxy(t, h2Listener.Addr().String())
-	path := &AgentExternalPath{ID: "tor", Method: "tor", Address: proxy.Addr().String()}
-	conn, err := dialHTTP2ConnectViaPath(cfg, path)
+	proxyAddress := startTestSOCKS5Relay(t, h2Listener.Addr().String())
+	cfg := Config{Role: "agent", Transport: transportHTTP2, Underlay: underlayPsiphon, PsiphonProxy: proxyAddress, HubAddr: baseAddr, TLSServerName: "localhost", Token: token, Fingerprint: fingerprint, TunnelChannels: 1}
+	conn, err := dialHTTP2Connect(cfg)
 	if err != nil {
-		t.Fatalf("dial HTTP/2 CONNECT through external SOCKS5 path: %v", err)
+		t.Fatalf("dial HTTP/2 CONNECT: %v", err)
 	}
 	defer conn.Close()
 	payload := bytes.Repeat([]byte("ShahTunnel-H2-CONNECT-"), 4096)
@@ -1098,35 +687,500 @@ func testAgentFallbackOverHTTP1(t *testing.T, agentMode string) {
 	}
 }
 
-func TestTransportMenuNumberingPreservesLegacyAndAddsOptions(t *testing.T) {
-	oldReader := stdinReader
-	oldStep := wizardStep
-	defer func() {
-		stdinReader = oldReader
-		wizardStep = oldStep
+func startTestSOCKS5Relay(t *testing.T, target string) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			client, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(client net.Conn) {
+				defer client.Close()
+				_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+				var greeting [3]byte
+				if _, err := io.ReadFull(client, greeting[:]); err != nil || greeting != [3]byte{0x05, 0x01, 0x00} {
+					return
+				}
+				if _, err := client.Write([]byte{0x05, 0x00}); err != nil {
+					return
+				}
+				var header [4]byte
+				if _, err := io.ReadFull(client, header[:]); err != nil || header[0] != 0x05 || header[1] != 0x01 {
+					return
+				}
+				switch header[3] {
+				case 0x01:
+					var address [6]byte
+					if _, err := io.ReadFull(client, address[:]); err != nil {
+						return
+					}
+				case 0x04:
+					var address [18]byte
+					if _, err := io.ReadFull(client, address[:]); err != nil {
+						return
+					}
+				case 0x03:
+					var size [1]byte
+					if _, err := io.ReadFull(client, size[:]); err != nil {
+						return
+					}
+					address := make([]byte, int(size[0])+2)
+					if _, err := io.ReadFull(client, address); err != nil {
+						return
+					}
+				default:
+					return
+				}
+				server, err := net.DialTimeout("tcp", target, 3*time.Second)
+				if err != nil {
+					_, _ = client.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+					return
+				}
+				defer server.Close()
+				if _, err := client.Write([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0}); err != nil {
+					return
+				}
+				_ = client.SetDeadline(time.Time{})
+				copyDone := make(chan struct{}, 1)
+				go func() { _, _ = io.Copy(server, client); close(copyDone) }()
+				_, _ = io.Copy(client, server)
+				_ = server.Close()
+				select {
+				case <-copyDone:
+				case <-time.After(time.Second):
+				}
+			}(client)
+		}
+	}()
+	return listener.Addr().String()
+}
+
+func TestAgentTransportsActuallyDialHubThroughPsiphonSOCKS5(t *testing.T) {
+	certDir := t.TempDir()
+	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
+	fingerprint, err := generateCertificate(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("generate certificate: %v", err)
+	}
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("load certificate: %v", err)
+	}
+	pin, err := normalizeFingerprint(fingerprint)
+	if err != nil {
+		t.Fatalf("normalize fingerprint: %v", err)
+	}
+	token := strings.Repeat("a1", 32)
+
+	for index, mode := range []string{transportTCP, transportWebSocket} {
+		t.Run(mode, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			h := &hubServer{cfg: Config{Role: "hub", Transport: transportAdaptive, Token: token}, sessions: make(map[*hubSession]struct{})}
+			serverDone := make(chan struct{})
+			go func() {
+				defer close(serverDone)
+				conn, acceptErr := listener.Accept()
+				if acceptErr == nil {
+					h.serveAgent(conn, hubTLSConfig(cert))
+				}
+			}()
+			proxyAddress := startTestSOCKS5Relay(t, listener.Addr().String())
+			channel := 91 + index
+			agentPreferredTransport.Delete(channel)
+			agentPreferredUnderlay.Delete(channel)
+			t.Cleanup(func() {
+				agentPreferredTransport.Delete(channel)
+				agentPreferredUnderlay.Delete(channel)
+			})
+			cfg := Config{
+				Role:           "agent",
+				Transport:      transportAdaptive,
+				Underlay:       underlayPsiphon,
+				PsiphonProxy:   proxyAddress,
+				HubAddr:        "hub.example.test:" + portOf(listener.Addr().String()),
+				TLSServerName:  "localhost",
+				Token:          token,
+				Fingerprint:    fingerprint,
+				TunnelChannels: 1,
+				Ports:          []PortMapping{},
+			}
+			agentDone := make(chan error, 1)
+			go func() { agentDone <- connectAndRunAgentWithTransport(cfg, pin, channel, mode) }()
+			deadline := time.Now().Add(5 * time.Second)
+			for h.sessionCount() == 0 && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if h.sessionCount() == 0 {
+				t.Fatal("Agent did not authenticate with the Hub through the SOCKS5 proxy")
+			}
+			if got, ok := agentPreferredUnderlay.Load(channel); !ok || got != underlayPsiphon {
+				t.Fatalf("Agent did not remember Psiphon egress after success: got=%v present=%v", got, ok)
+			}
+			if got, ok := agentPreferredTransport.Load(channel); !ok || got != mode {
+				t.Fatalf("Agent did not remember successful transport: got=%v present=%v", got, ok)
+			}
+			h.mu.RLock()
+			var active *hubSession
+			for session := range h.sessions {
+				active = session
+				break
+			}
+			h.mu.RUnlock()
+			if active == nil {
+				t.Fatal("expected an authenticated Hub session")
+			}
+			active.shutdown()
+			select {
+			case <-agentDone:
+			case <-time.After(4 * time.Second):
+				t.Fatal("Agent did not finish after test Hub session shutdown")
+			}
+			_ = listener.Close()
+			select {
+			case <-serverDone:
+			case <-time.After(2 * time.Second):
+				t.Fatal("Hub test handler did not exit")
+			}
+		})
+	}
+}
+
+func TestOptionNineSwitchesFromFailedDirectPathToPsiphonSOCKS5(t *testing.T) {
+	certDir := t.TempDir()
+	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
+	fingerprint, err := generateCertificate(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("generate certificate: %v", err)
+	}
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("load certificate: %v", err)
+	}
+	pin, err := normalizeFingerprint(fingerprint)
+	if err != nil {
+		t.Fatalf("normalize fingerprint: %v", err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &hubServer{cfg: Config{Role: "hub", Transport: transportAdaptive, Token: strings.Repeat("b2", 32)}, sessions: make(map[*hubSession]struct{})}
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			h.serveAgent(conn, hubTLSConfig(cert))
+		}
 	}()
 
-	want := map[string]string{
-		"1": transportTCP,
-		"2": transportWebSocket,
-		"3": transportHTTP2,
-		"4": transportHTTP1,
-		"5": transportHTTPConnectAuto,
-		"6": transportAuto,
-		"7": transportAdaptive,
-		"8": transportNewMethods,
-		"9": transportFullAdaptive,
+	// Reserve then close a local TCP port so the Direct candidate fails
+	// deterministically, while the test SOCKS5 proxy forwards to the live Hub.
+	unavailable, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	for choice, expected := range want {
-		stdinReader = bufio.NewReader(strings.NewReader(choice + "\n"))
-		wizardStep = 0
-		got, err := wizardAskTransport("Transport")
-		if err != nil {
-			t.Fatalf("menu choice %s: %v", choice, err)
+	unavailableAddress := unavailable.Addr().String()
+	_ = unavailable.Close()
+	proxyAddress := startTestSOCKS5Relay(t, listener.Addr().String())
+	channel := 109
+	agentPreferredTransport.Delete(channel)
+	agentPreferredUnderlay.Delete(channel)
+	t.Cleanup(func() {
+		agentPreferredTransport.Delete(channel)
+		agentPreferredUnderlay.Delete(channel)
+	})
+	cfg := Config{
+		Role:           "agent",
+		Transport:      transportAdaptive,
+		Underlay:       underlayAdaptive,
+		PsiphonConfig:  "/tmp/psiphon-client.json",
+		PsiphonProxy:   proxyAddress,
+		HubAddr:        unavailableAddress,
+		TLSServerName:  "localhost",
+		Token:          strings.Repeat("b2", 32),
+		Fingerprint:    fingerprint,
+		TunnelChannels: 1,
+		Ports:          []PortMapping{},
+	}
+	agentDone := make(chan error, 1)
+	go func() { agentDone <- connectAndRunAgent(cfg, pin, channel) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.sessionCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h.sessionCount() == 0 {
+		t.Fatal("option 9 did not reach the Hub after the direct path failed")
+	}
+	if got, ok := agentPreferredUnderlay.Load(channel); !ok || got != underlayPsiphon {
+		t.Fatalf("option 9 did not switch to Psiphon: got=%v present=%v", got, ok)
+	}
+	if got, ok := agentPreferredTransport.Load(channel); !ok || got != transportTCP {
+		t.Fatalf("option 9 used unexpected inner transport after fallback: got=%v present=%v", got, ok)
+	}
+	_ = listener.Close()
+	h.mu.RLock()
+	var active *hubSession
+	for session := range h.sessions {
+		active = session
+		break
+	}
+	h.mu.RUnlock()
+	if active != nil {
+		active.shutdown()
+	}
+	select {
+	case <-agentDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("option 9 did not finish its remaining fallback attempts")
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Hub test handler did not exit")
+	}
+}
+
+func TestOptionNineRequiresAllFourInnerTransports(t *testing.T) {
+	cfg := Config{
+		Version:        version,
+		Role:           "agent",
+		Transport:      transportTCP,
+		Underlay:       underlayAdaptive,
+		PsiphonConfig:  "/tmp/psiphon-client.json",
+		PsiphonProxy:   "127.0.0.1:1080",
+		HubAddr:        "127.0.0.1:9443",
+		Token:          strings.Repeat("a", 48),
+		Fingerprint:    strings.Repeat("0", 64),
+		TunnelChannels: 1,
+		Ports:          []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
+	}
+	if err := validateConfig(cfg); err == nil {
+		t.Fatal("option 9 accepted a single inner transport instead of all four")
+	}
+	cfg.Transport = transportAdaptive
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("option 9 rejected all-protocol adaptive configuration: %v", err)
+	}
+}
+
+func TestWarpUnderlayFailsClosedWhenClientIsUnavailable(t *testing.T) {
+	// A selected WARP mode must never fall back to the host's ordinary route
+	// when the WARP client is missing or disconnected.
+	t.Setenv("PATH", t.TempDir())
+	for _, underlay := range []string{underlayMASQUE, underlayWARP} {
+		t.Run(underlay, func(t *testing.T) {
+			cfg := Config{Transport: transportAdaptive, Underlay: underlay}
+			err := connectAndRunAgent(cfg, nil, 120)
+			if err == nil || !strings.Contains(err.Error(), "warp-cli is not installed") {
+				t.Fatalf("selected WARP underlay did not fail closed: %v", err)
+			}
+		})
+	}
+}
+
+func TestWarpStatusAndProtocolParsing(t *testing.T) {
+	if !warpStatusConnected("Status update: Connected\n") {
+		t.Fatal("connected WARP status was not recognized")
+	}
+	if warpStatusConnected("Status update: Disconnected\n") {
+		t.Fatal("disconnected WARP status was incorrectly recognized as connected")
+	}
+	if !warpProtocolMatches("(network policy) WARP tunnel protocol: MASQUE\n", "MASQUE") {
+		t.Fatal("MASQUE setting was not recognized")
+	}
+	if warpProtocolMatches("(network policy) WARP tunnel protocol: MASQUE\n", "WireGuard") {
+		t.Fatal("mismatched WARP protocol was accepted")
+	}
+	for _, test := range []struct {
+		body string
+		want bool
+	}{
+		{body: `fl=01
+warp=on
+loc=DE`, want: true},
+		{body: `fl=01
+warp=off
+loc=DE`, want: false},
+		{body: "warp=online", want: false},
+	} {
+		if got := traceHasWarpOn(test.body); got != test.want {
+			t.Errorf("traceHasWarpOn(%q) = %v; want %v", test.body, got, test.want)
 		}
-		if got != expected {
-			t.Fatalf("menu choice %s = %q; want %q", choice, got, expected)
+	}
+}
+
+func TestUnderlayModesAndLoopbackValidation(t *testing.T) {
+	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayWARP, underlayPsiphon, underlayAdaptive} {
+		if !validUnderlayMode(mode) {
+			t.Fatalf("valid underlay %q was rejected", mode)
 		}
+	}
+	for _, mode := range []string{"", "warp", "masque", "socks5://127.0.0.1:1080", "unknown"} {
+		if validUnderlayMode(mode) {
+			t.Fatalf("invalid underlay %q was accepted", mode)
+		}
+	}
+	if got := normalizeConfig(Config{Role: "agent"}).Underlay; got != underlayDirect {
+		t.Fatalf("legacy Agent underlay = %q; want %q", got, underlayDirect)
+	}
+	for _, address := range []string{"127.0.0.1:1080", "[::1]:1080"} {
+		if !isLoopbackProxyAddress(address) {
+			t.Errorf("loopback proxy address %q was rejected", address)
+		}
+	}
+	for _, address := range []string{"0.0.0.0:1080", "192.0.2.10:1080", "localhost:1080", "example.com:1080", "127.0.0.1:0", "127.0.0.1:70000", "127.0.0.1:abc"} {
+		if isLoopbackProxyAddress(address) {
+			t.Errorf("non-loopback/invalid proxy address %q was accepted", address)
+		}
+	}
+}
+
+func TestAdaptiveUnderlayCandidatesPreferLastSuccessfulEgress(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // Keep this test independent of a host WARP installation.
+	cfg := Config{Underlay: underlayAdaptive, PsiphonConfig: "/tmp/psiphon-client.json"}
+	want := []string{underlayDirect, underlayPsiphon}
+	got := adaptiveUnderlayCandidates(cfg, "")
+	if !equalStrings(got, want) {
+		t.Fatalf("default egress candidates = %v; want %v", got, want)
+	}
+	got = adaptiveUnderlayCandidates(cfg, underlayPsiphon)
+	if !equalStrings(got, []string{underlayPsiphon, underlayDirect}) {
+		t.Fatalf("preferred Psiphon candidates = %v", got)
+	}
+	got = adaptiveUnderlayCandidates(Config{Underlay: underlayAdaptive}, underlayPsiphon)
+	if !equalStrings(got, []string{underlayDirect}) {
+		t.Fatalf("without Psiphon config, candidates = %v; want direct only", got)
+	}
+}
+
+func TestAdaptiveUnderlayCandidatesDetectWARPAndFailOver(t *testing.T) {
+	binDir := t.TempDir()
+	warpCLI := filepath.Join(binDir, "warp-cli")
+	script := `#!/bin/sh
+case "$1" in
+  status) printf '%s\\n' "$FAKE_WARP_STATUS" ;;
+  settings) printf '%s\\n' "$FAKE_WARP_SETTINGS" ;;
+  *) exit 2 ;;
+esac
+`
+	if err := os.WriteFile(warpCLI, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+	t.Setenv("FAKE_WARP_STATUS", "Status update: Connected")
+	t.Setenv("FAKE_WARP_SETTINGS", "WARP tunnel protocol: MASQUE")
+	cfg := Config{Underlay: underlayAdaptive, PsiphonConfig: "/etc/shah-tunnel/psiphon-client.json"}
+	if got := detectActiveWarpUnderlay(); got != underlayMASQUE {
+		t.Fatalf("detected WARP mode = %q; want MASQUE", got)
+	}
+	if got, want := adaptiveUnderlayCandidates(cfg, ""), []string{underlayMASQUE, underlayPsiphon, underlayDirect}; !equalStrings(got, want) {
+		t.Fatalf("active MASQUE candidate order = %v; want %v", got, want)
+	}
+
+	t.Setenv("FAKE_WARP_SETTINGS", "WARP tunnel protocol: WireGuard")
+	if got := detectActiveWarpUnderlay(); got != underlayWARP {
+		t.Fatalf("detected WARP mode = %q; want WireGuard", got)
+	}
+	if got, want := adaptiveUnderlayCandidates(cfg, underlayPsiphon), []string{underlayWARP, underlayPsiphon, underlayDirect}; !equalStrings(got, want) {
+		t.Fatalf("active WireGuard candidate order = %v; want %v", got, want)
+	}
+
+	t.Setenv("FAKE_WARP_STATUS", "Status update: Disconnected")
+	if got := detectActiveWarpUnderlay(); got != "" {
+		t.Fatalf("disconnected WARP was detected as %q", got)
+	}
+	if got, want := adaptiveUnderlayCandidates(cfg, underlayMASQUE), []string{underlayPsiphon, underlayDirect}; !equalStrings(got, want) {
+		t.Fatalf("WARP-down fallback order = %v; want %v", got, want)
+	}
+}
+
+func TestSOCKS5DialerUsesRemoteHostnameAndCarriesTCP(t *testing.T) {
+	proxy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, acceptErr := proxy.Accept()
+		if acceptErr != nil {
+			serverDone <- acceptErr
+			return
+		}
+		defer conn.Close()
+		var greeting [3]byte
+		if _, readErr := io.ReadFull(conn, greeting[:]); readErr != nil {
+			serverDone <- readErr
+			return
+		}
+		if greeting != [3]byte{0x05, 0x01, 0x00} {
+			serverDone <- fmt.Errorf("unexpected SOCKS greeting: %v", greeting)
+			return
+		}
+		if _, writeErr := conn.Write([]byte{0x05, 0x00}); writeErr != nil {
+			serverDone <- writeErr
+			return
+		}
+		var head [5]byte
+		if _, readErr := io.ReadFull(conn, head[:]); readErr != nil {
+			serverDone <- readErr
+			return
+		}
+		if head[0] != 0x05 || head[1] != 0x01 || head[2] != 0x00 || head[3] != 0x03 {
+			serverDone <- fmt.Errorf("expected SOCKS5 domain CONNECT, got %v", head)
+			return
+		}
+		host := make([]byte, int(head[4]))
+		if _, readErr := io.ReadFull(conn, host); readErr != nil {
+			serverDone <- readErr
+			return
+		}
+		var portBytes [2]byte
+		if _, readErr := io.ReadFull(conn, portBytes[:]); readErr != nil {
+			serverDone <- readErr
+			return
+		}
+		if string(host) != "hub.example.test" || binary.BigEndian.Uint16(portBytes[:]) != 9443 {
+			serverDone <- fmt.Errorf("SOCKS destination = %s:%d", string(host), binary.BigEndian.Uint16(portBytes[:]))
+			return
+		}
+		if _, writeErr := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0}); writeErr != nil {
+			serverDone <- writeErr
+			return
+		}
+		if _, writeErr := conn.Write([]byte("Psiphon-path-ok")); writeErr != nil {
+			serverDone <- writeErr
+			return
+		}
+		serverDone <- nil
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := dialSOCKS5Context(ctx, proxy.Addr().String(), "hub.example.test:9443")
+	if err != nil {
+		t.Fatalf("SOCKS5 dial: %v", err)
+	}
+	defer conn.Close()
+	got := make([]byte, len("Psiphon-path-ok"))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read tunneled bytes: %v", err)
+	}
+	if string(got) != "Psiphon-path-ok" {
+		t.Fatalf("tunneled bytes = %q", got)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1152,25 +1206,6 @@ func TestTransportConfigDefaultsAndPolicy(t *testing.T) {
 	if !validTransportMode(transportHTTPConnectAuto) || !transportAllowed(transportHTTPConnectAuto, transportHTTP2) || !transportAllowed(transportHTTPConnectAuto, transportHTTP1) {
 		t.Fatal("HTTP CONNECT fallback must allow HTTP/2 and HTTP/1.1 only")
 	}
-	if !validTransportMode(transportNewMethods) || !transportAllowed(transportNewMethods, transportTCP) {
-		t.Fatal("option 8 must accept the Agent external-path TCP/TLS carrier")
-	}
-	if !validTransportMode(transportAdaptive) || !transportAllowed(transportAdaptive, transportTCP) || !transportAllowed(transportAdaptive, transportWebSocket) || !transportAllowed(transportAdaptive, transportHTTP2) || !transportAllowed(transportAdaptive, transportHTTP1) {
-		t.Fatal("option 7 must keep all four original native transports")
-	}
-	for _, observed := range []string{transportWebSocket, transportHTTP2, transportHTTP1} {
-		if transportAllowed(transportNewMethods, observed) {
-			t.Fatalf("option 8 must not accept native transport %q", observed)
-		}
-	}
-	if !validTransportMode(transportFullAdaptive) {
-		t.Fatal("option 9 must be a valid transport policy")
-	}
-	for _, observed := range []string{transportTCP, transportWebSocket, transportHTTP2, transportHTTP1} {
-		if !transportAllowed(transportFullAdaptive, observed) {
-			t.Fatalf("option 9 must accept native transport %q", observed)
-		}
-	}
 	if transportAllowed(transportHTTPConnectAuto, transportTCP) || transportAllowed(transportHTTPConnectAuto, transportWebSocket) {
 		t.Fatal("HTTP CONNECT fallback must not silently allow native TLS/WebSocket transports")
 	}
@@ -1181,159 +1216,6 @@ func TestTransportConfigDefaultsAndPolicy(t *testing.T) {
 		if validTransportMode(unsupported) {
 			t.Fatalf("unknown transport %q was accepted", unsupported)
 		}
-	}
-}
-
-func TestAgentExternalPathConfigValidation(t *testing.T) {
-	base := Config{
-		Version:              version,
-		Role:                 "agent",
-		Transport:            transportNewMethods,
-		HubAddr:              "127.0.0.1:9443",
-		Token:                strings.Repeat("a", 64),
-		Fingerprint:          strings.Repeat("a", 64),
-		TunnelChannels:       1,
-		Ports:                []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
-		ExternalPaths:        []AgentExternalPath{{ID: "tor", Method: "tor", Address: "127.0.0.1:9050"}},
-		SelectedExternalPath: "tor",
-	}
-	if err := validateConfig(base); err != nil {
-		t.Fatalf("valid option 8 SOCKS5 Agent config rejected: %v", err)
-	}
-	warpProfile := base
-	warpProfile.ExternalPaths = []AgentExternalPath{{ID: "warp", Method: "warp"}}
-	warpProfile.SelectedExternalPath = "warp"
-	if kind := externalPathKind(warpProfile.ExternalPaths[0]); kind != "socks5" {
-		t.Fatalf("un-normalized WARP path kind = %q; want socks5 (never device/system route)", kind)
-	}
-	if endpoint := externalPathSOCKSEndpoint(warpProfile.ExternalPaths[0]); endpoint != warpSOCKSAddress {
-		t.Fatalf("legacy WARP path proxy endpoint = %q; want %q", endpoint, warpSOCKSAddress)
-	}
-	warpProfile = normalizeConfig(warpProfile)
-	if got := externalPathKind(warpProfile.ExternalPaths[0]); got != "socks5" {
-		t.Fatalf("WARP path kind = %q; want socks5", got)
-	}
-	if warpProfile.ExternalPaths[0].Address != warpSOCKSAddress {
-		t.Fatalf("legacy WARP profile was not migrated to local proxy address: %+v", warpProfile.ExternalPaths[0])
-	}
-	if err := validateConfig(warpProfile); err != nil {
-		t.Fatalf("valid WARP Local Proxy config rejected: %v", err)
-	}
-
-	missingSelected := base
-	missingSelected.SelectedExternalPath = "missing"
-	if err := validateConfig(missingSelected); err == nil {
-		t.Fatal("option 8 accepted an unknown selected external path")
-	}
-	missingProxy := base
-	missingProxy.ExternalPaths = []AgentExternalPath{{ID: "tor", Method: "tor"}}
-	if err := validateConfig(missingProxy); err == nil {
-		t.Fatal("Tor path accepted without a local SOCKS5 endpoint")
-	}
-	full := base
-	full.Transport = transportFullAdaptive
-	full.SelectedExternalPath = ""
-	if err := validateConfig(full); err != nil {
-		t.Fatalf("valid option 9 Agent config rejected: %v", err)
-	}
-}
-
-func TestReplaceConfiguredExternalPathPreservesAgentSettings(t *testing.T) {
-	cfg := Config{
-		Name:                 "s",
-		Version:              version,
-		Role:                 "agent",
-		Transport:            transportNewMethods,
-		HubAddr:              "91.223.61.40:9443",
-		TLSServerName:        "shahl.f82.ir",
-		Token:                strings.Repeat("a", 64),
-		Fingerprint:          strings.Repeat("b", 64),
-		TunnelChannels:       12,
-		Ports:                []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
-		ExternalPaths:        []AgentExternalPath{{ID: "masque", Method: "masque", Address: "127.0.0.1:40001"}},
-		SelectedExternalPath: "masque",
-	}
-	updated, err := replaceConfiguredExternalPath(cfg, "masque", AgentExternalPath{ID: "warp", Method: "warp"})
-	if err != nil {
-		t.Fatalf("replace external path: %v", err)
-	}
-	if updated.SelectedExternalPath != "warp" || len(updated.ExternalPaths) != 1 || updated.ExternalPaths[0].Method != "warp" || updated.ExternalPaths[0].Address != warpSOCKSAddress {
-		t.Fatalf("replacement path not applied: %+v", updated.ExternalPaths)
-	}
-	if updated.Token != cfg.Token || updated.Fingerprint != cfg.Fingerprint || updated.HubAddr != cfg.HubAddr || updated.TLSServerName != cfg.TLSServerName || updated.TunnelChannels != cfg.TunnelChannels || updated.Ports[0] != cfg.Ports[0] {
-		t.Fatal("external path repair changed unrelated Agent settings")
-	}
-}
-
-func TestBackhaulForwardAddressPreservesAdjacentTransportPorts(t *testing.T) {
-	got, err := backhaulForwardAddress("hub.example:9443", "127.0.0.1:19443", "hub.example:9444")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "127.0.0.1:19444" {
-		t.Fatalf("Backhaul HTTP/2 forward = %q; want 127.0.0.1:19444", got)
-	}
-	got, err = backhaulForwardAddress("hub.example:9443", "127.0.0.1:19443", "hub.example:9445")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "127.0.0.1:19445" {
-		t.Fatalf("Backhaul HTTP/1.1 forward = %q; want 127.0.0.1:19445", got)
-	}
-}
-
-func TestSystemExternalPathBindsToSelectedInterface(t *testing.T) {
-	if _, err := net.InterfaceByName("lo"); err != nil {
-		t.Skip("loopback interface is unavailable")
-	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	accepted := make(chan net.Conn, 1)
-	go func() {
-		conn, acceptErr := listener.Accept()
-		if acceptErr == nil {
-			accepted <- conn
-		}
-	}()
-	path := &AgentExternalPath{ID: "masque-test", Method: "masque", Interface: "lo"}
-	conn, err := dialAgentExternalPath(context.Background(), Config{}, path, listener.Addr().String())
-	if err != nil {
-		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
-			t.Skipf("runtime does not permit SO_BINDTODEVICE in this environment: %v", err)
-		}
-		t.Fatalf("dial over selected interface: %v", err)
-	}
-	_ = conn.Close()
-	select {
-	case serverConn := <-accepted:
-		_ = serverConn.Close()
-	case <-time.After(2 * time.Second):
-		t.Fatal("listener did not receive the socket bound to the selected interface")
-	}
-}
-
-func TestFullAdaptivePathCandidatesIncludeDirectAndConfiguredRoutes(t *testing.T) {
-	cfg := Config{ExternalPaths: []AgentExternalPath{
-		{ID: "warp", Method: "warp"},
-		{ID: "tor", Method: "tor", Address: "127.0.0.1:9050"},
-	}}
-	got := fullAdaptivePathCandidates(cfg, "tor")
-	if len(got) != 3 || got[0] == nil || got[0].ID != "tor" || got[1] != nil || got[2] == nil || got[2].ID != "warp" {
-		t.Fatalf("full adaptive routes = %#v; want preferred tor, direct, warp", got)
-	}
-}
-
-func TestOption9StartsWithConfiguredExternalPath(t *testing.T) {
-	cfg := Config{ExternalPaths: []AgentExternalPath{
-		{ID: "warp", Method: "warp", Address: "127.0.0.1:40000"},
-		{ID: "tor", Method: "tor", Address: "127.0.0.1:9050"},
-	}}
-	got := fullAdaptivePathCandidates(cfg, cfg.ExternalPaths[0].ID)
-	if len(got) != 3 || got[0] == nil || got[0].ID != "warp" || got[1] != nil || got[2] == nil || got[2].ID != "tor" {
-		t.Fatalf("option 9 first route order = %#v; want selected WARP, direct fallback, Tor", got)
 	}
 }
 
@@ -1724,7 +1606,7 @@ func TestShahTunnelRouteDiagram(t *testing.T) {
 		"NETWORK ROUTE  /  TCP FORWARDING",
 		"CLIENT ── TCP ──▶ HUB ═ TLS 1.3 + TOKEN AUTH ═▶ AGENT",
 		"PATHS: TCP/TLS | WS/TLS | H2 CONNECT | H1 CONNECT",
-		"OPTIONS 7/8/9: NATIVE / EXTERNAL / COMBINED FAILOVER",
+		"OPTION 7: ADAPTIVE FAILOVER ACROSS 4 PATHS",
 		"CERT PINNING • TOKEN AUTH • TLS 1.3",
 	}
 	if len(shahTunnelRouteArt) != 7 {
@@ -1951,230 +1833,5 @@ func TestListenAddressConflictDetection(t *testing.T) {
 		if got := listenAddressesConflict(tc.a, tc.b); got != tc.want {
 			t.Errorf("listenAddressesConflict(%q, %q) = %v; want %v", tc.a, tc.b, got, tc.want)
 		}
-	}
-}
-
-func TestParsePhysicalDefaultRoute(t *testing.T) {
-	route, err := parsePhysicalDefaultRoute("-4", "default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100\n")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if route.Gateway != "192.0.2.1" || route.Device != "eth0" || route.Source != "192.0.2.10" {
-		t.Fatalf("unexpected parsed physical route: %+v", route)
-	}
-	if _, err := parsePhysicalDefaultRoute("-4", "default dev CloudflareWARP proto static\n"); err == nil {
-		t.Fatal("virtual WARP route was accepted as the physical default")
-	}
-}
-
-func TestMissingFIBTableOutput(t *testing.T) {
-	tests := []struct {
-		name   string
-		family string
-		output string
-		want   bool
-	}{
-		{
-			name:   "new IPv4 table is an expected empty state",
-			family: "-4",
-			output: "Error: ipv4: FIB table does not exist.\nDump terminated\n",
-			want:   true,
-		},
-		{
-			name:   "new IPv6 table is an expected empty state",
-			family: "-6",
-			output: "Error: ipv6: FIB table does not exist.\nDump terminated\n",
-			want:   true,
-		},
-		{
-			name:   "wrong address family is not suppressed",
-			family: "-4",
-			output: "Error: ipv6: FIB table does not exist.\nDump terminated\n",
-			want:   false,
-		},
-		{
-			name:   "permission error is not suppressed",
-			family: "-4",
-			output: "RTNETLINK answers: Operation not permitted",
-			want:   false,
-		},
-		{
-			name:   "unknown family is not suppressed",
-			family: "-x",
-			output: "Error: ipv4: FIB table does not exist.",
-			want:   false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := missingFIBTableOutput(tt.family, tt.output); got != tt.want {
-				t.Fatalf("missingFIBTableOutput(%q, %q) = %v, want %v", tt.family, tt.output, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestPolicyFieldsContainScansAllRuleTokens(t *testing.T) {
-	fields := []string{"10:", "from", "all", "fwmark", "0x5348/0xffffffff", "lookup", "42420"}
-	if !policyFieldsContain(fields, "fwmark", "0x5348") {
-		t.Fatal("fwmark after leading rule tokens was not detected")
-	}
-	if !policyFieldsContain(fields, "lookup", "42420") {
-		t.Fatal("lookup table after leading rule tokens was not detected")
-	}
-	if policyFieldsContain(fields, "lookup", "42421") {
-		t.Fatal("a different lookup table was reported as present")
-	}
-	if policyFieldsContain(fields, "to", "198.51.100.4/32") {
-		t.Fatal("an absent match field was reported as present")
-	}
-}
-
-func TestAddIPRuleIsIdempotentForExactExistingRule(t *testing.T) {
-	dir := t.TempDir()
-	ipScript := `#!/bin/sh
-if [ "$1" = "-4" ] && [ "$2" = "rule" ] && [ "$3" = "add" ]; then
-  echo "RTNETLINK answers: File exists" >&2
-  exit 2
-fi
-if [ "$1" = "-4" ] && [ "$2" = "rule" ] && [ "$3" = "show" ]; then
-  echo "10: from all fwmark 0x5348/0xffffffff lookup 42420"
-  exit 0
-fi
-exit 1
-`
-	ipPath := filepath.Join(dir, "ip")
-	if err := os.WriteFile(ipPath, []byte(ipScript), 0700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", dir)
-
-	if err := addIPRule("-4", "priority", "10", "fwmark", "0x5348/0xffffffff", "lookup", "42420"); err != nil {
-		t.Fatalf("exact existing guard rule should be accepted idempotently: %v", err)
-	}
-	if err := addIPRule("-4", "priority", "10", "fwmark", "0x5348/0xffffffff", "lookup", "42421"); err == nil {
-		t.Fatal("a different lookup table at the same priority must remain a conflict")
-	}
-}
-
-func TestPolicyRuleUsesPrivateRouteTable(t *testing.T) {
-	if !policyRuleUsesTable("100: from all fwmark 0x5348 lookup 42420\n", warpIPv4Table) {
-		t.Fatal("an existing RPDB lookup of table 42420 was not detected")
-	}
-	if !policyRuleUsesTable("101: from all to 2001:db8::1 lookup 42421\n", warpIPv6Table) {
-		t.Fatal("an existing RPDB lookup of table 42421 was not detected")
-	}
-	if policyRuleUsesTable("100: from all lookup main\n101: from all lookup 4242\n", warpIPv4Table) {
-		t.Fatal("an unrelated policy table was reported as a conflict")
-	}
-}
-
-func TestWARPProxyPathByTransportMode(t *testing.T) {
-	warp := AgentExternalPath{ID: "warp", Method: "warp"}
-	tor := AgentExternalPath{ID: "tor", Method: "tor", Address: "127.0.0.1:9050"}
-	cfg := Config{Role: "agent", Transport: transportNewMethods, ExternalPaths: []AgentExternalPath{warp, tor}, SelectedExternalPath: "warp"}
-	if !configRequiresCloudflareWarp(cfg) {
-		t.Fatal("option 8 with selected WARP path must prepare the local WARP SOCKS proxy")
-	}
-	cfg.SelectedExternalPath = "tor"
-	if configRequiresCloudflareWarp(cfg) {
-		t.Fatal("option 8 selecting Tor must not require the WARP SOCKS proxy")
-	}
-	cfg.Transport = transportFullAdaptive
-	if !configRequiresCloudflareWarp(cfg) {
-		t.Fatal("option 9 with a configured WARP candidate must prepare the local WARP SOCKS proxy")
-	}
-	cfg.Transport = transportAdaptive
-	if configRequiresCloudflareWarp(cfg) {
-		t.Fatal("legacy option 7 must not need a WARP SOCKS proxy")
-	}
-}
-
-func TestWARPStatusConnectedDetection(t *testing.T) {
-	tests := []struct {
-		name   string
-		status string
-		want   bool
-	}{
-		{name: "connected", status: "Status update: Connected\nNetwork: healthy", want: true},
-		{name: "disconnected", status: "Status update: Disconnected", want: false},
-		{name: "connecting", status: "Status update: Connecting", want: false},
-		{name: "missing status", status: "Network: healthy", want: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := warpStatusOutputConnected(tt.status); got != tt.want {
-				t.Fatalf("warpStatusOutputConnected() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestWARPSettingsModeDetection(t *testing.T) {
-	tests := []struct {
-		name       string
-		settings   string
-		wantDevice bool
-	}{
-		{name: "local proxy", settings: "(user set) Mode: WarpProxy on port 40000", wantDevice: false},
-		{name: "device warp doh", settings: "(user set) Mode: Warp+doh", wantDevice: true},
-		{name: "device warp", settings: "(default) Mode: Warp", wantDevice: true},
-		{name: "no mode reported", settings: "WARP tunnel protocol: MASQUE", wantDevice: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := warpSettingsIsDeviceMode(tt.settings); got != tt.wantDevice {
-				t.Fatalf("warpSettingsIsDeviceMode() = %v, want %v", got, tt.wantDevice)
-			}
-		})
-	}
-}
-
-func TestLegacyDeviceWarpProfileDetection(t *testing.T) {
-	legacy := Config{Role: "agent", ExternalPaths: []AgentExternalPath{{ID: "warp", Method: "warp"}}}
-	if !legacyDeviceWarpConfig(legacy) {
-		t.Fatal("pre-2.2.8 WARP profile with no address was not detected")
-	}
-	current := normalizeConfig(legacy)
-	if legacyDeviceWarpConfig(current) {
-		t.Fatal("2.2.8 normalized WARP SOCKS profile was incorrectly detected as legacy device mode")
-	}
-	if current.ExternalPaths[0].Address != warpSOCKSAddress {
-		t.Fatalf("normalized WARP path address = %q, want %q", current.ExternalPaths[0].Address, warpSOCKSAddress)
-	}
-}
-
-func TestAgentNetworkPoliciesCompatibility(t *testing.T) {
-	legacy := Config{Role: "agent", Transport: transportAdaptive}
-	warp8 := Config{
-		Role:                 "agent",
-		Transport:            transportNewMethods,
-		ExternalPaths:        []AgentExternalPath{{ID: "warp", Method: "warp"}},
-		SelectedExternalPath: "warp",
-	}
-	warp9 := Config{
-		Role:          "agent",
-		Transport:     transportFullAdaptive,
-		ExternalPaths: []AgentExternalPath{{ID: "warp", Method: "warp"}},
-	}
-	warp9NoWarp := Config{Role: "agent", Transport: transportFullAdaptive, ExternalPaths: []AgentExternalPath{{ID: "tor", Method: "tor", Address: "127.0.0.1:9050"}}}
-
-	if !agentNetworkPoliciesCompatible(legacy, warp8) {
-		t.Fatal("a WARP SOCKS path and a direct Agent profile must share one host safely")
-	}
-	if !agentNetworkPoliciesCompatible(warp8, legacy) {
-		t.Fatal("a direct Agent and a WARP SOCKS path must share one host safely")
-	}
-	if !agentNetworkPoliciesCompatible(legacy, Config{Role: "agent", Transport: transportTCP}) {
-		t.Fatal("two non-WARP Agent profiles should be compatible")
-	}
-	if !agentNetworkPoliciesCompatible(warp8, warp9) {
-		t.Fatal("two WARP SOCKS Agent profiles should share one proxy safely")
-	}
-	if !agentNetworkPoliciesCompatible(legacy, warp9NoWarp) {
-		t.Fatal("option 9 without a WARP candidate must remain compatible with legacy mode")
-	}
-	if !agentNetworkPoliciesCompatible(Config{Role: "hub", Transport: transportAdaptive}, warp8) {
-		t.Fatal("Hub profiles must not be treated as local Agent egress conflicts")
 	}
 }
