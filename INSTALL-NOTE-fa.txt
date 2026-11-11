@@ -21,7 +21,7 @@
 روش انتشار و نصب:
 - در GitHub فقط سورس، تست‌ها، مستندات و S1T-START.sh قرار می‌گیرد؛ هیچ باینری ShahTunnel را commit یا در Releases آپلود نکنید.
 - دستور one-line بالا اسکریپت را از raw.githubusercontent.com دریافت می‌کند.
-- اسکریپت سورس را از codeload.github.com/ShahNetLab/ShahTunnel شاخه main می‌گیرد، ابزار Go را از توزیع رسمی Go با SHA-256 معتبر می‌کند و باینری را روی همان VPS می‌سازد.
+- اسکریپت سورس را از codeload.github.com/ShahNetLab/ShahTunnel شاخه main می‌گیرد، ابزار Go نسخه 1.26.1 را از توزیع رسمی Go با SHA-256 معتبر می‌کند و باینری را روی همان VPS می‌سازد.
 - باینری نهایی فقط روی VPS در /usr/local/bin/ravanreverse نصب می‌شود.
 
 

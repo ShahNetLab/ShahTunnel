@@ -6,73 +6,17 @@
 
 **GALACTIC EDITION · PROFILE-ISOLATED REVERSE TCP TUNNEL**
 
-One Hub. Multiple Agents. Adaptive lanes. Independent egress paths.
-
 [![Version](https://img.shields.io/badge/version-3.0.0-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
-[![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8?style=flat-square&logo=go)](go.mod)
+[![Build Go](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
-[![Telegram Channel](https://img.shields.io/badge/Channel-@MediaZet-229ED9?style=flat-square&logo=telegram&logoColor=white)](https://t.me/MediaZet)
-[![Cloudflare Bot](https://img.shields.io/badge/Cloudflare-@cloudflare0__bot-229ED9?style=flat-square&logo=telegram&logoColor=white)](https://t.me/cloudflare0_bot)
 
 **English** · [فارسی](README-fa.md)
-
-<sub>Join the channel to support ShahTunnel and get updates. Use the bot for Cloudflare operations.</sub>
 
 [🌌 Network Flow](#network-flow) · [⚡ Capabilities](#capabilities) · [🚀 Install](https://t.me/MediaZet)
 
 </div>
 
 ---
-
-## Install
-
-ShahTunnel uses a **Hub / Agent** layout. Install it on the Hub and on every Agent that should connect to it. A third server can optionally run as a Relay.
-
-**Requirements:** Linux `amd64` or `arm64`, `systemd`, root access, and outbound connectivity from each Agent to the Hub. The installer prepares the pinned Go toolchain and builds the program on the server.
-
-**1. Run the installer** on each server:
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
-```
-
-The manager opens after installation. You can reopen it with:
-
-```bash
-sudo shah-tunnel menu
-```
-
-**2. Configure the Hub**
-
-1. Choose **Create a new tunnel** and select **HUB**.
-2. Set the control listener (default `0.0.0.0:9443`) and the accepted Hub↔Agent transport.
-3. Add each public port mapping. Give every mapping an ID such as `main` or `web`.
-4. Save the generated **Agent token** and **certificate SHA-256 fingerprint**. The Agent must use both values exactly.
-
-**3. Configure each Agent**
-
-1. Create a tunnel and select **AGENT**.
-2. Enter the Hub address and control port, then choose a transport accepted by the Hub.
-3. Enter the token and certificate fingerprint from the Hub.
-4. Add the same mapping IDs and set each local target, for example `127.0.0.1:443`.
-5. Save the profile. ShahTunnel enables its dedicated service and reconnects dropped lanes automatically.
-
-**4. Open only the required firewall ports.** The Hub needs its selected control listener, any selected CONNECT port (`control + 1` for HTTP/2 or `control + 2` for HTTP/1.1), and the public mapping ports. Agents initiate the connection to the Hub; local targets stay on the Agent side.
-
-For guided setup and release announcements, use the [ShahTunnel Telegram channel](https://t.me/MediaZet). The [Cloudflare bot](https://t.me/cloudflare0_bot) is a separate helper for Cloudflare operations.
-
-## Network Flow
-
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.0 Galactic Network Flow" width="100%"></p>
-
-The tunnel and the optional per-profile Internet egress are separate paths:
-
-```text
-Client → Hub public mapping → authenticated Agent lanes → Agent local target
-Selected Xray inbound → loopback-only Xray sidecar → WARP SOCKS5 → Internet
-```
-
-The second path is optional and applies only to the selected Agent profile when per-tunnel WARP egress is enabled.
 
 ## Capabilities
 
@@ -114,6 +58,43 @@ Choose a mode during tunnel creation. The Hub and Agent must use compatible sett
 | `Adaptive` | Uses the supported Direct/Psiphon egress failover path. |
 
 > **Two different option 9 entries:** option `9` in the *creation wizard* means All-protocol adaptive. Option `9` in the *main manager menu* enables per-profile Xray WARP egress for a selected Agent.
+
+## Install
+
+ShahTunnel uses a **Hub / Agent** layout. Install it on the Hub and on every Agent that should connect to it. A third server can optionally run as a Relay.
+
+**Requirements:** Linux `amd64` or `arm64`, `systemd`, root access, and outbound connectivity from each Agent to the Hub. The installer downloads and verifies the pinned Go 1.26.1 toolchain, then builds the Linux binary on the server.
+
+**1. Run the installer** on each server:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
+```
+
+The manager opens after installation. You can reopen it with:
+
+```bash
+sudo shah-tunnel menu
+```
+
+**2. Configure the Hub**
+
+1. Choose **Create a new tunnel** and select **HUB**.
+2. Set the control listener (default `0.0.0.0:9443`) and the accepted Hub↔Agent transport.
+3. Add each public port mapping. Give every mapping an ID such as `main` or `web`.
+4. Save the generated **Agent token** and **certificate SHA-256 fingerprint**. The Agent must use both values exactly.
+
+**3. Configure each Agent**
+
+1. Create a tunnel and select **AGENT**.
+2. Enter the Hub address and control port, then choose a transport accepted by the Hub.
+3. Enter the token and certificate fingerprint from the Hub.
+4. Add the same mapping IDs and set each local target, for example `127.0.0.1:443`.
+5. Save the profile. ShahTunnel enables its dedicated service and reconnects dropped lanes automatically.
+
+**4. Open only the required firewall ports.** The Hub needs its selected control listener, any selected CONNECT port (`control + 1` for HTTP/2 or `control + 2` for HTTP/1.1), and the public mapping ports. Agents initiate the connection to the Hub; local targets stay on the Agent side.
+
+
 
 ## Per-tunnel WARP egress for Xray
 
@@ -171,9 +152,21 @@ Replace `PROFILE` with the selected profile's systemd instance name. The manager
 
 ---
 
-<div align="center">
+## Network Flow
 
-**SHAHTUNNEL 3.0.0 · GALACTIC EDITION**  
-One Hub. Multiple Agents. Adaptive lanes. Independent egress paths.
+The Hub-to-Agent forwarding path and optional per-profile Internet egress are separate: the tunnel forwards mapped TCP services to Agent-side targets, while the optional Xray sidecar sends only the selected inbound through that Agent profile’s WARP SOCKS5 egress.
 
-</div>
+```text
+Client → Hub public mapping → authenticated Agent lanes → Agent local target
+Selected Xray inbound → loopback-only Xray sidecar → WARP SOCKS5 → Internet
+```
+
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.0 Network Flow" width="100%"></p>
+
+<p align="center">Support ShahTunnel and get project updates by joining the channel. The bot is for Cloudflare operations.</p>
+
+<p align="center">
+<a href="https://t.me/MediaZet"><img src="https://img.shields.io/badge/Telegram-Channel%20%40MediaZet-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="Join ShahTunnel Telegram channel"></a>
+&nbsp;
+<a href="https://t.me/cloudflare0_bot"><img src="https://img.shields.io/badge/Telegram-Cloudflare%20Bot-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="Open Cloudflare bot"></a>
+</p>

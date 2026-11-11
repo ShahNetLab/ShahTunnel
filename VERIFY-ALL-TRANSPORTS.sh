@@ -60,8 +60,11 @@ printf '\n== 3/7: Installer syntax ==\n'
 bash -n S1T-START.sh
 bash -n install.sh
 bash -n VERIFY-ALL-TRANSPORTS.sh
+[[ -s docs/img/ShahTunnel-Network.png ]] || fail "Galactic ShahTunnel logo is missing."
 [[ -s docs/img/ShahTunnel-Network-Flow-v3.png ]] || fail "English v3 Network Flow image is missing."
 [[ -s docs/img/ShahTunnel-Network-Flow-v3-fa.png ]] || fail "Persian v3 Network Flow image is missing."
+image_count="$(find docs/img -maxdepth 1 -type f | wc -l | tr -d ' ')"
+[[ "$image_count" == 3 ]] || fail "Expected exactly 3 files in docs/img, found $image_count."
 grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/psiphon' S1T-START.sh || fail "Psiphon systemd data-directory permission is missing."
 grep -Fq 'func detectActiveWarpUnderlay() string' S1T-CAPSULE/main.go || fail "Adaptive WARP protocol detection is missing."
 grep -Fq 'func warpProxyAddressFromSettings(settings string)' S1T-CAPSULE/main.go || fail "Cloudflare Local Proxy detection is missing."
@@ -72,7 +75,7 @@ grep -Fq 'TestAdaptiveUnderlayCandidatesDetectWARPAndFailOver' S1T-CAPSULE/main_
 grep -Fq 'TestOptionNineSwitchesFromFailedDirectPathToPsiphonSOCKS5' S1T-CAPSULE/main_test.go || fail "Option 9 SOCKS5 failover coverage is missing."
 grep -Fq 'func applyXrayWarpEgressToSelectedTunnel() error' S1T-CAPSULE/xray_warp.go || fail "Per-tunnel Xray WARP isolation is missing."
 grep -Fq 'TestBuildXrayWarpConfigIsolatesOnlyClonedInbound' S1T-CAPSULE/main_test.go || fail "Per-inbound Xray WARP isolation coverage is missing."
-pass "Shell syntax, v3 Network Flow diagrams, Psiphon systemd permissions, WARP Local Proxy detection/SOCKS5, and WARP/Psiphon failover coverage"
+pass "Shell syntax, three-image docs layout, v3 Network Flow diagrams, Psiphon permissions, WARP Local Proxy detection/SOCKS5, and failover coverage"
 
 printf '\n== 4/7: Transport loopback suite ==\n'
 "$GO_BIN" test -count=20 ./S1T-CAPSULE || fail "Automated transport tests failed."
