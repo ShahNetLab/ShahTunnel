@@ -3,77 +3,105 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>V2.2.9 · Secure Reverse TCP Relay · Per-Profile WARP Xray Egress</strong></p>
-<p align="center">A reverse TCP relay that carries public client connections through a Hub to mapped target services via authenticated Agent lanes. The private Hub↔Agent channel uses TLS 1.3, SHA-256 certificate pinning and adaptive recovery across four native transports and preconfigured Agent-side external network paths.</p>
+<p align="center"><strong>V3.0.0 · Secure Reverse TCP Relay · Multi-layer Adaptive Recovery</strong></p>
+<p align="center">ShahTunnel relays public TCP connections through a Hub and authenticated Agent lanes to mapped local services. Version 3 adds real Agent-side Psiphon SOCKS5 egress and validation for an already-connected Cloudflare WARP tunnel using MASQUE or WireGuard.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
-
-## 2.2.9 per-profile WARP egress for Xray clients
-
-- Option 8 still uses Cloudflare WARP Local Proxy (`127.0.0.1:40000`) for the Agent-to-Hub carrier.
-- When the Agent wizard asks whether VPN client traffic should also use WARP, it can prepare an isolated Xray sidecar from the currently running local Xray inbound. The original panel Xray config, process, listener and existing direct profiles are not edited or restarted.
-- The sidecar listens only on loopback, clones the selected Xray inbound (including users and TLS/Reality settings), and routes its client traffic through the WARP SOCKS5 outbound. Shah Tunnel refreshes this sidecar from the panel config before each sidecar start.
-- **Use a separate Hub profile for WARP clients.** Hub transport control port, mapping ID and public client port must be different from the existing direct Hub profile. Wizard defaults are control port +10, mapping ID `warp`, and public listener `0.0.0.0:8443`. Open the selected control port and public listener in the Iran firewall.
-- Clients that should use WARP must connect to the dedicated public WARP port (default `8443`). Existing clients on their old public port continue to use the direct Xray target and are not changed.
-- The Agent target must be a local Xray inbound on `127.0.0.1` or `::1`. The setup wizard locates the running Xray process/config, validates the cloned configuration with the same Xray binary, and refuses the profile if it cannot safely identify a unique inbound.
-- WARP sidecars use the WARP Local Proxy SOCKS5 endpoint, do not add a VPS-wide route, and do not change SSH or the original Xray listener. If the local WARP proxy is not healthy for both IPv4 and IPv6, setup stops before saving the profile.
-- This isolates TCP Xray client egress. Do not assume every UDP/QUIC flow is proxied by the Cloudflare Local Proxy; verify the actual protocol/egress required by your deployment.
-
-## Compatibility and safety
-
-Profiles without `target_egress: warp_xray` retain their original target and route. The sidecar is a separate Xray process bound to loopback and a dedicated local port; it never edits the panel's active config or restarts the panel's Xray service. A WARP Agent profile must use its own Hub control listener and public listener so Hub session selection cannot mix direct and WARP mappings. Existing direct tunnel profiles remain on their original Hub port, target port and Xray instance.
 
 ## Network flow
 
 <p align="center">
-  <img src="docs/img/ShahTunnel-Network-Flow.png" alt="Network flow: public clients, Hub, four authenticated private transports, Agent and local target service" width="100%" />
+  <img src="docs/img/ShahTunnel-Network-Flow-v3.svg" alt="Version 3 network flow showing Hub, Agent, four inner transports, direct egress, WARP MASQUE/WireGuard and Psiphon SOCKS5" width="100%" />
 </p>
 
 ## Features
 
-- **Four implemented transports:** TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT and HTTP/1.1 CONNECT/TLS.
-- **Automatic recovery:** reconnect with jittered backoff; options 7 and 9 adaptively select the last successful native transport and (for option 9) external route per lane.
-- **Security:** TLS 1.3 for the private Hub↔Agent channel, token authentication and SHA-256 certificate pinning.
-- **Concurrency:** twelve independent lanes by default, bounded queues and load-aware session selection.
-- **Management:** interactive CLI, systemd integration, status and logs, installer and local verification script.
+- **Four implemented inner transports:** TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT, and HTTP/1.1 CONNECT/TLS.
+- **Option 8 — external egress:** choose Cloudflare WARP over MASQUE, WARP over WireGuard, or the official Psiphon ConsoleClient through a local SOCKS5 proxy.
+- **Option 9 — multi-layer adaptive recovery:** try all four inner transports; detect an already-connected WARP mode (MASQUE/WireGuard), and consider it alongside Psiphon SOCKS5 and Direct. An active WARP route is verified first and falls back to Psiphon then Direct; without WARP, each lane prefers its last successful Direct/Psiphon route. Each lane remembers its last successful transport and egress path.
+- **Security:** TLS 1.3, token authentication, SHA-256 certificate pinning, and loopback-only Psiphon proxy endpoints.
+- **Management:** isolated tunnel profiles and systemd services. Main manager options retain their prior numbering and behaviour.
 
-## Transport menu
+## Transport selection
 
-Choose the same transport policy on both Hub and Agent. Options 1–7 retain their original meaning; options 8 and 9 add external routing without replacing the old transports.
+Options 1–7 retain their previous behaviour and numbering. Options 8 and 9 are added only to the transport wizard. The main manager's option 8 remains Complete uninstall.
 
 | Option | Transport / strategy | Behaviour |
 |---|---|---|
 | `1` | TCP/TLS | Native TLS-protected stream. |
 | `2` | WebSocket/TLS | Tunnel stream carried in WebSocket binary frames over TLS. |
-| `3` | HTTP/2 CONNECT | Bidirectional CONNECT stream over TLS on control port + 1. |
+| `3` | HTTP/2 CONNECT | CONNECT stream over TLS on control port + 1. |
 | `4` | HTTP/1.1 CONNECT/TLS | CONNECT stream over TLS on control port + 2. |
-| `5` | HTTP CONNECT fallback | Tries HTTP/2 CONNECT, then HTTP/1.1 CONNECT if setup fails. |
+| `5` | HTTP CONNECT fallback | HTTP/2, then HTTP/1.1. |
 | `6` | Automatic fallback | TCP/TLS, then WebSocket/TLS. |
-| `7` | FULL ADAPTIVE FAILOVER — legacy | Preserves the original four implemented transports and fails over among them. |
-| `8` | EXTERNAL TUNNEL | Uses one selected Agent-side external path with the authenticated TCP/TLS carrier. |
-| `9` | FULL ADAPTIVE FAILOVER — all | Tries all four native transports over configured external paths and the direct route; selected external path is tried first, with direct/native fallbacks. |
+| `7` | Full Adaptive Failover | All four inner transports; the last successful one is preferred per lane. |
+| `8` | External egress | On the Agent, choose MASQUE/WARP, WARP/WireGuard, or Psiphon/SOCKS5. The Hub accepts the adaptive inner transports. |
+| `9` | All-Protocol Adaptive | All four inner transports over detected WARP (MASQUE/WireGuard), Psiphon, and Direct; an active WARP path is verified first, while a lost WARP path falls through to Psiphon/Direct; without WARP, the last successful Direct/Psiphon path is preferred. |
+
+### WARP, MASQUE, and SSH safety
+
+On Linux, Cloudflare WARP is a system-level tunnel. For option 8, ShahTunnel verifies `warp-cli` presence, Connected status, the protocol reported by `warp-cli settings`, and a live `warp=on` egress check. ShahTunnel **never** runs `warp-cli connect`, changes the WARP protocol, disconnects WARP, or modifies system routes. WARP must already be active before the Agent service starts. The same status, protocol, and live egress checks are repeated before each reconnect, so a lost WARP tunnel does not silently fall back to the ordinary host route.
+
+Enabling WARP can change the server's default route and interrupt SSH. Run the commands below only from a provider console or with a tested out-of-band recovery path; do not switch the default route from your only SSH session:
+
+```bash
+warp-cli tunnel protocol set MASQUE
+warp-cli connect
+warp-cli status
+warp-cli settings | grep -i protocol
+curl -fsS https://www.cloudflare.com/cdn-cgi/trace | grep '^warp=on$'
+```
+
+For WireGuard, use `warp-cli tunnel protocol set WireGuard` instead. See Cloudflare's [Linux setup](https://developers.cloudflare.com/warp-client/get-started/linux/) and [WARP modes](https://developers.cloudflare.com/warp-client/warp-modes/).
+
+### Psiphon setup
+
+The integration uses the official Linux `ConsoleClient` and a valid Psiphon client JSON configuration. The Psiphon executable is not bundled in this ZIP; obtain it from the [official Psiphon binary repository](https://github.com/Psiphon-Labs/psiphon-tunnel-core-binaries). Set `LocalSocksProxyPort` in that JSON to the local SOCKS5 port selected in the Agent wizard (default `1080`). ShahTunnel starts `ConsoleClient` with a profile-specific data directory and binds its proxy to the loopback interface, then dials the Hub through SOCKS5. The installer adds a narrow systemd drop-in granting write access only to `/var/lib/shah-tunnel/psiphon`, preserving `ProtectSystem=strict`. Only the Agent's outbound TCP stream is proxied; SSH and the system default route are not changed.
 
 ### Hub firewall ports
 
 If the Hub control port is `9443`:
 
-- `9443/TCP`: TCP/TLS and WebSocket/TLS; also required by external-only option 8.
-- `9444/TCP`: HTTP/2 CONNECT in options 3, 5, 7 and 9.
-- `9445/TCP`: HTTP/1.1 CONNECT in options 4, 5, 7 and 9.
+- `9443/TCP`: native TCP/TLS and WebSocket/TLS.
+- `9444/TCP`: HTTP/2 CONNECT.
+- `9445/TCP`: HTTP/1.1 CONNECT/TLS.
 
-Option 8 uses only the authenticated TCP/TLS carrier, so it needs the control port. Option 7 keeps the original four native transports. Option 9 can use all four native transports and therefore needs the control port, control+1 and control+2. Open only the ports required by the selected transports.
+Keep all three open for adaptive options 7–9. WARP/MASQUE and Psiphon do not add another inbound Hub listener.
 
-### Agent-side external paths
+## Failover details and layer boundaries
 
-The installer adds the official Cloudflare WARP package on supported Debian/Ubuntu APT systems, but it does not register or connect WARP during installation. The Agent wizard offers these external paths. The default selection is option `2` (Cloudflare WARP), not the preconfigured MASQUE gateway:
+- Option 9 tries the four inner TCP transports over a connected WARP tunnel (MASQUE or WireGuard) when detected, then Psiphon SOCKS5 and Direct. If WARP is not connected, the order is Direct then Psiphon. WARP status, protocol, and live `warp=on` egress are checked before every WARP attempt; each lane remembers its last successful inner transport and egress path.
+- MASQUE and WireGuard are Cloudflare WARP tunnel protocols managed by `warp-svc` at the system level; they are not independent per-socket proxies. ShahTunnel does not switch WARP protocols while running because doing so could interrupt SSH and all other host traffic. When WARP is active, its current system route is treated as a separately verified candidate; ensure the Hub IP is not excluded by the WARP split-tunnel policy. If the WARP tunnel drops, ShahTunnel skips it and moves to the next configured route.
+- Psiphon is integrated as a SOCKS5 TCP proxy in this release; this path does not provide an independent UDP transport.
+- Each lane reconnects independently. Healthy lanes and the SSH service are not restarted or modified.
 
-- **MASQUE:** connect through a preconfigured local MASQUE gateway exposed as a SOCKS5 endpoint (default `127.0.0.1:40001`). The wizard checks that this preconfigured SOCKS5 gateway answers before saving the profile. Shah Tunnel does not start a standalone MASQUE client.
-- **Cloudflare WARP:** uses Cloudflare WARP Local Proxy (`127.0.0.1:40000`) over MASQUE as a SOCKS5 next-hop for this Agent profile’s Hub connections only. It does not enable full-device routing, change the VPS default route, or affect other tunnel profiles. Optionally, the wizard creates a separate Xray sidecar for client egress. The original panel listener stays direct.
-- **WARP on WARP:** use a separately prepared second SOCKS5 chain endpoint (default `127.0.0.1:40002`). Shah Tunnel does not register a second Cloudflare client or create a second WARP tunnel by itself.
-- **Tor/Psiphon:** enter the local SOCKS5 proxy address. Defaults are `127.0.0.1:9050` for Tor and `127.0.0.1:1080` for Psiphon; adjust them to the actual client settings. Destination hostnames are resolved by the proxy.
+## Multiple tunnel profiles and performance
 
-Option 7 is the original four-transport adaptive mode. Option 8 selects one external path and uses the authenticated TCP/TLS carrier. Option 9 combines the four native transports with configured external paths. SOCKS-backed paths, including WARP, are opened by the relevant Agent lane only; direct/native paths use ordinary direct sockets. Each lane remembers its last successful route and transport. A failed outer connection is re-established on another candidate; an already-active TCP flow is not migrated seamlessly and may reconnect. The Hub must be configured with the corresponding mode.
-**WARP scope:** 2.2.9 keeps the Agent carrier and optional isolated Xray client egress on separate SOCKS5-based paths. Full-device route changes are not used. Use a dedicated Hub profile and public client port for WARP Xray clients; old direct profiles remain unchanged.
+Each create operation stores a unique named profile. Every profile runs as its own systemd service; Start, Stop, Restart, Status, and Delete act only on the selected profile. Existing profiles are not overwritten.
 
-### WARP installation on restricted networks
+The per-stream in-flight window remains 64 frames of up to 64 KiB. Actual throughput depends on bandwidth, RTT, packet loss, congestion, qdisc, and host limits; no fixed throughput can be guaranteed.
 
-The installer uses bounded timeouts when retrieving Cloudflare's official signing key. If `pkg.cloudflareclient.com` is unreachable from the VPS network, WARP package setup is skipped with a clear warning and the Shah Tunnel core installation continues; no routes are changed during installation. WARP paths remain unavailable until the official client is installed. For new profiles, no nftables rule, policy route, or device-level WARP route is needed. If an older full-device WARP profile is still active, restart that profile once with the new release before starting another Agent profile; the migration checks this state and refuses to alter a running legacy tunnel.
+## Install and upgrade
+
+Run as root on Linux amd64 or arm64 with systemd:
+
+```bash
+sudo bash S1T-START.sh
+```
+
+The installer builds version `3.0.0` from the local source tree, verifies the pinned Go toolchain with SHA-256, and backs up an existing binary. It does not restart an already-active service during upgrade, avoiding interruption of current sessions. Legacy service/config names `ravanreverse.service` and `/etc/ravanreverse` remain for compatibility.
+
+The running service keeps its old in-memory binary until you restart the selected ShahTunnel unit during a maintenance window. This interrupts that tunnel's forwarded sessions, but does not restart or modify `sshd`:
+
+```bash
+sudo systemctl restart ravanreverse.service
+# Or, for a named profile:
+sudo systemctl restart 'ravanreverse@PROFILE.service'
+```
+
+## Tests
+
+```bash
+./VERIFY-ALL-TRANSPORTS.sh
+```
+
+The helper runs inner-transport tests, a real local SOCKS5 TCP-dial integration test, static analysis, and amd64/arm64 builds. Live WARP validation requires an active WARP client and Internet connectivity; it is not run as a live test in an offline build environment.

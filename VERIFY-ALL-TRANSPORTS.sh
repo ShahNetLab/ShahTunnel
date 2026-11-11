@@ -11,6 +11,12 @@ GO_BIN=""
 fail() { printf '\n[FAIL] %s\n' "$*" >&2; exit 1; }
 pass() { printf '[ OK ] %s\n' "$*"; }
 
+case "$(uname -m)" in
+  x86_64|amd64) TARGET_ARCH="amd64" ;;
+  aarch64|arm64) TARGET_ARCH="arm64" ;;
+  *) fail "Unsupported verification architecture: $(uname -m)" ;;
+esac
+
 version_is_pinned() {
   local bin="$1" v
   [[ -x "$bin" ]] || return 1
@@ -19,7 +25,7 @@ version_is_pinned() {
 }
 
 # Reuse only an exact Go 1.26.1 binary. An older/newer system toolchain is not used.
-for candidate in "$GO_HOME/bin/go" "/usr/local/lib/shah-tunnel/go-${GO_VERSION}/bin/go" "$(command -v go 2>/dev/null || true)"; do
+for candidate in "$GO_HOME/bin/go" "/usr/local/lib/shah-tunnel/toolchains/go${GO_VERSION}-${TARGET_ARCH}/bin/go" "/usr/local/lib/shah-tunnel/go-${GO_VERSION}/bin/go" "$(command -v go 2>/dev/null || true)"; do
   if [[ -n "$candidate" ]] && version_is_pinned "$candidate"; then
     GO_BIN="$candidate"
     break
@@ -42,14 +48,21 @@ printf '\n== 1/7: Resolve Go module metadata ==\n'
 pass "Module metadata resolved"
 
 printf '\n== 2/7: Formatting ==\n'
-unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/warp_network.go S1T-CAPSULE/main_test.go)"
+unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go)"
 [[ -z "$unformatted" ]] || fail "gofmt required for: $unformatted"
 pass "Go source formatting"
 
 printf '\n== 3/7: Installer syntax ==\n'
 bash -n S1T-START.sh
 bash -n install.sh
-pass "Shell syntax"
+bash -n VERIFY-ALL-TRANSPORTS.sh
+[[ -s docs/img/ShahTunnel-Network-Flow-v3.svg ]] || fail "English v3 Network Flow diagram is missing."
+[[ -s docs/img/ShahTunnel-Network-Flow-v3-fa.svg ]] || fail "Persian v3 Network Flow diagram is missing."
+grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/psiphon' S1T-START.sh || fail "Psiphon systemd data-directory permission is missing."
+grep -Fq 'func detectActiveWarpUnderlay() string' S1T-CAPSULE/main.go || fail "Adaptive WARP protocol detection is missing."
+grep -Fq 'TestAdaptiveUnderlayCandidatesDetectWARPAndFailOver' S1T-CAPSULE/main_test.go || fail "WARP failover coverage is missing."
+grep -Fq 'TestOptionNineSwitchesFromFailedDirectPathToPsiphonSOCKS5' S1T-CAPSULE/main_test.go || fail "Option 9 SOCKS5 failover coverage is missing."
+pass "Shell syntax, v3 Network Flow diagrams, Psiphon systemd permissions, and WARP/Psiphon failover coverage"
 
 printf '\n== 4/7: Transport loopback suite ==\n'
 "$GO_BIN" test -count=20 ./S1T-CAPSULE || fail "Automated transport tests failed."
@@ -70,7 +83,7 @@ pass "go vet"
 printf '\n== 7/7: Linux binaries build ==\n'
 mkdir -p dist
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-amd64 ./S1T-CAPSULE
-[[ "$(dist/shah-tunnel-linux-amd64 version)" == "Shah Tunnel 2.2.9 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+[[ "$(dist/shah-tunnel-linux-amd64 version)" == "Shah Tunnel 3.0.0 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o dist/shah-tunnel-linux-arm64 ./S1T-CAPSULE
 (cd dist && sha256sum shah-tunnel-linux-amd64 > shah-tunnel-linux-amd64.sha256)
 (cd dist && sha256sum shah-tunnel-linux-arm64 > shah-tunnel-linux-arm64.sha256)

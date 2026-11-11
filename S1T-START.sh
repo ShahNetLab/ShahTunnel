@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 2.2.9 installer.
+# Shah Tunnel 3.0.0 installer.
 # Downloads the pinned Go toolchain, verifies its SHA-256, fetches the source,
 # and builds the binary on the target server. No GitHub Release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="2.2.9"
+VERSION="3.0.0"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -76,95 +76,6 @@ curl_download() {
   PHASE_HAS_DOWNLOAD=1
   rm -f "$headers" "$log"
 }
-# Install the official Cloudflare WARP client without registering or connecting it.
-# Shah Tunnel uses the WARP Local Proxy only for the Agent profile's own
-# Hub sockets. No device-wide WARP route or SSH policy route is installed.
-install_cloudflare_warp() {
-  if command -v warp-cli >/dev/null 2>&1; then
-    echo "Cloudflare WARP already installed; keeping its existing registration and configuration."
-    warp-cli --version || true
-    return 0
-  fi
-  if ! command -v apt-get >/dev/null 2>&1 || ! command -v dpkg >/dev/null 2>&1; then
-    echo "Cloudflare WARP auto-install is supported by this installer on Debian/Ubuntu (APT) only; skipping package setup."
-    return 0
-  fi
-  local distro codename arch
-  . /etc/os-release
-  distro="${ID:-unknown}"
-  codename="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
-  if [[ "$distro" != "ubuntu" && "$distro" != "debian" ]]; then
-    echo "Cloudflare WARP auto-install skipped: unsupported APT distribution '${distro}'."
-    return 0
-  fi
-  if [[ ! "$codename" =~ ^[a-z0-9]+$ ]]; then
-    echo "Cloudflare WARP auto-install skipped: could not determine a safe repository codename."
-    return 1
-  fi
-  arch="$(dpkg --print-architecture 2>/dev/null || true)"
-  if [[ "$arch" != "amd64" && "$arch" != "arm64" ]]; then
-    echo "Cloudflare WARP auto-install skipped: unsupported package architecture '${arch}'."
-    return 0
-  fi
-  echo "Installing Cloudflare WARP client from Cloudflare's official APT repository (${codename}/${arch})."
-  if ! apt-get update; then
-    echo "APT package index update failed before adding the Cloudflare repository."
-    return 1
-  fi
-  if ! apt-get install -y curl gpg ca-certificates; then
-    echo "Could not install Cloudflare WARP prerequisites."
-    return 1
-  fi
-  install -d -o root -g root -m 0755 /usr/share/keyrings
-  local key_download="${TMP}/cloudflare-warp-pubkey.gpg"
-  local key_output="/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg"
-  local key_new="${key_output}.new.$$"
-
-  # Iran/filtered VPS networks may silently stall on pkg.cloudflareclient.com.
-  # Bound every network step and let the core Shah Tunnel install continue if
-  # the official WARP repository cannot be reached. Never leave a half key.
-  echo "Fetching Cloudflare's official signing key (8s connect timeout, 25s total)..."
-  if ! curl -fLsS --proto '=https' --proto-redir '=https' \
-      --connect-timeout 8 --max-time 25 --retry 1 --retry-delay 1 \
-      https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_download"; then
-    echo "WARNING: pkg.cloudflareclient.com is unreachable from this VPS network."
-    echo "WARP installation is skipped; Shah Tunnel installation will continue without changing network routes."
-    rm -f "$key_new" "$key_download"
-    return 1
-  fi
-  if [[ ! -s "$key_download" ]] || ! gpg --yes --dearmor --output "$key_new" "$key_download"; then
-    echo "WARNING: Cloudflare signing key was empty or invalid; WARP installation is skipped."
-    rm -f "$key_new" "$key_download"
-    return 1
-  fi
-  install -o root -g root -m 0644 "$key_new" "$key_output"
-  rm -f "$key_new" "$key_download"
-  printf 'deb [arch=%s signed-by=%s] https://pkg.cloudflareclient.com/ %s main\n' "$arch" "$key_output" "$codename" \
-      > /etc/apt/sources.list.d/cloudflare-client.list
-  echo "Updating Cloudflare package index (bounded network timeouts)..."
-  if ! apt-get -o Acquire::http::Timeout=18 -o Acquire::https::Timeout=18 \
-      -o Acquire::Retries=1 update; then
-    echo "WARNING: Cloudflare APT repository is unreachable; WARP installation is skipped."
-    rm -f /etc/apt/sources.list.d/cloudflare-client.list
-    return 1
-  fi
-  echo "Installing Cloudflare WARP package (bounded network timeouts)..."
-  if ! apt-get -o Acquire::http::Timeout=18 -o Acquire::https::Timeout=18 \
-      -o Acquire::Retries=1 install -y cloudflare-warp; then
-    echo "WARNING: cloudflare-warp package could not be downloaded/installed."
-    echo "Removing the incomplete Cloudflare APT source to avoid breaking later system updates."
-    rm -f /etc/apt/sources.list.d/cloudflare-client.list
-    echo "Shah Tunnel installation will continue; WARP-dependent paths remain unavailable until WARP is installed."
-    return 1
-  fi
-  if ! command -v warp-cli >/dev/null 2>&1; then
-    echo "cloudflare-warp package finished but warp-cli was not found."
-    return 1
-  fi
-  warp-cli --version
-  echo "Cloudflare WARP package installed. It was NOT registered or connected; no server routes, IPv4/IPv6 defaults, or SSH paths were changed during installation."
-}
-
 # Download a large file while retaining partial bytes between mirror attempts.
 # Unlike curl_download(), this helper must NEVER remove the destination file on
 # failure, because the next mirror may resume at the existing byte offset.
@@ -651,14 +562,8 @@ if ! build_from_official_go_toolchain; then
   exit 1
 fi
 phase_start 2 "Installing binary and configuring service"
-if ! install_cloudflare_warp; then
-  echo "WARNING: Shah Tunnel can still be installed, but Cloudflare WARP package setup did not complete. Review the message above and install WARP separately." >&2
-fi
 install -d -o root -g root -m 0700 /etc/ravanreverse
 install -d -o root -g root -m 0700 /etc/ravanreverse/tunnels
-# This directory is referenced by ReadWritePaths in the systemd units.
-# Create it before any profile service is started to prevent 226/NAMESPACE.
-install -d -o root -g root -m 0755 /etc/shah-tunnel
 install -d -o root -g root -m 0755 /usr/local/bin
 install -d -o root -g root -m 0755 "$STATE_DIR"
 BIN="/usr/local/bin/ravanreverse"
@@ -703,11 +608,10 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
-ReadWritePaths=/etc/ravanreverse /etc/shah-tunnel
+ReadWritePaths=/etc/ravanreverse
 [Install]
 WantedBy=multi-user.target
 UNIT
@@ -745,15 +649,26 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
-ReadWritePaths=/etc/ravanreverse /etc/shah-tunnel
+ReadWritePaths=/etc/ravanreverse
 [Install]
 WantedBy=multi-user.target
 UNIT
 install -o root -g root -m 0644 "$TMP/ravanreverse@.service" /etc/systemd/system/ravanreverse@.service
+# Psiphon ConsoleClient runs in local SOCKS5 mode and needs a private persistent
+# data directory. Keep ProtectSystem=strict and grant write access only there.
+install -d -o root -g root -m 0755 /var/lib/shah-tunnel/psiphon
+for unit in ravanreverse.service ravanreverse@.service; do
+  dropin_dir="/etc/systemd/system/${unit}.d"
+  install -d -o root -g root -m 0755 "$dropin_dir"
+  cat > "$TMP/psiphon-${unit}.conf" <<'DROPIN'
+[Service]
+ReadWritePaths=/var/lib/shah-tunnel/psiphon
+DROPIN
+  install -o root -g root -m 0644 "$TMP/psiphon-${unit}.conf" "$dropin_dir/psiphon.conf"
+done
 if ! timeout --kill-after=3s 15s systemctl daemon-reload; then
   echo "systemd daemon-reload timed out. The binary is installed, but service metadata may need: systemctl daemon-reload" >&2
   exit 1
