@@ -41,10 +41,10 @@
 
 شاه‌تونل دو حالت WARP را برای Agent پشتیبانی می‌کند. در حالت تونل سراسری، مسیر شبکهٔ میزبان باید از قبل از WARP عبور کند؛ برنامه وضعیت `warp-cli`، پروتکل فعال و خروجی واقعی `warp=on` را بررسی می‌کند. در حالت پراکسی محلی (`Mode: WarpProxy on port 40000`)، برنامه پورت پراکسی loopback را از `warp-cli settings` تشخیص می‌دهد و در دسترس بودن listener محلی را بررسی می‌کند؛ سپس هر کانال، اتصال واقعی HTTP CONNECT به Hub را از `127.0.0.1:<port>` عبور می‌دهد. پاسخ 404 از endpoint تشخیصی trace دیگر به‌تنهایی باعث رد پراکسی نمی‌شود؛ شکست CONNECT واقعی همچنان اتصال را متوقف می‌کند و مسیر مستقیم جایگزین نمی‌شود. این حالت با MASQUE پشتیبانی می‌شود؛ پراکسی محلی Cloudflare با WireGuard سازگار نیست. در این روش فقط کانال‌های خروجی Agent از WARP عبور می‌کنند و SSH، شنونده‌های ورودی و default route میزبان دست‌نخورده می‌مانند. برنامه **هیچ‌وقت** `warp-cli connect`، تغییر پروتکل، `disconnect` یا تغییر route سیستم را اجرا نمی‌کند. WARP باید پیش از اجرای سرویس Agent متصل باشد. این بررسی‌ها پیش از هر اتصال مجدد نیز تکرار می‌شوند و در گزینهٔ ۸، خرابی WARP باعث استفادهٔ پنهانی از مسیر مستقیم نمی‌شود.
 
-اگر Local Proxy از قبل فعال است، حالت آن را تغییر ندهید؛ `WarpProxy` را روشن نگه دارید و از پورت نمایش‌داده‌شده در تنظیمات استفاده کنید (در بسیاری از نصب‌ها `40000` است). بررسی فقط‌خواندنی:
+اگر نسخهٔ `warp-cli` هنگام اجرای سرویس systemd پیام پذیرش Terms of Service نشان دهد، ShahTunnel همان فرمان را با `--accept-tos` دوباره اجرا می‌کند و این نیاز را برای فراخوانی‌های بعدی به خاطر می‌سپارد؛ پذیرش اولیهٔ شرایط باید توسط مدیر سرور انجام شده باشد. اگر Local Proxy از قبل فعال است، حالت آن را تغییر ندهید؛ `WarpProxy` را روشن نگه دارید و از پورت نمایش‌داده‌شده در تنظیمات استفاده کنید (در بسیاری از نصب‌ها `40000` است). بررسی فقط‌خواندنی:
 
 ```bash
-sudo warp-cli status
+sudo warp-cli --accept-tos status
 sudo warp-cli settings | grep -i -E 'Mode:|WARP tunnel protocol:'
 sudo ss -lntp | grep '127.0.0.1:40000'
 ```
@@ -56,7 +56,7 @@ sudo ss -lntp | grep '127.0.0.1:40000'
 ```bash
 warp-cli tunnel protocol set MASQUE
 warp-cli connect
-warp-cli status
+warp-cli --accept-tos status
 warp-cli settings | grep -i protocol
 curl -fsS https://api.cloudflare.com/cdn-cgi/trace | grep '^warp=on$'
 ```
