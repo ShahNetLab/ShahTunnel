@@ -921,7 +921,12 @@ func TestOptionNineSwitchesFromFailedDirectPathToPsiphonSOCKS5(t *testing.T) {
 	agentDone := make(chan error, 1)
 	go func() { agentDone <- connectAndRunAgent(cfg, pin, channel) }()
 	deadline := time.Now().Add(5 * time.Second)
-	for h.sessionCount() == 0 && time.Now().Before(deadline) {
+	for time.Now().Before(deadline) {
+		_, underlayReady := agentPreferredUnderlay.Load(channel)
+		_, transportReady := agentPreferredTransport.Load(channel)
+		if h.sessionCount() > 0 && underlayReady && transportReady {
+			break
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	if h.sessionCount() == 0 {
@@ -1219,6 +1224,44 @@ func TestDialAgentUnderlayUsesDetectedWarpLocalProxy(t *testing.T) {
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatalf("WARP local proxy: %v", err)
+	}
+}
+
+func TestVerifyWarpUnderlayLocalProxyDoesNotDependOnTraceEndpoint(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := t.TempDir()
+	warpCLI := filepath.Join(binDir, "warp-cli")
+	script := "#!/bin/sh\ncase \"$1\" in\n" +
+		"status) echo 'Status update: Connected';;\n" +
+		"settings) printf '%s\\n' '(user set) Mode: WarpProxy on port " + port + "' '(consumer overrides) WARP tunnel protocol: MASQUE';;\n" +
+		"esac\n"
+	if err := os.WriteFile(warpCLI, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+
+	accepted := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			_ = conn.Close()
+		}
+		accepted <- acceptErr
+	}()
+	if err := verifyWarpUnderlay("MASQUE"); err != nil {
+		t.Fatalf("local WarpProxy was rejected based on an external trace endpoint: %v", err)
+	}
+	if err := <-accepted; err != nil {
+		t.Fatalf("local WarpProxy listener was not probed: %v", err)
 	}
 }
 

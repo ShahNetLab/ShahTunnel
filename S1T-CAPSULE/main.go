@@ -25,7 +25,6 @@ import (
 	"math/big"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -3286,22 +3285,34 @@ func verifyWarpUnderlay(expectedProtocol string) error {
 		return errors.New("Cloudflare WarpProxy endpoint is not a safe loopback address")
 	}
 
+	// Cloudflare trace endpoints can return HTTP 404 from some WarpProxy
+	// egress locations even when the local HTTP CONNECT proxy is usable. Do
+	// not use that optional diagnostic endpoint as a gate for every tunnel
+	// lane. Verify the local listener here; the actual per-lane CONNECT to
+	// cfg.HubAddr below is the authoritative end-to-end proxy test. Because
+	// dialAgentUnderlay uses only this proxy in WarpProxy mode, no direct-route
+	// fallback can occur if the proxy cannot reach the Hub.
+	if localProxyMode {
+		conn, dialErr := net.DialTimeout("tcp", proxyAddress, 3*time.Second)
+		if dialErr != nil {
+			return fmt.Errorf("Cloudflare WARP local proxy %s is not accepting connections: %w", proxyAddress, dialErr)
+		}
+		_ = conn.Close()
+		log.Printf("Cloudflare WARP local proxy listener reachable (protocol=%s, proxy=%s); each lane will verify its real Hub HTTP CONNECT; system routes and SSH were not modified", expectedProtocol, proxyAddress)
+		return nil
+	}
+
+	// System-tunnel mode has no per-application proxy to test, so verify the
+	// host egress with Cloudflare's trace response before using the host route.
 	clientTransport := &http.Transport{
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: 7 * time.Second,
 	}
-	if localProxyMode {
-		proxyURL := &url.URL{Scheme: "http", Host: proxyAddress}
-		clientTransport.Proxy = http.ProxyURL(proxyURL)
-	}
 	client := &http.Client{Timeout: 9 * time.Second, Transport: clientTransport}
 	defer client.CloseIdleConnections()
-	// api.cloudflare.com's trace endpoint is used because it returns the same
-	// WARP status fields while avoiding inconsistent 404 responses seen on
-	// the www.cloudflare.com hostname in some environments.
 	resp, err := client.Get("https://api.cloudflare.com/cdn-cgi/trace")
 	if err != nil {
-		return fmt.Errorf("WARP egress check failed (local proxy=%t, endpoint=api.cloudflare.com): %w", localProxyMode, err)
+		return fmt.Errorf("WARP system egress check failed (endpoint=api.cloudflare.com): %w", err)
 	}
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
 	_ = resp.Body.Close()
@@ -3309,13 +3320,9 @@ func verifyWarpUnderlay(expectedProtocol string) error {
 		return fmt.Errorf("read WARP egress check: %w", readErr)
 	}
 	if resp.StatusCode != http.StatusOK || !traceHasWarpOn(string(body)) {
-		return fmt.Errorf("WARP reports connected, but the %s egress check did not return HTTP 200 with exact warp=on (HTTP %d)", map[bool]string{true: "local proxy", false: "system route"}[localProxyMode], resp.StatusCode)
+		return fmt.Errorf("WARP reports connected, but the system egress check did not return HTTP 200 with exact warp=on (HTTP %d)", resp.StatusCode)
 	}
-	if localProxyMode {
-		log.Printf("Cloudflare WARP local proxy verified (protocol=%s, proxy=%s); system routes and SSH were not modified", expectedProtocol, proxyAddress)
-	} else {
-		log.Printf("Cloudflare WARP system egress verified (protocol=%s); ShahTunnel did not modify system routing", expectedProtocol)
-	}
+	log.Printf("Cloudflare WARP system egress verified (protocol=%s); ShahTunnel did not modify system routing", expectedProtocol)
 	return nil
 }
 
