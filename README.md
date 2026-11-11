@@ -1,126 +1,179 @@
-<p align="center">
-  <img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel Galactic emblem" width="290" />
-</p>
+<div align="center">
 
-<h1 align="center">SHAH TUNNEL 3.0.0</h1>
-<p align="center"><strong>GALACTIC EDITION · PROFILE-ISOLATED REVERSE TCP TUNNEL</strong></p>
-<p align="center">One Hub. Multiple Agents. Adaptive lanes. Independent egress paths.</p>
+<img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel Galactic emblem" width="100%">
 
-<p align="center">
-  <a href="README-fa.md">🇮🇷 فارسی</a> &nbsp;·&nbsp;
-  <a href="#network-flow">🌌 Network Flow</a> &nbsp;·&nbsp;
-  <a href="#tunnel-capabilities">⚡ Capabilities</a> &nbsp;·&nbsp;
-  <a href="https://t.me/MediaZet">🚀 Install on Telegram</a>
-</p>
+# ShahTunnel 3.0.0
 
-<p align="center">
-  <a href="https://t.me/MediaZet"><img src="https://img.shields.io/badge/Telegram_Channel-%40MediaZet-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="Join ShahTunnel Telegram channel @MediaZet" /></a>
-  &nbsp;
-  <a href="https://t.me/cloudflare0_bot"><img src="https://img.shields.io/badge/Cloudflare_Bot-%40cloudflare0_bot-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="Open Cloudflare Telegram bot @cloudflare0_bot" /></a>
-</p>
-<p align="center"><sub>Join the channel for ShahTunnel updates and support. Use the bot for Cloudflare operations.</sub></p>
+**GALACTIC EDITION · PROFILE-ISOLATED REVERSE TCP TUNNEL**
 
-<a id="network-flow"></a>
-## 🌌 Network Flow
+One Hub. Multiple Agents. Adaptive lanes. Independent egress paths.
 
-<p align="center"><strong>GALACTIC NETWORK ARCHITECTURE</strong><br/><sub>Reverse TCP relay · Adaptive transports · Isolated Agent egress</sub></p>
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.0 Galactic Network Flow" width="100%" /></p>
+[![Version](https://img.shields.io/badge/version-3.0.0-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8?style=flat-square&logo=go)](go.mod)
+![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
+[![Telegram Channel](https://img.shields.io/badge/Channel-@MediaZet-229ED9?style=flat-square&logo=telegram&logoColor=white)](https://t.me/MediaZet)
+[![Cloudflare Bot](https://img.shields.io/badge/Cloudflare-@cloudflare0__bot-229ED9?style=flat-square&logo=telegram&logoColor=white)](https://t.me/cloudflare0_bot)
 
-<a id="tunnel-capabilities"></a>
-## ⚡ Tunnel capabilities
+**English** · [فارسی](README-fa.md)
 
-<table>
-<tr>
-<td width="50%" valign="top">
-<h3>🔵✔ Hub–Agent reverse relay</h3>
-<sub>Hub accepts public TCP connections. Agents open authenticated outbound lanes and forward streams to mapped local services.</sub>
-</td>
-<td width="50%" valign="top">
-<h3>🔵✔ Adaptive transports</h3>
-<sub>TCP/TLS, WebSocket/TLS, HTTP/2 CONNECT and HTTP/1.1 CONNECT are available as inner tunnel transports.</sub>
-</td>
-</tr>
-<tr>
-<td width="50%" valign="top">
-<h3>🔵✔ Lane-level recovery</h3>
-<sub>Failed lanes recover independently; healthy lanes do not need to be dropped with them.</sub>
-</td>
-<td width="50%" valign="top">
-<h3>🔵✔ Profile isolation</h3>
-<sub>Each tunnel profile has its own configuration and systemd service. Operations stay scoped to the selected profile.</sub>
-</td>
-</tr>
-<tr>
-<td width="50%" valign="top">
-<h3>🔵✔ Independent Agent egress</h3>
-<sub>Agent transport can use Direct, WARP/MASQUE, WARP/WireGuard or Psiphon/SOCKS5, according to the selected mode.</sub>
-</td>
-<td width="50%" valign="top">
-<h3>🔵✔ Per-profile Xray WARP</h3>
-<sub>Only the selected Xray inbound is cloned to a loopback-only sidecar and routed through the local WARP SOCKS5 proxy.</sub>
-</td>
-</tr>
-<tr>
-<td width="50%" valign="top">
-<h3>🔵✔ Automatic DNS path</h3>
-<sub>The sidecar handles client DNS and sends its DoH resolver traffic through the same profile-specific WARP egress.</sub>
-</td>
-<td width="50%" valign="top">
-<h3>🔵✔ Host-route safety</h3>
-<sub>No server default-route changes, SSH restarts, or edits to the X-UI-managed Xray configuration and service.</sub>
-</td>
-</tr>
-</table>
+<sub>Join the channel to support ShahTunnel and get updates. Use the bot for Cloudflare operations.</sub>
 
-## 🚦 Tunnel transport matrix
+[🌌 Network Flow](#network-flow) · [⚡ Capabilities](#capabilities) · [🚀 Install](https://t.me/MediaZet)
 
-| Option | Transport / strategy | Tunnel behaviour |
-|:--:|---|---|
-| `1` | TCP/TLS | TLS-protected stream between Hub and Agent. |
-| `2` | WebSocket/TLS | Tunnel stream carried in WebSocket binary frames over TLS. |
-| `3` | HTTP/2 CONNECT | CONNECT stream over TLS on control port + 1. |
-| `4` | HTTP/1.1 CONNECT/TLS | CONNECT stream over TLS on control port + 2. |
-| `5` | HTTP CONNECT fallback | HTTP/2 first, then HTTP/1.1. |
-| `6` | Automatic fallback | TCP/TLS first, then WebSocket/TLS. |
-| `7` | Full Adaptive Failover | All four inner transports; each lane prefers its last successful transport. |
-| `8` | External egress | Select Agent egress: WARP/MASQUE, WARP/WireGuard or Psiphon/SOCKS5. |
-| `9` | WARP egress | Per-profile Xray egress through the local WARP SOCKS5 proxy. |
+</div>
 
-## 🌐 Per-tunnel WARP egress for Xray
-
-<table>
-<tr><td>
-<h3>🔵✔ Automatic setup for new Agents</h3>
-<sub>When an Agent is created with MASQUE and the Cloudflare Local Proxy is already active, ShahTunnel prepares the dedicated Xray sidecar and DNS path before starting that Agent.</sub>
-</td></tr>
-<tr><td>
-<h3>🔵✔ Existing Agent profiles</h3>
-<sub>Use Manager → [9] WARP egress. ShahTunnel discovers the Xray inbound associated with the selected profile mapping and creates a loopback-only clone.</sub>
-</td></tr>
-<tr><td>
-<h3>🔵✔ Isolation boundaries</h3>
-<sub>Other Xray inbounds and profiles stay Direct. The X-UI-managed Xray service, SSH and host default route are not modified or restarted.</sub>
-</td></tr>
-</table>
-
-**WARP Local Proxy requirement:** per-tunnel Xray egress requires the Cloudflare `WarpProxy` / MASQUE local SOCKS5 listener. It is not system-wide WARP routing. If the local proxy is unavailable, ShahTunnel does not silently replace the isolated path with a host-wide route.
+---
 
 ## Install
 
-Select **🚀 Install on Telegram** above to open the ShahTunnel channel for release and installation guidance. The Linux installer is also available directly:
+ShahTunnel uses a **Hub / Agent** layout. Install it on the Hub and on every Agent that should connect to it. A third server can optionally run as a Relay.
+
+**Requirements:** Linux `amd64` or `arm64`, `systemd`, root access, and outbound connectivity from each Agent to the Hub. The installer prepares the pinned Go toolchain and builds the program on the server.
+
+**1. Run the installer** on each server:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 ```
 
-Run as root on a supported Linux server (amd64 or arm64) with systemd. The installer downloads the source and builds the ShahTunnel binary on the target server.
-
-## Verify transports
+The manager opens after installation. You can reopen it with:
 
 ```bash
-./VERIFY-ALL-TRANSPORTS.sh
+sudo shah-tunnel menu
 ```
+
+**2. Configure the Hub**
+
+1. Choose **Create a new tunnel** and select **HUB**.
+2. Set the control listener (default `0.0.0.0:9443`) and the accepted Hub↔Agent transport.
+3. Add each public port mapping. Give every mapping an ID such as `main` or `web`.
+4. Save the generated **Agent token** and **certificate SHA-256 fingerprint**. The Agent must use both values exactly.
+
+**3. Configure each Agent**
+
+1. Create a tunnel and select **AGENT**.
+2. Enter the Hub address and control port, then choose a transport accepted by the Hub.
+3. Enter the token and certificate fingerprint from the Hub.
+4. Add the same mapping IDs and set each local target, for example `127.0.0.1:443`.
+5. Save the profile. ShahTunnel enables its dedicated service and reconnects dropped lanes automatically.
+
+**4. Open only the required firewall ports.** The Hub needs its selected control listener, any selected CONNECT port (`control + 1` for HTTP/2 or `control + 2` for HTTP/1.1), and the public mapping ports. Agents initiate the connection to the Hub; local targets stay on the Agent side.
+
+For guided setup and release announcements, use the [ShahTunnel Telegram channel](https://t.me/MediaZet). The [Cloudflare bot](https://t.me/cloudflare0_bot) is a separate helper for Cloudflare operations.
+
+## Network Flow
+
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.0 Galactic Network Flow" width="100%"></p>
+
+The tunnel and the optional per-profile Internet egress are separate paths:
+
+```text
+Client → Hub public mapping → authenticated Agent lanes → Agent local target
+Selected Xray inbound → loopback-only Xray sidecar → WARP SOCKS5 → Internet
+```
+
+The second path is optional and applies only to the selected Agent profile when per-tunnel WARP egress is enabled.
+
+## Capabilities
+
+| | Capability | What it does |
+|:--:|---|---|
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Hub–Agent reverse relay** | The Hub exposes public TCP listeners; Agents connect outward and forward each mapping to its local target. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Independent tunnel profiles** | Each named profile has its own configuration and systemd service. Start, stop and restart operations are profile-scoped. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Adaptive transport lanes** | Four implemented transports can be selected individually or used by adaptive failover modes. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Lane-level recovery** | Each Agent lane reconnects independently; one failed lane does not require dropping every healthy lane. New Agent profiles use 12 independent lanes by default (maximum 16). |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Multiple port mappings** | Mapping IDs pair Hub public listeners with Agent-side local targets. IDs must match on both ends. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **External Agent egress** | Agent traffic can use Direct, Cloudflare WARP/MASQUE, WARP/WireGuard or Psiphon/SOCKS5. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Per-profile Xray WARP** | A selected Xray inbound is cloned to a loopback-only sidecar and routed through the local WARP SOCKS5 proxy. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Automatic WARP DNS path** | The isolated sidecar handles client DNS and routes its DoH resolver traffic through the same WARP egress. |
+
+## Hub↔Agent transport modes
+
+Choose a mode during tunnel creation. The Hub and Agent must use compatible settings.
+
+| Wizard option | Mode | Behaviour |
+|:--:|---|---|
+| `1` | TCP/TLS | TLS-protected stream between Hub and Agent. |
+| `2` | WebSocket/TLS | Carries the tunnel stream in WebSocket binary frames over TLS. |
+| `3` | HTTP/2 CONNECT | Uses HTTP/2 CONNECT over TLS on the control port + 1. |
+| `4` | HTTP/1.1 CONNECT/TLS | Uses HTTP/1.1 CONNECT over TLS on the control port + 2. |
+| `5` | HTTP CONNECT fallback | Tries HTTP/2 CONNECT, then HTTP/1.1 CONNECT. |
+| `6` | Automatic fallback | Tries TCP/TLS, then WebSocket/TLS. |
+| `7` | Full Adaptive Failover | Uses all four implemented transports; each lane remembers its last successful transport. |
+| `8` | External egress | On an Agent, select Cloudflare MASQUE, WARP/WireGuard or Psiphon/SOCKS5. |
+| `9` | All-protocol adaptive | On an Agent, combines all four transports with Direct/Psiphon egress failover. |
+
+### Agent egress providers
+
+| Provider | Requirement / path |
+|---|---|
+| `Direct` | Agent connects to the Hub through its normal network route. |
+| `Cloudflare WARP / MASQUE` | Requires an already-connected WARP MASQUE path or the Cloudflare Local Proxy. |
+| `Cloudflare WARP / WireGuard` | Requires an already-connected system WARP tunnel. |
+| `Psiphon / SOCKS5` | Requires the official Psiphon ConsoleClient config and a loopback SOCKS5 listener. |
+| `Adaptive` | Uses the supported Direct/Psiphon egress failover path. |
+
+> **Two different option 9 entries:** option `9` in the *creation wizard* means All-protocol adaptive. Option `9` in the *main manager menu* enables per-profile Xray WARP egress for a selected Agent.
+
+## Per-tunnel WARP egress for Xray
+
+- **New Agent profiles:** when an Agent is created with MASQUE and the Cloudflare Local Proxy is detected, ShahTunnel prepares the dedicated Xray sidecar and WARP-routed DNS before starting that Agent.
+- **Existing Agent profiles:** select the Agent in the manager and use **`[9] WARP egress`**.
+- **Isolation:** only the selected profile's cloned Xray inbound uses the local WARP SOCKS5 proxy. Other profiles and inbounds remain Direct.
+- **Host safety:** the X-UI-managed Xray config/service, SSH and the server default route are not modified or restarted by this per-profile integration.
+
+The per-tunnel Xray route requires the Cloudflare **WarpProxy / Local Proxy** SOCKS5 listener. It is not system-wide WARP routing. If the Local Proxy is unavailable, the isolated route is not silently replaced with a host-wide route; the Agent remains on its configured egress until the requirement is met.
+
+## Day to day
+
+`sudo shah-tunnel menu` opens the manager. Its operations are scoped to the selected profile:
+
+| Menu option | Action |
+|:--:|---|
+| `1` | Create a new tunnel profile (Hub, Agent or Relay). |
+| `2` | Start a selected tunnel. |
+| `3` | Stop a selected tunnel. |
+| `4` | Restart a selected tunnel. |
+| `5` | Show status and recent logs. |
+| `6` | Configure scheduled restarts for active tunnels. |
+| `7` | Delete one selected tunnel profile. |
+| `8` | Complete uninstall. |
+| `9` | Enable isolated WARP egress for a selected Agent. |
+
+Useful commands:
+
+```bash
+sudo shah-tunnel version
+sudo shah-tunnel menu
+sudo systemctl status 'ravanreverse@PROFILE.service' --no-pager -l
+sudo journalctl -u 'ravanreverse@PROFILE.service' -n 80 --no-pager
+```
+
+Replace `PROFILE` with the selected profile's systemd instance name. The manager's **Status & Logs** entry is the simplest way to inspect the selected tunnel.
+
+## Security
+
+- Keep the Hub token and certificate fingerprint private. The Agent must use the exact values generated by its Hub.
+- Restrict the Hub firewall to the selected control/CONNECT ports and the public mapping ports you actually use.
+- Do not publish tokens, private keys, full tunnel configs or unredacted logs in issues or screenshots.
+- The optional Xray WARP sidecar listens on loopback for its cloned inbound; it does not replace the X-UI-managed Xray service.
+- Use ShahTunnel only on servers and services you own or are authorized to administer. See [SECURITY.md](SECURITY.md).
+
+## Troubleshooting
+
+| Symptom | First check |
+|---|---|
+| Agent does not connect | Confirm Hub address, token, certificate fingerprint, matching transport mode and firewall ports. |
+| HTTP/2 or HTTP/1.1 CONNECT fails | Check the additional Hub TCP port (`control + 1` or `control + 2`) selected for that mode. |
+| A mapping does not forward | Confirm the mapping ID matches on Hub and Agent and the Agent-side target is reachable locally. |
+| WARP egress does not activate | Confirm the selected Agent uses MASQUE and Cloudflare Local Proxy is active before enabling manager option `9`. |
+| Google/YouTube DNS fails through per-profile WARP | Check the dedicated `shah-tunnel-xray-warp-<profile>.service` status and its recent logs; do not change host routes. |
 
 ---
 
-<p align="center"><strong>SHAH TUNNEL 3.0.0 · GALACTIC EDITION</strong><br/><sub>One Hub. Many Agents. Independent paths. A network that keeps moving.</sub></p>
+<div align="center">
+
+**SHAHTUNNEL 3.0.0 · GALACTIC EDITION**  
+One Hub. Multiple Agents. Adaptive lanes. Independent egress paths.
+
+</div>

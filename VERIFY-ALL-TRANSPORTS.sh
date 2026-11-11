@@ -60,8 +60,8 @@ printf '\n== 3/7: Installer syntax ==\n'
 bash -n S1T-START.sh
 bash -n install.sh
 bash -n VERIFY-ALL-TRANSPORTS.sh
-[[ -s docs/img/ShahTunnel-Network-Flow-v3.svg ]] || fail "English v3 Network Flow diagram is missing."
-[[ -s docs/img/ShahTunnel-Network-Flow-v3-fa.svg ]] || fail "Persian v3 Network Flow diagram is missing."
+[[ -s docs/img/ShahTunnel-Network-Flow-v3.png ]] || fail "English v3 Network Flow image is missing."
+[[ -s docs/img/ShahTunnel-Network-Flow-v3-fa.png ]] || fail "Persian v3 Network Flow image is missing."
 grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/psiphon' S1T-START.sh || fail "Psiphon systemd data-directory permission is missing."
 grep -Fq 'func detectActiveWarpUnderlay() string' S1T-CAPSULE/main.go || fail "Adaptive WARP protocol detection is missing."
 grep -Fq 'func warpProxyAddressFromSettings(settings string)' S1T-CAPSULE/main.go || fail "Cloudflare Local Proxy detection is missing."

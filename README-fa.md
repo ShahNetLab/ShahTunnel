@@ -1,126 +1,209 @@
-<p align="center">
-  <img src="docs/img/ShahTunnel-Network.png" alt="نشان کهکشانی شاه‌تونل" width="290" />
-</p>
+<div align="center">
 
-<h1 align="center">شاه‌تونل ۳٫۰٫۰</h1>
-<p align="center"><strong>ویرایش کهکشانی · تونل معکوس TCP با جداسازی پروفایل</strong></p>
-<p align="center">یک Hub، چند Agent، مسیرهای تطبیقی و خروجی‌های مستقل.</p>
+<img src="docs/img/ShahTunnel-Network.png" alt="نشان کهکشانی شاه‌تونل" width="100%">
 
-<p align="center">
-  <a href="README.md">🇬🇧 English</a> &nbsp;·&nbsp;
-  <a href="#network-flow">🌌 جریان شبکه</a> &nbsp;·&nbsp;
-  <a href="#tunnel-capabilities">⚡ قابلیت‌ها</a> &nbsp;·&nbsp;
-  <a href="https://t.me/MediaZet">🚀 نصب و راهنما در تلگرام</a>
-</p>
+# شاه‌تونل ۳٫۰٫۰
 
-<p align="center">
-  <a href="https://t.me/MediaZet"><img src="https://img.shields.io/badge/Telegram_Channel-%40MediaZet-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="ورود به کانال تلگرام شاه‌تونل MediaZet" /></a>
-  &nbsp;
-  <a href="https://t.me/cloudflare0_bot"><img src="https://img.shields.io/badge/Cloudflare_Bot-%40cloudflare0_bot-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="ورود به ربات کلودفلر در تلگرام" /></a>
-</p>
-<p align="center"><sub>برای حمایت و دریافت خبرهای شاه‌تونل عضو کانال شوید؛ ربات برای انجام کارهای کلودفلر است.</sub></p>
+**GALACTIC EDITION · تونل معکوس TCP با جداسازی پروفایل**
 
-<a id="network-flow"></a>
-## 🌌 Network Flow | جریان شبکه
+یک Hub، چند Agent، مسیرهای تطبیقی و خروجی‌های مستقل.
 
-<p align="center"><strong>معماری کهکشانی جریان شبکه</strong><br/><sub>تونل معکوس · انتقال‌های تطبیقی · خروجی مستقل هر Agent</sub></p>
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="نقشه جریان شبکه کهکشانی شاه‌تونل نسخه ۳٫۰٫۰" width="100%" /></p>
+[![نسخه](https://img.shields.io/badge/version-3.0.0-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8?style=flat-square&logo=go)](go.mod)
+![سیستم‌عامل](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
+[![کانال تلگرام](https://img.shields.io/badge/Channel-@MediaZet-229ED9?style=flat-square&logo=telegram&logoColor=white)](https://t.me/MediaZet)
+[![ربات کلودفلر](https://img.shields.io/badge/Cloudflare-@cloudflare0__bot-229ED9?style=flat-square&logo=telegram&logoColor=white)](https://t.me/cloudflare0_bot)
 
-<a id="tunnel-capabilities"></a>
-## ⚡ Tunnel capabilities | قابلیت‌های تونل
+[English](README.md) · **فارسی**
 
-<table>
-<tr>
-<td width="50%" valign="top">
-<h3>🔵✔ رله معکوس Hub و Agent</h3>
-<sub>Hub اتصال عمومی TCP را می‌پذیرد. Agent کانال خروجی احرازشده می‌سازد و جریان را به سرویس محلیِ متصل به Mapping می‌رساند.</sub>
-</td>
-<td width="50%" valign="top">
-<h3>🔵✔ انتقال تطبیقی</h3>
-<sub>انتقال‌های TCP/TLS، ‏WebSocket/TLS، ‏HTTP/2 CONNECT و ‏HTTP/1.1 CONNECT برای مسیر داخلی تونل.</sub>
-</td>
-</tr>
-<tr>
-<td width="50%" valign="top">
-<h3>🔵✔ بازیابی مستقل Laneها</h3>
-<sub>هر Lane جداگانه بازیابی می‌شود؛ خرابی یک Lane لزوماً مسیرهای سالم را قطع نمی‌کند.</sub>
-</td>
-<td width="50%" valign="top">
-<h3>🔵✔ جداسازی پروفایل‌ها</h3>
-<sub>هر پروفایل فایل تنظیمات و سرویس systemd مستقل دارد؛ عملیات فقط همان پروفایل را درگیر می‌کند.</sub>
-</td>
-</tr>
-<tr>
-<td width="50%" valign="top">
-<h3>🔵✔ خروجی مستقل Agent</h3>
-<sub>بر اساس حالت انتخابی: Direct، ‏WARP/MASQUE، ‏WARP/WireGuard یا Psiphon/SOCKS5.</sub>
-</td>
-<td width="50%" valign="top">
-<h3>🔵✔ خروجی WARP اختصاصی Xray</h3>
-<sub>فقط Inbound انتخاب‌شده در Sidecar مستقل و Loopback کپی می‌شود و از SOCKS5 محلی WARP عبور می‌کند.</sub>
-</td>
-</tr>
-<tr>
-<td width="50%" valign="top">
-<h3>🔵✔ مسیر DNS خودکار</h3>
-<sub>Sidecar درخواست DNS کاربر را مدیریت می‌کند و درخواست DoH مربوط به Resolver را نیز از خروجی WARP همان پروفایل می‌فرستد.</sub>
-</td>
-<td width="50%" valign="top">
-<h3>🔵✔ حفاظت از مسیر میزبان</h3>
-<sub>Default Route سرور، SSH و تنظیمات و سرویس اصلی Xray تحت مدیریت X-UI تغییر یا Restart نمی‌شوند.</sub>
-</td>
-</tr>
-</table>
+<sub>برای حمایت از ShahTunnel و دریافت خبرها عضو کانال شوید؛ ربات برای عملیات Cloudflare است.</sub>
 
-## 🚦 جدول انتقال‌های تونل
+[🌌 جریان شبکه](#network-flow) · [⚡ قابلیت‌ها](#capabilities) · [🚀 نصب](https://t.me/MediaZet)
 
-| گزینه | انتقال / راهبرد | عملکرد تونل |
-|:--:|---|---|
-| `1` | TCP/TLS | جریان رمزنگاری‌شده با TLS بین Hub و Agent. |
-| `2` | WebSocket/TLS | حمل جریان تونل در فریم‌های باینری WebSocket روی TLS. |
-| `3` | HTTP/2 CONNECT | جریان CONNECT روی TLS و پورت کنترل + ۱. |
-| `4` | HTTP/1.1 CONNECT/TLS | جریان CONNECT روی TLS و پورت کنترل + ۲. |
-| `5` | HTTP CONNECT fallback | ابتدا HTTP/2 و سپس HTTP/1.1. |
-| `6` | Automatic fallback | ابتدا TCP/TLS و سپس WebSocket/TLS. |
-| `7` | Full Adaptive Failover | هر چهار انتقال داخلی؛ هر Lane آخرین انتقال موفق خود را ترجیح می‌دهد. |
-| `8` | External egress | انتخاب خروجی Agent: ‏WARP/MASQUE، ‏WARP/WireGuard یا Psiphon/SOCKS5. |
-| `9` | WARP egress | خروجی Xray اختصاصی هر پروفایل از طریق SOCKS5 محلی WARP. |
+</div>
 
-## 🌐 خروجی WARP مستقل برای هر تونل Xray
+---
 
-<table>
-<tr><td>
-<h3>🔵✔ راه‌اندازی خودکار Agent جدید</h3>
-<sub>هنگام ساخت Agent با MASQUE، اگر Cloudflare Local Proxy فعال باشد، ShahTunnel پیش از شروع Agent، Sidecar اختصاصی Xray و مسیر DNS آن را آماده می‌کند.</sub>
-</td></tr>
-<tr><td>
-<h3>🔵✔ پروفایل‌های Agent موجود</h3>
-<sub>از مسیر Manager → [9] WARP egress استفاده کنید. ShahTunnel، Inbound مرتبط با Mapping همان پروفایل را پیدا کرده و نسخه Loopback آن را ایجاد می‌کند.</sub>
-</td></tr>
-<tr><td>
-<h3>🔵✔ محدوده جداسازی</h3>
-<sub>Inboundها و پروفایل‌های دیگر Direct می‌مانند. سرویس Xray تحت مدیریت X-UI، SSH و Default Route میزبان تغییر یا Restart نمی‌شوند.</sub>
-</td></tr>
-</table>
-
-**پیش‌نیاز WARP Local Proxy:** خروجی مستقل Xray به Listener محلی SOCKS5 در حالت Cloudflare ‏`WarpProxy` / ‏MASQUE نیاز دارد. این قابلیت به معنی عبور کل سرور از WARP نیست. اگر پراکسی محلی در دسترس نباشد، مسیر اختصاصی با Route سراسری جایگزین نمی‌شود.
+<div dir="rtl">
 
 ## نصب
 
-برای ورود به تلگرام، دریافت راهنمای نصب و اطلاع از انتشارها روی دکمه **🚀 نصب و راهنما در تلگرام** در بالای صفحه بزنید. دستور نصب لینوکس نیز در دسترس است:
+ShahTunnel از معماری **Hub / Agent** استفاده می‌کند. برنامه را روی سرور Hub و هر Agent نصب کنید. در صورت نیاز، یک سرور سوم نیز می‌تواند نقش Relay داشته باشد.
+
+**پیش‌نیازها:** لینوکس `amd64` یا `arm64`، سرویس `systemd` و دسترسی root. نصب‌کننده ابزار Go موردنیاز را دریافت می‌کند و برنامه را روی همان سرور Build می‌کند.
+
+**۱. نصب روی هر سرور**
+
+</div>
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 ```
 
-دستور را با دسترسی root روی سرور Linux دارای systemd و معماری amd64 یا arm64 اجرا کنید. نصب‌کننده سورس را دریافت کرده و باینری ShahTunnel را روی سرور Build می‌کند.
+<div dir="rtl">
 
-## بررسی انتقال‌ها
+پس از نصب، منوی مدیریت باز می‌شود. برای ورود دوباره:
+
+</div>
 
 ```bash
-./VERIFY-ALL-TRANSPORTS.sh
+sudo shah-tunnel menu
 ```
+
+<div dir="rtl">
+
+**۲. ساخت Hub**
+
+1. گزینه ساخت تونل جدید را انتخاب کنید و نقش **HUB** را بزنید.
+2. پورت کنترل را تعیین کنید (پیش‌فرض `0.0.0.0:9443`) و انتقال مورد قبول Hub را انتخاب کنید.
+3. نگاشت پورت‌های عمومی را بسازید. برای هر نگاشت یک شناسه مانند `main` یا `web` تعیین کنید.
+4. **توکن Agent** و **اثر انگشت SHA-256 گواهی** را ذخیره کنید؛ Agent باید دقیقاً از همین دو مقدار استفاده کند.
+
+**۳. ساخت Agent**
+
+1. روی سرور مقصد، تونل جدید بسازید و نقش **AGENT** را انتخاب کنید.
+2. آدرس Hub و پورت کنترل را وارد کنید و انتقال سازگار با Hub را برگزینید.
+3. توکن و اثر انگشت گواهی Hub را وارد کنید.
+4. همان شناسه‌های Mapping را بسازید و مقصد محلی هرکدام را وارد کنید؛ برای نمونه `127.0.0.1:443`.
+5. پروفایل را ذخیره کنید. ShahTunnel سرویس مستقل آن را فعال می‌کند و Laneهای قطع‌شده را به‌صورت خودکار دوباره متصل می‌کند.
+
+**۴. فایروال:** فقط پورت‌های لازم را باز کنید. Hub به پورت کنترل انتخاب‌شده، پورت CONNECT در صورت نیاز (`کنترل + ۱` برای HTTP/2 یا `کنترل + ۲` برای HTTP/1.1) و پورت‌های عمومی Mapping نیاز دارد. Agent اتصال خروجی را به Hub برقرار می‌کند و مقصدهای محلی در سمت Agent هستند.
+
+برای راهنمای نصب و خبرهای انتشار، به [کانال تلگرام ShahTunnel](https://t.me/MediaZet) بروید. [ربات کلودفلر](https://t.me/cloudflare0_bot) ابزار جداگانه‌ای برای کارهای Cloudflare است.
+
+</div>
+
+## Network Flow | جریان شبکه
+
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه کهکشانی ShahTunnel 3.0.0" width="100%"></p>
+
+<div dir="rtl">
+
+مسیر تونل و خروجی اینترنت اختصاصی هر پروفایل، دو مسیر جدا هستند:
+
+</div>
+
+```text
+کاربر → پورت عمومی Hub → Laneهای احرازشده Agent → مقصد محلی Agent
+Inbound انتخاب‌شده Xray → Sidecar محلی → SOCKS5 وایرپ → اینترنت
+```
+
+<div dir="rtl">
+
+مسیر دوم اختیاری است و فقط برای پروفایل Agent انتخاب‌شده، پس از فعال‌سازی WARP مستقل همان پروفایل، استفاده می‌شود.
+
+## قابلیت‌ها
+
+</div>
+
+| | قابلیت | کارکرد |
+|:--:|---|---|
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **رله معکوس Hub و Agent** | Hub پورت عمومی TCP را می‌پذیرد؛ Agent اتصال خروجی می‌سازد و هر Mapping را به مقصد محلی می‌رساند. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **پروفایل‌های مستقل** | هر تونل فایل تنظیمات و سرویس systemd جدا دارد؛ عملیات مدیریت روی پروفایل انتخاب‌شده انجام می‌شود. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Laneهای انتقال تطبیقی** | چهار انتقال پیاده‌سازی‌شده به‌صورت جدا یا در حالت‌های Failover قابل استفاده‌اند. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **بازیابی مستقل Lane** | هر Lane جداگانه دوباره متصل می‌شود؛ خرابی یک Lane الزاماً Laneهای سالم را قطع نمی‌کند. پروفایل Agent جدید به‌صورت پیش‌فرض ۱۲ Lane مستقل دارد (حداکثر ۱۶). |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **چند Mapping پورت** | شناسه هر Mapping، Listener عمومی Hub را به مقصد محلی Agent متصل می‌کند و باید در دو سمت یکسان باشد. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **خروجی مستقل Agent** | خروجی Agent می‌تواند Direct، ‏WARP/MASQUE، ‏WARP/WireGuard یا Psiphon/SOCKS5 باشد. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **WARP اختصاصی Xray** | Inbound انتخاب‌شده به Sidecar محدود به Loopback کپی و از SOCKS5 محلی WARP عبور داده می‌شود. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **مسیر خودکار DNS در WARP** | Sidecar درخواست DNS کاربر را مدیریت می‌کند و درخواست DoH مربوط به Resolver را نیز از همان خروجی WARP می‌فرستد. |
+
+## انتقال‌های Hub↔Agent
+
+در زمان ساخت تونل یک حالت را انتخاب کنید. تنظیمات Hub و Agent باید با هم سازگار باشند.
+
+| گزینه ویزارد | حالت | عملکرد |
+|:--:|---|---|
+| `1` | TCP/TLS | جریان TLS بین Hub و Agent. |
+| `2` | WebSocket/TLS | انتقال جریان تونل در فریم‌های باینری WebSocket روی TLS. |
+| `3` | HTTP/2 CONNECT | انتقال CONNECT روی TLS و پورت کنترل + ۱. |
+| `4` | HTTP/1.1 CONNECT/TLS | انتقال CONNECT روی TLS و پورت کنترل + ۲. |
+| `5` | HTTP CONNECT fallback | ابتدا HTTP/2 و در صورت نیاز HTTP/1.1. |
+| `6` | Automatic fallback | ابتدا TCP/TLS و سپس WebSocket/TLS. |
+| `7` | Full Adaptive Failover | هر چهار انتقال؛ هر Lane آخرین انتقال موفق خود را ترجیح می‌دهد. |
+| `8` | External egress | در Agent انتخاب Cloudflare MASQUE، ‏WARP/WireGuard یا Psiphon/SOCKS5. |
+| `9` | All-protocol adaptive | در Agent ترکیب هر چهار انتقال با Failover خروجی Direct/Psiphon. |
+
+### روش‌های خروجی Agent
+
+| روش | پیش‌نیاز / مسیر |
+|---|---|
+| `Direct` | اتصال Agent به Hub از مسیر عادی سرور. |
+| `WARP / MASQUE` | تونل WARP با MASQUE یا Cloudflare Local Proxy باید از قبل فعال باشد. |
+| `WARP / WireGuard` | تونل سیستمی WARP باید از قبل متصل باشد. |
+| `Psiphon / SOCKS5` | فایل تنظیمات رسمی Psiphon ConsoleClient و Listener محلی SOCKS5 لازم است. |
+| `Adaptive` | مسیر Failover خروجی Direct/Psiphon. |
+
+> **دو گزینه ۹ متفاوت هستند:** گزینه `9` در ویزارد ساخت تونل یعنی All-protocol adaptive؛ گزینه `9` در منوی اصلی مدیریت، خروجی WARP مستقل Xray را برای Agent انتخاب‌شده فعال می‌کند.
+
+## خروجی WARP مستقل برای هر تونل Xray
+
+- **Agent جدید:** هنگام ساخت Agent با MASQUE، اگر Cloudflare Local Proxy شناسایی شود، ShahTunnel پیش از شروع Agent، Sidecar مستقل Xray و مسیر DNS مبتنی بر WARP را آماده می‌کند.
+- **Agent موجود:** پروفایل Agent را در منوی مدیریت انتخاب کنید و گزینه **`[9] WARP egress`** را بزنید.
+- **جداسازی:** فقط Inbound کپی‌شده از پروفایل انتخاب‌شده از SOCKS5 محلی WARP عبور می‌کند؛ سایر Inboundها و پروفایل‌ها Direct می‌مانند.
+- **امنیت مسیر میزبان:** تنظیمات و سرویس اصلی Xray تحت مدیریت X-UI، سرویس SSH و Default Route سرور توسط این اتصال مستقل تغییر یا Restart نمی‌شوند.
+
+این قابلیت به Listener محلی **Cloudflare WarpProxy / Local Proxy** از نوع SOCKS5 نیاز دارد. این قابلیت WARP سراسری سرور نیست. اگر Local Proxy در دسترس نباشد، مسیر اختصاصی بی‌صدا با Route سراسری جایگزین نمی‌شود.
+
+## مدیریت روزمره
+
+</div>
+
+`sudo shah-tunnel menu` منوی مدیریت را باز می‌کند. عملیات روی پروفایل انتخاب‌شده انجام می‌شود:
+
+| گزینه منو | عملکرد |
+|:--:|---|
+| `1` | ساخت پروفایل جدید Hub، Agent یا Relay. |
+| `2` | شروع تونل انتخاب‌شده. |
+| `3` | توقف تونل انتخاب‌شده. |
+| `4` | راه‌اندازی مجدد تونل انتخاب‌شده. |
+| `5` | نمایش وضعیت و لاگ‌های اخیر. |
+| `6` | تنظیم Restart زمان‌بندی‌شده تونل‌های فعال. |
+| `7` | حذف فقط یک پروفایل انتخاب‌شده. |
+| `8` | حذف کامل ShahTunnel. |
+| `9` | فعال‌سازی WARP مستقل برای Agent انتخاب‌شده. |
+
+<div dir="rtl">
+
+دستورهای کاربردی:
+
+</div>
+
+```bash
+sudo shah-tunnel version
+sudo shah-tunnel menu
+sudo systemctl status 'ravanreverse@PROFILE.service' --no-pager -l
+sudo journalctl -u 'ravanreverse@PROFILE.service' -n 80 --no-pager
+```
+
+<div dir="rtl">
+
+به‌جای `PROFILE` نام Instance سرویس همان پروفایل را قرار دهید. برای بررسی ساده‌تر، گزینه **Status & Logs** در منوی مدیریت، وضعیت و ۴۰ لاگ اخیر را نشان می‌دهد.
+
+## امنیت
+
+- توکن Hub و اثر انگشت گواهی را محرمانه نگه دارید. Agent باید دقیقاً از مقادیر تولیدشده در Hub استفاده کند.
+- در فایروال Hub فقط پورت کنترل/CONNECT انتخاب‌شده و پورت‌های عمومی Mapping موردنیاز را باز کنید.
+- توکن، کلید خصوصی، فایل کامل تنظیمات یا لاگ بدون حذف اطلاعات حساس را در Issue یا تصویر عمومی منتشر نکنید.
+- Sidecar اختصاصی WARP برای Inbound کپی‌شده روی Loopback گوش می‌دهد و جایگزین سرویس اصلی Xray تحت مدیریت X-UI نمی‌شود.
+- ShahTunnel را فقط روی سرورها و سرویس‌هایی استفاده کنید که مالک آن هستید یا مجوز مدیریتشان را دارید. [سیاست امنیتی](SECURITY.md).
+
+## عیب‌یابی
+
+</div>
+
+| مشکل | اولین بررسی |
+|---|---|
+| Agent متصل نمی‌شود | آدرس Hub، توکن، اثر انگشت گواهی، سازگاری حالت انتقال و پورت‌های فایروال را بررسی کنید. |
+| HTTP/2 یا HTTP/1.1 CONNECT کار نمی‌کند | پورت TCP اضافه Hub را بررسی کنید (`کنترل + ۱` یا `کنترل + ۲`). |
+| Mapping ترافیک را عبور نمی‌دهد | شناسه Mapping در Hub و Agent و دسترسی به مقصد محلی Agent را بررسی کنید. |
+| WARP مستقل فعال نمی‌شود | مطمئن شوید Agent روی MASQUE است و Cloudflare Local Proxy پیش از گزینه `9` فعال است. |
+| DNS گوگل/یوتیوب روی WARP مستقل مشکل دارد | وضعیت سرویس `shah-tunnel-xray-warp-<profile>.service` و لاگ‌های همان Sidecar را ببینید؛ مسیرهای میزبان را تغییر ندهید. |
 
 ---
 
-<p align="center"><strong>شاه‌تونل ۳٫۰٫۰ · ویرایش کهکشانی</strong><br/><sub>یک Hub، چند Agent، مسیرهای مستقل؛ شبکه‌ای که هوشمندانه به حرکت ادامه می‌دهد.</sub></p>
+<div align="center">
+
+**شاه‌تونل ۳٫۰٫۰ · ویرایش کهکشانی**  
+یک Hub، چند Agent، Laneهای تطبیقی و مسیرهای خروجی مستقل.
+
+</div>
