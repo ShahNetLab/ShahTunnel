@@ -3,13 +3,17 @@
 </p>
 
 <h1 align="center">SHAH TUNNEL</h1>
-<p align="center"><strong>V2.2.7 · Secure Reverse TCP Relay · External Paths + Adaptive Failover</strong></p>
+<p align="center"><strong>V2.2.8 · Secure Reverse TCP Relay · Profile-Scoped External Paths</strong></p>
 <p align="center">A reverse TCP relay that carries public client connections through a Hub to mapped target services via authenticated Agent lanes. The private Hub↔Agent channel uses TLS 1.3, SHA-256 certificate pinning and adaptive recovery across four native transports and preconfigured Agent-side external network paths.</p>
 <p align="center"><a href="README.md">🇬🇧 English</a> · <a href="README-fa.md">🇮🇷 فارسی</a></p>
 
-## 2.2.7 maintenance fix
+## 2.2.8 profile-scoped external paths
 
-The WARP SSH route guard now detects its own already-installed `ip rule` entries across the complete rule token list. Re-running/restarting the oneshot guard is idempotent, while a different rule occupying the same policy priority is still rejected. A regression test reproduces the duplicate-rule response from iproute2.
+- Cloudflare WARP now uses the official client Local Proxy listener (`127.0.0.1:40000`) as a SOCKS5 next-hop for the selected Agent profile. It never enables device-wide routing as part of a normal Shah Tunnel profile.
+- Native transports (options 1–7), other Agent profiles, SSH, and unrelated host applications retain their own normal routes. SOCKS-backed external paths are applied per Agent connection, not through global route or nftables changes.
+- If the host is already connected in full-device WARP mode, the interactive wizard asks before switching to Local Proxy. Declining leaves the existing WARP route and saved profile untouched. A non-interactive service start will not silently convert an unknown or device-wide WARP configuration.
+- The Hub carrier is the only traffic controlled by the Agent external path. The local target application (for example, Xray listening on `127.0.0.1:2083`) keeps its own outbound policy. To make VPN users' internet traffic exit through WARP, configure that Xray instance's own SOCKS5 outbound/routing separately or use an isolated target instance.
+- Existing pre-2.2.8 full-device WARP Agent profiles must be restarted interactively once to migrate. A still-running legacy full-device profile is detected and not stopped or modified automatically.
 
 ## Network flow
 
@@ -56,50 +60,13 @@ Option 8 uses only the authenticated TCP/TLS carrier, so it needs the control po
 The installer adds the official Cloudflare WARP package on supported Debian/Ubuntu APT systems, but it does not register or connect WARP during installation. The Agent wizard offers these external paths. The default selection is option `2` (Cloudflare WARP), not the preconfigured MASQUE gateway:
 
 - **MASQUE:** connect through a preconfigured local MASQUE gateway exposed as a SOCKS5 endpoint (default `127.0.0.1:40001`). The wizard checks that this preconfigured SOCKS5 gateway answers before saving the profile. Shah Tunnel does not start a standalone MASQUE client.
-- **Cloudflare WARP:** configure the official client in device mode (`warp+doh`) using MASQUE. This is required so both the Agent↔Hub carrier and the local target service's IPv4/IPv6 internet egress (including VPN-client egress) use WARP. Before changing modes, Shah Tunnel records the physical IPv4/IPv6 routes and installs an SSH reply route guard; direct native failover sockets use `SO_MARK` to keep using the physical VPS route.
+- **Cloudflare WARP:** uses Cloudflare WARP Local Proxy (`127.0.0.1:40000`) over MASQUE as a SOCKS5 next-hop for this Agent profile’s Hub connections only. It does not enable full-device routing, change the VPS default route, or affect other tunnel profiles. The local target service keeps its existing egress policy; configure that application separately if its internet traffic must also use WARP.
 - **WARP on WARP:** use a separately prepared second SOCKS5 chain endpoint (default `127.0.0.1:40002`). Shah Tunnel does not register a second Cloudflare client or create a second WARP tunnel by itself.
 - **Tor/Psiphon:** enter the local SOCKS5 proxy address. Defaults are `127.0.0.1:9050` for Tor and `127.0.0.1:1080` for Psiphon; adjust them to the actual client settings. Destination hostnames are resolved by the proxy.
 
-Option 7 is the original four-transport adaptive mode. Before it starts, Shah Tunnel returns any Shah-managed device WARP session to Local Proxy mode so the old native transports do not inherit WARP routing. Option 8 selects one external path and uses the authenticated TCP/TLS carrier. When that path is Cloudflare WARP, device-level MASQUE is enabled so the local target service's internet egress—and therefore VPN clients' visible IPv4/IPv6 egress—also uses WARP. Option 9 combines all four native transports with the configured external paths; the selected external path is tried first, then the physical direct route and other candidates. Direct/native fallback sockets are explicitly marked to use the physical VPS route while the WARP path uses WARP. Each lane remembers its last successful route and transport. A failed outer connection is re-established on another candidate; an already-active TCP flow is not migrated seamlessly and may reconnect. The Hub must be configured with the corresponding mode.
-
-**WARP scope:** When option 8 selects WARP, or option 9 contains a WARP candidate, device-level WARP is active on the Agent host. Consequently, unmarked host traffic—including the local target service's outbound traffic—uses WARP. SSH replies and direct failover sockets are routed over the physical VPS link. Other independently running applications on that VPS may also use WARP during this mode. A direct/legacy Agent and a WARP Agent therefore cannot safely run together on the same VPS when their client egress must remain different. Shah Tunnel checks this before collecting the Hub token and again before saving; a conflict aborts setup without changing or stopping the existing tunnel. To keep both client egress policies separate, use a separate VPS or separately network-isolated target/Xray instances. Do not remove this guard to force both profiles to start.
-
-For an existing Agent profile that was saved with an unavailable MASQUE endpoint such as `127.0.0.1:40001`, upgrade the binary on the outside host and run:
-
-```bash
-ravanreverse repair-external
-```
-
-Select the Agent profile and choose option `2` (Cloudflare WARP). The command replaces only the selected external path, creates a private backup first, preserves the token, fingerprint, Hub address, mappings and lane count, and restarts the profile only when it was already active.
-
-## Multiple tunnel profiles and upload throughput
-
-Each create operation asks for a unique tunnel name and stores its configuration separately. Existing profiles remain intact. Every named profile runs as its own systemd instance; Start, Stop, Restart, Status, and Delete act on the selected profile. The profile-management menu keeps its separate delete and full-uninstall actions.
-
-The per-stream in-flight window is increased to 64 frames of up to 64 KiB (about 4 MiB per stream), while each tunnel socket keeps a smaller bounded outbound queue to limit head-of-line delay. On Linux kernels that support BBR, the outer tunnel TCP socket attempts to use BBR per-socket; unsupported kernels retain their existing default. This reduces the throughput ceiling caused by a small flow-control window on high-RTT paths and can improve latency under load. Actual throughput still depends on link capacity, packet loss, congestion, kernel qdisc, and provider limits; application-level changes cannot prevent an uplink from being fully saturated without an appropriate network-level rate limit.
-
-## Responsible use and privacy
-
-ShahTunnel is a general-purpose TCP relay. Configure it only for servers and services you own or are explicitly authorized to administer. Do not use it to access third-party systems without permission, relay abusive traffic, or disrupt services. Operators are responsible for the endpoints and traffic they choose to forward.
-
-The server information display may make outbound HTTPS requests to public IP and GeoIP providers (including ipify, icanhazip, checkip.amazonaws.com, ipinfo.io, ip.sb, ipapi.co and ipwho.is) to determine the server's public IPv4 address and country. These providers can observe the server's public IP and request metadata; the GeoIP lookups do not include the tunnel token or tunnel payload.
-
-## Install
-
-Extract the ZIP and run the installer from its folder as root:
-
-```bash
-sudo bash S1T-START.sh
-```
-
-After this updated version has been published to the repository's `main` branch, the one-command installer is:
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
-```
-
-On supported Debian/Ubuntu APT systems, the installer also installs the official Cloudflare WARP package, but does not register or connect it during installation. When a WARP external path is selected and the Agent starts, Shah Tunnel installs the physical-route and SSH guard first, then enables device-level MASQUE. Options 1–7 return WARP to Local Proxy mode before starting so the old transports do not inherit WARP routing.
+Option 7 is the original four-transport adaptive mode. Option 8 selects one external path and uses the authenticated TCP/TLS carrier. Option 9 combines the four native transports with configured external paths. SOCKS-backed paths, including WARP, are opened by the relevant Agent lane only; direct/native paths use ordinary direct sockets. Each lane remembers its last successful route and transport. A failed outer connection is re-established on another candidate; an already-active TCP flow is not migrated seamlessly and may reconnect. The Hub must be configured with the corresponding mode.
+**WARP scope:** 2.2.8 uses WARP Local Proxy instead of full-device mode. This removes the global-route conflict between native and WARP Agent profiles, so multiple independent tunnel profiles can run together without changing each other’s routes. WARP here secures the Agent-to-Hub carrier only. It does not automatically change the public IP used by a local Xray/VPN target service; that service needs its own WARP SOCKS5 outbound/routing configuration. Profiles created by older releases with WARP device mode must be restarted once after upgrading so they migrate to the local proxy path.
 
 ### WARP installation on restricted networks
 
-The installer uses bounded timeouts when retrieving Cloudflare's official signing key. If `pkg.cloudflareclient.com` is unreachable from the VPS network, WARP package setup is skipped with a clear warning and the Shah Tunnel core installation continues; no routes are changed during installation. WARP paths remain unavailable until the official client is installed. At tunnel start, WARP device mode is refused if nftables, a physical default route, or the SSH route guard cannot be prepared safely. A not-yet-created numeric FIB table is treated as empty and is instantiated when Shah Tunnel adds its physical default route; existing routes or policy rules that reference the reserved table IDs are left untouched and cause a safe refusal.
+The installer uses bounded timeouts when retrieving Cloudflare's official signing key. If `pkg.cloudflareclient.com` is unreachable from the VPS network, WARP package setup is skipped with a clear warning and the Shah Tunnel core installation continues; no routes are changed during installation. WARP paths remain unavailable until the official client is installed. For new profiles, no nftables rule, policy route, or device-level WARP route is needed. If an older full-device WARP profile is still active, restart that profile once with the new release before starting another Agent profile; the migration checks this state and refuses to alter a running legacy tunnel.

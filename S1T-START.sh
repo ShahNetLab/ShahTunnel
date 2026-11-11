@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 2.2.7 installer.
+# Shah Tunnel 2.2.8 installer.
 # Downloads the pinned Go toolchain, verifies its SHA-256, fetches the source,
 # and builds the binary on the target server. No GitHub Release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="2.2.7"
+VERSION="2.2.8"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -77,9 +77,8 @@ curl_download() {
   rm -f "$headers" "$log"
 }
 # Install the official Cloudflare WARP client without registering or connecting it.
-# Shah Tunnel enables device-level MASQUE only for Agent option 8/9 when WARP
-# is selected. Before that, it installs a physical-route guard for SSH replies
-# and direct legacy fallbacks. Options 1-7 restore WARP local-proxy mode.
+# Shah Tunnel uses the WARP Local Proxy only for the Agent profile's own
+# Hub sockets. No device-wide WARP route or SSH policy route is installed.
 install_cloudflare_warp() {
   if command -v warp-cli >/dev/null 2>&1; then
     echo "Cloudflare WARP already installed; keeping its existing registration and configuration."
@@ -672,8 +671,8 @@ if [[ ! -f /etc/systemd/system/ravanreverse.service ]]; then
   cat > "$TMP/ravanreverse.service" <<'UNIT'
 [Unit]
 Description=Shah Tunnel authenticated reverse TCP tunnel
-Wants=network-online.target shah-tunnel-warp-ssh-bypass.service
-After=network-online.target shah-tunnel-warp-ssh-bypass.service warp-svc.service
+Wants=network-online.target
+After=network-online.target
 StartLimitIntervalSec=60
 StartLimitBurst=10
 [Service]
@@ -714,8 +713,8 @@ fi
 cat > "$TMP/ravanreverse@.service" <<'UNIT'
 [Unit]
 Description=Shah Tunnel authenticated reverse TCP tunnel (%i)
-Wants=network-online.target shah-tunnel-warp-ssh-bypass.service
-After=network-online.target shah-tunnel-warp-ssh-bypass.service warp-svc.service
+Wants=network-online.target
+After=network-online.target
 StartLimitIntervalSec=60
 StartLimitBurst=10
 [Service]
