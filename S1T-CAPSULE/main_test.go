@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -2093,5 +2094,79 @@ func TestListenAddressConflictDetection(t *testing.T) {
 		if got := listenAddressesConflict(tc.a, tc.b); got != tc.want {
 			t.Errorf("listenAddressesConflict(%q, %q) = %v; want %v", tc.a, tc.b, got, tc.want)
 		}
+	}
+}
+
+func TestWarpNeedsToSAcceptance(t *testing.T) {
+	tests := []struct {
+		name string
+		out  string
+		want bool
+	}{
+		{
+			name: "Cloudflare non-interactive ToS error",
+			out:  "Please accept the WARP Terms of Service by running this command in a TTY or by passing the --accept-tos flag.",
+			want: true,
+		},
+		{
+			name: "unrelated command error",
+			out:  "warp-cli: unknown command status",
+			want: false,
+		},
+		{
+			name: "connected status",
+			out:  "Status update: Connected\nNetwork: healthy",
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := warpNeedsToSAcceptance([]byte(tt.out)); got != tt.want {
+				t.Fatalf("warpNeedsToSAcceptance() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRunWarpCLIRetriesWithAcceptTOSWhenSystemdStyleCallIsRejected(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("test helper uses a POSIX shell script")
+	}
+	warpCLIMu.Lock()
+	warpCLIAcceptTOS = false
+	warpCLIMu.Unlock()
+	t.Cleanup(func() {
+		warpCLIMu.Lock()
+		warpCLIAcceptTOS = false
+		warpCLIMu.Unlock()
+	})
+
+	bin := filepath.Join(t.TempDir(), "warp-cli")
+	script := `#!/bin/sh
+if [ "$1" = "--accept-tos" ]; then
+  case "$2" in
+    status) printf 'Status update: Connected\nNetwork: healthy\n'; exit 0 ;;
+    settings) printf 'WARP tunnel protocol: MASQUE\n'; exit 0 ;;
+  esac
+fi
+printf 'Please accept the WARP Terms of Service by running this command in a TTY or by passing the --accept-tos flag.\n' >&2
+exit 1
+`
+	if err := os.WriteFile(bin, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake warp-cli: %v", err)
+	}
+	output, err := runWarpCLI(bin, "status")
+	if err != nil {
+		t.Fatalf("runWarpCLI should retry with --accept-tos, got error %v and output %q", err, output)
+	}
+	if !warpStatusConnected(string(output)) {
+		t.Fatalf("expected connected status after retry, got %q", output)
+	}
+	settings, err := runWarpCLI(bin, "settings")
+	if err != nil {
+		t.Fatalf("subsequent WARP CLI calls should remember --accept-tos, got error %v and output %q", err, settings)
+	}
+	if !warpProtocolMatches(string(settings), "MASQUE") {
+		t.Fatalf("expected MASQUE settings after the remembered ToS flag, got %q", settings)
 	}
 }

@@ -3175,10 +3175,42 @@ func warpProtocolMatches(settings, expected string) bool {
 	return false
 }
 
+var warpCLIMu sync.Mutex
+var warpCLIAcceptTOS bool
+
+func warpNeedsToSAcceptance(output []byte) bool {
+	text := strings.ToLower(string(output))
+	return strings.Contains(text, "please accept the warp terms of service") ||
+		(strings.Contains(text, "accept the warp terms") && strings.Contains(text, "--accept-tos"))
+}
+
 func runWarpCLI(warpCLI string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Serialize WARP CLI access. On systemd the first command may reveal that
+	// this installation requires --accept-tos for non-interactive invocations.
+	// Remember that requirement so the remaining 11 lanes do not all retry
+	// the same failing command concurrently.
+	warpCLIMu.Lock()
+	defer warpCLIMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	return exec.CommandContext(ctx, warpCLI, args...).CombinedOutput()
+
+	commandArgs := args
+	if warpCLIAcceptTOS {
+		commandArgs = append([]string{"--accept-tos"}, args...)
+	}
+	output, err := exec.CommandContext(ctx, warpCLI, commandArgs...).CombinedOutput()
+	if err == nil || !warpNeedsToSAcceptance(output) || warpCLIAcceptTOS {
+		return output, err
+	}
+
+	// The administrator accepted Cloudflare's terms during WARP setup. This
+	// CLI build nevertheless requires the explicit flag for commands launched
+	// without a TTY (such as systemd). Retry once with the documented flag.
+	warpCLIAcceptTOS = true
+	log.Printf("warp-cli requires --accept-tos for non-interactive execution; retrying with the explicit flag")
+	acceptedArgs := append([]string{"--accept-tos"}, args...)
+	return exec.CommandContext(ctx, warpCLI, acceptedArgs...).CombinedOutput()
 }
 
 func detectActiveWarpUnderlay() string {
