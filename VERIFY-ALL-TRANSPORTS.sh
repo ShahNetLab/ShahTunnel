@@ -52,7 +52,7 @@ printf '\n== 1/7: Resolve Go module metadata ==\n'
 pass "Module metadata resolved"
 
 printf '\n== 2/7: Formatting ==\n'
-unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go)"
+unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go S1T-CAPSULE/xray_warp.go)"
 [[ -z "$unformatted" ]] || fail "gofmt required for: $unformatted"
 pass "Go source formatting"
 
@@ -65,13 +65,14 @@ bash -n VERIFY-ALL-TRANSPORTS.sh
 grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/psiphon' S1T-START.sh || fail "Psiphon systemd data-directory permission is missing."
 grep -Fq 'func detectActiveWarpUnderlay() string' S1T-CAPSULE/main.go || fail "Adaptive WARP protocol detection is missing."
 grep -Fq 'func warpProxyAddressFromSettings(settings string)' S1T-CAPSULE/main.go || fail "Cloudflare Local Proxy detection is missing."
-grep -Fq 'func dialHTTPConnectContext(' S1T-CAPSULE/main.go || fail "WARP Local Proxy HTTP CONNECT dialer is missing."
+grep -Fq 'return dialSOCKS5Context(ctx, proxyAddress, address)' S1T-CAPSULE/main.go || fail "WARP Local Proxy SOCKS5 dialer is missing."
 grep -Fq 'TestWarpProxyAddressFromSettings' S1T-CAPSULE/main_test.go || fail "WARP Local Proxy parsing tests are missing."
-grep -Fq 'TestDialHTTPConnectContext' S1T-CAPSULE/main_test.go || fail "WARP Local Proxy CONNECT tests are missing."
 grep -Fq 'TestDialAgentUnderlayUsesDetectedWarpLocalProxy' S1T-CAPSULE/main_test.go || fail "WARP Local Proxy Agent integration coverage is missing."
 grep -Fq 'TestAdaptiveUnderlayCandidatesDetectWARPAndFailOver' S1T-CAPSULE/main_test.go || fail "WARP failover coverage is missing."
 grep -Fq 'TestOptionNineSwitchesFromFailedDirectPathToPsiphonSOCKS5' S1T-CAPSULE/main_test.go || fail "Option 9 SOCKS5 failover coverage is missing."
-pass "Shell syntax, v3 Network Flow diagrams, Psiphon systemd permissions, WARP Local Proxy detection/CONNECT, and WARP/Psiphon failover coverage"
+grep -Fq 'func applyXrayWarpEgressToSelectedTunnel() error' S1T-CAPSULE/xray_warp.go || fail "Per-tunnel Xray WARP isolation is missing."
+grep -Fq 'TestBuildXrayWarpConfigIsolatesOnlyClonedInbound' S1T-CAPSULE/main_test.go || fail "Per-inbound Xray WARP isolation coverage is missing."
+pass "Shell syntax, v3 Network Flow diagrams, Psiphon systemd permissions, WARP Local Proxy detection/SOCKS5, and WARP/Psiphon failover coverage"
 
 printf '\n== 4/7: Transport loopback suite ==\n'
 "$GO_BIN" test -count=20 ./S1T-CAPSULE || fail "Automated transport tests failed."
