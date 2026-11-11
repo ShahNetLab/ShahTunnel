@@ -25,6 +25,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2647,9 +2648,9 @@ func adaptiveTransportCandidates(preferred string) []string {
 }
 
 func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
-	// WARP is only a candidate when its system client reports a connected
-	// MASQUE or WireGuard tunnel. The actual route is verified immediately
-	// before use; this detection step never changes host routing.
+	// WARP is only a candidate when its client reports a connected MASQUE
+	// or WireGuard path. verifyWarpUnderlay distinguishes a system route from
+	// a per-application WarpProxy endpoint without changing host routing.
 	warpMode := detectActiveWarpUnderlay()
 	usesPsiphon := strings.TrimSpace(cfg.PsiphonConfig) != ""
 	all := make([]string, 0, 3)
@@ -2686,9 +2687,10 @@ func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
 }
 
 func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
-	// WARP is a system-wide route, not a per-socket proxy. Re-validate it on
-	// every new connection attempt so a dropped WARP tunnel fails closed
-	// instead of silently sending a reconnect over the ordinary interface.
+	// Re-validate WARP on each connection attempt. System-tunnel mode must
+	// prove warp=on on the host route; Local Proxy mode must prove warp=on
+	// through its loopback proxy. A selected WARP path never falls back to
+	// the ordinary route behind the user's back.
 	switch cfg.Underlay {
 	case underlayMASQUE:
 		if err := verifyWarpUnderlay("MASQUE"); err != nil {
@@ -2854,11 +2856,94 @@ func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode s
 }
 
 func dialAgentUnderlay(ctx context.Context, cfg Config, network, address string) (net.Conn, error) {
-	if cfg.Underlay == underlayPsiphon {
+	switch cfg.Underlay {
+	case underlayPsiphon:
 		return dialSOCKS5Context(ctx, cfg.PsiphonProxy, address)
+	case underlayMASQUE, underlayWARP:
+		proxyAddress, localProxyMode, err := warpProxyAddressFromCLI()
+		if err != nil {
+			return nil, err
+		}
+		if localProxyMode {
+			if cfg.Underlay != underlayMASQUE {
+				return nil, errors.New("Cloudflare WarpProxy mode only supports the MASQUE underlay; select MASQUE in ShahTunnel")
+			}
+			return dialHTTPConnectContext(ctx, proxyAddress, address)
+		}
 	}
 	d := net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
 	return d.DialContext(ctx, network, address)
+}
+
+// bufferedNetConn preserves any bytes net/http's buffered reader may have read
+// beyond the successful CONNECT response headers before TLS starts.
+type bufferedNetConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedNetConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
+
+// dialHTTPConnectContext opens a raw TCP stream through Cloudflare's local
+// HTTP CONNECT proxy. The endpoint must be loopback-only so an untrusted remote
+// proxy can never receive Hub connection attempts or tunnel credentials.
+func dialHTTPConnectContext(ctx context.Context, proxyAddress, targetAddress string) (net.Conn, error) {
+	if !isLoopbackProxyAddress(proxyAddress) {
+		return nil, errors.New("HTTP CONNECT proxy must be a loopback address")
+	}
+	if _, _, err := net.SplitHostPort(targetAddress); err != nil {
+		return nil, fmt.Errorf("invalid HTTP CONNECT destination %q: %w", targetAddress, err)
+	}
+	d := net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", proxyAddress)
+	if err != nil {
+		return nil, fmt.Errorf("connect WARP local proxy %s: %w", proxyAddress, err)
+	}
+	fail := func(err error) (net.Conn, error) {
+		_ = conn.Close()
+		return nil, err
+	}
+	deadline := time.Now().Add(8 * time.Second)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+	request := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\n\r\n", targetAddress, targetAddress)
+	if err := writeFull(conn, []byte(request)); err != nil {
+		return fail(fmt.Errorf("WARP HTTP CONNECT request: %w", err))
+	}
+	reader := bufio.NewReaderSize(conn, 4096)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		return fail(fmt.Errorf("WARP HTTP CONNECT response: %w", err))
+	}
+	fields := strings.Fields(strings.TrimSpace(statusLine))
+	if len(fields) < 2 || !strings.HasPrefix(fields[0], "HTTP/") {
+		return fail(fmt.Errorf("invalid WARP HTTP CONNECT response %q", strings.TrimSpace(statusLine)))
+	}
+	statusCode, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return fail(fmt.Errorf("invalid WARP HTTP CONNECT status %q", fields[1]))
+	}
+	headerBytes := len(statusLine)
+	for {
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			return fail(fmt.Errorf("read WARP HTTP CONNECT headers: %w", readErr))
+		}
+		headerBytes += len(line)
+		if headerBytes > 16*1024 {
+			return fail(errors.New("WARP HTTP CONNECT response headers exceed 16 KiB"))
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+	if statusCode != http.StatusOK {
+		return fail(fmt.Errorf("WARP HTTP CONNECT proxy rejected %s with HTTP %d", targetAddress, statusCode))
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return &bufferedNetConn{Conn: conn, reader: reader}, nil
 }
 
 func dialSOCKS5Context(ctx context.Context, proxyAddress, targetAddress string) (net.Conn, error) {
@@ -3119,6 +3204,49 @@ func detectActiveWarpUnderlay() string {
 	return ""
 }
 
+// warpProxyAddressFromSettings detects Cloudflare's per-application Local Proxy
+// mode (for example: "Mode: WarpProxy on port 40000"). It returns a loopback
+// endpoint only; ShahTunnel must never send the proxy to a non-local address.
+func warpProxyAddressFromSettings(settings string) (string, bool, error) {
+	for _, line := range strings.Split(settings, "\n") {
+		lower := strings.ToLower(line)
+		marker := strings.Index(lower, "mode:")
+		if marker < 0 {
+			continue
+		}
+		value := strings.TrimSpace(line[marker+len("mode:"):])
+		fields := strings.Fields(value)
+		if len(fields) == 0 || !strings.EqualFold(fields[0], "WarpProxy") {
+			continue
+		}
+		for i := 1; i+1 < len(fields); i++ {
+			if !strings.EqualFold(fields[i], "port") {
+				continue
+			}
+			portText := strings.Trim(fields[i+1], ",; \t")
+			port, err := strconv.Atoi(portText)
+			if err != nil || port < 1 || port > 65535 {
+				return "", true, fmt.Errorf("Cloudflare WarpProxy reported an invalid local port %q", portText)
+			}
+			return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), true, nil
+		}
+		return "", true, errors.New("Cloudflare is in WarpProxy mode, but `warp-cli settings` did not report a valid `on port` value")
+	}
+	return "", false, nil
+}
+
+func warpProxyAddressFromCLI() (string, bool, error) {
+	warpCLI, err := exec.LookPath("warp-cli")
+	if err != nil {
+		return "", false, errors.New("warp-cli is not installed")
+	}
+	settings, err := runWarpCLI(warpCLI, "settings")
+	if err != nil {
+		return "", false, fmt.Errorf("warp-cli settings failed: %w: %s", err, strings.TrimSpace(string(settings)))
+	}
+	return warpProxyAddressFromSettings(string(settings))
+}
+
 func traceHasWarpOn(body string) bool {
 	for _, line := range strings.Split(body, "\n") {
 		if strings.TrimSpace(line) == "warp=on" {
@@ -3147,18 +3275,33 @@ func verifyWarpUnderlay(expectedProtocol string) error {
 	if !warpProtocolMatches(string(settings), expectedProtocol) {
 		return fmt.Errorf("Cloudflare WARP is connected, but its configured tunnel protocol could not be verified as %s; inspect `warp-cli settings`", expectedProtocol)
 	}
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			Proxy:                 nil,
-			TLSHandshakeTimeout:   5 * time.Second,
-			ResponseHeaderTimeout: 5 * time.Second,
-		},
+	proxyAddress, localProxyMode, proxyErr := warpProxyAddressFromSettings(string(settings))
+	if proxyErr != nil {
+		return proxyErr
 	}
+	if localProxyMode && !strings.EqualFold(expectedProtocol, "MASQUE") {
+		return errors.New("Cloudflare Local Proxy mode requires MASQUE; WireGuard is not supported by WARP proxy mode")
+	}
+	if localProxyMode && !isLoopbackProxyAddress(proxyAddress) {
+		return errors.New("Cloudflare WarpProxy endpoint is not a safe loopback address")
+	}
+
+	clientTransport := &http.Transport{
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 7 * time.Second,
+	}
+	if localProxyMode {
+		proxyURL := &url.URL{Scheme: "http", Host: proxyAddress}
+		clientTransport.Proxy = http.ProxyURL(proxyURL)
+	}
+	client := &http.Client{Timeout: 9 * time.Second, Transport: clientTransport}
 	defer client.CloseIdleConnections()
-	resp, err := client.Get("https://www.cloudflare.com/cdn-cgi/trace")
+	// api.cloudflare.com's trace endpoint is used because it returns the same
+	// WARP status fields while avoiding inconsistent 404 responses seen on
+	// the www.cloudflare.com hostname in some environments.
+	resp, err := client.Get("https://api.cloudflare.com/cdn-cgi/trace")
 	if err != nil {
-		return fmt.Errorf("WARP egress check failed: %w", err)
+		return fmt.Errorf("WARP egress check failed (local proxy=%t, endpoint=api.cloudflare.com): %w", localProxyMode, err)
 	}
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
 	_ = resp.Body.Close()
@@ -3166,9 +3309,13 @@ func verifyWarpUnderlay(expectedProtocol string) error {
 		return fmt.Errorf("read WARP egress check: %w", readErr)
 	}
 	if resp.StatusCode != http.StatusOK || !traceHasWarpOn(string(body)) {
-		return errors.New("WARP reports connected, but the direct public egress check did not return an exact warp=on status")
+		return fmt.Errorf("WARP reports connected, but the %s egress check did not return HTTP 200 with exact warp=on (HTTP %d)", map[bool]string{true: "local proxy", false: "system route"}[localProxyMode], resp.StatusCode)
 	}
-	log.Printf("Cloudflare WARP egress verified (protocol=%s); ShahTunnel did not modify system routing", expectedProtocol)
+	if localProxyMode {
+		log.Printf("Cloudflare WARP local proxy verified (protocol=%s, proxy=%s); system routes and SSH were not modified", expectedProtocol, proxyAddress)
+	} else {
+		log.Printf("Cloudflare WARP system egress verified (protocol=%s); ShahTunnel did not modify system routing", expectedProtocol)
+	}
 	return nil
 }
 
@@ -4124,8 +4271,8 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 			return transportAdaptive, underlayDirect, "", nil
 		}
 		fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "EXTERNAL EGRESS PROVIDER"))
-		fmt.Println("  1) Cloudflare WARP over MASQUE (HTTP/3; WARP must already be Connected)")
-		fmt.Println("  2) Cloudflare WARP over WireGuard (WARP must already be Connected)")
+		fmt.Println("  1) Cloudflare WARP over MASQUE (system tunnel or Local Proxy; already Connected)")
+		fmt.Println("  2) Cloudflare WARP over WireGuard (system-tunnel mode; already Connected)")
 		fmt.Println("  3) Psiphon ConsoleClient via local SOCKS5")
 		sub := wizardAsk("Select external egress (1-3)", "1")
 		switch sub {
@@ -4393,8 +4540,11 @@ func setup() error {
 			return err
 		}
 		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s; egress=%s.", c.TunnelChannels, c.Transport, c.Underlay))
-		if c.Underlay == underlayMASQUE || c.Underlay == underlayWARP {
-			uiInfo("WARP is system-wide on Linux. ShahTunnel only verifies an already-connected WARP tunnel and never changes the default route, starts WARP, or disconnects SSH.")
+		if c.Underlay == underlayMASQUE {
+			uiInfo("WARP MASQUE may use an existing system tunnel or the detected Local Proxy (WarpProxy); ShahTunnel never changes host routes or restarts SSH.")
+		}
+		if c.Underlay == underlayWARP {
+			uiInfo("WARP WireGuard requires an already-connected system tunnel; Local Proxy mode is MASQUE-only. ShahTunnel never changes host routes or restarts SSH.")
 		}
 		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
 			uiInfo("Install the official Psiphon ConsoleClient and provide its client JSON; ShahTunnel starts it as a child and dials the local SOCKS5 proxy.")

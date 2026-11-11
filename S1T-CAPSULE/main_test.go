@@ -817,7 +817,12 @@ func TestAgentTransportsActuallyDialHubThroughPsiphonSOCKS5(t *testing.T) {
 			agentDone := make(chan error, 1)
 			go func() { agentDone <- connectAndRunAgentWithTransport(cfg, pin, channel, mode) }()
 			deadline := time.Now().Add(5 * time.Second)
-			for h.sessionCount() == 0 && time.Now().Before(deadline) {
+			for time.Now().Before(deadline) {
+				_, underlayReady := agentPreferredUnderlay.Load(channel)
+				_, transportReady := agentPreferredTransport.Load(channel)
+				if h.sessionCount() > 0 && underlayReady && transportReady {
+					break
+				}
 				time.Sleep(10 * time.Millisecond)
 			}
 			if h.sessionCount() == 0 {
@@ -1017,6 +1022,218 @@ loc=DE`, want: false},
 		if got := traceHasWarpOn(test.body); got != test.want {
 			t.Errorf("traceHasWarpOn(%q) = %v; want %v", test.body, got, test.want)
 		}
+	}
+}
+
+func TestWarpProxyAddressFromSettings(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		settings string
+		want     string
+		isProxy  bool
+		wantErr  bool
+	}{
+		{
+			name: "local proxy mode",
+			settings: "Merged configuration:\n(user set) Mode: WarpProxy on port 40000\n" +
+				"(consumer overrides) WARP tunnel protocol: MASQUE\n",
+			want: "127.0.0.1:40000", isProxy: true,
+		},
+		{
+			name: "system tunnel mode",
+			settings: "(user set) Mode: warp+doh\n" +
+				"(consumer overrides) WARP tunnel protocol: MASQUE\n",
+		},
+		{
+			name:     "invalid port",
+			settings: "(user set) Mode: WarpProxy on port 70000\n",
+			isProxy:  true, wantErr: true,
+		},
+		{
+			name:     "missing port",
+			settings: "(user set) Mode: WarpProxy enabled\n",
+			isProxy:  true, wantErr: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, isProxy, err := warpProxyAddressFromSettings(test.settings)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if isProxy != test.isProxy {
+				t.Fatalf("local proxy mode = %v; want %v", isProxy, test.isProxy)
+			}
+			if got != test.want {
+				t.Fatalf("proxy address = %q; want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDialHTTPConnectContext(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		reader := bufio.NewReader(conn)
+		requestLine, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		if strings.TrimSpace(requestLine) != "CONNECT hub.example:9443 HTTP/1.1" {
+			serverErr <- fmt.Errorf("unexpected CONNECT request %q", strings.TrimSpace(requestLine))
+			return
+		}
+		for {
+			line, headerErr := reader.ReadString('\n')
+			if headerErr != nil {
+				serverErr <- headerErr
+				return
+			}
+			if line == "\r\n" || line == "\n" {
+				break
+			}
+		}
+		if _, writeErr := io.WriteString(conn, "HTTP/1.1 200 Connection established\r\nProxy-Agent: test\r\n\r\n"); writeErr != nil {
+			serverErr <- writeErr
+			return
+		}
+		payload := make([]byte, 4)
+		if _, readErr = io.ReadFull(reader, payload); readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		_, writeErr := conn.Write(payload)
+		serverErr <- writeErr
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	proxyConn, err := dialHTTPConnectContext(ctx, listener.Addr().String(), "hub.example:9443")
+	if err != nil {
+		t.Fatalf("HTTP CONNECT dial failed: %v", err)
+	}
+	defer proxyConn.Close()
+	if _, err := proxyConn.Write([]byte("ping")); err != nil {
+		t.Fatalf("write through CONNECT tunnel: %v", err)
+	}
+	got := make([]byte, 4)
+	if _, err := io.ReadFull(proxyConn, got); err != nil {
+		t.Fatalf("read through CONNECT tunnel: %v", err)
+	}
+	if string(got) != "ping" {
+		t.Fatalf("tunneled payload = %q; want ping", got)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("test proxy: %v", err)
+	}
+}
+
+func TestDialAgentUnderlayUsesDetectedWarpLocalProxy(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	warpCLI := filepath.Join(binDir, "warp-cli")
+	script := "#!/bin/sh\nif [ \"$1\" = settings ]; then echo '(user set) Mode: WarpProxy on port " + port + "'; fi\n"
+	if err := os.WriteFile(warpCLI, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		reader := bufio.NewReader(conn)
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		if strings.TrimSpace(line) != "CONNECT hub.example:9443 HTTP/1.1" {
+			serverErr <- fmt.Errorf("unexpected proxy request %q", strings.TrimSpace(line))
+			return
+		}
+		for {
+			line, readErr = reader.ReadString('\n')
+			if readErr != nil {
+				serverErr <- readErr
+				return
+			}
+			if line == "\r\n" || line == "\n" {
+				break
+			}
+		}
+		if _, writeErr := io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n"); writeErr != nil {
+			serverErr <- writeErr
+			return
+		}
+		payload := make([]byte, 4)
+		if _, readErr = io.ReadFull(reader, payload); readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		_, writeErr := conn.Write(payload)
+		serverErr <- writeErr
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := dialAgentUnderlay(ctx, Config{Underlay: underlayMASQUE}, "tcp", "hub.example:9443")
+	if err != nil {
+		t.Fatalf("MASQUE Agent did not use detected WarpProxy: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("warp")); err != nil {
+		t.Fatalf("write over WARP proxy: %v", err)
+	}
+	got := make([]byte, 4)
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read over WARP proxy: %v", err)
+	}
+	if string(got) != "warp" {
+		t.Fatalf("WARP proxy payload = %q; want warp", got)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("WARP local proxy: %v", err)
+	}
+}
+
+func TestWireGuardRejectsWarpProxyMode(t *testing.T) {
+	binDir := t.TempDir()
+	warpCLI := filepath.Join(binDir, "warp-cli")
+	if err := os.WriteFile(warpCLI, []byte("#!/bin/sh\necho '(user set) Mode: WarpProxy on port 40000'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := dialAgentUnderlay(ctx, Config{Underlay: underlayWARP}, "tcp", "hub.example:9443")
+	if err == nil || !strings.Contains(err.Error(), "only supports the MASQUE underlay") {
+		t.Fatalf("WireGuard unexpectedly accepted Local Proxy mode: %v", err)
 	}
 }
 
