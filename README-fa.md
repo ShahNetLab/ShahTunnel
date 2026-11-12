@@ -2,9 +2,9 @@
 
 <img src="docs/img/ShahTunnel-Network.png" alt="نشان کهکشانی شاه‌تونل" width="100%">
 
-# شاه‌تونل ۳٫۰٫۷
+# شاه‌تونل ۳٫۰٫۸
 
-[![نسخه](https://img.shields.io/badge/version-3.0.7-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![نسخه](https://img.shields.io/badge/version-3.0.8-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![پلتفرم](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![ساخت با Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -38,7 +38,7 @@
 Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCKS5 خروجی WARP یا Psiphon → اینترنت
 ```
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه ShahTunnel 3.0.7" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه ShahTunnel 3.0.8" width="100%"></p>
 
 <a id="capabilities"></a>
 
@@ -56,9 +56,11 @@ Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCK
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **خروجی کاربر از Psiphon** | Inboundهای همان Agent در Sidecar مستقل Xray کپی می‌شوند؛ TCP و DNS از SOCKS5 سایفون می‌روند و UDP برای جلوگیری از نشت مستقیم مسدود می‌شود. |
 
 
-### خروجی کاربران از Psiphon (نسخه ۳٫۰٫۷)
+### خروجی خودکار کاربران از Psiphon (نسخه ۳٫۰٫۸)
 
-برای Agent با خروجی Psiphon، هنگام ساخت پروفایل Inboundهای Xray متناظر با Mappingها در یک Sidecar مجزا و فقط روی `127.0.0.1` کپی می‌شوند. ترافیک TCP و DNS از SOCKS5 همان پروفایل عبور می‌کند. چون SOCKS5 محلی Psiphon یک پراکسی port-forward برای جریان TCP است و UDP را حمل نمی‌کند، UDP و هر نوع شبکهٔ ناشناخته در Sidecar به Blackhole می‌روند؛ بنابراین از خروج مستقیم UDP جلوگیری می‌شود، اما برنامه‌های UDP/QUIC و ICMP ping از این مسیر پشتیبانی نمی‌شوند. برای پروفایل‌های قدیمی از گزینهٔ `10` منوی مدیریت استفاده کنید؛ ابتدا اطمینان حاصل کنید Psiphon متصل است. این عملیات X-UI، کانفیگ اصلی Xray، سایر Inboundها، SSH و Routeهای میزبان را تغییر نمی‌دهد.
+برای Agent جدیدی که هنگام ساخت، خروجی Psiphon را انتخاب می‌کند، Inboundهای Xray متناظر با Mappingها به‌صورت خودکار و پیش از شروع Agent در Sidecar مجزا و فقط روی `127.0.0.1` کپی می‌شوند. ترافیک TCP و DNS از SOCKS5 همان پروفایل عبور می‌کند. چون SOCKS5 محلی Psiphon یک پراکسی port-forward برای جریان TCP است و UDP را حمل نمی‌کند، UDP و هر نوع شبکهٔ ناشناخته در Sidecar به Blackhole می‌روند؛ بنابراین از خروج مستقیم UDP جلوگیری می‌شود، اما برنامه‌های UDP/QUIC و ICMP ping از این مسیر پشتیبانی نمی‌شوند. گزینهٔ جداگانه‌ای به منوی مدیریت اضافه نمی‌شود. پروفایل‌های قبلی دست‌نخورده باقی می‌مانند و این راه‌اندازی خودکار مخصوص Agentهای جدید است. این عملیات X-UI، کانفیگ اصلی Xray، سایر Inboundها، SSH و Routeهای میزبان را تغییر نمی‌دهد.
+
+**درباره پینگ:** انتخاب Lane در Hub از RTT اندازه‌گیری‌شدهٔ PING/PONG و تعداد Streamهای فعال استفاده می‌کند تا اتصال‌های پرتاخیر یا شلوغ کمتر انتخاب شوند. این کار می‌تواند توزیع بار و تأخیر ناشی از صف را بهتر کند، اما تأخیر پایهٔ مسیر Psiphon را حذف نمی‌کند. ICMP ping و UDP/QUIC نیز روی مسیر SOCKS5-only پشتیبانی نمی‌شوند؛ کاهش پینگ فیزیکی تضمین‌شدنی نیست.
 
 **درباره پینگ:** TCP_NODELAY و BBR به‌صورت per-socket روی کانال‌های ShahTunnel فعال‌اند و انتخاب Lane بر اساس ترکیب RTT اندازه‌گیری‌شده و بار فعال انجام می‌شود. با این حال، عبور کاربر از مسیر اضافی Psiphon و موقعیت سرور خروجی ذاتاً تأخیر اضافه می‌کند؛ هیچ تغییر نرم‌افزاری نمی‌تواند RTT فیزیکی مسیر را تضمینی کم کند. برای پینگ کمتر، معمولاً باید خروجی نزدیک‌تر/کم‌تأخیرتر (مثلاً WARP یا مسیر مستقیم) انتخاب شود؛ مسیر Psiphon برای دور زدن محدودیت است، نه تضمین کمترین پینگ.
 
