@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1227,6 +1228,9 @@ func TestWarpStatusAndProtocolParsing(t *testing.T) {
 warp=on
 loc=DE`, want: true},
 		{body: `fl=01
+warp=plus
+loc=DE`, want: true},
+		{body: `fl=01
 warp=off
 loc=DE`, want: false},
 		{body: "warp=online", want: false},
@@ -1234,6 +1238,57 @@ loc=DE`, want: false},
 		if got := traceHasWarpOn(test.body); got != test.want {
 			t.Errorf("traceHasWarpOn(%q) = %v; want %v", test.body, got, test.want)
 		}
+	}
+}
+
+func TestVerifyWarpSystemEgressUsesCanonicalEndpointAndAcceptsWARPPlus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/cdn-cgi/trace" {
+			t.Errorf("trace path = %q; want /cdn-cgi/trace", r.URL.Path)
+		}
+		_, _ = io.WriteString(w, "fl=abc\nwarp=plus\ncolo=FRA\n")
+	}))
+	defer server.Close()
+	client := &http.Client{Timeout: time.Second}
+	if err := verifyWarpSystemEgressWithClient(client, []string{server.URL + "/cdn-cgi/trace"}); err != nil {
+		t.Fatalf("valid WARP+ system egress was rejected: %v", err)
+	}
+}
+
+func TestVerifyWarpSystemEgressDoesNotMaskWarpOff(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = io.WriteString(w, "fl=abc\nwarp=off\ncolo=FRA\n")
+	}))
+	defer server.Close()
+	client := &http.Client{Timeout: time.Second}
+	err := verifyWarpSystemEgressWithClient(client, []string{server.URL + "/cdn-cgi/trace", server.URL + "/fallback"})
+	if err == nil || !strings.Contains(err.Error(), "warp=off") {
+		t.Fatalf("explicit warp=off response was not rejected: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("checked %d endpoints after explicit warp=off; want exactly 1", calls)
+	}
+}
+
+func TestVerifyWarpSystemEgressFallsBackWhenCanonicalTraceIsUnavailable(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path == "/primary" {
+			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, "fl=abc\nwarp=on\ncolo=FRA\n")
+	}))
+	defer server.Close()
+	client := &http.Client{Timeout: time.Second}
+	if err := verifyWarpSystemEgressWithClient(client, []string{server.URL + "/primary", server.URL + "/fallback"}); err != nil {
+		t.Fatalf("secondary trace endpoint was not used: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("checked %d endpoints; want 2", calls)
 	}
 }
 

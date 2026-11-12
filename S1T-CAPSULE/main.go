@@ -3478,13 +3478,58 @@ func warpProxyAddressFromCLI() (string, bool, error) {
 	return warpProxyAddressFromSettings(string(settings))
 }
 
-func traceHasWarpOn(body string) bool {
+func warpTraceState(body string) string {
 	for _, line := range strings.Split(body, "\n") {
-		if strings.TrimSpace(line) == "warp=on" {
-			return true
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if ok && strings.EqualFold(strings.TrimSpace(key), "warp") {
+			return strings.ToLower(strings.TrimSpace(value))
 		}
 	}
-	return false
+	return ""
+}
+
+// Cloudflare's trace endpoint reports `warp=on` for standard WARP and
+// `warp=plus` for WARP+. Both prove that the request used the WARP network.
+func traceHasWarpOn(body string) bool {
+	switch warpTraceState(body) {
+	case "on", "plus":
+		return true
+	default:
+		return false
+	}
+}
+
+func verifyWarpSystemEgressWithClient(client *http.Client, endpoints []string) error {
+	var diagnostics []string
+	for _, endpoint := range endpoints {
+		resp, err := client.Get(endpoint)
+		if err != nil {
+			diagnostics = append(diagnostics, fmt.Sprintf("%s: %v", endpoint, err))
+			continue
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			diagnostics = append(diagnostics, fmt.Sprintf("%s: read response: %v", endpoint, readErr))
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			diagnostics = append(diagnostics, fmt.Sprintf("%s: HTTP %d", endpoint, resp.StatusCode))
+			continue
+		}
+		state := warpTraceState(string(body))
+		switch state {
+		case "on", "plus":
+			return nil
+		case "off":
+			// A successful trace explicitly showing `off` is evidence that this
+			// process is not using WARP. Do not let another endpoint hide a leak.
+			return fmt.Errorf("Cloudflare trace returned warp=off at %s; refusing direct-route fallback", endpoint)
+		default:
+			diagnostics = append(diagnostics, fmt.Sprintf("%s: HTTP 200 without a recognized warp=on/plus field", endpoint))
+		}
+	}
+	return fmt.Errorf("WARP system egress could not be verified using Cloudflare trace endpoints: %s", strings.Join(diagnostics, "; "))
 }
 
 func verifyWarpUnderlay(expectedProtocol string) error {
@@ -3534,25 +3579,23 @@ func verifyWarpUnderlay(expectedProtocol string) error {
 		return nil
 	}
 
-	// System-tunnel mode has no per-application proxy to test, so verify the
-	// host egress with Cloudflare's trace response before using the host route.
+	// System-tunnel mode has no per-application proxy to test. Cloudflare's
+	// documented Linux check is www.cloudflare.com/cdn-cgi/trace. Retain the
+	// prior API hostname as a secondary endpoint for installations where the
+	// canonical host is temporarily unreachable. A successful `warp=off`
+	// response is terminal: never mask evidence of a direct-route leak.
 	clientTransport := &http.Transport{
+		Proxy:                 nil,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: 7 * time.Second,
 	}
 	client := &http.Client{Timeout: 9 * time.Second, Transport: clientTransport}
 	defer client.CloseIdleConnections()
-	resp, err := client.Get("https://api.cloudflare.com/cdn-cgi/trace")
-	if err != nil {
-		return fmt.Errorf("WARP system egress check failed (endpoint=api.cloudflare.com): %w", err)
-	}
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
-	_ = resp.Body.Close()
-	if readErr != nil {
-		return fmt.Errorf("read WARP egress check: %w", readErr)
-	}
-	if resp.StatusCode != http.StatusOK || !traceHasWarpOn(string(body)) {
-		return fmt.Errorf("WARP reports connected, but the system egress check did not return HTTP 200 with exact warp=on (HTTP %d)", resp.StatusCode)
+	if err := verifyWarpSystemEgressWithClient(client, []string{
+		"https://www.cloudflare.com/cdn-cgi/trace",
+		"https://api.cloudflare.com/cdn-cgi/trace",
+	}); err != nil {
+		return fmt.Errorf("WARP system egress check failed: %w", err)
 	}
 	log.Printf("Cloudflare WARP system egress verified (protocol=%s); ShahTunnel did not modify system routing", expectedProtocol)
 	return nil
