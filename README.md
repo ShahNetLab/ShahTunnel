@@ -2,9 +2,9 @@
 
 <img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel Galactic emblem" width="100%">
 
-# ShahTunnel 3.0.1
+# ShahTunnel 3.0.2
 
-[![Version](https://img.shields.io/badge/version-3.0.1-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-3.0.2-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -34,7 +34,7 @@ Client → Hub public mapping → authenticated Agent lanes → Agent local targ
 Selected Xray inbound → loopback-only Xray sidecar → WARP SOCKS5 → Internet
 ```
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.1 Network Flow" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.2 Network Flow" width="100%"></p>
 
 ## Capabilities
 
@@ -74,6 +74,12 @@ Choose a mode during tunnel creation. The Hub and Agent must use compatible sett
 | `Cloudflare WARP / WireGuard` | Requires an already-connected system WARP tunnel. |
 | `Psiphon / SOCKS5` | ShahTunnel builds the official ConsoleClient on first use, creates a signed-server-list bootstrap config and an isolated loopback SOCKS5 endpoint. No manual binary or JSON is required. |
 | `Adaptive` | Uses the supported Direct/Psiphon egress failover path. |
+
+### Psiphon through the public TCP/443 Mapping
+
+When Psiphon cannot reach the default control port `9443`, the Agent automatically uses the Hub's public Mapping endpoint on `443` for the Psiphon egress only; the Direct path continues to use `9443`. The Hub distinguishes ShahTunnel control traffic from ordinary TLS with the dedicated `shah-tunnel-control/1` ALPN and forwards normal ClientHello bytes unchanged. This does not take over the public port, move a Mapping, or modify X-UI.
+
+Both Hub and Agent must run version `3.0.2`, and a public TCP/443 Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
 
 ### Automatic Psiphon setup
 

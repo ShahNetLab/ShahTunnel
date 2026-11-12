@@ -2,9 +2,9 @@
 
 <img src="docs/img/ShahTunnel-Network.png" alt="نشان کهکشانی شاه‌تونل" width="100%">
 
-# شاه‌تونل ۳٫۰٫۰
+# شاه‌تونل ۳٫۰٫۲
 
-[![نسخه](https://img.shields.io/badge/version-3.0.1-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![نسخه](https://img.shields.io/badge/version-3.0.2-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![پلتفرم](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![ساخت با Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -38,7 +38,7 @@
 Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCKS5 وایرپ → اینترنت
 ```
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه ShahTunnel 3.0.1" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه ShahTunnel 3.0.2" width="100%"></p>
 
 <a id="capabilities"></a>
 
@@ -80,6 +80,12 @@ Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCK
 | `WARP / WireGuard` | تونل سیستمی WARP باید از قبل متصل باشد. |
 | `Psiphon / SOCKS5` | ShahTunnel در اولین استفاده ConsoleClient رسمی را می‌سازد، تنظیمات امضاشدهٔ دریافت فهرست سرورها و SOCKS5 اختصاصی را خودکار آماده می‌کند؛ نیازی به فایل باینری یا JSON دستی نیست. |
 | `Adaptive` | مسیر Failover خروجی Direct/Psiphon. |
+
+### اتصال Psiphon از پورت عمومی ۴۴۳
+
+اگر Psiphon به پورت کنترل پیش‌فرض `9443` اجازهٔ اتصال ندهد، Agent به‌صورت خودکار مسیر Psiphon را از نشانی Mapping عمومی Hub روی `443` عبور می‌دهد؛ مسیر Direct همچنان از `9443` استفاده می‌کند. Hub اتصال ShahTunnel را با ALPN اختصاصی `shah-tunnel-control/1` از ترافیک عادی TLS تشخیص می‌دهد و بایت‌های ClientHello کاربران عادی را بدون تغییر به Agent می‌فرستد. بنابراین نیازی به اشغال مجدد پورت ۴۴۳، تغییر X-UI، یا جابه‌جایی Mapping نیست.
+
+این قابلیت به نسخهٔ `3.0.2` روی هر دو سمت نیاز دارد و Mapping عمومی TCP/443 باید روی Hub فعال و از مسیر Psiphon قابل دسترسی باشد. در ویزارد Agent می‌توان نشانی جایگزین را تغییر داد؛ برای پروفایل‌های قدیمی که HubAddr آن‌ها روی `9443` است، مقدار `PsiphonHubAddr` هنگام بارگذاری به‌طور خودکار به همان IP روی `443` تبدیل می‌شود.
 
 ### راه‌اندازی خودکار Psiphon
 
