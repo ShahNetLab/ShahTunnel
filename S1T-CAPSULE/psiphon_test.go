@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -313,5 +314,18 @@ func TestValidatePsiphonRejectsUnauthenticatedServerList(t *testing.T) {
 	}
 	if err := validatePsiphonClientConfig(path, "127.0.0.1:24568"); err == nil {
 		t.Fatal("unauthenticated Psiphon server list must be rejected")
+	}
+}
+
+func TestPsiphonConsoleClientArgsUseDefaultLoopbackBinding(t *testing.T) {
+	args := psiphonConsoleClientArgs("/etc/ravanreverse/psiphon/s.json", "/var/lib/shah-tunnel/psiphon/s")
+	want := []string{"-config", "/etc/ravanreverse/psiphon/s.json", "-dataRootDirectory", "/var/lib/shah-tunnel/psiphon/s"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("Psiphon ConsoleClient args = %#v; want %#v", args, want)
+	}
+	for _, arg := range args {
+		if arg == "-listenInterface" {
+			t.Fatal("Psiphon must use its built-in 127.0.0.1 default instead of enumerating interfaces")
+		}
 	}
 }

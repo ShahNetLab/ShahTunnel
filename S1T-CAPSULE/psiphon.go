@@ -86,6 +86,14 @@ type psiphonClientConfig struct {
 	ConnectionWorkerPoolMaxSize int    `json:"ConnectionWorkerPoolMaxSize"`
 }
 
+// psiphonConsoleClientArgs deliberately leaves ListenInterface unset.
+// Psiphon then binds its local SOCKS proxy to 127.0.0.1 directly. Passing
+// "lo" makes Psiphon enumerate OS interfaces, which can fail inside the
+// hardened systemd sandbox where AF_NETLINK is not permitted.
+func psiphonConsoleClientArgs(configPath, dataDir string) []string {
+	return []string{"-config", configPath, "-dataRootDirectory", dataDir}
+}
+
 func newPsiphonClientConfig(port int) psiphonClientConfig {
 	return psiphonClientConfig{
 		ClientVersion:                      "1",

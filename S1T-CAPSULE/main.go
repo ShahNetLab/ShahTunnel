@@ -3227,7 +3227,7 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 		return nil, fmt.Errorf("secure Psiphon data directory: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, binary, "-config", configPath, "-dataRootDirectory", dataDir, "-listenInterface", "lo")
+	cmd := exec.CommandContext(ctx, binary, psiphonConsoleClientArgs(configPath, dataDir)...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
