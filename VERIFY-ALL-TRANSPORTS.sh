@@ -85,9 +85,12 @@ grep -Fq 'func warpProxyAddressFromSettings(settings string)' S1T-CAPSULE/main.g
 grep -Fq 'return dialSOCKS5Context(ctx, proxyAddress, address)' S1T-CAPSULE/main.go || fail "WARP Local Proxy SOCKS5 dialer is missing."
 grep -Fq 'TestWarpProxyAddressFromSettings' S1T-CAPSULE/main_test.go || fail "WARP Local Proxy parsing tests are missing."
 grep -Fq 'TestDialAgentUnderlayUsesDetectedWarpLocalProxy' S1T-CAPSULE/main_test.go || fail "WARP Local Proxy Agent integration coverage is missing."
-grep -Fq 'TestAdaptiveUnderlayCandidatesDetectWARPAndFailOver' S1T-CAPSULE/main_test.go || fail "WARP failover coverage is missing."
+grep -Fq 'TestAdaptiveUnderlayCandidatesDetectMASQUEAndFailOver' S1T-CAPSULE/main_test.go || fail "WARP failover coverage is missing."
 grep -Fq 'TestOptionNineSwitchesFromFailedDirectPathToPsiphonSOCKS5' S1T-CAPSULE/main_test.go || fail "Option 9 SOCKS5 failover coverage is missing."
-grep -Fq 'func applyXrayWarpEgressToSelectedTunnel() error' S1T-CAPSULE/xray_warp.go || fail "Per-tunnel Xray WARP isolation is missing."
+grep -Fq 'func verifyWarpPerTunnelPrerequisites() (string, error)' S1T-CAPSULE/xray_warp.go || fail "Automatic per-tunnel WARP prerequisites are missing."
+grep -Fq 'TestWarpProxyForPerTunnelEgressRejectsSystemTunnelMode' S1T-CAPSULE/main_test.go || fail "System Tunnel rejection for per-profile WARP is not covered."
+grep -Fq 'autoApplyXrayWarpForNewAgent()' S1T-CAPSULE/main.go || fail "New-Agent setup does not invoke automatic WARP user egress."
+if grep -Fq 'menuItem("9", "🌐 WARP egress"' S1T-CAPSULE/main.go; then fail "Separate manager WARP egress menu item must not be present."; fi
 grep -Fq 'TestBuildXrayWarpConfigIsolatesOnlyClonedInbound' S1T-CAPSULE/main_test.go || fail "Per-inbound Xray WARP isolation coverage is missing."
 grep -Fq 'func buildXrayPsiphonConfig(' S1T-CAPSULE/xray_psiphon.go || fail "Per-profile Xray Psiphon egress builder is missing."
 grep -Fq 'func autoApplyXrayPsiphonForNewAgent() error' S1T-CAPSULE/xray_psiphon.go || fail "Automatic Psiphon user-egress setup is missing."
@@ -96,7 +99,7 @@ if grep -Fq 'menuItem("10", "🛡️ Psiphon user egress"' S1T-CAPSULE/main.go; 
 grep -Fq 'TestBuildXrayPsiphonConfigIsolatesTCPAndBlocksUDP' S1T-CAPSULE/main_test.go || fail "Psiphon TCP/DNS isolation and UDP fail-closed coverage is missing."
 grep -Fq 'TestXrayPsiphonManagedPathsAndUnitAreRestricted' S1T-CAPSULE/main_test.go || fail "Psiphon sidecar service/path safety coverage is missing."
 grep -Fq 'TestHubBalancesMeasuredRTTAndLoad' S1T-CAPSULE/main_test.go || fail "RTT/load lane selection coverage is missing."
-pass "Shell syntax, docs layout, Psiphon bootstrap/runtime, public-Mapping ALPN multiplex, WARP Local Proxy, and failover coverage"
+pass "Shell syntax, docs layout, Psiphon bootstrap/runtime, public-Mapping ALPN multiplex, MASQUE Local Proxy, and failover coverage"
 
 printf '\n== 4/7: Transport loopback suite ==\n'
 "$GO_BIN" test -count=20 ./S1T-CAPSULE || fail "Automated transport tests failed."
@@ -116,7 +119,7 @@ pass "go vet"
 
 printf '\n== 7/7: Linux build validation (temporary files only) ==\n'
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-amd64" ./S1T-CAPSULE
-[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 3.0.8 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 3.0.10 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-arm64" ./S1T-CAPSULE
 sha256sum "$BUILD_TMP/shah-tunnel-linux-amd64" "$BUILD_TMP/shah-tunnel-linux-arm64" > "$BUILD_TMP/SHA256SUMS"
 pass "Linux amd64 and arm64 binaries built and checksum-checked in a temporary directory (nothing added to the repository)"

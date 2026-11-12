@@ -2,9 +2,9 @@
 
 <img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel Galactic emblem" width="100%">
 
-# ShahTunnel 3.0.8
+# ShahTunnel 3.0.10
 
-[![Version](https://img.shields.io/badge/version-3.0.8-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-3.0.10-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -34,7 +34,7 @@ Client → Hub public mapping → authenticated Agent lanes → Agent local targ
 Selected Xray inbound → loopback-only Xray sidecar → WARP or Psiphon SOCKS5 → Internet
 ```
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.8 Network Flow" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.10 Network Flow" width="100%"></p>
 
 ## Capabilities
 
@@ -45,7 +45,7 @@ Selected Xray inbound → loopback-only Xray sidecar → WARP or Psiphon SOCKS5 
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Adaptive transport lanes** | Four implemented transports can be selected individually or used by adaptive failover modes. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Lane-level recovery** | Each Agent lane reconnects independently; one failed lane does not require dropping every healthy lane. New Agent profiles use 12 independent lanes by default (maximum 16). |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Multiple port mappings** | Mapping IDs pair Hub public listeners with Agent-side local targets. IDs must match on both ends. |
-| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **External Agent egress** | Agent traffic can use Direct, Cloudflare WARP/MASQUE, WARP/WireGuard or Psiphon/SOCKS5. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **External Agent egress** | Agent traffic can use Direct, Cloudflare WARP/MASQUE or Psiphon/SOCKS5. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Per-profile Xray WARP** | A selected Xray inbound is cloned to a loopback-only sidecar and routed through the local WARP SOCKS5 proxy. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Automatic WARP DNS path** | The isolated sidecar handles client DNS and routes its DoH resolver traffic through the same WARP egress. |
 | **Per-profile Psiphon user egress** | Selected Agent Xray inbounds are cloned into an isolated sidecar; TCP and DNS use Psiphon SOCKS5, while UDP is blocked to prevent direct leakage. |
@@ -70,18 +70,17 @@ Choose a mode during tunnel creation. The Hub and Agent must use compatible sett
 | `5` | HTTP CONNECT fallback | Tries HTTP/2 CONNECT, then HTTP/1.1 CONNECT. |
 | `6` | Automatic fallback | Tries TCP/TLS, then WebSocket/TLS. |
 | `7` | Full Adaptive Failover | Uses all four implemented transports; each lane remembers its last successful transport. |
-| `8` | External egress | On an Agent, select Cloudflare MASQUE, WARP/WireGuard or Psiphon/SOCKS5. |
-| `9` | All-protocol adaptive | On an Agent, combines all four transports with Direct/Psiphon egress failover. |
+| `8` | External egress | On an Agent, select Cloudflare MASQUE or Psiphon/SOCKS5. |
+| `9` | All-protocol adaptive | On an Agent, combines all four transports with active MASQUE, configured Psiphon and Direct egress failover. |
 
 ### Agent egress providers
 
 | Provider | Requirement / path |
 |---|---|
 | `Direct` | Agent connects to the Hub through its normal network route. |
-| `Cloudflare WARP / MASQUE` | Requires an already-connected WARP MASQUE path or the Cloudflare Local Proxy. |
-| `Cloudflare WARP / WireGuard` | Requires an already-connected system WARP tunnel. |
+| `Cloudflare WARP / MASQUE` | Requires WARP Connected over MASQUE and a reachable loopback WarpProxy / Local Proxy. System Tunnel mode is rejected for per-profile user egress. |
 | `Psiphon / SOCKS5` | ShahTunnel builds the official ConsoleClient on first use, creates a signed-server-list bootstrap config and an isolated loopback SOCKS5 endpoint. No manual binary or JSON is required. |
-| `Adaptive` | Uses the supported Direct/Psiphon egress failover path. |
+| `Adaptive` | Uses an already-active MASQUE path, configured Psiphon, and Direct failover; unsupported WARP protocols are not selected. |
 
 ### Psiphon through the public TCP/443 Mapping
 
@@ -104,16 +103,16 @@ For an existing Agent profile whose earlier Psiphon bootstrap did not connect, r
 
 No TUN device, default route, SSH service, or X-UI service is changed. The first Psiphon setup downloads and builds the official client; it requires access to GitHub source hosting and the Go toolchain distribution. For a newly created Agent that selects Psiphon, both its outer TCP lanes to the Hub and its mapped end-user Xray TCP/DNS traffic use the profile's Psiphon SOCKS5 path; UDP is blocked on the user sidecar to prevent direct leakage.
 
-> **Two different option 9 entries:** option `9` in the *creation wizard* means All-protocol adaptive. Option `9` in the *main manager menu* enables per-profile Xray WARP egress for a selected Agent.
+> The creation wizard's option `9` means **All-protocol adaptive**. There is no WARP egress action in the main manager menu anymore: WARP is applied automatically while creating an Agent profile when selected as its external egress.
 
-## Per-tunnel WARP egress for Xray
+## Automatic per-tunnel WARP egress for Xray
 
-- **New Agent profiles:** when an Agent is created with MASQUE and the Cloudflare Local Proxy is detected, ShahTunnel prepares the dedicated Xray sidecar and WARP-routed DNS before starting that Agent.
-- **Existing Agent profiles:** select the Agent in the manager and use **`[9] WARP egress`**.
-- **Isolation:** only the selected profile's cloned Xray inbound uses the local WARP SOCKS5 proxy. Other profiles and inbounds remain Direct.
-- **Host safety:** the X-UI-managed Xray config/service, SSH and the server default route are not modified or restarted by this per-profile integration.
+- **New Agent profiles:** choose Cloudflare WARP over MASQUE in the Agent creation wizard. ShahTunnel verifies that WARP is connected over MASQUE and that its loopback **WarpProxy / Local Proxy** is available, then prepares the dedicated Xray sidecar and WARP-routed DNS before starting the Agent.
+- **Isolation:** only the selected profile's cloned Xray inbounds use that profile's local WARP SOCKS5 proxy. Other profiles and inbounds remain unchanged.
+- **Host safety:** the X-UI-managed Xray config/service, SSH and server routes are not modified or restarted by this per-profile integration.
+- **Existing Agent profiles:** the automatic integration is performed at creation time. Recreate an Agent profile to add this behavior; there is no separate manager-menu action.
 
-The per-tunnel Xray route requires the Cloudflare **WarpProxy / Local Proxy** SOCKS5 listener. It is not system-wide WARP routing. If the Local Proxy is unavailable, the isolated route is not silently replaced with a host-wide route; the Agent remains on its configured egress until the requirement is met.
+Per-tunnel WARP requires Cloudflare **WarpProxy / Local Proxy** in MASQUE mode. **System Tunnel mode is deliberately rejected** for this per-profile feature because its routing is host-wide and cannot guarantee isolation to one Agent. If Local Proxy is unavailable, profile creation stops with an explanatory error; ShahTunnel does not silently fall back to Direct or modify host routes.
 
 ## Day to day
 
@@ -129,7 +128,6 @@ The per-tunnel Xray route requires the Cloudflare **WarpProxy / Local Proxy** SO
 | `6` | Configure scheduled restarts for active tunnels. |
 | `7` | Delete one selected tunnel profile. |
 | `8` | Complete uninstall. |
-| `9` | Enable isolated WARP egress for a selected Agent. |
 
 Useful commands:
 
@@ -193,7 +191,7 @@ sudo shah-tunnel menu
 | Agent does not connect | Confirm Hub address, token, certificate fingerprint, matching transport mode and firewall ports. |
 | HTTP/2 or HTTP/1.1 CONNECT fails | Check the additional Hub TCP port (`control + 1` or `control + 2`) selected for that mode. |
 | A mapping does not forward | Confirm the mapping ID matches on Hub and Agent and the Agent-side target is reachable locally. |
-| WARP egress does not activate | Confirm the selected Agent uses MASQUE and Cloudflare Local Proxy is active before enabling manager option `9`. |
+| WARP egress does not activate | Before creating the Agent, confirm WARP is Connected over MASQUE and `warp-cli settings` shows a reachable `WarpProxy` Local Proxy listener. System Tunnel mode is not accepted for per-profile isolation. |
 | Google/YouTube DNS fails through per-profile WARP | Check the dedicated `shah-tunnel-xray-warp-<profile>.service` status and its recent logs; do not change host routes. |
 
 ---

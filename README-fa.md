@@ -2,9 +2,9 @@
 
 <img src="docs/img/ShahTunnel-Network.png" alt="نشان کهکشانی شاه‌تونل" width="100%">
 
-# شاه‌تونل ۳٫۰٫۸
+# شاه‌تونل ۳٫۰٫۱۰
 
-[![نسخه](https://img.shields.io/badge/version-3.0.8-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![نسخه](https://img.shields.io/badge/version-3.0.10-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![پلتفرم](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![ساخت با Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -38,7 +38,7 @@
 Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCKS5 خروجی WARP یا Psiphon → اینترنت
 ```
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه ShahTunnel 3.0.8" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه ShahTunnel 3.0.10" width="100%"></p>
 
 <a id="capabilities"></a>
 
@@ -51,12 +51,12 @@ Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCK
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Laneهای انتقال تطبیقی** | چهار انتقال پیاده‌سازی‌شده به‌صورت جدا یا در حالت‌های Failover قابل استفاده‌اند. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **بازیابی مستقل Lane** | هر Lane جداگانه دوباره متصل می‌شود؛ خرابی یک Lane الزاماً Laneهای سالم را قطع نمی‌کند. پروفایل Agent جدید به‌صورت پیش‌فرض ۱۲ Lane مستقل دارد (حداکثر ۱۶). |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **چند Mapping پورت** | شناسه هر Mapping، Listener عمومی Hub را به مقصد محلی Agent متصل می‌کند و باید در دو سمت یکسان باشد. |
-| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **خروجی مستقل Agent** | خروجی Agent می‌تواند Direct، ‏WARP/MASQUE، ‏WARP/WireGuard یا Psiphon/SOCKS5 باشد. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **خروجی مستقل Agent** | خروجی Agent می‌تواند Direct، ‏WARP/MASQUE یا Psiphon/SOCKS5 باشد. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **WARP اختصاصی Xray** | Inbound انتخاب‌شده به Sidecar محدود به Loopback کپی و از SOCKS5 محلی WARP عبور داده می‌شود. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **خروجی کاربر از Psiphon** | Inboundهای همان Agent در Sidecar مستقل Xray کپی می‌شوند؛ TCP و DNS از SOCKS5 سایفون می‌روند و UDP برای جلوگیری از نشت مستقیم مسدود می‌شود. |
 
 
-### خروجی خودکار کاربران از Psiphon (نسخه ۳٫۰٫۸)
+### خروجی خودکار کاربران از Psiphon (نسخه ۳٫۰٫۱۰)
 
 برای Agent جدیدی که هنگام ساخت، خروجی Psiphon را انتخاب می‌کند، Inboundهای Xray متناظر با Mappingها به‌صورت خودکار و پیش از شروع Agent در Sidecar مجزا و فقط روی `127.0.0.1` کپی می‌شوند. ترافیک TCP و DNS از SOCKS5 همان پروفایل عبور می‌کند. چون SOCKS5 محلی Psiphon یک پراکسی port-forward برای جریان TCP است و UDP را حمل نمی‌کند، UDP و هر نوع شبکهٔ ناشناخته در Sidecar به Blackhole می‌روند؛ بنابراین از خروج مستقیم UDP جلوگیری می‌شود، اما برنامه‌های UDP/QUIC و ICMP ping از این مسیر پشتیبانی نمی‌شوند. گزینهٔ جداگانه‌ای به منوی مدیریت اضافه نمی‌شود. پروفایل‌های قبلی دست‌نخورده باقی می‌مانند و این راه‌اندازی خودکار مخصوص Agentهای جدید است. این عملیات X-UI، کانفیگ اصلی Xray، سایر Inboundها، SSH و Routeهای میزبان را تغییر نمی‌دهد.
 
@@ -77,18 +77,17 @@ Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCK
 | `5` | HTTP CONNECT fallback | ابتدا HTTP/2 و در صورت نیاز HTTP/1.1. |
 | `6` | Automatic fallback | ابتدا TCP/TLS و سپس WebSocket/TLS. |
 | `7` | Full Adaptive Failover | هر چهار انتقال؛ هر Lane آخرین انتقال موفق خود را ترجیح می‌دهد. |
-| `8` | External egress | در Agent انتخاب Cloudflare MASQUE، ‏WARP/WireGuard یا Psiphon/SOCKS5. |
-| `9` | All-protocol adaptive | در Agent ترکیب هر چهار انتقال با Failover خروجی Direct/Psiphon. |
+| `8` | External egress | در Agent انتخاب Cloudflare MASQUE یا Psiphon/SOCKS5. |
+| `9` | All-protocol adaptive | در Agent ترکیب هر چهار انتقال با Failover خروجی MASQUE فعال، Psiphon پیکربندی‌شده و Direct. |
 
 ### روش‌های خروجی Agent
 
 | روش | پیش‌نیاز / مسیر |
 |---|---|
 | `Direct` | اتصال Agent به Hub از مسیر عادی سرور. |
-| `WARP / MASQUE` | تونل WARP با MASQUE یا Cloudflare Local Proxy باید از قبل فعال باشد. |
-| `WARP / WireGuard` | تونل سیستمی WARP باید از قبل متصل باشد؛ اعتبارسنجی خروجی، `warp=on` و `warp=plus` را می‌پذیرد و از Trace رسمی Cloudflare استفاده می‌کند. |
+| `WARP / MASQUE` | WARP باید با MASQUE متصل باشد و Listener محلی WarpProxy / Local Proxy داشته باشد؛ حالت System Tunnel برای جداسازی خروجی یک پروفایل پذیرفته نمی‌شود. |
 | `Psiphon / SOCKS5` | ShahTunnel در اولین استفاده ConsoleClient رسمی را می‌سازد، تنظیمات امضاشدهٔ دریافت فهرست سرورها و SOCKS5 اختصاصی را خودکار آماده می‌کند؛ نیازی به فایل باینری یا JSON دستی نیست. |
-| `Adaptive` | مسیر Failover خروجی Direct/Psiphon. |
+| `Adaptive` | از MASQUE فعال، Psiphon پیکربندی‌شده و مسیر جایگزین Direct استفاده می‌کند؛ پروتکل‌های پشتیبانی‌نشدهٔ WARP انتخاب نمی‌شوند. |
 
 ### اتصال Psiphon از پورت عمومی ۴۴۳
 
@@ -111,16 +110,17 @@ Hub باید نسخهٔ `3.0.3` یا جدیدتر با پشتیبانی ALPN ر�
 
 نیازی به تهیهٔ دستی باینری یا JSON نیست. راه‌اندازی اولیه برای دریافت سورس رسمی و ابزار Go به دسترسی اینترنت نیاز دارد. هیچ TUN، مسیر پیش‌فرض سرور، SSH یا سرویس X-UI تغییر نمی‌کند. خروجی Psiphon در این پیاده‌سازی برای Laneهای TCP ارتباط Agent با Hub است و به معنی خروجی اینترنت کاربران Xray نیست.
 
-> **دو گزینه ۹ متفاوت هستند:** گزینه `9` در ویزارد ساخت تونل یعنی All-protocol adaptive؛ گزینه `9` در منوی اصلی مدیریت، خروجی WARP مستقل Xray را برای Agent انتخاب‌شده فعال می‌کند.
+> گزینه `9` فقط در ویزارد ساخت تونل وجود دارد و معنی آن **All-protocol adaptive** است. در منوی اصلی مدیریت دیگر عملیات جداگانهٔ WARP وجود ندارد؛ خروجی WARP هنگام ساخت Agent و انتخاب آن در بخش External Egress به‌صورت خودکار اعمال می‌شود.
 
-## خروجی WARP مستقل برای هر تونل Xray
+## اعمال خودکار خروجی WARP هنگام ساخت Agent
 
-- **Agent جدید:** هنگام ساخت Agent با MASQUE، اگر Cloudflare Local Proxy شناسایی شود، ShahTunnel پیش از شروع Agent، Sidecar مستقل Xray و مسیر DNS مبتنی بر WARP را آماده می‌کند.
-- **Agent موجود:** پروفایل Agent را در منوی مدیریت انتخاب کنید و گزینه **`[9] WARP egress`** را بزنید.
-- **جداسازی:** فقط Inbound کپی‌شده از پروفایل انتخاب‌شده از SOCKS5 محلی WARP عبور می‌کند؛ سایر Inboundها و پروفایل‌ها Direct می‌مانند.
-- **امنیت مسیر میزبان:** تنظیمات و سرویس اصلی Xray تحت مدیریت X-UI، سرویس SSH و Default Route سرور توسط این اتصال مستقل تغییر یا Restart نمی‌شوند.
+- هنگام ساخت Agent، گزینهٔ Cloudflare WARP over MASQUE را انتخاب کنید.
+- ShahTunnel پیش از ذخیره و شروع سرویس بررسی می‌کند که WARP با پروتکل MASQUE متصل است و Listener محلی **WarpProxy / Local Proxy** در دسترس است.
+- سپس Sidecar مستقل Xray و مسیر DNS مبتنی بر WARP را فقط برای Mappingهای همان پروفایل آماده می‌کند.
+- سایر پروفایل‌ها، Inboundهای دیگر، تنظیمات X-UI، SSH و مسیرهای میزبان تغییر نمی‌کنند.
+- برای Agentهای موجود، این رفتار در زمان ساخت اعمال می‌شود؛ برای افزودن آن به یک Agent قدیمی، پروفایل Agent را دوباره با خروجی WARP بسازید. عملیات جداگانه‌ای در منوی مدیریت وجود ندارد.
 
-این قابلیت به Listener محلی **Cloudflare WarpProxy / Local Proxy** از نوع SOCKS5 نیاز دارد. این قابلیت WARP سراسری سرور نیست. اگر Local Proxy در دسترس نباشد، مسیر اختصاصی بی‌صدا با Route سراسری جایگزین نمی‌شود.
+**نکته مهم:** قابلیت خروجی اختصاصی هر پروفایل به **WarpProxy / Local Proxy در حالت MASQUE** نیاز دارد. حالت **System Tunnel** به‌دلیل اعمال مسیر در سطح کل سرور برای جداسازی یک پروفایل پذیرفته نمی‌شود. اگر Local Proxy فعال یا قابل دسترسی نباشد، ویزارد با پیام خطا متوقف می‌شود؛ ShahTunnel مسیر را بی‌صدا به Direct تغییر نمی‌دهد و Route میزبان را هم دست‌کاری نمی‌کند.
 
 ## مدیریت روزمره
 
@@ -136,7 +136,6 @@ Hub باید نسخهٔ `3.0.3` یا جدیدتر با پشتیبانی ALPN ر�
 | `6` | تنظیم Restart زمان‌بندی‌شده تونل‌های فعال. |
 | `7` | حذف فقط یک پروفایل انتخاب‌شده. |
 | `8` | حذف کامل ShahTunnel. |
-| `9` | فعال‌سازی WARP مستقل برای Agent انتخاب‌شده. |
 
 <div dir="rtl">
 
@@ -216,7 +215,7 @@ sudo shah-tunnel menu
 | Agent متصل نمی‌شود | آدرس Hub، توکن، اثر انگشت گواهی، سازگاری حالت انتقال و پورت‌های فایروال را بررسی کنید. |
 | HTTP/2 یا HTTP/1.1 CONNECT کار نمی‌کند | پورت TCP اضافه Hub را بررسی کنید (`کنترل + ۱` یا `کنترل + ۲`). |
 | Mapping ترافیک را عبور نمی‌دهد | شناسه Mapping در Hub و Agent و دسترسی به مقصد محلی Agent را بررسی کنید. |
-| WARP مستقل فعال نمی‌شود | مطمئن شوید Agent روی MASQUE است و Cloudflare Local Proxy پیش از گزینه `9` فعال است. |
+| خروجی WARP فعال نمی‌شود | قبل از ساخت Agent بررسی کنید WARP با MASQUE متصل است و `warp-cli settings` یک Listener محلی `WarpProxy` قابل دسترسی نشان می‌دهد. حالت System Tunnel برای جداسازی هر پروفایل پذیرفته نیست. |
 | DNS گوگل/یوتیوب روی WARP مستقل مشکل دارد | وضعیت سرویس `shah-tunnel-xray-warp-<profile>.service` و لاگ‌های همان Sidecar را ببینید؛ مسیرهای میزبان را تغییر ندهید. |
 
 ---
