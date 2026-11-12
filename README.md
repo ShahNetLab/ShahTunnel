@@ -72,8 +72,20 @@ Choose a mode during tunnel creation. The Hub and Agent must use compatible sett
 | `Direct` | Agent connects to the Hub through its normal network route. |
 | `Cloudflare WARP / MASQUE` | Requires an already-connected WARP MASQUE path or the Cloudflare Local Proxy. |
 | `Cloudflare WARP / WireGuard` | Requires an already-connected system WARP tunnel. |
-| `Psiphon / SOCKS5` | Requires the official Psiphon ConsoleClient config and a loopback SOCKS5 listener. |
+| `Psiphon / SOCKS5` | ShahTunnel builds the official ConsoleClient on first use, creates a signed-server-list bootstrap config and an isolated loopback SOCKS5 endpoint. No manual binary or JSON is required. |
 | `Adaptive` | Uses the supported Direct/Psiphon egress failover path. |
+
+### Automatic Psiphon setup
+
+When an Agent selects `Psiphon / SOCKS5` (or the adaptive egress option), ShahTunnel automatically:
+
+- builds the official Psiphon ConsoleClient from a pinned upstream source revision for the host architecture (`amd64` or `arm64`);
+- verifies the resulting executable architecture and version before installation;
+- creates a private per-Agent JSON configuration using Psiphon's signed remote server-list bootstrap;
+- assigns a unique `127.0.0.1` SOCKS5 port and private data directory;
+- starts ConsoleClient in local-proxy mode and waits for an actual `Tunnels`-connected notice before using the route.
+
+No TUN device, default route, SSH service, or X-UI service is changed. The first Psiphon setup downloads and builds the official client; it requires access to GitHub source hosting and the Go toolchain distribution. Psiphon egress applies to the Agent's outer TCP lanes to the Hub, not to end-user Xray traffic.
 
 > **Two different option 9 entries:** option `9` in the *creation wizard* means All-protocol adaptive. Option `9` in the *main manager menu* enables per-profile Xray WARP egress for a selected Agent.
 

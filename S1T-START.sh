@@ -500,8 +500,9 @@ build_from_official_go_toolchain() {
   if [[ -n "$script_dir" && -s "$script_dir/go.mod" && -s "$script_dir/S1T-CAPSULE/main.go" ]]; then
     echo "Building from the local ShahTunnel source beside S1T-START.sh..." >&2
     if ! cp -a "$script_dir/go.mod" "$source_dir/" ||
-       ! cp -a "$script_dir/S1T-CAPSULE" "$source_dir/"; then
-      echo "Could not copy the local ShahTunnel source tree." >&2
+       ! cp -a "$script_dir/S1T-CAPSULE" "$source_dir/" ||
+       ! cp -a "$script_dir/install-psiphon.sh" "$source_dir/"; then
+      echo "Could not copy the local ShahTunnel source tree or Psiphon auto-installer." >&2
       return 1
     fi
     if [[ -f "$script_dir/go.sum" ]]; then
@@ -523,6 +524,11 @@ build_from_official_go_toolchain() {
     || { echo "The downloaded repository does not contain the expected ShahTunnel source files." >&2; return 1; }
   if ! grep -Fq "module github.com/${OWNER}/${REPO}" "$source_dir/go.mod"; then
     echo "The source module path does not match github.com/${OWNER}/${REPO}; refusing to build." >&2
+    return 1
+  fi
+  [[ -s "$source_dir/install-psiphon.sh" ]] || { echo "Pinned Psiphon auto-installer is missing from the ShahTunnel source." >&2; return 1; }
+  if ! bash -n "$source_dir/install-psiphon.sh"; then
+    echo "Psiphon auto-installer has invalid shell syntax; refusing to continue." >&2
     return 1
   fi
   local source_fingerprint build_cache_dir cached_binary
@@ -566,6 +572,10 @@ install -d -o root -g root -m 0700 /etc/ravanreverse
 install -d -o root -g root -m 0700 /etc/ravanreverse/tunnels
 install -d -o root -g root -m 0755 /usr/local/bin
 install -d -o root -g root -m 0755 "$STATE_DIR"
+# Provision the pinned Psiphon builder now. The ConsoleClient binary itself is
+# built on-demand only when an Agent selects Psiphon; no TUN/routes are created.
+install -o root -g root -m 0750 "$TMP/source/install-psiphon.sh" "$STATE_DIR/install-psiphon.sh.new"
+mv -f "$STATE_DIR/install-psiphon.sh.new" "$STATE_DIR/install-psiphon.sh"
 BIN="/usr/local/bin/ravanreverse"
 if [[ -x "$BIN" ]]; then
   BACKUP="${BIN}.bak-shah-tunnel-$(date +%Y%m%d-%H%M%S)"
