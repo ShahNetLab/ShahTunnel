@@ -86,7 +86,7 @@ Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCK
 |---|---|
 | `Direct` | اتصال Agent به Hub از مسیر عادی سرور. |
 | `WARP / MASQUE` | تونل WARP با MASQUE یا Cloudflare Local Proxy باید از قبل فعال باشد. |
-| `WARP / WireGuard` | تونل سیستمی WARP باید از قبل متصل باشد. |
+| `WARP / WireGuard` | تونل سیستمی WARP باید از قبل متصل باشد؛ اعتبارسنجی خروجی، `warp=on` و `warp=plus` را می‌پذیرد و از Trace رسمی Cloudflare استفاده می‌کند. |
 | `Psiphon / SOCKS5` | ShahTunnel در اولین استفاده ConsoleClient رسمی را می‌سازد، تنظیمات امضاشدهٔ دریافت فهرست سرورها و SOCKS5 اختصاصی را خودکار آماده می‌کند؛ نیازی به فایل باینری یا JSON دستی نیست. |
 | `Adaptive` | مسیر Failover خروجی Direct/Psiphon. |
 
