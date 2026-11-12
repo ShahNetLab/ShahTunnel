@@ -81,9 +81,12 @@ When an Agent selects `Psiphon / SOCKS5` (or the adaptive egress option), ShahTu
 
 - builds the official Psiphon ConsoleClient from a pinned upstream source revision for the host architecture (`amd64` or `arm64`);
 - verifies the resulting executable architecture and version before installation;
-- creates a private per-Agent JSON configuration using Psiphon's signed remote server-list bootstrap;
+- creates a private per-Agent JSON configuration with the public client identity, authenticated server-list mirrors, server-entry signature key, and exchange-obfuscation key;
 - assigns a unique `127.0.0.1` SOCKS5 port and private data directory;
-- starts ConsoleClient in local-proxy mode and waits for an actual `Tunnels`-connected notice before using the route.
+- grants that Agent service write access only to its own Psiphon data directory;
+- starts ConsoleClient in local-proxy mode and reports setup as successful only after Psiphon has a real tunnel and at least one Agent lane reaches the Hub.
+
+For an existing Agent profile whose earlier Psiphon bootstrap did not connect, run `sudo bash repair-psiphon-profile.sh PROFILE` from the extracted project directory. The helper backs up and repairs only that profile's Psiphon JSON and restarts only its matching `ravanreverse@PROFILE.service` unit.
 
 No TUN device, default route, SSH service, or X-UI service is changed. The first Psiphon setup downloads and builds the official client; it requires access to GitHub source hosting and the Go toolchain distribution. Psiphon egress applies to the Agent's outer TCP lanes to the Hub, not to end-user Xray traffic.
 

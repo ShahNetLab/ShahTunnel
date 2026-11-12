@@ -27,3 +27,8 @@
 
 نصب سریع از GitHub (Linux amd64/arm64 با systemd):
 bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
+
+
+## اصلاح اتصال Psiphon در پروفایل موجود
+
+اگر ConsoleClient نصب شده اما پیش از ایجاد تونل خارج می‌شود، فایل `repair-psiphon-profile.sh` را از پوشه پروژه اجرا کنید: `sudo bash repair-psiphon-profile.sh s`. اسکریپت مسیر JSON و SOCKS5 را از تنظیمات خود پروفایل می‌خواند، قبل از تغییر نسخه پشتیبان می‌سازد، bootstrap عمومی Psiphon را با RemoteServerListURLs و ObfuscatedServerListRootURLs به‌همراه کلیدهای احراز اصالت تنظیم می‌کند، دسترسی نوشتن systemd را فقط برای پوشه داده همان Agent اضافه می‌کند و فقط سرویس همان Agent را راه‌اندازی مجدد می‌کند. موفقیت را با اتصال واقعی Psiphon و برقراری حداقل یک Lane از Agent به Hub بررسی می‌کند؛ اگر خود Psiphon متصل نشود، گزارش journal را چاپ کرده و سرویس همان پروفایل را متوقف می‌کند تا وارد چرخه restart بی‌پایان نشود. اگر Psiphon متصل باشد اما Hub پاسخ ندهد، سرویس را برای تلاش مجدد روشن نگه می‌دارد و خطای مسیر Hub را جداگانه گزارش می‌کند.
