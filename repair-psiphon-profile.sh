@@ -22,8 +22,8 @@ done
 [[ -s "$TUNNEL_CONFIG" ]] || { echo "ERROR: Agent config not found: $TUNNEL_CONFIG" >&2; exit 1; }
 
 VERSION_OUT="$("$BIN" version 2>&1 || true)"
-[[ "$VERSION_OUT" == "Shah Tunnel 3.0.3 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.3 (linux/arm64)" ]] || {
-  echo "ERROR: this repair requires the ShahTunnel 3.0.3 Psiphon-fixed binary; installed: ${VERSION_OUT:-unknown}" >&2
+[[ "$VERSION_OUT" == "Shah Tunnel 3.0.4 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.4 (linux/arm64)" ]] || {
+  echo "ERROR: this repair requires the ShahTunnel 3.0.4 Psiphon-fixed binary; installed: ${VERSION_OUT:-unknown}" >&2
   echo "Run the updated S1T-START.sh installer first." >&2
   exit 1
 }

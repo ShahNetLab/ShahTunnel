@@ -2,9 +2,9 @@
 
 <img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel Galactic emblem" width="100%">
 
-# ShahTunnel 3.0.3
+# ShahTunnel 3.0.4
 
-[![Version](https://img.shields.io/badge/version-3.0.3-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-3.0.4-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -34,7 +34,7 @@ Client → Hub public mapping → authenticated Agent lanes → Agent local targ
 Selected Xray inbound → loopback-only Xray sidecar → WARP SOCKS5 → Internet
 ```
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.3 Network Flow" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.4 Network Flow" width="100%"></p>
 
 ## Capabilities
 
@@ -79,7 +79,7 @@ Choose a mode during tunnel creation. The Hub and Agent must use compatible sett
 
 When Psiphon cannot reach the Hub control port (for example, a custom `9448`), the Agent uses the Hub public Mapping endpoint on `443` for Psiphon egress only; the Direct path continues to use the configured control port. The Step 06 default is independent of the control port and points to TCP/443. The Hub distinguishes ShahTunnel control traffic from ordinary TLS with the dedicated `shah-tunnel-control/1` ALPN and forwards normal ClientHello bytes unchanged. This does not take over the public port, move a Mapping, or modify X-UI.
 
-Both Hub and Agent must run version `3.0.3`, and a public TCP/443 Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
+The Hub must run version `3.0.3` or newer (with public-Mapping ALPN support); the Agent must run version `3.0.4` or newer for the separated Mapping/control endpoint handling. A public Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
 
 ### Automatic Psiphon setup
 
@@ -190,4 +190,6 @@ sudo shah-tunnel menu
 
 ---
 
-> **Psiphon startup in 3.0.3:** a ready local SOCKS5 listener is not the same as an established Psiphon tunnel. If SOCKS5 is ready but the external tunnel is not yet established, the Agent service remains active and ConsoleClient keeps retrying; the wizard reports a pending connection, not a successful tunnel. Psiphon diagnostic notices are written to the local journal and may include network/server details; do not publish them publicly.
+> **Psiphon startup in 3.0.4:** a ready local SOCKS5 listener is not the same as an established Psiphon tunnel. If SOCKS5 is ready but the external tunnel is not yet established, the Agent service remains active and ConsoleClient keeps retrying; the wizard reports a pending connection, not a successful tunnel. Psiphon diagnostic notices are written to the local journal and may include network/server details; do not publish them publicly.
+
+> **Psiphon endpoint routing in 3.0.4:** TCP/TLS and WebSocket/TLS use the configured public Mapping endpoint through the local SOCKS5 proxy. HTTP/2 CONNECT and HTTP/1.1 CONNECT continue to use the control listener +1 and +2 respectively; the Mapping port is never used as the base for deriving CONNECT ports.
