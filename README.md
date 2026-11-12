@@ -5,12 +5,20 @@
 # ShahTunnel 3.0.0
 
 [![Version](https://img.shields.io/badge/version-3.0.0-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
-[![Build Go](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
+[![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
+
+<p align="center">
+<a href="https://t.me/MediaZet"><img src="https://img.shields.io/badge/Telegram-Channel%20%40MediaZet-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="Join ShahTunnel Telegram channel"></a>
+&nbsp;
+<a href="https://t.me/cloudflare0_bot"><img src="https://img.shields.io/badge/Telegram-Cloudflare%20Bot%20%40cloudflare0__bot-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="Open Cloudflare bot"></a>
+</p>
+
+<p align="center">Support ShahTunnel and get project updates by joining the channel. The bot is for Cloudflare operations.</p>
 
 **English** · [فارسی](README-fa.md)
 
-[🌌 Network Flow](#network-flow) · [⚡ Capabilities](#capabilities) · [🚀 Install](https://t.me/MediaZet)
+[⚡ Capabilities](#capabilities) · [🚀 Install](#install)
 
 </div>
 
@@ -27,14 +35,6 @@ Selected Xray inbound → loopback-only Xray sidecar → WARP SOCKS5 → Interne
 ```
 
 <p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.0 Network Flow" width="100%"></p>
-
-<p align="center">Support ShahTunnel and get project updates by joining the channel. The bot is for Cloudflare operations.</p>
-
-<p align="center">
-<a href="https://t.me/MediaZet"><img src="https://img.shields.io/badge/Telegram-Channel%20%40MediaZet-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="Join ShahTunnel Telegram channel"></a>
-&nbsp;
-<a href="https://t.me/cloudflare0_bot"><img src="https://img.shields.io/badge/Telegram-Cloudflare%20Bot-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="Open Cloudflare bot"></a>
-</p>
 
 ## Capabilities
 
@@ -121,6 +121,7 @@ Replace `PROFILE` with the selected profile's systemd instance name. The manager
 - The optional Xray WARP sidecar listens on loopback for its cloned inbound; it does not replace the X-UI-managed Xray service.
 - Use ShahTunnel only on servers and services you own or are authorized to administer. See [SECURITY.md](SECURITY.md).
 
+<a id="install"></a>
 ## Install
 
 ShahTunnel uses a **Hub / Agent** layout. Install it on the Hub and on every Agent that should connect to it. A third server can optionally run as a Relay.

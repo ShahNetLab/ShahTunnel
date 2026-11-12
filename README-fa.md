@@ -5,12 +5,20 @@
 # شاه‌تونل ۳٫۰٫۰
 
 [![نسخه](https://img.shields.io/badge/version-3.0.0-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
-[![نسخه ابزار ساخت](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
-![سیستم‌عامل](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
+![پلتفرم](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
+[![ساخت با Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
+
+<p align="center">
+<a href="https://t.me/MediaZet"><img src="https://img.shields.io/badge/تلگرام-کانال%20%40MediaZet-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="عضویت در کانال تلگرام ShahTunnel"></a>
+&nbsp;
+<a href="https://t.me/cloudflare0_bot"><img src="https://img.shields.io/badge/تلگرام-ربات%20Cloudflare%20%40cloudflare0__bot-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="ورود به ربات Cloudflare"></a>
+</p>
+
+<div dir="rtl" align="center">برای حمایت از ShahTunnel و دریافت خبرها عضو کانال شوید؛ ربات برای عملیات Cloudflare است.</div>
 
 [English](README.md) · **فارسی**
 
-[🌌 جریان شبکه](#network-flow) · [⚡ قابلیت‌ها](#capabilities) · [🚀 نصب](https://t.me/MediaZet)
+[⚡ قابلیت‌ها](#capabilities) · [🚀 نصب](#install)
 
 </div>
 
@@ -31,18 +39,6 @@ Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCK
 ```
 
 <p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه ShahTunnel 3.0.0" width="100%"></p>
-
-<div dir="rtl">
-
-برای حمایت از ShahTunnel و دریافت خبرها عضو کانال شوید؛ ربات برای عملیات Cloudflare است.
-
-</div>
-
-<p align="center">
-<a href="https://t.me/MediaZet"><img src="https://img.shields.io/badge/تلگرام-کانال%20%40MediaZet-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="عضویت در کانال تلگرام ShahTunnel"></a>
-&nbsp;
-<a href="https://t.me/cloudflare0_bot"><img src="https://img.shields.io/badge/تلگرام-ربات%20Cloudflare-229ED9?style=for-the-badge&logo=telegram&logoColor=white" alt="ورود به ربات Cloudflare"></a>
-</p>
 
 <a id="capabilities"></a>
 
@@ -137,6 +133,7 @@ sudo journalctl -u 'ravanreverse@PROFILE.service' -n 80 --no-pager
 - Sidecar اختصاصی WARP برای Inbound کپی‌شده روی Loopback گوش می‌دهد و جایگزین سرویس اصلی Xray تحت مدیریت X-UI نمی‌شود.
 - ShahTunnel را فقط روی سرورها و سرویس‌هایی استفاده کنید که مالک آن هستید یا مجوز مدیریتشان را دارید. [سیاست امنیتی](SECURITY.md).
 
+<a id="install"></a>
 ## نصب
 
 ShahTunnel از معماری **Hub / Agent** استفاده می‌کند. برنامه را روی سرور Hub و هر Agent نصب کنید. در صورت نیاز، یک سرور سوم نیز می‌تواند نقش Relay داشته باشد.
