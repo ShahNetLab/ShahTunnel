@@ -2,9 +2,9 @@
 
 <img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel Galactic emblem" width="100%">
 
-# ShahTunnel 3.0.6
+# ShahTunnel 3.0.7
 
-[![Version](https://img.shields.io/badge/version-3.0.6-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-3.0.7-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -27,14 +27,14 @@
 <a id="network-flow"></a>
 ## Network Flow
 
-The Hub-to-Agent forwarding path and optional per-profile Internet egress are separate: the tunnel forwards mapped TCP services to Agent-side targets, while the optional Xray sidecar sends only the selected inbound through that Agent profile’s WARP SOCKS5 egress.
+The Hub-to-Agent forwarding path and optional per-profile Internet egress are separate: the tunnel forwards mapped TCP services to Agent-side targets, while the optional Xray sidecar sends only the selected inbound through that Agent profile’s WARP or Psiphon SOCKS5 egress.
 
 ```text
 Client → Hub public mapping → authenticated Agent lanes → Agent local target
-Selected Xray inbound → loopback-only Xray sidecar → WARP SOCKS5 → Internet
+Selected Xray inbound → loopback-only Xray sidecar → WARP or Psiphon SOCKS5 → Internet
 ```
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.6 Network Flow" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.7 Network Flow" width="100%"></p>
 
 ## Capabilities
 
@@ -48,6 +48,14 @@ Selected Xray inbound → loopback-only Xray sidecar → WARP SOCKS5 → Interne
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **External Agent egress** | Agent traffic can use Direct, Cloudflare WARP/MASQUE, WARP/WireGuard or Psiphon/SOCKS5. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Per-profile Xray WARP** | A selected Xray inbound is cloned to a loopback-only sidecar and routed through the local WARP SOCKS5 proxy. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Automatic WARP DNS path** | The isolated sidecar handles client DNS and routes its DoH resolver traffic through the same WARP egress. |
+| **Per-profile Psiphon user egress** | Selected Agent Xray inbounds are cloned into an isolated sidecar; TCP and DNS use Psiphon SOCKS5, while UDP is blocked to prevent direct leakage. |
+
+
+### Psiphon egress for user traffic (3.0.7)
+
+For Agent profiles using Psiphon, the matching Xray inbounds are copied into a separate loopback-only sidecar. TCP and DNS traffic use that profile's Psiphon SOCKS5 proxy. Psiphon's local port-forward SOCKS proxy carries TCP streams, not UDP; UDP and unknown network types are routed to a Blackhole outbound so they cannot silently fall back to the Agent's direct Internet connection. Consequently UDP/QUIC apps and ICMP ping are not supported on this Psiphon-only user path. Existing Agent profiles can enable it with main-menu option `10` after Psiphon is connected. The X-UI source config, unrelated inbounds, other profiles, SSH and host routes are left unchanged.
+
+**Latency note:** ShahTunnel already enables TCP_NODELAY and per-socket BBR for outer lanes and uses a measured-RTT/load score when choosing among healthy lanes. Psiphon adds another network hop and its exit location/congestion determines much of end-to-end latency; no code change can guarantee a lower physical RTT. Choose a closer/lower-latency exit or WARP/direct egress when minimum ping is the priority.
 
 ## Hub↔Agent transport modes
 

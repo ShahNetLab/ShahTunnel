@@ -52,7 +52,7 @@ printf '\n== 1/7: Resolve Go module metadata ==\n'
 pass "Module metadata resolved"
 
 printf '\n== 2/7: Formatting ==\n'
-unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go S1T-CAPSULE/xray_warp.go S1T-CAPSULE/psiphon.go S1T-CAPSULE/psiphon_test.go)"
+unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go S1T-CAPSULE/xray_warp.go S1T-CAPSULE/xray_psiphon.go S1T-CAPSULE/psiphon.go S1T-CAPSULE/psiphon_test.go)"
 [[ -z "$unformatted" ]] || fail "gofmt required for: $unformatted"
 pass "Go source formatting"
 
@@ -89,6 +89,11 @@ grep -Fq 'TestAdaptiveUnderlayCandidatesDetectWARPAndFailOver' S1T-CAPSULE/main_
 grep -Fq 'TestOptionNineSwitchesFromFailedDirectPathToPsiphonSOCKS5' S1T-CAPSULE/main_test.go || fail "Option 9 SOCKS5 failover coverage is missing."
 grep -Fq 'func applyXrayWarpEgressToSelectedTunnel() error' S1T-CAPSULE/xray_warp.go || fail "Per-tunnel Xray WARP isolation is missing."
 grep -Fq 'TestBuildXrayWarpConfigIsolatesOnlyClonedInbound' S1T-CAPSULE/main_test.go || fail "Per-inbound Xray WARP isolation coverage is missing."
+grep -Fq 'func buildXrayPsiphonConfig(' S1T-CAPSULE/xray_psiphon.go || fail "Per-profile Xray Psiphon egress builder is missing."
+grep -Fq 'func applyXrayPsiphonEgressToSelectedTunnel() error' S1T-CAPSULE/xray_psiphon.go || fail "Psiphon user-egress manager action is missing."
+grep -Fq 'TestBuildXrayPsiphonConfigIsolatesTCPAndBlocksUDP' S1T-CAPSULE/main_test.go || fail "Psiphon TCP/DNS isolation and UDP fail-closed coverage is missing."
+grep -Fq 'TestXrayPsiphonManagedPathsAndUnitAreRestricted' S1T-CAPSULE/main_test.go || fail "Psiphon sidecar service/path safety coverage is missing."
+grep -Fq 'TestHubBalancesMeasuredRTTAndLoad' S1T-CAPSULE/main_test.go || fail "RTT/load lane selection coverage is missing."
 pass "Shell syntax, docs layout, Psiphon bootstrap/runtime, public-Mapping ALPN multiplex, WARP Local Proxy, and failover coverage"
 
 printf '\n== 4/7: Transport loopback suite ==\n'
@@ -109,7 +114,7 @@ pass "go vet"
 
 printf '\n== 7/7: Linux build validation (temporary files only) ==\n'
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-amd64" ./S1T-CAPSULE
-[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 3.0.6 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 3.0.7 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-arm64" ./S1T-CAPSULE
 sha256sum "$BUILD_TMP/shah-tunnel-linux-amd64" "$BUILD_TMP/shah-tunnel-linux-arm64" > "$BUILD_TMP/SHA256SUMS"
 pass "Linux amd64 and arm64 binaries built and checksum-checked in a temporary directory (nothing added to the repository)"

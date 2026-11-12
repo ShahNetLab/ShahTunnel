@@ -2,9 +2,9 @@
 
 <img src="docs/img/ShahTunnel-Network.png" alt="نشان کهکشانی شاه‌تونل" width="100%">
 
-# شاه‌تونل ۳٫۰٫۲
+# شاه‌تونل ۳٫۰٫۷
 
-[![نسخه](https://img.shields.io/badge/version-3.0.6-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![نسخه](https://img.shields.io/badge/version-3.0.7-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![پلتفرم](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![ساخت با Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -29,16 +29,16 @@
 
 <div dir="rtl">
 
-مسیر انتقال Hub به Agent و خروجی اینترنت اختیاری هر پروفایل مستقل از یکدیگرند: تونل، Mappingهای TCP را به مقصد محلی Agent می‌رساند؛ مسیر اختیاری Xray فقط Inbound انتخاب‌شده را از خروجی SOCKS5 وایرپ همان پروفایل عبور می‌دهد.
+مسیر انتقال Hub به Agent و خروجی اینترنت اختیاری هر پروفایل مستقل از یکدیگرند: تونل، Mappingهای TCP را به مقصد محلی Agent می‌رساند؛ مسیر اختیاری Xray فقط Inbound انتخاب‌شده را از خروجی SOCKS5 WARP یا Psiphon همان پروفایل عبور می‌دهد.
 
 </div>
 
 ```text
 کاربر → پورت عمومی Hub → Laneهای احرازشده Agent → مقصد محلی Agent
-Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCKS5 وایرپ → اینترنت
+Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCKS5 خروجی WARP یا Psiphon → اینترنت
 ```
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه ShahTunnel 3.0.6" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه ShahTunnel 3.0.7" width="100%"></p>
 
 <a id="capabilities"></a>
 
@@ -53,7 +53,14 @@ Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCK
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **چند Mapping پورت** | شناسه هر Mapping، Listener عمومی Hub را به مقصد محلی Agent متصل می‌کند و باید در دو سمت یکسان باشد. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **خروجی مستقل Agent** | خروجی Agent می‌تواند Direct، ‏WARP/MASQUE، ‏WARP/WireGuard یا Psiphon/SOCKS5 باشد. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **WARP اختصاصی Xray** | Inbound انتخاب‌شده به Sidecar محدود به Loopback کپی و از SOCKS5 محلی WARP عبور داده می‌شود. |
-| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **مسیر خودکار DNS در WARP** | Sidecar درخواست DNS کاربر را مدیریت می‌کند و درخواست DoH مربوط به Resolver را نیز از همان خروجی WARP می‌فرستد. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **خروجی کاربر از Psiphon** | Inboundهای همان Agent در Sidecar مستقل Xray کپی می‌شوند؛ TCP و DNS از SOCKS5 سایفون می‌روند و UDP برای جلوگیری از نشت مستقیم مسدود می‌شود. |
+
+
+### خروجی کاربران از Psiphon (نسخه ۳٫۰٫۷)
+
+برای Agent با خروجی Psiphon، هنگام ساخت پروفایل Inboundهای Xray متناظر با Mappingها در یک Sidecar مجزا و فقط روی `127.0.0.1` کپی می‌شوند. ترافیک TCP و DNS از SOCKS5 همان پروفایل عبور می‌کند. چون SOCKS5 محلی Psiphon یک پراکسی port-forward برای جریان TCP است و UDP را حمل نمی‌کند، UDP و هر نوع شبکهٔ ناشناخته در Sidecar به Blackhole می‌روند؛ بنابراین از خروج مستقیم UDP جلوگیری می‌شود، اما برنامه‌های UDP/QUIC و ICMP ping از این مسیر پشتیبانی نمی‌شوند. برای پروفایل‌های قدیمی از گزینهٔ `10` منوی مدیریت استفاده کنید؛ ابتدا اطمینان حاصل کنید Psiphon متصل است. این عملیات X-UI، کانفیگ اصلی Xray، سایر Inboundها، SSH و Routeهای میزبان را تغییر نمی‌دهد.
+
+**درباره پینگ:** TCP_NODELAY و BBR به‌صورت per-socket روی کانال‌های ShahTunnel فعال‌اند و انتخاب Lane بر اساس ترکیب RTT اندازه‌گیری‌شده و بار فعال انجام می‌شود. با این حال، عبور کاربر از مسیر اضافی Psiphon و موقعیت سرور خروجی ذاتاً تأخیر اضافه می‌کند؛ هیچ تغییر نرم‌افزاری نمی‌تواند RTT فیزیکی مسیر را تضمینی کم کند. برای پینگ کمتر، معمولاً باید خروجی نزدیک‌تر/کم‌تأخیرتر (مثلاً WARP یا مسیر مستقیم) انتخاب شود؛ مسیر Psiphon برای دور زدن محدودیت است، نه تضمین کمترین پینگ.
 
 ## انتقال‌های Hub↔Agent
 
