@@ -84,6 +84,7 @@ type psiphonClientConfig struct {
 	LimitMeekBufferSizes        bool   `json:"LimitMeekBufferSizes"`
 	LimitCPUThreads             bool   `json:"LimitCPUThreads"`
 	LimitRelayBufferSizes       bool   `json:"LimitRelayBufferSizes"`
+	SSHChannelWindowSize        *int   `json:"SSHChannelWindowSize,omitempty"`
 	ConnectionWorkerPoolMaxSize int    `json:"ConnectionWorkerPoolMaxSize,omitempty"`
 	EmitDiagnosticNotices       bool   `json:"EmitDiagnosticNotices,omitempty"`
 }
@@ -101,6 +102,7 @@ type psiphonPerformanceProfile struct {
 	LimitMeekBufferSizes  bool
 	LimitCPUThreads       bool
 	LimitRelayBufferSizes bool
+	SSHChannelWindowSize  int
 }
 
 const psiphonHighThroughputMinRAM = uint64(3 << 30) // 3 GiB
@@ -108,12 +110,24 @@ const psiphonHighThroughputMinRAM = uint64(3 << 30) // 3 GiB
 // psiphonPerformanceProfileForHost avoids oversized buffers on small VPSes,
 // but removes Psiphon's conservative relay/Meek buffer caps when the host has
 // enough memory. CPU thread limiting is disabled only on multi-core hosts.
+func intPointer(value int) *int {
+	return &value
+}
+
 func psiphonPerformanceProfileForHost(totalRAMBytes uint64, cpuCount int) psiphonPerformanceProfile {
 	lowMemory := totalRAMBytes < psiphonHighThroughputMinRAM
+	windowSize := 16
+	if lowMemory {
+		// Psiphon documents 4 as the default SSH channel window (128 KiB).
+		// Keep that conservative default on small hosts; a moderate 16-packet
+		// window (512 KiB) improves throughput on high-RTT paths when RAM allows.
+		windowSize = 4
+	}
 	return psiphonPerformanceProfile{
 		LimitMeekBufferSizes:  lowMemory,
 		LimitCPUThreads:       cpuCount < 2,
 		LimitRelayBufferSizes: lowMemory,
+		SSHChannelWindowSize:  windowSize,
 	}
 }
 
@@ -164,6 +178,7 @@ func newPsiphonClientConfig(port int) psiphonClientConfig {
 		LimitMeekBufferSizes:    performance.LimitMeekBufferSizes,
 		LimitCPUThreads:         performance.LimitCPUThreads,
 		LimitRelayBufferSizes:   performance.LimitRelayBufferSizes,
+		SSHChannelWindowSize:    intPointer(performance.SSHChannelWindowSize),
 		// Diagnostic notices are written only to the local systemd journal;
 		// they are needed to distinguish bootstrap-list failures from blocked
 		// Psiphon server connections when the first tunnel is delayed.
@@ -387,7 +402,7 @@ func psiphonBootstrapNeedsMigration(cfg psiphonClientConfig) bool {
 }
 
 // repairLegacyPsiphonClientConfig upgrades incomplete legacy bootstraps from
-// older ShahTunnel 3.0.0 builds. It also recognizes the deprecated scalar URL
+// older ShahTunnel builds. It also recognizes the deprecated scalar URL
 // layout. Valid custom identities and region preferences are preserved.
 func repairLegacyPsiphonClientConfig(configPath, proxyAddress string) (bool, error) {
 	if !isLoopbackProxyAddress(proxyAddress) {
@@ -467,8 +482,8 @@ func repairLegacyPsiphonClientConfig(configPath, proxyAddress string) (bool, err
 	return true, nil
 }
 
-// tunePsiphonPerformanceConfig updates only the three performance switches
-// owned by ShahTunnel, preserving every other field and unknown Psiphon option.
+// tunePsiphonPerformanceConfig updates only the performance settings owned by
+// ShahTunnel, preserving every other field and unknown Psiphon option.
 func tunePsiphonPerformanceConfig(configPath string) (bool, error) {
 	return tunePsiphonPerformanceConfigForProfile(configPath, psiphonHostPerformanceProfile())
 }
@@ -485,10 +500,11 @@ func tunePsiphonPerformanceConfigForProfile(configPath string, profile psiphonPe
 	if raw == nil {
 		return false, errors.New("Psiphon config must be a JSON object")
 	}
-	settings := map[string]bool{
+	settings := map[string]any{
 		"LimitMeekBufferSizes":  profile.LimitMeekBufferSizes,
 		"LimitCPUThreads":       profile.LimitCPUThreads,
 		"LimitRelayBufferSizes": profile.LimitRelayBufferSizes,
+		"SSHChannelWindowSize":  profile.SSHChannelWindowSize,
 	}
 	changed := false
 	for key, value := range settings {
@@ -565,6 +581,9 @@ func validatePsiphonClientConfig(configPath, proxyAddress string) error {
 	}
 	if _, err := strconv.Atoi(cfg.ClientVersion); err != nil {
 		return fmt.Errorf("invalid Psiphon ClientVersion: %w", err)
+	}
+	if cfg.SSHChannelWindowSize != nil && (*cfg.SSHChannelWindowSize < 1 || *cfg.SSHChannelWindowSize > 128) {
+		return fmt.Errorf("invalid Psiphon SSHChannelWindowSize %d (valid range is 1-128)", *cfg.SSHChannelWindowSize)
 	}
 	decodeKey := func(name, value string, minBytes, exactBytes int) error {
 		decoded, err := base64.StdEncoding.DecodeString(value)

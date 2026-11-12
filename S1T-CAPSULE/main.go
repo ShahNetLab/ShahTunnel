@@ -3244,7 +3244,7 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 		return nil, fmt.Errorf("tune Psiphon performance profile: %w", tuneErr)
 	} else if tuned {
 		profile := psiphonHostPerformanceProfile()
-		log.Printf("Psiphon: applied memory-aware performance profile (MeekBufferLimit=%t, RelayBufferLimit=%t, CPUThreadLimit=%t)", profile.LimitMeekBufferSizes, profile.LimitRelayBufferSizes, profile.LimitCPUThreads)
+		log.Printf("Psiphon: applied resource-aware throughput profile (MeekBufferLimit=%t, RelayBufferLimit=%t, CPUThreadLimit=%t, SSHChannelWindowSize=%d)", profile.LimitMeekBufferSizes, profile.LimitRelayBufferSizes, profile.LimitCPUThreads, profile.SSHChannelWindowSize)
 	}
 	if err := validatePsiphonClientConfig(configPath, cfg.PsiphonProxy); err != nil {
 		return nil, fmt.Errorf("invalid Psiphon client configuration: %w", err)
@@ -3637,7 +3637,7 @@ func defaultPsiphonHubAddress(hubAddr string) string {
 func agentHubAddressForUnderlay(cfg Config, underlay string) string {
 	if underlay == underlayPsiphon {
 		configured := strings.TrimSpace(cfg.PsiphonHubAddr)
-		// Older 3.0.2 wizards copied the custom control port into Step 06 when
+		// Older wizard builds copied the custom control port into Step 06 when
 		// the user accepted the blank/default answer. In the standard Hub setup,
 		// that is not the public Mapping listener: it defaults to TCP/443.
 		// Preserve an explicit, different Mapping endpoint; repair only the

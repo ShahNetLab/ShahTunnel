@@ -60,6 +60,9 @@ func TestNewPsiphonClientConfigUsesAuthenticatedBootstrap(t *testing.T) {
 	if cfg.ConnectionWorkerPoolMaxSize != 0 {
 		t.Fatalf("ConnectionWorkerPoolMaxSize=%d; expected the Psiphon default (unset)", cfg.ConnectionWorkerPoolMaxSize)
 	}
+	if cfg.SSHChannelWindowSize == nil || *cfg.SSHChannelWindowSize < 1 || *cfg.SSHChannelWindowSize > 128 {
+		t.Fatalf("SSHChannelWindowSize=%v; want a valid Psiphon channel window", cfg.SSHChannelWindowSize)
+	}
 	// Exercise the same on-disk validator used by Agent startup, not a test-only
 	// approximation of its checks.
 	dir := t.TempDir()
@@ -338,23 +341,23 @@ func TestPsiphonConsoleClientArgsUseDefaultLoopbackBinding(t *testing.T) {
 
 func TestPsiphonPerformanceProfileIsMemoryAndCPUAware(t *testing.T) {
 	low := psiphonPerformanceProfileForHost(1<<30, 1)
-	if !low.LimitMeekBufferSizes || !low.LimitRelayBufferSizes || !low.LimitCPUThreads {
-		t.Fatalf("low-resource profile should retain all safety limits: %+v", low)
+	if !low.LimitMeekBufferSizes || !low.LimitRelayBufferSizes || !low.LimitCPUThreads || low.SSHChannelWindowSize != 4 {
+		t.Fatalf("low-resource profile should retain safety limits and the default SSH window: %+v", low)
 	}
 	highMemorySingleCore := psiphonPerformanceProfileForHost(4<<30, 1)
-	if highMemorySingleCore.LimitMeekBufferSizes || highMemorySingleCore.LimitRelayBufferSizes || !highMemorySingleCore.LimitCPUThreads {
-		t.Fatalf("high-memory single-core profile should expand buffers but limit CPU threads: %+v", highMemorySingleCore)
+	if highMemorySingleCore.LimitMeekBufferSizes || highMemorySingleCore.LimitRelayBufferSizes || !highMemorySingleCore.LimitCPUThreads || highMemorySingleCore.SSHChannelWindowSize != 16 {
+		t.Fatalf("high-memory single-core profile should expand buffers/window but limit CPU threads: %+v", highMemorySingleCore)
 	}
 	high := psiphonPerformanceProfileForHost(4<<30, 4)
-	if high.LimitMeekBufferSizes || high.LimitRelayBufferSizes || high.LimitCPUThreads {
-		t.Fatalf("high-resource profile should lift conservative throughput limits: %+v", high)
+	if high.LimitMeekBufferSizes || high.LimitRelayBufferSizes || high.LimitCPUThreads || high.SSHChannelWindowSize != 16 {
+		t.Fatalf("high-resource profile should lift conservative throughput limits and use a moderate larger SSH window: %+v", high)
 	}
 }
 
 func TestTunePsiphonPerformanceConfigPreservesUnknownFields(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "profile.json")
-	original := []byte(`{"EgressRegion":"DE","LocalSocksProxyPort":21086,"UnknownFuturePsiphonOption":{"keep":"me"},"LimitMeekBufferSizes":true,"LimitCPUThreads":true,"LimitRelayBufferSizes":true}`)
+	original := []byte(`{"EgressRegion":"DE","LocalSocksProxyPort":21086,"UnknownFuturePsiphonOption":{"keep":"me"},"LimitMeekBufferSizes":true,"LimitCPUThreads":true,"LimitRelayBufferSizes":true,"SSHChannelWindowSize":4}`)
 	if err := os.WriteFile(path, original, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -375,6 +378,9 @@ func TestTunePsiphonPerformanceConfigPreservesUnknownFields(t *testing.T) {
 	}
 	if string(got["EgressRegion"]) != `"DE"` || string(got["LocalSocksProxyPort"]) != "21086" {
 		t.Fatalf("known profile fields were not preserved: region=%s port=%s", got["EgressRegion"], got["LocalSocksProxyPort"])
+	}
+	if string(got["SSHChannelWindowSize"]) != "16" {
+		t.Fatalf("SSHChannelWindowSize=%s; want 16 for high-memory host", got["SSHChannelWindowSize"])
 	}
 	var unknown map[string]string
 	if err := json.Unmarshal(got["UnknownFuturePsiphonOption"], &unknown); err != nil || unknown["keep"] != "me" {
