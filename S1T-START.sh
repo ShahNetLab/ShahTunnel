@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 3.0.4 installer.
+# Shah Tunnel 3.0.5 installer.
 # Downloads the pinned Go 1.26.1 toolchain, verifies its SHA-256, fetches the source,
 # and builds the Linux binary on the target server. No prebuilt release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="3.0.4"
+VERSION="3.0.5"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -623,7 +623,7 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
 ReadWritePaths=/etc/ravanreverse
 [Install]
@@ -664,7 +664,7 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
 ReadWritePaths=/etc/ravanreverse
 [Install]
@@ -680,6 +680,10 @@ for unit in ravanreverse.service ravanreverse@.service; do
   cat > "$TMP/psiphon-${unit}.conf" <<'DROPIN'
 [Service]
 ReadWritePaths=/var/lib/shah-tunnel/psiphon
+# Psiphon's WebRTC ICE stack uses AF_NETLINK to enumerate usable interfaces.
+# Keep the allow-list narrow and do not grant CAP_NET_ADMIN.
+RestrictAddressFamilies=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 DROPIN
   install -o root -g root -m 0644 "$TMP/psiphon-${unit}.conf" "$dropin_dir/psiphon.conf"
 done

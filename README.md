@@ -2,9 +2,9 @@
 
 <img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel Galactic emblem" width="100%">
 
-# ShahTunnel 3.0.4
+# ShahTunnel 3.0.5
 
-[![Version](https://img.shields.io/badge/version-3.0.4-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-3.0.5-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -34,7 +34,7 @@ Client → Hub public mapping → authenticated Agent lanes → Agent local targ
 Selected Xray inbound → loopback-only Xray sidecar → WARP SOCKS5 → Internet
 ```
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.4 Network Flow" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.5 Network Flow" width="100%"></p>
 
 ## Capabilities
 
@@ -90,7 +90,7 @@ When an Agent selects `Psiphon / SOCKS5` (or the adaptive egress option), ShahTu
 - creates a private per-Agent JSON configuration with the public client identity, authenticated server-list mirrors, server-entry signature key, and exchange-obfuscation key;
 - assigns a unique `127.0.0.1` SOCKS5 port and private data directory;
 - grants that Agent service write access only to its own Psiphon data directory;
-- starts ConsoleClient in local-proxy mode. Local SOCKS5 readiness is distinguished from a real Psiphon tunnel and a connected Agent lane. If SOCKS5 becomes ready first, the service remains active and the wizard reports `PENDING` rather than claiming a successful connection. `ListenInterface` remains unset so Psiphon uses its built-in `127.0.0.1` bind and does not enumerate interfaces through Netlink. Diagnostic notices are written to the local journal; they may contain sensitive session/network details and should not be published.
+- starts ConsoleClient in local-proxy mode. Local SOCKS5 readiness is distinguished from a real Psiphon tunnel and a connected Agent lane. If SOCKS5 becomes ready first, the service remains active and the wizard reports `PENDING` rather than claiming a successful connection. `ListenInterface` remains unset so the local SOCKS5 listener uses Psiphon's loopback binding. Psiphon's WebRTC ICE stack can still enumerate host interfaces through `AF_NETLINK`; the service allow-list explicitly includes that family while retaining `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` (no `CAP_NET_ADMIN`). This enables interface discovery without permitting route changes. Diagnostic notices are written to the local journal; they may contain sensitive session/network details and should not be published.
 
 For an existing Agent profile whose earlier Psiphon bootstrap did not connect, run `sudo bash repair-psiphon-profile.sh PROFILE` from the extracted project directory. The helper backs up and repairs only that profile's Psiphon JSON and restarts only its matching `ravanreverse@PROFILE.service` unit.
 
@@ -190,6 +190,9 @@ sudo shah-tunnel menu
 
 ---
 
-> **Psiphon startup in 3.0.4:** a ready local SOCKS5 listener is not the same as an established Psiphon tunnel. If SOCKS5 is ready but the external tunnel is not yet established, the Agent service remains active and ConsoleClient keeps retrying; the wizard reports a pending connection, not a successful tunnel. Psiphon diagnostic notices are written to the local journal and may include network/server details; do not publish them publicly.
+> **Psiphon startup in 3.0.5:** a ready local SOCKS5 listener is not the same as an established Psiphon tunnel. If SOCKS5 is ready but the external tunnel is not yet established, the Agent service remains active and ConsoleClient keeps retrying; the wizard reports a pending connection, not a successful tunnel. Psiphon diagnostic notices are written to the local journal and may include network/server details; do not publish them publicly.
 
-> **Psiphon endpoint routing in 3.0.4:** TCP/TLS and WebSocket/TLS use the configured public Mapping endpoint through the local SOCKS5 proxy. HTTP/2 CONNECT and HTTP/1.1 CONNECT continue to use the control listener +1 and +2 respectively; the Mapping port is never used as the base for deriving CONNECT ports.
+> **Psiphon endpoint routing in 3.0.5:** TCP/TLS and WebSocket/TLS use the configured public Mapping endpoint through the local SOCKS5 proxy. HTTP/2 CONNECT and HTTP/1.1 CONNECT continue to use the control listener +1 and +2 respectively; the Mapping port is never used as the base for deriving CONNECT ports.
+
+
+> **Psiphon systemd sandbox in 3.0.5:** both the source-generated service template and installer-managed drop-ins allow `AF_NETLINK` for Psiphon's WebRTC ICE interface discovery. The capability set remains unchanged; `CAP_NET_ADMIN` is not granted. This is applied automatically by the installer and is not a manual VPS repair step.

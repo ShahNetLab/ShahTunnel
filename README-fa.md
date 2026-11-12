@@ -4,7 +4,7 @@
 
 # شاه‌تونل ۳٫۰٫۲
 
-[![نسخه](https://img.shields.io/badge/version-3.0.4-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![نسخه](https://img.shields.io/badge/version-3.0.5-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![پلتفرم](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![ساخت با Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -38,7 +38,7 @@
 Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCKS5 وایرپ → اینترنت
 ```
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه ShahTunnel 3.0.4" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه ShahTunnel 3.0.5" width="100%"></p>
 
 <a id="capabilities"></a>
 
@@ -216,4 +216,7 @@ sudo shah-tunnel menu
 
 > **رفتار شروع Psiphon در نسخه ۳٫۰٫۳:** آماده‌شدن SOCKS5 محلی با وصل‌شدن تونل Psiphon یکسان نیست. اگر SOCKS5 آماده شود اما اتصال خارجی هنوز برقرار نشده باشد، سرویس Agent فعال می‌ماند و ConsoleClient به تلاش مجدد ادامه می‌دهد؛ ویزارد وضعیت را «در حال اتصال» گزارش می‌کند، نه اتصال موفق. پیام‌های تشخیصی Psiphon در Journal محلی ثبت می‌شوند و ممکن است جزئیات شبکه/سرورها داشته باشند؛ آن‌ها را عمومی منتشر نکنید.
 
-> **اصلاح مسیریابی Psiphon در نسخه 3.0.4:** اتصال‌های TCP/TLS و WebSocket/TLS از Public Mapping تنظیم‌شده و از طریق SOCKS5 محلی عبور می‌کنند. HTTP/2 CONNECT و HTTP/1.1 CONNECT همچنان به‌ترتیب از پورت کنترل +1 و +2 استفاده می‌کنند؛ پورت Mapping مبنای محاسبه پورت‌های CONNECT نیست.
+> **اصلاح مسیریابی Psiphon در نسخه 3.0.5:** اتصال‌های TCP/TLS و WebSocket/TLS از Public Mapping تنظیم‌شده و از طریق SOCKS5 محلی عبور می‌کنند. HTTP/2 CONNECT و HTTP/1.1 CONNECT همچنان به‌ترتیب از پورت کنترل +1 و +2 استفاده می‌کنند؛ پورت Mapping مبنای محاسبه پورت‌های CONNECT نیست.
+
+
+> **اصلاح Sandbox در نسخهٔ 3.0.5:** Psiphon برای گردآوری ICE candidateهای WebRTC ممکن است از `AF_NETLINK` برای شناسایی رابط‌های شبکه استفاده کند. فایل اصلی سرویس و Drop-in نصب‌کننده این خانوادهٔ سوکت را به‌صورت خودکار مجاز می‌کنند؛ مجموعهٔ Capability بدون تغییر می‌ماند و `CAP_NET_ADMIN` اضافه نمی‌شود. بنابراین نیازی به ساخت دستی فایل systemd روی VPS نیست و Route یا رابط شبکه‌ای تغییر داده نمی‌شود.
