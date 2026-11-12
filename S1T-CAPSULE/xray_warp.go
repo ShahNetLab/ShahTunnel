@@ -226,6 +226,20 @@ func cloneJSONMap(src map[string]any) (map[string]any, error) {
 }
 
 func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappings []PortMapping) ([]byte, []XrayWarpBinding, string, error) {
+	return buildXrayEgressConfig(original, profileID, proxyAddress, mappings, "warp", false)
+}
+
+// buildXrayEgressConfig creates a private Xray sidecar containing only cloned
+// inbounds for the selected ShahTunnel mappings. The original X-UI config is
+// never modified. For Psiphon, UDP is explicitly blackholed because its local
+// SOCKS proxy is a TCP port-forward proxy and does not implement UDP ASSOCIATE.
+func buildXrayEgressConfig(original []byte, profileID, proxyAddress string, mappings []PortMapping, kind string, blockUDP bool) ([]byte, []XrayWarpBinding, string, error) {
+	if kind != "warp" && kind != "psiphon" {
+		return nil, nil, "", fmt.Errorf("unsupported isolated Xray egress kind %q", kind)
+	}
+	if _, _, err := net.SplitHostPort(proxyAddress); err != nil || !isLoopbackProxyAddress(proxyAddress) {
+		return nil, nil, "", errors.New("isolated Xray SOCKS proxy must be a loopback IP:PORT endpoint")
+	}
 	var root map[string]any
 	if err := json.Unmarshal(original, &root); err != nil {
 		return nil, nil, "", fmt.Errorf("Xray config is not plain JSON; refusing to edit it: %w", err)
@@ -242,8 +256,8 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 	usedTags := map[string]bool{}
 	for _, raw := range inbounds {
 		if x, ok := raw.(map[string]any); ok {
-			if p, ok := xrayPortValue(x["port"]); ok {
-				usedPorts[p] = true
+			if port, ok := xrayPortValue(x["port"]); ok {
+				usedPorts[port] = true
 			}
 			if tag, _ := x["tag"].(string); tag != "" {
 				usedTags[tag] = true
@@ -258,14 +272,18 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 		}
 	}
 	shortID := safeXrayTag(profileID)
-	outTag := "s1t-warp-" + shortID + "-out"
+	outTag := "s1t-" + kind + "-" + shortID + "-out"
 	if usedTags[outTag] {
 		return nil, nil, "", fmt.Errorf("Xray tag %q already exists; refusing to overwrite it", outTag)
+	}
+	blockTag := "s1t-" + kind + "-" + shortID + "-udp-block"
+	if blockUDP && usedTags[blockTag] {
+		return nil, nil, "", fmt.Errorf("Xray tag %q already exists; refusing to overwrite it", blockTag)
 	}
 
 	bindings := make([]XrayWarpBinding, 0, len(mappings))
 	newInbounds := make([]any, 0, len(mappings))
-	newRules := make([]any, 0, len(mappings))
+	newRules := make([]any, 0, len(mappings)*2)
 	newInboundTags := make([]string, 0, len(mappings))
 	portToBinding := map[int]XrayWarpBinding{}
 	for _, mapping := range mappings {
@@ -294,8 +312,8 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 			if !ok {
 				continue
 			}
-			p, ok := xrayPortValue(candidate["port"])
-			if ok && p == sourcePort {
+			port, ok := xrayPortValue(candidate["port"])
+			if ok && port == sourcePort {
 				if source != nil {
 					return nil, nil, "", fmt.Errorf("more than one Xray inbound uses port %d; automatic isolation is ambiguous", sourcePort)
 				}
@@ -313,7 +331,7 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 		if err != nil {
 			return nil, nil, "", err
 		}
-		inTag := fmt.Sprintf("s1t-warp-%s-%s", shortID, safeXrayTag(mapping.ID))
+		inTag := fmt.Sprintf("s1t-%s-%s-%s", kind, shortID, safeXrayTag(mapping.ID))
 		if usedTags[inTag] {
 			return nil, nil, "", fmt.Errorf("Xray inbound tag %q already exists; refusing to overwrite it", inTag)
 		}
@@ -323,7 +341,16 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 		clone["port"] = port
 		newInbounds = append(newInbounds, clone)
 		newInboundTags = append(newInboundTags, inTag)
-		newRules = append(newRules, map[string]any{"type": "field", "inboundTag": []any{inTag}, "outboundTag": outTag})
+		if blockUDP {
+			newRules = append(newRules,
+				map[string]any{"type": "field", "inboundTag": []any{inTag}, "network": "tcp", "outboundTag": outTag},
+				map[string]any{"type": "field", "inboundTag": []any{inTag}, "network": "udp", "outboundTag": blockTag},
+				// Any future/unknown network type is blocked as a final fail-closed guard.
+				map[string]any{"type": "field", "inboundTag": []any{inTag}, "outboundTag": blockTag},
+			)
+		} else {
+			newRules = append(newRules, map[string]any{"type": "field", "inboundTag": []any{inTag}, "outboundTag": outTag})
+		}
 		b := XrayWarpBinding{MappingID: mapping.ID, OriginalTarget: mapping.Target, WarpTarget: net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), InboundTag: inTag}
 		portToBinding[sourcePort] = b
 		bindings = append(bindings, b)
@@ -331,13 +358,11 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 	if len(newInbounds) == 0 {
 		return nil, nil, "", errors.New("no new Xray inbound routes were created")
 	}
-	// Run the selected inbound clones in a dedicated Xray sidecar process.
-	// Never mutate the X-UI-managed config or restart its service: X-UI may
-	// regenerate config.json from its database during a service restart.
+	// Run only selected inbound clones in a dedicated Xray sidecar process.
 	root["inbounds"] = newInbounds
 	delete(root, "api")
 	delete(root, "metrics")
-	dnsOutbound, dnsRules, err := configureXrayWarpDNS(root, shortID, outTag, newInboundTags, usedTags)
+	dnsOutbound, dnsRules, err := configureXrayProxyDNS(root, shortID, outTag, newInboundTags, usedTags, kind)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -348,6 +373,11 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 		},
 		dnsOutbound,
 	)
+	if blockUDP {
+		root["outbounds"] = append(root["outbounds"].([]any), map[string]any{
+			"tag": blockTag, "protocol": "blackhole", "settings": map[string]any{"response": map[string]any{"type": "none"}},
+		})
+	}
 	routing, ok := root["routing"].(map[string]any)
 	if !ok {
 		routing = map[string]any{}
@@ -357,9 +387,7 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 	if !ok && routing["rules"] != nil {
 		return nil, nil, "", errors.New("Xray routing.rules is not an array")
 	}
-	// DNS hijack must precede the general cloned-inbound WARP rule. The
-	// internal DNS requests are separately tagged by dns.tag and are sent
-	// through the same WARP SOCKS5 outbound to avoid filtered/system DNS.
+	// DNS interception precedes all per-inbound egress and UDP-block rules.
 	routing["rules"] = append(append(dnsRules, newRules...), rules...)
 	result, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
@@ -373,6 +401,12 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 // DoH requests are routed through the per-profile WARP SOCKS5 outbound.
 // This modifies only the generated sidecar config, never the X-UI source JSON.
 func configureXrayWarpDNS(root map[string]any, shortID, warpOutboundTag string, inboundTags []string, usedTags map[string]bool) (map[string]any, []any, error) {
+	return configureXrayProxyDNS(root, shortID, warpOutboundTag, inboundTags, usedTags, "warp")
+}
+
+// configureXrayProxyDNS sends DNS-over-HTTPS requests through the same
+// profile-scoped SOCKS5 egress as the cloned client inbounds.
+func configureXrayProxyDNS(root map[string]any, shortID, proxyOutboundTag string, inboundTags []string, usedTags map[string]bool, kind string) (map[string]any, []any, error) {
 	dnsConfig, ok := root["dns"].(map[string]any)
 	if !ok {
 		if root["dns"] != nil {
@@ -384,44 +418,28 @@ func configureXrayWarpDNS(root map[string]any, shortID, warpOutboundTag string, 
 	dnsInboundTag, _ := dnsConfig["tag"].(string)
 	dnsInboundTag = strings.TrimSpace(dnsInboundTag)
 	if dnsInboundTag == "" {
-		dnsInboundTag = "s1t-warp-" + shortID + "-dns-in"
+		dnsInboundTag = "s1t-" + kind + "-" + shortID + "-dns-in"
 		dnsConfig["tag"] = dnsInboundTag
 	}
-	dnsOutboundTag := "s1t-warp-" + shortID + "-dns-out"
-	if usedTags[dnsOutboundTag] || dnsOutboundTag == warpOutboundTag {
+	dnsOutboundTag := "s1t-" + kind + "-" + shortID + "-dns-out"
+	if usedTags[dnsOutboundTag] || dnsOutboundTag == proxyOutboundTag {
 		return nil, nil, fmt.Errorf("Xray DNS outbound tag %q already exists; refusing to overwrite it", dnsOutboundTag)
 	}
 	if len(inboundTags) == 0 {
-		return nil, nil, errors.New("no cloned inbound tags available for WARP DNS routing")
+		return nil, nil, errors.New("no cloned inbound tags available for isolated DNS routing")
 	}
-
-	// Use provider IPs directly so the resolver hostname itself cannot create
-	// a bootstrap DNS loop. DoH is TCP/TLS and works through SOCKS5 CONNECT.
-	dnsConfig["servers"] = []any{
-		"https://1.1.1.1/dns-query",
-		"https://8.8.8.8/dns-query",
-	}
+	// Provider IPs avoid needing a DNS lookup to bootstrap the DoH connection.
+	dnsConfig["servers"] = []any{"https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"}
 	dnsConfig["queryStrategy"] = "UseIPv4"
-
-	dnsOutbound := map[string]any{
-		"tag":      dnsOutboundTag,
-		"protocol": "dns",
-		"settings": map[string]any{},
-	}
+	dnsOutbound := map[string]any{"tag": dnsOutboundTag, "protocol": "dns", "settings": map[string]any{}}
 	dnsRules := []any{
 		map[string]any{
-			"type":        "field",
-			"inboundTag":  stringSliceToAny(inboundTags),
-			"network":     "tcp,udp",
-			"port":        "53",
-			"outboundTag": dnsOutboundTag,
-			"ruleTag":     "s1t-warp-" + shortID + "-dns-hijack",
+			"type": "field", "inboundTag": stringSliceToAny(inboundTags), "network": "tcp,udp", "port": "53",
+			"outboundTag": dnsOutboundTag, "ruleTag": "s1t-" + kind + "-" + shortID + "-dns-hijack",
 		},
 		map[string]any{
-			"type":        "field",
-			"inboundTag":  []any{dnsInboundTag},
-			"outboundTag": warpOutboundTag,
-			"ruleTag":     "s1t-warp-" + shortID + "-dns-egress",
+			"type": "field", "inboundTag": []any{dnsInboundTag}, "outboundTag": proxyOutboundTag,
+			"ruleTag": "s1t-" + kind + "-" + shortID + "-dns-egress",
 		},
 	}
 	return dnsOutbound, dnsRules, nil

@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "3.0.6"
+	version                          = "3.0.7"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -134,9 +134,10 @@ type Config struct {
 	Fingerprint    string `json:"fingerprint,omitempty"`
 	// TunnelChannels controls the number of independent authenticated TCP/TLS lanes
 	// between Agent and Hub. Missing values on old configs are upgraded in memory to the current default.
-	TunnelChannels int                  `json:"tunnel_channels,omitempty"`
-	Ports          []PortMapping        `json:"ports,omitempty"`
-	XrayWARP       *XrayWarpIntegration `json:"xray_warp,omitempty"`
+	TunnelChannels int                     `json:"tunnel_channels,omitempty"`
+	Ports          []PortMapping           `json:"ports,omitempty"`
+	XrayWARP       *XrayWarpIntegration    `json:"xray_warp,omitempty"`
+	XrayPsiphon    *XrayPsiphonIntegration `json:"xray_psiphon,omitempty"`
 }
 
 type RuntimeSnapshot struct {
@@ -1751,10 +1752,10 @@ func (h *hubServer) sessionCount() int {
 	return n
 }
 
-// current chooses the least-loaded healthy lane. When several lanes have the
-// same load and all have measured RTT, the lowest-RTT lane wins; a rotating
-// tie-breaker prevents pinning every new flow to one connection. RTT is only a
-// tie-breaker, not a promise that the lowest-latency lane has the highest capacity.
+// current chooses a healthy lane using measured RTT and active-stream load.
+// Once every candidate has an RTT sample, a bounded load penalty prevents
+// pinning all new flows to a fast-but-busy lane while still preferring lower
+// latency paths. Before RTT samples exist, least-loaded round-robin is used.
 func (h *hubServer) current() *hubSession {
 	h.mu.RLock()
 	candidates := make([]*hubSession, 0, len(h.sessions))
@@ -1772,47 +1773,61 @@ func (h *hubServer) current() *hubSession {
 		ordered = append(ordered, candidates[(start+i)%len(candidates)])
 	}
 
-	bestLoad := maxStreams + 1
-	var leastLoaded []*hubSession
+	// A stream on a lane with a very high active count can experience queueing.
+	// The penalty rises linearly to +100% at maxStreams; measured RTT remains
+	// the primary signal and all arithmetic is bounded to positive durations.
+	type laneMetric struct {
+		session *hubSession
+		load    int
+		rtt     time.Duration
+	}
+	metrics := make([]laneMetric, 0, len(ordered))
+	allMeasured := true
 	for _, candidate := range ordered {
 		load := candidate.activeStreams()
 		if load >= maxStreams {
 			continue
 		}
-		if load < bestLoad {
-			bestLoad = load
+		rtt := candidate.wire.roundTripTime()
+		if rtt <= 0 {
+			allMeasured = false
+		}
+		metrics = append(metrics, laneMetric{session: candidate, load: load, rtt: rtt})
+	}
+	if len(metrics) == 0 {
+		return nil
+	}
+	if allMeasured {
+		best := metrics[0]
+		bestScore := best.rtt + best.rtt*time.Duration(best.load)/time.Duration(maxStreams)
+		for _, metric := range metrics[1:] {
+			score := metric.rtt + metric.rtt*time.Duration(metric.load)/time.Duration(maxStreams)
+			if score < bestScore {
+				best, bestScore = metric, score
+			}
+		}
+		// `ordered` is rotated each call, so equal scores remain fairly shared.
+		return best.session
+	}
+
+	// Until every lane has a reliable sample, retain least-loaded selection.
+	bestLoad := maxStreams + 1
+	var leastLoaded []*hubSession
+	for _, metric := range metrics {
+		if metric.load < bestLoad {
+			bestLoad = metric.load
 			leastLoaded = leastLoaded[:0]
 		}
-		if load == bestLoad {
-			leastLoaded = append(leastLoaded, candidate)
+		if metric.load == bestLoad {
+			leastLoaded = append(leastLoaded, metric.session)
 		}
 	}
 	if len(leastLoaded) == 0 {
 		return nil
 	}
-	if len(leastLoaded) == 1 {
-		return leastLoaded[0]
-	}
-
-	// Do not prefer an unmeasured lane over a measured one (or vice versa):
-	// keep round-robin behaviour until every equally loaded candidate has RTT.
-	bestRTT := time.Duration(0)
-	for _, candidate := range leastLoaded {
-		rtt := candidate.wire.roundTripTime()
-		if rtt <= 0 {
-			return leastLoaded[0]
-		}
-		if bestRTT == 0 || rtt < bestRTT {
-			bestRTT = rtt
-		}
-	}
-	for _, candidate := range leastLoaded {
-		if candidate.wire.roundTripTime() == bestRTT {
-			return candidate
-		}
-	}
 	return leastLoaded[0]
 }
+
 func (h *hubServer) acceptPublic(ln net.Listener, portID string) {
 	pending := h.pendingPublic
 	if pending == nil {
@@ -3769,6 +3784,17 @@ func validateConfig(c Config) error {
 		if _, err := normalizeFingerprint(c.Fingerprint); err != nil {
 			return err
 		}
+		if c.XrayWARP != nil && c.XrayPsiphon != nil {
+			return errors.New("an Agent profile cannot have both isolated WARP and Psiphon Xray egress")
+		}
+		if c.XrayPsiphon != nil {
+			if c.Underlay != underlayPsiphon && c.Underlay != underlayAdaptive {
+				return errors.New("isolated Xray Psiphon egress requires Psiphon SOCKS5 or adaptive external underlay")
+			}
+			if !isLoopbackProxyAddress(c.XrayPsiphon.Proxy) {
+				return errors.New("isolated Xray Psiphon proxy must be loopback-only")
+			}
+		}
 	} else {
 		for _, p := range c.Ports {
 			if !validMappingID(p.ID) {
@@ -4224,6 +4250,11 @@ func deleteOneTunnel() error {
 	if cfg.XrayWARP != nil {
 		if err := removeXrayWarpIntegration(&cfg); err != nil {
 			return fmt.Errorf("tunnel stopped, but its isolated Xray WARP route could not be removed; tunnel profile was kept: %w", err)
+		}
+	}
+	if cfg.XrayPsiphon != nil {
+		if err := removeXrayPsiphonIntegration(&cfg); err != nil {
+			return fmt.Errorf("tunnel stopped, but its isolated Xray Psiphon route could not be removed; tunnel profile was kept: %w", err)
 		}
 	}
 	if !selected.Legacy {
@@ -4825,7 +4856,7 @@ func setup() error {
 			uiInfo("WARP WireGuard requires an already-connected system tunnel; Local Proxy mode is MASQUE-only. ShahTunnel never changes host routes or restarts SSH.")
 		}
 		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
-			uiInfo("Psiphon starts as a loopback-only child process for this Agent profile; no TUN device or host route changes are made. TCP tunnel lanes use its local SOCKS5 endpoint.")
+			uiInfo("Psiphon starts as a loopback-only child process. The Agent-to-Hub lanes and the isolated Xray user TCP/DNS egress use its SOCKS5 endpoint; UDP is blocked on the isolated user path to prevent direct-IP leaks. No TUN device or host route changes are made.")
 		}
 		uiSuccess("Agent configuration saved. Reconnection is automatic if a lane drops.")
 	case "3", "relay", "front":
@@ -4862,6 +4893,11 @@ func setup() error {
 	}
 	if c.Role == "agent" && c.Underlay == underlayMASQUE {
 		if err := autoApplyXrayWarpForNewAgent(); err != nil {
+			return err
+		}
+	}
+	if c.Role == "agent" && (c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive) {
+		if err := autoApplyXrayPsiphonForNewAgent(); err != nil {
 			return err
 		}
 	}
@@ -5901,6 +5937,7 @@ func menu() {
 		menuItem("7", "🗑️ Delete one tunnel", "Delete this tunnel only")
 		menuItem("8", "💣 Complete uninstall", "Remove all tunnels")
 		menuItem("9", "🌐 WARP egress", "Selected Agent only")
+		menuItem("10", "🛡️ Psiphon user egress", "Selected Agent TCP + DNS")
 		menuItem("0", "🚪 Exit", "Close menu")
 		uiRule()
 		choice := ask("Select an operation", "0")
@@ -5943,6 +5980,10 @@ func menu() {
 		case "9":
 			if chooseTunnel("Select the Agent tunnel to isolate through WARP") {
 				err = applyXrayWarpEgressToSelectedTunnel()
+			}
+		case "10":
+			if chooseTunnel("Select the Agent tunnel to isolate user traffic through Psiphon") {
+				err = applyXrayPsiphonEgressToSelectedTunnel()
 			}
 		case "0":
 			return

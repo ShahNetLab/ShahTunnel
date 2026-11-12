@@ -2552,3 +2552,138 @@ func TestBuildXrayWarpConfigRejectsNonLoopbackAndAmbiguousInbound(t *testing.T) 
 		t.Fatal("ambiguous port must be rejected")
 	}
 }
+
+func TestBuildXrayPsiphonConfigIsolatesTCPAndBlocksUDP(t *testing.T) {
+	original := []byte(`{
+  "inbounds": [
+    {"tag":"xui-vless","listen":"0.0.0.0","port":2083,"protocol":"vless","settings":{"clients":[{"id":"test-id"}]}}
+  ],
+  "outbounds": [
+    {"tag":"direct","protocol":"freedom"}
+  ],
+  "routing": {"rules": []}
+}`)
+	before := append([]byte(nil), original...)
+	generated, bindings, outTag, err := buildXrayPsiphonConfig(original, "psiphon-profile", "127.0.0.1:21082", []PortMapping{{ID: "main", Target: "127.0.0.1:2083"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(original, before) {
+		t.Fatal("source X-UI config bytes were mutated")
+	}
+	if len(bindings) != 1 || bindings[0].OriginalTarget != "127.0.0.1:2083" || bindings[0].PsiphonTarget == bindings[0].OriginalTarget {
+		t.Fatalf("unexpected isolated Psiphon binding: %#v", bindings)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(generated, &got); err != nil {
+		t.Fatal(err)
+	}
+	inbounds := got["inbounds"].([]any)
+	if len(inbounds) != 1 {
+		t.Fatalf("sidecar inbound count=%d; want one cloned inbound", len(inbounds))
+	}
+	clone := inbounds[0].(map[string]any)
+	if clone["listen"] != "127.0.0.1" || clone["tag"] != bindings[0].InboundTag {
+		t.Fatalf("Psiphon clone is not loopback-only/tagged: %#v", clone)
+	}
+	outbounds := got["outbounds"].([]any)
+	foundSocks, foundBlock, foundDirect := false, false, false
+	blockTag := "s1t-psiphon-psiphon-profile-udp-block"
+	for _, raw := range outbounds {
+		x := raw.(map[string]any)
+		switch x["tag"] {
+		case outTag:
+			foundSocks = x["protocol"] == "socks"
+		case blockTag:
+			foundBlock = x["protocol"] == "blackhole"
+		case "direct":
+			foundDirect = true
+		}
+	}
+	if !foundSocks || !foundBlock || !foundDirect {
+		t.Fatalf("sidecar must preserve original outbound and add SOCKS+UDP blackhole: %#v", outbounds)
+	}
+	rules := got["routing"].(map[string]any)["rules"].([]any)
+	if len(rules) < 5 {
+		t.Fatalf("not enough ordered Psiphon routing rules: %#v", rules)
+	}
+	if rules[0].(map[string]any)["outboundTag"] != "s1t-psiphon-psiphon-profile-dns-out" {
+		t.Fatalf("DNS hijack must run before protocol routing: %#v", rules[0])
+	}
+	if rules[1].(map[string]any)["outboundTag"] != outTag {
+		t.Fatalf("DNS resolver traffic must use Psiphon SOCKS: %#v", rules[1])
+	}
+	tcpRule := rules[2].(map[string]any)
+	if tcpRule["network"] != "tcp" || tcpRule["outboundTag"] != outTag {
+		t.Fatalf("cloned TCP traffic must use Psiphon: %#v", tcpRule)
+	}
+	udpRule := rules[3].(map[string]any)
+	if udpRule["network"] != "udp" || udpRule["outboundTag"] != blockTag {
+		t.Fatalf("cloned UDP traffic must be blocked, not sent Direct: %#v", udpRule)
+	}
+	unknownRule := rules[4].(map[string]any)
+	if unknownRule["outboundTag"] != blockTag {
+		t.Fatalf("unmatched protocols on the cloned inbound must fail closed: %#v", unknownRule)
+	}
+	if _, ok := got["api"]; ok {
+		t.Fatal("X-UI API section must not be copied into the sidecar")
+	}
+}
+
+func TestXrayPsiphonManagedPathsAndUnitAreRestricted(t *testing.T) {
+	if _, err := xrayPsiphonUnitPath("x-ui.service"); err == nil {
+		t.Fatal("must not manage X-UI systemd unit")
+	}
+	if _, err := xrayPsiphonConfigDirectory("/usr/local/x-ui/bin/config.json"); err == nil {
+		t.Fatal("must not remove or alter X-UI config directory")
+	}
+	if dir, err := xrayPsiphonConfigDirectory("/etc/ravanreverse/xray-psiphon/profile-s/config.json"); err != nil || dir != "/etc/ravanreverse/xray-psiphon/profile-s" {
+		t.Fatalf("unexpected managed config directory %q, error=%v", dir, err)
+	}
+	runtime := xrayRuntime{Binary: "/usr/local/x-ui/bin/xray-linux-amd64", CWD: "/usr/local/x-ui/bin", Service: "x-ui.service"}
+	service := xrayPsiphonServiceName("profile-s")
+	unit, err := renderXrayPsiphonUnit(runtime, "/etc/ravanreverse/xray-psiphon/profile-s/config.json", service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unitText := string(unit)
+	for _, want := range []string{
+		"ExecStart=\"/usr/local/x-ui/bin/xray-linux-amd64\" run -config \"/etc/ravanreverse/xray-psiphon/profile-s/config.json\"",
+		"WorkingDirectory=/usr/local/x-ui/bin",
+		"Restart=on-failure",
+		"After=network-online.target",
+		"NoNewPrivileges=yes",
+		"PrivateTmp=yes",
+		"ProtectSystem=full",
+		"ProtectHome=yes",
+		"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+	} {
+		if !strings.Contains(unitText, want) {
+			t.Fatalf("Psiphon sidecar unit missing %q:\n%s", want, unitText)
+		}
+	}
+	if strings.Contains(unitText, "x-ui.service") || strings.Contains(unitText, "ExecStart=/bin/sh") {
+		t.Fatalf("Psiphon sidecar must not restart X-UI or run through a shell: %s", unitText)
+	}
+}
+
+func TestHubBalancesMeasuredRTTAndLoad(t *testing.T) {
+	mkSession := func(id uint64, active int, rtt time.Duration) *hubSession {
+		streams := make(map[uint32]*hubStream, active)
+		for i := 0; i < active; i++ {
+			streams[uint32(i+1)] = &hubStream{}
+		}
+		w := &wire{done: make(chan struct{})}
+		w.rttNanos.Store(int64(rtt))
+		return &hubSession{id: id, streams: streams, wire: w}
+	}
+	// The 14ms lane has some load but a lower weighted RTT than the idle 30ms lane.
+	fast := mkSession(1, 32, 14*time.Millisecond)
+	slower := mkSession(2, 0, 30*time.Millisecond)
+	h := &hubServer{sessions: map[*hubSession]struct{}{fast: {}, slower: {}}}
+	for i := 0; i < 20; i++ {
+		if got := h.current(); got != fast {
+			t.Fatalf("selected lane %d (RTT %s, load %d), want the lower weighted RTT lane", got.id, got.wire.roundTripTime(), got.activeStreams())
+		}
+	}
+}
