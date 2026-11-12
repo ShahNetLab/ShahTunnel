@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -96,7 +97,51 @@ func psiphonConsoleClientArgs(configPath, dataDir string) []string {
 	return []string{"-config", configPath, "-dataRootDirectory", dataDir}
 }
 
+type psiphonPerformanceProfile struct {
+	LimitMeekBufferSizes  bool
+	LimitCPUThreads       bool
+	LimitRelayBufferSizes bool
+}
+
+const psiphonHighThroughputMinRAM = uint64(3 << 30) // 3 GiB
+
+// psiphonPerformanceProfileForHost avoids oversized buffers on small VPSes,
+// but removes Psiphon's conservative relay/Meek buffer caps when the host has
+// enough memory. CPU thread limiting is disabled only on multi-core hosts.
+func psiphonPerformanceProfileForHost(totalRAMBytes uint64, cpuCount int) psiphonPerformanceProfile {
+	lowMemory := totalRAMBytes < psiphonHighThroughputMinRAM
+	return psiphonPerformanceProfile{
+		LimitMeekBufferSizes:  lowMemory,
+		LimitCPUThreads:       cpuCount < 2,
+		LimitRelayBufferSizes: lowMemory,
+	}
+}
+
+func psiphonHostPerformanceProfile() psiphonPerformanceProfile {
+	// Fail safe: if memory information cannot be read, preserve conservative
+	// buffer limits rather than risking memory pressure on an unknown VPS.
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return psiphonPerformanceProfileForHost(0, runtime.NumCPU())
+	}
+	var totalRAM uint64
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			if kib, parseErr := strconv.ParseUint(fields[1], 10, 64); parseErr == nil {
+				totalRAM = kib * 1024
+			}
+		}
+		break
+	}
+	return psiphonPerformanceProfileForHost(totalRAM, runtime.NumCPU())
+}
+
 func newPsiphonClientConfig(port int) psiphonClientConfig {
+	performance := psiphonHostPerformanceProfile()
 	return psiphonClientConfig{
 		ClientVersion:                      "1",
 		ClientPlatform:                     "Linux",
@@ -116,9 +161,9 @@ func newPsiphonClientConfig(port int) psiphonClientConfig {
 		// ShahTunnel binaries during an in-place config-only recovery.
 		RemoteServerListURL:     psiphonRemoteServerListURL,
 		UseIndistinguishableTLS: true,
-		LimitMeekBufferSizes:    true,
-		LimitCPUThreads:         true,
-		LimitRelayBufferSizes:   true,
+		LimitMeekBufferSizes:    performance.LimitMeekBufferSizes,
+		LimitCPUThreads:         performance.LimitCPUThreads,
+		LimitRelayBufferSizes:   performance.LimitRelayBufferSizes,
 		// Diagnostic notices are written only to the local systemd journal;
 		// they are needed to distinguish bootstrap-list failures from blocked
 		// Psiphon server connections when the first tunnel is delayed.
@@ -415,6 +460,76 @@ func repairLegacyPsiphonClientConfig(configPath, proxyAddress string) (bool, err
 	}
 	if err := os.Rename(tmpName, configPath); err != nil {
 		return false, fmt.Errorf("replace upgraded Psiphon config: %w", err)
+	}
+	if err := os.Chmod(configPath, 0600); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// tunePsiphonPerformanceConfig updates only the three performance switches
+// owned by ShahTunnel, preserving every other field and unknown Psiphon option.
+func tunePsiphonPerformanceConfig(configPath string) (bool, error) {
+	return tunePsiphonPerformanceConfigForProfile(configPath, psiphonHostPerformanceProfile())
+}
+
+func tunePsiphonPerformanceConfigForProfile(configPath string, profile psiphonPerformanceProfile) (bool, error) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return false, err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return false, fmt.Errorf("read Psiphon performance settings: %w", err)
+	}
+	if raw == nil {
+		return false, errors.New("Psiphon config must be a JSON object")
+	}
+	settings := map[string]bool{
+		"LimitMeekBufferSizes":  profile.LimitMeekBufferSizes,
+		"LimitCPUThreads":       profile.LimitCPUThreads,
+		"LimitRelayBufferSizes": profile.LimitRelayBufferSizes,
+	}
+	changed := false
+	for key, value := range settings {
+		encoded, _ := json.Marshal(value)
+		if existing, ok := raw[key]; ok && string(existing) == string(encoded) {
+			continue
+		}
+		raw[key] = encoded
+		changed = true
+	}
+	if !changed {
+		return false, nil
+	}
+	updated, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return false, fmt.Errorf("encode Psiphon performance settings: %w", err)
+	}
+	updated = append(updated, '\n')
+	tmp, err := os.CreateTemp(filepath.Dir(configPath), ".psiphon-tune-*.tmp")
+	if err != nil {
+		return false, fmt.Errorf("create temporary Psiphon config: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return false, err
+	}
+	if _, err := tmp.Write(updated); err != nil {
+		_ = tmp.Close()
+		return false, err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return false, err
+	}
+	if err := tmp.Close(); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tmpName, configPath); err != nil {
+		return false, fmt.Errorf("replace Psiphon config with performance profile: %w", err)
 	}
 	if err := os.Chmod(configPath, 0600); err != nil {
 		return false, err

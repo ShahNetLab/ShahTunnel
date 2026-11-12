@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "3.0.10"
+	version                          = "4.0.0"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -1123,8 +1123,13 @@ func acknowledge(ch chan struct{}) {
 	}
 }
 
+const (
+	lanePingInterval = 5 * time.Second
+	laneRTTMaxAge    = 3 * lanePingInterval
+)
+
 func heartbeat(w *wire, stop <-chan struct{}) {
-	t := time.NewTicker(15 * time.Second)
+	t := time.NewTicker(lanePingInterval)
 	defer t.Stop()
 	for {
 		select {
@@ -1147,7 +1152,8 @@ func heartbeat(w *wire, stop <-chan struct{}) {
 
 // observePong records the round-trip time encoded by our own PING timestamp.
 // A wall-clock adjustment or malformed/stale payload is ignored instead of
-// poisoning lane selection. The 1/8 EWMA dampens transient scheduling spikes.
+// poisoning lane selection. The 1/4 EWMA reacts faster to route changes while
+// retaining enough smoothing to avoid overreacting to a single scheduling spike.
 func (w *wire) observePong(payload []byte) {
 	if len(payload) != 8 {
 		return
@@ -1164,7 +1170,7 @@ func (w *wire) observePong(payload []byte) {
 		if old <= 0 {
 			next = elapsed
 		} else {
-			next = (old*7 + elapsed) / 8
+			next = (old*3 + elapsed) / 4
 		}
 		if w.rttNanos.CompareAndSwap(old, next) {
 			w.lastPongAt.Store(now)
@@ -1182,6 +1188,24 @@ func (w *wire) roundTripTime() time.Duration {
 		return 0
 	}
 	return time.Duration(n)
+}
+
+// freshRoundTripTime returns a lane sample only while a recent authenticated
+// PONG has been observed. Stale low values must not keep a degraded route in
+// preference over a currently healthy lane.
+func (w *wire) freshRoundTripTime(now time.Time) time.Duration {
+	if w == nil {
+		return 0
+	}
+	last := w.lastPongAt.Load()
+	if last <= 0 {
+		return 0
+	}
+	age := now.Sub(time.Unix(0, last))
+	if age < 0 || age > laneRTTMaxAge {
+		return 0
+	}
+	return w.roundTripTime()
 }
 
 type hubStream struct {
@@ -1781,25 +1805,30 @@ func (h *hubServer) current() *hubSession {
 		rtt     time.Duration
 	}
 	metrics := make([]laneMetric, 0, len(ordered))
-	allMeasured := true
+	freshMetrics := make([]laneMetric, 0, len(ordered))
+	now := time.Now()
 	for _, candidate := range ordered {
 		load := candidate.activeStreams()
 		if load >= maxStreams {
 			continue
 		}
-		rtt := candidate.wire.roundTripTime()
-		if rtt <= 0 {
-			allMeasured = false
+		metric := laneMetric{session: candidate, load: load}
+		metric.rtt = candidate.wire.freshRoundTripTime(now)
+		metrics = append(metrics, metric)
+		if metric.rtt > 0 {
+			freshMetrics = append(freshMetrics, metric)
 		}
-		metrics = append(metrics, laneMetric{session: candidate, load: load, rtt: rtt})
 	}
 	if len(metrics) == 0 {
 		return nil
 	}
-	if allMeasured {
-		best := metrics[0]
+	// As soon as one lane has a fresh sample, rank only fresh lanes. A stale
+	// measurement (even a formerly excellent one) is not evidence of current
+	// path quality. New lanes join ranking as soon as their first PONG arrives.
+	if len(freshMetrics) > 0 {
+		best := freshMetrics[0]
 		bestScore := best.rtt + best.rtt*time.Duration(best.load)/time.Duration(maxStreams)
-		for _, metric := range metrics[1:] {
+		for _, metric := range freshMetrics[1:] {
 			score := metric.rtt + metric.rtt*time.Duration(metric.load)/time.Duration(maxStreams)
 			if score < bestScore {
 				best, bestScore = metric, score
@@ -1809,7 +1838,7 @@ func (h *hubServer) current() *hubSession {
 		return best.session
 	}
 
-	// Until every lane has a reliable sample, retain least-loaded selection.
+	// Before a fresh RTT sample exists, retain least-loaded selection.
 	bestLoad := maxStreams + 1
 	var leastLoaded []*hubSession
 	for _, metric := range metrics {
@@ -3210,6 +3239,12 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 		return nil, fmt.Errorf("migrate legacy Psiphon bootstrap: %w", migrateErr)
 	} else if migrated {
 		log.Printf("Psiphon: migrated legacy/incomplete bootstrap to the current authenticated server-list format")
+	}
+	if tuned, tuneErr := tunePsiphonPerformanceConfig(configPath); tuneErr != nil {
+		return nil, fmt.Errorf("tune Psiphon performance profile: %w", tuneErr)
+	} else if tuned {
+		profile := psiphonHostPerformanceProfile()
+		log.Printf("Psiphon: applied memory-aware performance profile (MeekBufferLimit=%t, RelayBufferLimit=%t, CPUThreadLimit=%t)", profile.LimitMeekBufferSizes, profile.LimitRelayBufferSizes, profile.LimitCPUThreads)
 	}
 	if err := validatePsiphonClientConfig(configPath, cfg.PsiphonProxy); err != nil {
 		return nil, fmt.Errorf("invalid Psiphon client configuration: %w", err)

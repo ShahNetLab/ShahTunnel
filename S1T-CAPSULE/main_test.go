@@ -1859,6 +1859,7 @@ func TestHubPrefersLowerRTTAmongEquallyLoadedLanes(t *testing.T) {
 	mkSession := func(id uint64, rtt time.Duration) *hubSession {
 		w := &wire{done: make(chan struct{})}
 		w.rttNanos.Store(int64(rtt))
+		w.lastPongAt.Store(time.Now().UnixNano())
 		return &hubSession{id: id, streams: make(map[uint32]*hubStream), wire: w}
 	}
 	slow := mkSession(1, 80*time.Millisecond)
@@ -2545,6 +2546,9 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 	if dnsConfig["queryStrategy"] != "UseIPv4" {
 		t.Fatalf("sidecar DNS queryStrategy=%v; want UseIPv4", dnsConfig["queryStrategy"])
 	}
+	if dnsConfig["disableCache"] != false {
+		t.Fatalf("sidecar DNS disableCache=%v; repeat lookups should use the Xray cache", dnsConfig["disableCache"])
+	}
 	dnsServers := dnsConfig["servers"].([]any)
 	if len(dnsServers) != 2 || dnsServers[0] != "https://1.1.1.1/dns-query" || dnsServers[1] != "https://8.8.8.8/dns-query" {
 		t.Fatalf("sidecar DNS servers were not normalized: %#v", dnsServers)
@@ -2752,6 +2756,7 @@ func TestHubBalancesMeasuredRTTAndLoad(t *testing.T) {
 		}
 		w := &wire{done: make(chan struct{})}
 		w.rttNanos.Store(int64(rtt))
+		w.lastPongAt.Store(time.Now().UnixNano())
 		return &hubSession{id: id, streams: streams, wire: w}
 	}
 	// The 14ms lane has some load but a lower weighted RTT than the idle 30ms lane.
@@ -2762,5 +2767,21 @@ func TestHubBalancesMeasuredRTTAndLoad(t *testing.T) {
 		if got := h.current(); got != fast {
 			t.Fatalf("selected lane %d (RTT %s, load %d), want the lower weighted RTT lane", got.id, got.wire.roundTripTime(), got.activeStreams())
 		}
+	}
+}
+
+func TestHubPrefersFreshRTTOverStaleLowRTT(t *testing.T) {
+	mkSession := func(id uint64, rtt time.Duration, last time.Time) *hubSession {
+		w := &wire{done: make(chan struct{})}
+		w.rttNanos.Store(int64(rtt))
+		w.lastPongAt.Store(last.UnixNano())
+		return &hubSession{id: id, streams: make(map[uint32]*hubStream), wire: w}
+	}
+	now := time.Now()
+	staleFormerlyFast := mkSession(1, 2*time.Millisecond, now.Add(-2*time.Minute))
+	freshHealthy := mkSession(2, 28*time.Millisecond, now)
+	h := &hubServer{sessions: map[*hubSession]struct{}{staleFormerlyFast: {}, freshHealthy: {}}}
+	if got := h.current(); got != freshHealthy {
+		t.Fatalf("selected lane %d; want fresh lane %d despite stale lower RTT", got.id, freshHealthy.id)
 	}
 }

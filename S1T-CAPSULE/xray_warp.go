@@ -431,6 +431,8 @@ func configureXrayProxyDNS(root map[string]any, shortID, proxyOutboundTag string
 	// Provider IPs avoid needing a DNS lookup to bootstrap the DoH connection.
 	dnsConfig["servers"] = []any{"https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"}
 	dnsConfig["queryStrategy"] = "UseIPv4"
+	// Keep Xray's DNS cache enabled so repeat lookups avoid another DoH round trip.
+	dnsConfig["disableCache"] = false
 	dnsOutbound := map[string]any{"tag": dnsOutboundTag, "protocol": "dns", "settings": map[string]any{}}
 	dnsRules := []any{
 		map[string]any{

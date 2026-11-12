@@ -335,3 +335,60 @@ func TestPsiphonConsoleClientArgsUseDefaultLoopbackBinding(t *testing.T) {
 		}
 	}
 }
+
+func TestPsiphonPerformanceProfileIsMemoryAndCPUAware(t *testing.T) {
+	low := psiphonPerformanceProfileForHost(1<<30, 1)
+	if !low.LimitMeekBufferSizes || !low.LimitRelayBufferSizes || !low.LimitCPUThreads {
+		t.Fatalf("low-resource profile should retain all safety limits: %+v", low)
+	}
+	highMemorySingleCore := psiphonPerformanceProfileForHost(4<<30, 1)
+	if highMemorySingleCore.LimitMeekBufferSizes || highMemorySingleCore.LimitRelayBufferSizes || !highMemorySingleCore.LimitCPUThreads {
+		t.Fatalf("high-memory single-core profile should expand buffers but limit CPU threads: %+v", highMemorySingleCore)
+	}
+	high := psiphonPerformanceProfileForHost(4<<30, 4)
+	if high.LimitMeekBufferSizes || high.LimitRelayBufferSizes || high.LimitCPUThreads {
+		t.Fatalf("high-resource profile should lift conservative throughput limits: %+v", high)
+	}
+}
+
+func TestTunePsiphonPerformanceConfigPreservesUnknownFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profile.json")
+	original := []byte(`{"EgressRegion":"DE","LocalSocksProxyPort":21086,"UnknownFuturePsiphonOption":{"keep":"me"},"LimitMeekBufferSizes":true,"LimitCPUThreads":true,"LimitRelayBufferSizes":true}`)
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := tunePsiphonPerformanceConfigForProfile(path, psiphonPerformanceProfileForHost(4<<30, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("expected performance settings to be reconciled")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got["EgressRegion"]) != `"DE"` || string(got["LocalSocksProxyPort"]) != "21086" {
+		t.Fatalf("known profile fields were not preserved: region=%s port=%s", got["EgressRegion"], got["LocalSocksProxyPort"])
+	}
+	var unknown map[string]string
+	if err := json.Unmarshal(got["UnknownFuturePsiphonOption"], &unknown); err != nil || unknown["keep"] != "me" {
+		t.Fatalf("unknown Psiphon option was not preserved: value=%s err=%v", got["UnknownFuturePsiphonOption"], err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0600 {
+		t.Fatalf("tuned config mode=%o, want 600", st.Mode().Perm())
+	}
+	changed, err = tunePsiphonPerformanceConfigForProfile(path, psiphonPerformanceProfileForHost(4<<30, 4))
+	if err != nil || changed {
+		t.Fatalf("second tune should be a no-op: changed=%t err=%v", changed, err)
+	}
+}
