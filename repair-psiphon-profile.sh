@@ -22,8 +22,8 @@ done
 [[ -s "$TUNNEL_CONFIG" ]] || { echo "ERROR: Agent config not found: $TUNNEL_CONFIG" >&2; exit 1; }
 
 VERSION_OUT="$("$BIN" version 2>&1 || true)"
-[[ "$VERSION_OUT" == "Shah Tunnel 3.0.6 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.6 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.8 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.8 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.9 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.9 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.10 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.10 (linux/arm64)" ]] || {
-  echo "ERROR: this repair requires a ShahTunnel 3.0.6/3.0.7/3.0.8/3.0.9/3.0.10 Psiphon-compatible binary; installed: ${VERSION_OUT:-unknown}" >&2
+[[ "$VERSION_OUT" == "Shah Tunnel 3.0.6 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.6 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.7 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.8 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.7 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.8 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.9 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.9 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.10 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.10 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 4.0.0 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 4.0.0 (linux/arm64)" ]] || {
+  echo "ERROR: this repair requires a ShahTunnel 3.0.6/3.0.7/3.0.8/3.0.9/3.0.10/4.0.0 Psiphon-compatible binary; installed: ${VERSION_OUT:-unknown}" >&2
   echo "Run the updated S1T-START.sh installer first." >&2
   exit 1
 }

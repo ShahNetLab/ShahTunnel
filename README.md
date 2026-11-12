@@ -2,9 +2,9 @@
 
 <img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel Galactic emblem" width="100%">
 
-# ShahTunnel 3.0.10
+# ShahTunnel 4.0.0
 
-[![Version](https://img.shields.io/badge/version-3.0.10-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-4.0.0-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -34,7 +34,7 @@ Client → Hub public mapping → authenticated Agent lanes → Agent local targ
 Selected Xray inbound → loopback-only Xray sidecar → WARP or Psiphon SOCKS5 → Internet
 ```
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.10 Network Flow" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v4.png" alt="ShahTunnel 4.0.0 Network Flow" width="100%"></p>
 
 ## Capabilities
 
@@ -51,11 +51,11 @@ Selected Xray inbound → loopback-only Xray sidecar → WARP or Psiphon SOCKS5 
 | **Per-profile Psiphon user egress** | Selected Agent Xray inbounds are cloned into an isolated sidecar; TCP and DNS use Psiphon SOCKS5, while UDP is blocked to prevent direct leakage. |
 
 
-### Automatic Psiphon egress for user traffic (3.0.8)
+### Automatic Psiphon egress for user traffic
 
 When a new Agent profile is created with Psiphon egress, ShahTunnel automatically clones only the mapped Xray inbounds into a dedicated loopback-only sidecar before starting the Agent. TCP and DNS traffic use that profile's Psiphon SOCKS5 proxy. Psiphon's local port-forward SOCKS proxy carries TCP streams, not UDP; UDP and unknown network types are routed to a Blackhole outbound so they cannot silently fall back to the Agent's direct Internet connection. Consequently UDP/QUIC apps and ICMP ping are not supported on this Psiphon-only user path. No separate Psiphon action is added to the manager menu. Existing profiles are left untouched; this automatic setup applies to newly created Agent profiles. The X-UI source config, unrelated inbounds, other profiles, SSH and host routes are left unchanged.
 
-**Latency note:** ShahTunnel already enables TCP_NODELAY and per-socket BBR for outer lanes and uses a measured-RTT/load score when choosing among healthy lanes. Psiphon adds another network hop and its exit location/congestion determines much of end-to-end latency; no code change can guarantee a lower physical RTT. Choose a closer/lower-latency exit or WARP/direct egress when minimum ping is the priority.
+**4.0.0 Psiphon performance tuning:** Tunnel-lane PING/PONG sampling now runs every 5 seconds, uses a quicker 1/4 EWMA, and only ranks RTT samples fresher than 15 seconds; a stale low RTT cannot keep a degraded lane selected. Active-stream load remains part of the score. The isolated Xray sidecar keeps DNS caching enabled to reduce repeated lookups. Psiphon buffer limits are selected from actual host resources: below 3 GiB RAM the conservative Meek/relay limits remain enabled; at or above 3 GiB they are lifted for throughput, while CPU-thread limiting is lifted only on hosts with at least 2 CPUs. This is a throughput/queueing optimisation, not a promise that the physical Psiphon route will have a lower RTT. The SOCKS5 user path still carries TCP/DNS only; UDP/QUIC and ICMP ping are not supported and are blocked rather than sent Direct.
 
 ## Hub↔Agent transport modes
 

@@ -63,8 +63,8 @@ bash -n install-psiphon.sh
 bash -n repair-psiphon-profile.sh
 bash -n VERIFY-ALL-TRANSPORTS.sh
 [[ -s docs/img/ShahTunnel-Network.png ]] || fail "Galactic ShahTunnel logo is missing."
-[[ -s docs/img/ShahTunnel-Network-Flow-v3.png ]] || fail "English v3 Network Flow image is missing."
-[[ -s docs/img/ShahTunnel-Network-Flow-v3-fa.png ]] || fail "Persian v3 Network Flow image is missing."
+[[ -s docs/img/ShahTunnel-Network-Flow-v4.png ]] || fail "English v4 Network Flow image is missing."
+[[ -s docs/img/ShahTunnel-Network-Flow-v4-fa.png ]] || fail "Persian v4 Network Flow image is missing."
 image_count="$(find docs/img -maxdepth 1 -type f | wc -l | tr -d ' ')"
 [[ "$image_count" == 3 ]] || fail "Expected exactly 3 files in docs/img, found $image_count."
 grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/psiphon' S1T-START.sh || fail "Psiphon systemd data-directory permission is missing."
@@ -99,6 +99,11 @@ if grep -Fq 'menuItem("10", "🛡️ Psiphon user egress"' S1T-CAPSULE/main.go; 
 grep -Fq 'TestBuildXrayPsiphonConfigIsolatesTCPAndBlocksUDP' S1T-CAPSULE/main_test.go || fail "Psiphon TCP/DNS isolation and UDP fail-closed coverage is missing."
 grep -Fq 'TestXrayPsiphonManagedPathsAndUnitAreRestricted' S1T-CAPSULE/main_test.go || fail "Psiphon sidecar service/path safety coverage is missing."
 grep -Fq 'TestHubBalancesMeasuredRTTAndLoad' S1T-CAPSULE/main_test.go || fail "RTT/load lane selection coverage is missing."
+grep -Fq 'TestHubPrefersFreshRTTOverStaleLowRTT' S1T-CAPSULE/main_test.go || fail "Fresh RTT lane selection regression coverage is missing."
+grep -Fq 'TestPsiphonPerformanceProfileIsMemoryAndCPUAware' S1T-CAPSULE/psiphon_test.go || fail "Psiphon memory-aware performance profile coverage is missing."
+grep -Fq 'TestTunePsiphonPerformanceConfigPreservesUnknownFields' S1T-CAPSULE/psiphon_test.go || fail "Psiphon profile tuning compatibility coverage is missing."
+grep -Fq 'lanePingInterval = 5 * time.Second' S1T-CAPSULE/main.go || fail "Five-second lane RTT sampling is missing."
+grep -Fq 'dnsConfig["disableCache"] = false' S1T-CAPSULE/xray_warp.go || fail "Xray DNS cache is not explicitly enabled."
 pass "Shell syntax, docs layout, Psiphon bootstrap/runtime, public-Mapping ALPN multiplex, MASQUE Local Proxy, and failover coverage"
 
 printf '\n== 4/7: Transport loopback suite ==\n'
@@ -119,7 +124,7 @@ pass "go vet"
 
 printf '\n== 7/7: Linux build validation (temporary files only) ==\n'
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-amd64" ./S1T-CAPSULE
-[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 3.0.10 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 4.0.0 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-arm64" ./S1T-CAPSULE
 sha256sum "$BUILD_TMP/shah-tunnel-linux-amd64" "$BUILD_TMP/shah-tunnel-linux-arm64" > "$BUILD_TMP/SHA256SUMS"
 pass "Linux amd64 and arm64 binaries built and checksum-checked in a temporary directory (nothing added to the repository)"
