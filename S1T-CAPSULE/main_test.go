@@ -1384,12 +1384,21 @@ func TestPsiphonHubAddressDefaultsToPublicMappingPort(t *testing.T) {
 		{input: "37.32.12.244:9443", want: "37.32.12.244:443"},
 		{input: "hub.example.net:9443", want: "hub.example.net:443"},
 		{input: "[2001:db8::1]:9443", want: "[2001:db8::1]:443"},
-		{input: "hub.example.net:10443", want: "hub.example.net:10443"},
+		{input: "hub.example.net:10443", want: "hub.example.net:443"},
+		{input: "37.32.12.244:9448", want: "37.32.12.244:443"},
 	}
 	for _, tc := range cases {
 		if got := defaultPsiphonHubAddress(tc.input); got != tc.want {
 			t.Errorf("defaultPsiphonHubAddress(%q) = %q; want %q", tc.input, got, tc.want)
 		}
+	}
+	legacyCustomControl := Config{Role: "agent", Underlay: underlayPsiphon, HubAddr: "37.32.12.244:9448", PsiphonHubAddr: "37.32.12.244:9448"}
+	if got := agentHubAddressForUnderlay(legacyCustomControl, underlayPsiphon); got != "37.32.12.244:443" {
+		t.Fatalf("legacy default Psiphon endpoint = %q; want public Mapping 37.32.12.244:443", got)
+	}
+	explicitNonDefault := Config{Role: "agent", Underlay: underlayPsiphon, HubAddr: "37.32.12.244:9448", PsiphonHubAddr: "37.32.12.244:8443"}
+	if got := agentHubAddressForUnderlay(explicitNonDefault, underlayPsiphon); got != "37.32.12.244:8443" {
+		t.Fatalf("explicit nondefault Psiphon Mapping = %q; want 37.32.12.244:8443", got)
 	}
 	legacy := normalizeConfig(Config{Role: "agent", Underlay: underlayAdaptive, HubAddr: "37.32.12.244:9443"})
 	if legacy.PsiphonHubAddr != "37.32.12.244:443" {

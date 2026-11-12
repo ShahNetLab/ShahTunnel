@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "3.0.2"
+	version                          = "3.0.3"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -3278,13 +3278,23 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 		noticeReaders.Wait()
 		done <- cmd.Wait()
 	}()
-	deadline := time.Now().Add(90 * time.Second)
 	proxyReady := false
 	connectedTunnels := 0
-	for time.Now().Before(deadline) {
+	statusTicker := time.NewTicker(30 * time.Second)
+	defer statusTicker.Stop()
+	// Dedicated Psiphon mode must not kill ConsoleClient after an arbitrary
+	// 90-second startup window. Psiphon can take longer to fetch its bootstrap
+	// lists or establish its first tunnel; it also performs its own retries.
+	// Keep the child alive until a real tunnel is reported. Adaptive mode keeps
+	// a bounded startup window so its direct-egress fallback is not blocked.
+	adaptiveDeadline := time.Time{}
+	if cfg.Underlay == underlayAdaptive {
+		adaptiveDeadline = time.Now().Add(90 * time.Second)
+	}
+	for {
 		if !proxyReady && probeSOCKS5(cfg.PsiphonProxy, 700*time.Millisecond) == nil {
 			proxyReady = true
-			log.Printf("Psiphon local SOCKS5 listener ready at %s; waiting for a real tunnel", cfg.PsiphonProxy)
+			log.Printf("Psiphon local SOCKS5 listener ready at %s; waiting for a real tunnel (ConsoleClient remains running)", cfg.PsiphonProxy)
 		}
 		if proxyReady && connectedTunnels > 0 {
 			log.Printf("Psiphon ConsoleClient connected (%d tunnel(s)); TCP egress uses SOCKS5 %s", connectedTunnels, cfg.PsiphonProxy)
@@ -3298,6 +3308,19 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 				}
 			}, nil
 		}
+		if !adaptiveDeadline.IsZero() && time.Now().After(adaptiveDeadline) {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(4 * time.Second):
+				_ = cmd.Process.Kill()
+				<-done
+			}
+			if !proxyReady {
+				return nil, fmt.Errorf("Psiphon SOCKS5 proxy %s did not become ready within 90 seconds", cfg.PsiphonProxy)
+			}
+			return nil, errors.New("Psiphon did not establish a tunnel within 90 seconds; adaptive mode will keep direct egress available")
+		}
 		select {
 		case count := <-tunnelReady:
 			connectedTunnels = count
@@ -3307,20 +3330,13 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 				processErr = errors.New("process exited normally before a Psiphon tunnel was established")
 			}
 			return nil, fmt.Errorf("Psiphon ConsoleClient exited before establishing a tunnel: %v", processErr)
+		case <-statusTicker.C:
+			if proxyReady {
+				log.Printf("Psiphon is still trying to establish its first tunnel; diagnostic notices are enabled; the ConsoleClient will not be killed by a ShahTunnel startup timeout")
+			}
 		case <-time.After(400 * time.Millisecond):
 		}
 	}
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(4 * time.Second):
-		_ = cmd.Process.Kill()
-		<-done
-	}
-	if !proxyReady {
-		return nil, fmt.Errorf("Psiphon SOCKS5 proxy %s did not become ready within 90 seconds", cfg.PsiphonProxy)
-	}
-	return nil, errors.New("Psiphon ConsoleClient opened SOCKS5 but did not report an established tunnel within 90 seconds")
 }
 
 func warpStatusConnected(output string) bool {
@@ -3526,25 +3542,28 @@ func verifyWarpUnderlay(expectedProtocol string) error {
 }
 
 func defaultPsiphonHubAddress(hubAddr string) string {
-	host, port, err := net.SplitHostPort(strings.TrimSpace(hubAddr))
+	host, _, err := net.SplitHostPort(strings.TrimSpace(hubAddr))
 	if err != nil {
 		return hubAddr
 	}
-	// 9443 is the standard private control port. The default public HTTPS
-	// Mapping port 443 can carry the authenticated S1T ALPN through its existing
-	// listener, so Psiphon does not need to CONNECT to filtered high ports.
-	if port == "9443" {
-		return net.JoinHostPort(host, "443")
-	}
-	return hubAddr
+	// The Hub wizard's default public Mapping listener is TCP/443. The control
+	// port can be customized (for example 9448), but that does not change the
+	// default public Mapping port. Step 06 remains available for a custom Mapping.
+	return net.JoinHostPort(host, "443")
 }
 
 func agentHubAddressForUnderlay(cfg Config, underlay string) string {
 	if underlay == underlayPsiphon {
-		if strings.TrimSpace(cfg.PsiphonHubAddr) != "" {
-			return strings.TrimSpace(cfg.PsiphonHubAddr)
+		configured := strings.TrimSpace(cfg.PsiphonHubAddr)
+		// Older 3.0.2 wizards copied the custom control port into Step 06 when
+		// the user accepted the blank/default answer. In the standard Hub setup,
+		// that is not the public Mapping listener: it defaults to TCP/443.
+		// Preserve an explicit, different Mapping endpoint; repair only the
+		// legacy same-as-control default.
+		if configured == "" || configured == strings.TrimSpace(cfg.HubAddr) {
+			return defaultPsiphonHubAddress(cfg.HubAddr)
 		}
-		return defaultPsiphonHubAddress(cfg.HubAddr)
+		return configured
 	}
 	return cfg.HubAddr
 }
@@ -4832,10 +4851,15 @@ func setup() error {
 	}
 	fmt.Printf("\n  %s %s\n", paint(ansiGreen+ansiBold, "✓"), "Configuration saved: "+configPath)
 	uiInfo("Enabling the independent service and automatic startup after VPS reboot…")
-	if err := ensureTunnelRunning(true); err != nil {
-		return fmt.Errorf("configuration was saved, but automatic startup failed: %w", err)
+	connected, startErr := ensureTunnelRunning(true)
+	if startErr != nil {
+		return fmt.Errorf("configuration was saved, but automatic startup failed: %w", startErr)
 	}
-	uiSuccess("Tunnel '" + name + "' is active. Existing tunnels were not changed.")
+	if c.Underlay == underlayPsiphon && !connected {
+		uiInfo("Agent service and local Psiphon SOCKS5 are running. Psiphon egress and/or the Agent-to-Hub lane may still be connecting; end-to-end connectivity is not yet confirmed.")
+	} else {
+		uiSuccess("Tunnel '" + name + "' is active. Existing tunnels were not changed.")
+	}
 	return nil
 }
 
@@ -4871,20 +4895,20 @@ func tunnelIsActive() bool {
 }
 
 // ensureTunnelRunning enables and manages only the currently selected profile.
-func ensureTunnelRunning(restartActive bool) error {
+func ensureTunnelRunning(restartActive bool) (bool, error) {
 	if !isRoot() {
-		return errors.New("run as root")
+		return false, errors.New("run as root")
 	}
 	service := currentServiceName()
 	if filepath.Clean(configPath) != filepath.Clean(legacyConfigPath) {
 		if err := ensureTunnelTemplateUnit(); err != nil {
-			return err
+			return false, err
 		}
 	} else if _, err := os.Stat("/etc/systemd/system/ravanreverse.service"); err != nil {
-		return errors.New("legacy Shah Tunnel service is not installed; select a named tunnel or run the installer")
+		return false, errors.New("legacy Shah Tunnel service is not installed; select a named tunnel or run the installer")
 	}
 	if err := runSystemctl("enable", service); err != nil {
-		return fmt.Errorf("could not enable automatic startup for %s: %w", service, err)
+		return false, fmt.Errorf("could not enable automatic startup for %s: %w", service, err)
 	}
 	var err error
 	serviceStartTime := time.Now()
@@ -4904,41 +4928,45 @@ func ensureTunnelRunning(restartActive bool) error {
 	if err != nil || !tunnelIsActive() {
 		showRecentLogs(40)
 		if err != nil {
-			return fmt.Errorf("service start/restart failed: %w", err)
+			return false, fmt.Errorf("service start/restart failed: %w", err)
 		}
-		return errors.New("service did not reach active state; recent logs are shown above")
+		return false, errors.New("service did not reach active state; recent logs are shown above")
 	}
-	// A systemd Type=simple unit becomes active as soon as the ravanreverse
-	// process starts. For a dedicated Psiphon Agent that is not enough: the
-	// ConsoleClient must report at least one established Psiphon tunnel before
-	// the manager tells the operator that setup succeeded.
+	psiphonTunnelReady := true
+	// For dedicated Psiphon mode, distinguish a ready local SOCKS listener
+	// from an established Psiphon tunnel. The latter may take longer than the
+	// menu's startup window; keep the service running and let ConsoleClient
+	// continue its own retries rather than reporting a false install failure.
 	if data, readErr := os.ReadFile(configPath); readErr == nil {
 		var selected Config
-		if json.Unmarshal(data, &selected) == nil && selected.Role == "agent" && selected.Underlay == underlayPsiphon {
-			if serviceWasStarted {
-				if waitErr := waitForPsiphonAgentReady(service, serviceStartTime, 100*time.Second); waitErr != nil {
-					showRecentLogs(55)
-					return fmt.Errorf("Psiphon Agent did not become ready: %w", waitErr)
-				}
+		if json.Unmarshal(data, &selected) == nil && selected.Role == "agent" && selected.Underlay == underlayPsiphon && serviceWasStarted {
+			ready, waitErr := waitForPsiphonAgentReady(service, serviceStartTime, 100*time.Second)
+			if waitErr != nil {
+				showRecentLogs(55)
+				return false, fmt.Errorf("Psiphon Agent startup failed: %w", waitErr)
+			}
+			psiphonTunnelReady = ready
+			if !ready {
+				fmt.Println("Psiphon SOCKS5 is running locally; its first external tunnel is still connecting. ConsoleClient remains running and will retry. This is NOT yet a connected Agent lane.")
 			}
 		}
 	}
 	fmt.Printf("Tunnel service %s is active; automatic startup at boot is enabled.\n", service)
-	return nil
+	return psiphonTunnelReady, nil
 }
 
-func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.Duration) error {
+func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.Duration) (bool, error) {
 	if timeout <= 0 {
-		return errors.New("invalid Psiphon readiness timeout")
+		return false, errors.New("invalid Psiphon readiness timeout")
 	}
 	startMarker := fmt.Sprintf("@%d", startedAt.Unix())
 	deadline := time.Now().Add(timeout)
-	psiphonReady := false
-	agentLaneReady := false
 	for time.Now().Before(deadline) {
 		logs, _ := exec.Command("journalctl", "-u", service, "--since", startMarker, "--no-pager", "-o", "cat").CombinedOutput()
 		logText := string(logs)
-		psiphonReady = psiphonReady || strings.Contains(logText, "Psiphon ConsoleClient connected")
+		psiphonReady := strings.Contains(logText, "Psiphon ConsoleClient connected")
+		agentLaneReady := false
+		proxyReady := strings.Contains(logText, "Psiphon local SOCKS5 listener ready")
 		for _, line := range strings.Split(logText, "\n") {
 			if strings.Contains(line, "tunnel lane ") && strings.Contains(line, " connected via ") && strings.Contains(line, " over psiphon_socks5") {
 				agentLaneReady = true
@@ -4946,17 +4974,14 @@ func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.
 			}
 		}
 		if psiphonReady && agentLaneReady && exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
-			return nil
+			return true, nil
+		}
+		if proxyReady && exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
+			return false, nil
 		}
 		time.Sleep(time.Second)
 	}
-	if !psiphonReady {
-		return fmt.Errorf("service %s did not establish a real Psiphon tunnel within %s", service, timeout)
-	}
-	if !agentLaneReady {
-		return fmt.Errorf("Psiphon itself connected, but no Agent lane reached the Hub through psiphon_socks5 within %s", timeout)
-	}
-	return fmt.Errorf("service %s is no longer active after Psiphon startup", service)
+	return false, fmt.Errorf("service %s did not start its local Psiphon SOCKS5 listener within %s", service, timeout)
 }
 
 func showRecentLogs(n int) {
@@ -5869,7 +5894,7 @@ func menu() {
 			err = setup()
 		case "2":
 			if chooseTunnel("Select the tunnel to start (number or name)") {
-				err = ensureTunnelRunning(false)
+				_, err = ensureTunnelRunning(false)
 			}
 		case "3":
 			if chooseTunnel("Select the tunnel to stop (number or name)") {
@@ -5881,7 +5906,7 @@ func menu() {
 			}
 		case "4":
 			if chooseTunnel("Select the tunnel to restart (number or name)") {
-				err = ensureTunnelRunning(true)
+				_, err = ensureTunnelRunning(true)
 			}
 		case "5":
 			if chooseTunnel("Select the tunnel to inspect (number or name)") {

@@ -54,6 +54,12 @@ func TestNewPsiphonClientConfigUsesAuthenticatedBootstrap(t *testing.T) {
 	if !cfg.DisableLocalHTTPProxy || cfg.DisableLocalSocksProxy || cfg.UseUnixDomainSockets {
 		t.Fatal("configuration must expose only a TCP loopback SOCKS5 proxy")
 	}
+	if !cfg.EmitDiagnosticNotices {
+		t.Fatal("Psiphon diagnostic notices must be enabled so bootstrap/tunnel failures are observable")
+	}
+	if cfg.ConnectionWorkerPoolMaxSize != 0 {
+		t.Fatalf("ConnectionWorkerPoolMaxSize=%d; expected the Psiphon default (unset)", cfg.ConnectionWorkerPoolMaxSize)
+	}
 	// Exercise the same on-disk validator used by Agent startup, not a test-only
 	// approximation of its checks.
 	dir := t.TempDir()

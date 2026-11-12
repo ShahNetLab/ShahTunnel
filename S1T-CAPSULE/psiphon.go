@@ -83,7 +83,8 @@ type psiphonClientConfig struct {
 	LimitMeekBufferSizes        bool   `json:"LimitMeekBufferSizes"`
 	LimitCPUThreads             bool   `json:"LimitCPUThreads"`
 	LimitRelayBufferSizes       bool   `json:"LimitRelayBufferSizes"`
-	ConnectionWorkerPoolMaxSize int    `json:"ConnectionWorkerPoolMaxSize"`
+	ConnectionWorkerPoolMaxSize int    `json:"ConnectionWorkerPoolMaxSize,omitempty"`
+	EmitDiagnosticNotices       bool   `json:"EmitDiagnosticNotices,omitempty"`
 }
 
 // psiphonConsoleClientArgs deliberately leaves ListenInterface unset.
@@ -112,12 +113,15 @@ func newPsiphonClientConfig(port int) psiphonClientConfig {
 		ExchangeObfuscationKey:             psiphonExchangeObfuscationKey,
 		// Retain the legacy scalar URL for compatibility with existing
 		// ShahTunnel binaries during an in-place config-only recovery.
-		RemoteServerListURL:         psiphonRemoteServerListURL,
-		UseIndistinguishableTLS:     true,
-		LimitMeekBufferSizes:        true,
-		LimitCPUThreads:             true,
-		LimitRelayBufferSizes:       true,
-		ConnectionWorkerPoolMaxSize: 2,
+		RemoteServerListURL:     psiphonRemoteServerListURL,
+		UseIndistinguishableTLS: true,
+		LimitMeekBufferSizes:    true,
+		LimitCPUThreads:         true,
+		LimitRelayBufferSizes:   true,
+		// Diagnostic notices are written only to the local systemd journal;
+		// they are needed to distinguish bootstrap-list failures from blocked
+		// Psiphon server connections when the first tunnel is delayed.
+		EmitDiagnosticNotices: true,
 	}
 }
 
@@ -324,7 +328,7 @@ func psiphonBootstrapNeedsMigration(cfg psiphonClientConfig) bool {
 	if _, err := strconv.Atoi(strings.TrimSpace(cfg.ClientVersion)); err != nil {
 		return true
 	}
-	if cfg.DisableLocalSocksProxy || cfg.UseUnixDomainSockets {
+	if cfg.DisableLocalSocksProxy || cfg.UseUnixDomainSockets || !cfg.EmitDiagnosticNotices || cfg.ConnectionWorkerPoolMaxSize != 0 {
 		return true
 	}
 	keysIncomplete := strings.TrimSpace(cfg.RemoteServerListSignaturePublicKey) == "" ||
