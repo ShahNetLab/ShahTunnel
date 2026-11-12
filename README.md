@@ -90,7 +90,7 @@ When an Agent selects `Psiphon / SOCKS5` (or the adaptive egress option), ShahTu
 - creates a private per-Agent JSON configuration with the public client identity, authenticated server-list mirrors, server-entry signature key, and exchange-obfuscation key;
 - assigns a unique `127.0.0.1` SOCKS5 port and private data directory;
 - grants that Agent service write access only to its own Psiphon data directory;
-- starts ConsoleClient in local-proxy mode and reports setup as successful only after Psiphon has a real tunnel and at least one Agent lane reaches the Hub.
+- starts ConsoleClient in local-proxy mode and reports setup as successful only after Psiphon has a real tunnel and at least one Agent lane reaches the Hub. It leaves `ListenInterface` unset so Psiphon uses its built-in `127.0.0.1` bind; this avoids interface enumeration through `AF_NETLINK`, which is not allowed by the hardened systemd unit.
 
 For an existing Agent profile whose earlier Psiphon bootstrap did not connect, run `sudo bash repair-psiphon-profile.sh PROFILE` from the extracted project directory. The helper backs up and repairs only that profile's Psiphon JSON and restarts only its matching `ravanreverse@PROFILE.service` unit.
 
