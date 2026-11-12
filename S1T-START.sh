@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 3.0.2 installer.
+# Shah Tunnel 3.0.3 installer.
 # Downloads the pinned Go 1.26.1 toolchain, verifies its SHA-256, fetches the source,
 # and builds the Linux binary on the target server. No prebuilt release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="3.0.2"
+VERSION="3.0.3"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -501,7 +501,8 @@ build_from_official_go_toolchain() {
     echo "Building from the local ShahTunnel source beside S1T-START.sh..." >&2
     if ! cp -a "$script_dir/go.mod" "$source_dir/" ||
        ! cp -a "$script_dir/S1T-CAPSULE" "$source_dir/" ||
-       ! cp -a "$script_dir/install-psiphon.sh" "$source_dir/"; then
+       ! cp -a "$script_dir/install-psiphon.sh" "$source_dir/" ||
+       ! cp -a "$script_dir/repair-psiphon-profile.sh" "$source_dir/"; then
       echo "Could not copy the local ShahTunnel source tree or Psiphon auto-installer." >&2
       return 1
     fi

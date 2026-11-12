@@ -22,8 +22,8 @@ done
 [[ -s "$TUNNEL_CONFIG" ]] || { echo "ERROR: Agent config not found: $TUNNEL_CONFIG" >&2; exit 1; }
 
 VERSION_OUT="$("$BIN" version 2>&1 || true)"
-[[ "$VERSION_OUT" == "Shah Tunnel 3.0.2 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.2 (linux/arm64)" ]] || {
-  echo "ERROR: this repair requires the ShahTunnel 3.0.2 Psiphon-fixed binary; installed: ${VERSION_OUT:-unknown}" >&2
+[[ "$VERSION_OUT" == "Shah Tunnel 3.0.3 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.3 (linux/arm64)" ]] || {
+  echo "ERROR: this repair requires the ShahTunnel 3.0.3 Psiphon-fixed binary; installed: ${VERSION_OUT:-unknown}" >&2
   echo "Run the updated S1T-START.sh installer first." >&2
   exit 1
 }
@@ -84,11 +84,13 @@ if ! systemctl start "$UNIT"; then
   exit 1
 fi
 
-echo "Checking Psiphon tunnel and this Agent's Hub lane (up to 100 seconds)..."
+echo "Checking the local Psiphon SOCKS5 listener and Agent lane (up to 100 seconds)..."
+PROXY_READY=0
 PSIPHON_READY=0
 LANE_READY=0
 for ((i=0; i<100; i++)); do
   LOGS="$(journalctl -u "$UNIT" --since "$START_MARK" --no-pager -o cat 2>/dev/null || true)"
+  if grep -Fq "Psiphon local SOCKS5 listener ready" <<<"$LOGS"; then PROXY_READY=1; fi
   if grep -Fq "Psiphon ConsoleClient connected" <<<"$LOGS"; then PSIPHON_READY=1; fi
   if grep -Eq 'tunnel lane [0-9]+/[0-9]+ connected via .* over psiphon_socks5' <<<"$LOGS"; then LANE_READY=1; fi
   if [[ "$PSIPHON_READY" == 1 && "$LANE_READY" == 1 ]] && systemctl is-active --quiet "$UNIT"; then
@@ -97,20 +99,18 @@ for ((i=0; i<100; i++)); do
     journalctl -u "$UNIT" --since "$START_MARK" -n 20 --no-pager -o cat
     exit 0
   fi
+  if [[ "$PROXY_READY" == 1 ]] && systemctl is-active --quiet "$UNIT"; then
+    echo "PENDING: local Psiphon SOCKS5 is ready, but the complete Psiphon-to-Hub Agent path is not yet verified."
+    echo "The service is deliberately left running; ConsoleClient will keep retrying. No Hub lane is claimed connected."
+    echo "Profile: $PROFILE | SOCKS5: $PSIPHON_PROXY | Config backup: $BACKUP"
+    journalctl -u "$UNIT" --since "$START_MARK" -n 35 --no-pager -o cat
+    exit 0
+  fi
   sleep 1
 done
 
-if [[ "$PSIPHON_READY" == 1 ]] && systemctl is-active --quiet "$UNIT"; then
-  echo "Psiphon connected, but no Agent lane reached the Hub through Psiphon within 100 seconds." >&2
-  echo "The profile is left running; check Hub address, firewall, token and fingerprint." >&2
-  journalctl -u "$UNIT" --since "$START_MARK" -n 60 --no-pager -o cat >&2 || true
-  echo "Config backup: $BACKUP" >&2
-  exit 2
-fi
-
-# Avoid a rapid restart loop when the Psiphon client itself cannot connect.
+echo "ERROR: the local Psiphon SOCKS5 listener did not become ready; only this Agent profile is stopped." >&2
 systemctl stop "$UNIT" || true
-echo "ERROR: Psiphon did not establish a tunnel; only this Agent profile was stopped." >&2
 journalctl -u "$UNIT" --since "$START_MARK" -n 60 --no-pager -o cat >&2 || true
 echo "Config backup: $BACKUP" >&2
 exit 1

@@ -4,7 +4,7 @@
 
 # شاه‌تونل ۳٫۰٫۲
 
-[![نسخه](https://img.shields.io/badge/version-3.0.2-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![نسخه](https://img.shields.io/badge/version-3.0.3-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![پلتفرم](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![ساخت با Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -38,7 +38,7 @@
 Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCKS5 وایرپ → اینترنت
 ```
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه ShahTunnel 3.0.2" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3-fa.png" alt="جریان شبکه ShahTunnel 3.0.3" width="100%"></p>
 
 <a id="capabilities"></a>
 
@@ -83,9 +83,9 @@ Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCK
 
 ### اتصال Psiphon از پورت عمومی ۴۴۳
 
-اگر Psiphon به پورت کنترل پیش‌فرض `9443` اجازهٔ اتصال ندهد، Agent به‌صورت خودکار مسیر Psiphon را از نشانی Mapping عمومی Hub روی `443` عبور می‌دهد؛ مسیر Direct همچنان از `9443` استفاده می‌کند. Hub اتصال ShahTunnel را با ALPN اختصاصی `shah-tunnel-control/1` از ترافیک عادی TLS تشخیص می‌دهد و بایت‌های ClientHello کاربران عادی را بدون تغییر به Agent می‌فرستد. بنابراین نیازی به اشغال مجدد پورت ۴۴۳، تغییر X-UI، یا جابه‌جایی Mapping نیست.
+اگر Psiphon به پورت کنترل Hub (برای نمونه `9448`) دسترسی نداشته باشد، Agent مسیر Psiphon را از نشانی Mapping عمومی Hub روی `443` عبور می‌دهد؛ مسیر Direct همچنان از پورت کنترل تنظیم‌شده استفاده می‌کند. مقدار پیش‌فرض Step 06 اکنون از پورت کنترل مستقل است و روی TCP/443 قرار می‌گیرد. Hub اتصال ShahTunnel را با ALPN اختصاصی `shah-tunnel-control/1` از ترافیک عادی TLS تشخیص می‌دهد و بایت‌های ClientHello کاربران عادی را بدون تغییر به Agent می‌فرستد. بنابراین نیازی به اشغال مجدد پورت ۴۴۳، تغییر X-UI، یا جابه‌جایی Mapping نیست.
 
-این قابلیت به نسخهٔ `3.0.2` روی هر دو سمت نیاز دارد و Mapping عمومی TCP/443 باید روی Hub فعال و از مسیر Psiphon قابل دسترسی باشد. در ویزارد Agent می‌توان نشانی جایگزین را تغییر داد؛ برای پروفایل‌های قدیمی که HubAddr آن‌ها روی `9443` است، مقدار `PsiphonHubAddr` هنگام بارگذاری به‌طور خودکار به همان IP روی `443` تبدیل می‌شود.
+این قابلیت به نسخهٔ `3.0.3` روی هر دو سمت نیاز دارد و Mapping عمومی TCP/443 باید روی Hub فعال و از مسیر Psiphon قابل دسترسی باشد. در ویزارد Agent می‌توان نشانی جایگزین را تغییر داد؛ برای پروفایل‌های قدیمی که HubAddr آن‌ها روی `9443` است، مقدار `PsiphonHubAddr` هنگام بارگذاری به‌طور خودکار به همان IP روی `443` تبدیل می‌شود.
 
 ### راه‌اندازی خودکار Psiphon
 
@@ -96,9 +96,9 @@ Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCK
 - فایل JSON خصوصی هر Agent را با شناسه‌های عمومی کلاینت، آینه‌های فهرست سرور، کلید امضای فهرست، کلید امضای Server Entry و کلید Exchange می‌سازد.
 - یک پورت SOCKS5 یکتا روی `127.0.0.1` و پوشهٔ دادهٔ مستقل اختصاص می‌دهد.
 - دسترسی نوشتن systemd را فقط به پوشهٔ دادهٔ همان Agent محدود می‌کند.
-- ConsoleClient را در حالت پراکسی محلی اجرا می‌کند و موفقیت را فقط پس از اتصال واقعی Psiphon و رسیدن حداقل یک Lane از Agent به Hub گزارش می‌دهد. در اجرای Psiphon گزینهٔ `ListenInterface=lo` به آن تحمیل نمی‌شود؛ Psiphon از bind پیش‌فرض و محدود به `127.0.0.1` استفاده می‌کند تا با sandbox سخت‌گیرانهٔ systemd و محدودیت `AF_NETLINK` تداخل نداشته باشد.
+- ConsoleClient را در حالت پراکسی محلی اجرا می‌کند. آماده‌شدن SOCKS5 محلی از اتصال واقعی Psiphon و از اتصال Lane به Hub جدا گزارش می‌شود. اگر SOCKS5 آماده شود اما مسیر هنوز کامل نشده باشد، سرویس فعال می‌ماند و وضعیت `PENDING` نشان داده می‌شود؛ اتصال موفق ادعا نمی‌شود. گزینهٔ `ListenInterface` ارسال نمی‌شود تا Psiphon از bind پیش‌فرض `127.0.0.1` استفاده کند و برای شناسایی اینترفیس به Netlink نیاز نداشته باشد. گزارش‌های تشخیصی فقط در Journal محلی ذخیره می‌شوند و می‌توانند اطلاعات حساس نشست/شبکه داشته باشند.
 
-برای تعمیر پروفایلی که با تنظیمات قبلی Psiphon وصل نشده، از پوشهٔ پروژه اجرا کنید: `sudo bash repair-psiphon-profile.sh PROFILE`. این ابزار از JSON همان پروفایل نسخهٔ پشتیبان می‌گیرد و فقط سرویس `ravanreverse@PROFILE` را راه‌اندازی مجدد می‌کند.
+برای تعمیر پروفایلی که با تنظیمات قبلی Psiphon وصل نشده، از پوشهٔ پروژه اجرا کنید: `sudo bash repair-psiphon-profile.sh PROFILE`. این ابزار از JSON همان پروفایل نسخهٔ پشتیبان می‌گیرد و فقط سرویس `ravanreverse@PROFILE` را راه‌اندازی مجدد می‌کند. اگر SOCKS5 محلی آماده شود اما Psiphon یا Lane ارتباط با Hub هنوز متصل نشده باشد، وضعیت `PENDING` می‌دهد و سرویس را برای تلاش مجدد روشن می‌گذارد؛ فقط در صورت آماده‌نشدن SOCKS5، همان پروفایل را متوقف می‌کند.
 
 نیازی به تهیهٔ دستی باینری یا JSON نیست. راه‌اندازی اولیه برای دریافت سورس رسمی و ابزار Go به دسترسی اینترنت نیاز دارد. هیچ TUN، مسیر پیش‌فرض سرور، SSH یا سرویس X-UI تغییر نمی‌کند. خروجی Psiphon در این پیاده‌سازی برای Laneهای TCP ارتباط Agent با Hub است و به معنی خروجی اینترنت کاربران Xray نیست.
 
@@ -213,3 +213,5 @@ sudo shah-tunnel menu
 ---
 
 <a id="network-flow"></a>
+
+> **رفتار شروع Psiphon در نسخه ۳٫۰٫۳:** آماده‌شدن SOCKS5 محلی با وصل‌شدن تونل Psiphon یکسان نیست. اگر SOCKS5 آماده شود اما اتصال خارجی هنوز برقرار نشده باشد، سرویس Agent فعال می‌ماند و ConsoleClient به تلاش مجدد ادامه می‌دهد؛ ویزارد وضعیت را «در حال اتصال» گزارش می‌کند، نه اتصال موفق. پیام‌های تشخیصی Psiphon در Journal محلی ثبت می‌شوند و ممکن است جزئیات شبکه/سرورها داشته باشند؛ آن‌ها را عمومی منتشر نکنید.

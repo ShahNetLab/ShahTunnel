@@ -2,9 +2,9 @@
 
 <img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel Galactic emblem" width="100%">
 
-# ShahTunnel 3.0.2
+# ShahTunnel 3.0.3
 
-[![Version](https://img.shields.io/badge/version-3.0.2-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-3.0.3-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -34,7 +34,7 @@ Client → Hub public mapping → authenticated Agent lanes → Agent local targ
 Selected Xray inbound → loopback-only Xray sidecar → WARP SOCKS5 → Internet
 ```
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.2 Network Flow" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.3 Network Flow" width="100%"></p>
 
 ## Capabilities
 
@@ -77,9 +77,9 @@ Choose a mode during tunnel creation. The Hub and Agent must use compatible sett
 
 ### Psiphon through the public TCP/443 Mapping
 
-When Psiphon cannot reach the default control port `9443`, the Agent automatically uses the Hub's public Mapping endpoint on `443` for the Psiphon egress only; the Direct path continues to use `9443`. The Hub distinguishes ShahTunnel control traffic from ordinary TLS with the dedicated `shah-tunnel-control/1` ALPN and forwards normal ClientHello bytes unchanged. This does not take over the public port, move a Mapping, or modify X-UI.
+When Psiphon cannot reach the Hub control port (for example, a custom `9448`), the Agent uses the Hub public Mapping endpoint on `443` for Psiphon egress only; the Direct path continues to use the configured control port. The Step 06 default is independent of the control port and points to TCP/443. The Hub distinguishes ShahTunnel control traffic from ordinary TLS with the dedicated `shah-tunnel-control/1` ALPN and forwards normal ClientHello bytes unchanged. This does not take over the public port, move a Mapping, or modify X-UI.
 
-Both Hub and Agent must run version `3.0.2`, and a public TCP/443 Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
+Both Hub and Agent must run version `3.0.3`, and a public TCP/443 Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
 
 ### Automatic Psiphon setup
 
@@ -90,7 +90,7 @@ When an Agent selects `Psiphon / SOCKS5` (or the adaptive egress option), ShahTu
 - creates a private per-Agent JSON configuration with the public client identity, authenticated server-list mirrors, server-entry signature key, and exchange-obfuscation key;
 - assigns a unique `127.0.0.1` SOCKS5 port and private data directory;
 - grants that Agent service write access only to its own Psiphon data directory;
-- starts ConsoleClient in local-proxy mode and reports setup as successful only after Psiphon has a real tunnel and at least one Agent lane reaches the Hub. It leaves `ListenInterface` unset so Psiphon uses its built-in `127.0.0.1` bind; this avoids interface enumeration through `AF_NETLINK`, which is not allowed by the hardened systemd unit.
+- starts ConsoleClient in local-proxy mode. Local SOCKS5 readiness is distinguished from a real Psiphon tunnel and a connected Agent lane. If SOCKS5 becomes ready first, the service remains active and the wizard reports `PENDING` rather than claiming a successful connection. `ListenInterface` remains unset so Psiphon uses its built-in `127.0.0.1` bind and does not enumerate interfaces through Netlink. Diagnostic notices are written to the local journal; they may contain sensitive session/network details and should not be published.
 
 For an existing Agent profile whose earlier Psiphon bootstrap did not connect, run `sudo bash repair-psiphon-profile.sh PROFILE` from the extracted project directory. The helper backs up and repairs only that profile's Psiphon JSON and restarts only its matching `ravanreverse@PROFILE.service` unit.
 
@@ -189,3 +189,5 @@ sudo shah-tunnel menu
 | Google/YouTube DNS fails through per-profile WARP | Check the dedicated `shah-tunnel-xray-warp-<profile>.service` status and its recent logs; do not change host routes. |
 
 ---
+
+> **Psiphon startup in 3.0.3:** a ready local SOCKS5 listener is not the same as an established Psiphon tunnel. If SOCKS5 is ready but the external tunnel is not yet established, the Agent service remains active and ConsoleClient keeps retrying; the wizard reports a pending connection, not a successful tunnel. Psiphon diagnostic notices are written to the local journal and may include network/server details; do not publish them publicly.
