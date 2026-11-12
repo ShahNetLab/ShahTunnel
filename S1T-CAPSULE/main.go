@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "3.0.0"
+	version                          = "3.0.1"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -3026,7 +3026,7 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 	if migrated, migrateErr := repairLegacyPsiphonClientConfig(configPath, cfg.PsiphonProxy); migrateErr != nil {
 		return nil, fmt.Errorf("migrate legacy Psiphon bootstrap: %w", migrateErr)
 	} else if migrated {
-		log.Printf("Psiphon: upgraded legacy placeholder bootstrap to authenticated public server-list configuration")
+		log.Printf("Psiphon: migrated legacy/incomplete bootstrap to the current authenticated server-list format")
 	}
 	if err := validatePsiphonClientConfig(configPath, cfg.PsiphonProxy); err != nil {
 		return nil, fmt.Errorf("invalid Psiphon client configuration: %w", err)

@@ -117,6 +117,100 @@ func TestRepairLegacyPsiphonConfigMigratesOnlyPlaceholderBootstrap(t *testing.T)
 	}
 }
 
+func TestRepairLegacyPsiphonConfigMigratesEmptyIdentityAndScalarURL(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty-legacy.json")
+	legacy := newPsiphonClientConfig(21084)
+	legacy.PropagationChannelID = ""
+	legacy.SponsorID = ""
+	legacy.RemoteServerListURLs = nil
+	legacy.ObfuscatedServerListRootURLs = nil
+	legacy.RemoteServerListSignaturePublicKey = ""
+	legacy.ServerEntrySignaturePublicKey = ""
+	legacy.ExchangeObfuscationKey = ""
+	legacy.RemoteServerListURL = psiphonRemoteServerListURL
+	legacy.EgressRegion = "DE"
+	legacyBytes, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, legacyBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := repairLegacyPsiphonClientConfig(path, "127.0.0.1:21084")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migrated {
+		t.Fatal("empty legacy Psiphon identity was not migrated")
+	}
+	if err := validatePsiphonClientConfig(path, "127.0.0.1:21084"); err != nil {
+		t.Fatalf("migrated config is not valid: %v", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got psiphonClientConfig
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !isUsablePsiphonClientID(got.PropagationChannelID) || !isUsablePsiphonClientID(got.SponsorID) {
+		t.Fatal("empty Psiphon IDs remain after migration")
+	}
+	if len(got.RemoteServerListURLs) == 0 || len(got.ObfuscatedServerListRootURLs) == 0 {
+		t.Fatal("new authenticated server-list URL arrays were not generated")
+	}
+	if got.EgressRegion != "DE" {
+		t.Fatalf("EgressRegion=%q, want DE", got.EgressRegion)
+	}
+}
+
+func TestRepairLegacyPsiphonConfigPreservesValidIdentityWhenUpdatingScalarBootstrap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "custom-legacy.json")
+	legacy := newPsiphonClientConfig(21085)
+	legacy.PropagationChannelID = "24BCA4EE20BEB92C"
+	legacy.SponsorID = "721AE60D76700F5A"
+	legacy.RemoteServerListURLs = nil
+	legacy.ObfuscatedServerListRootURLs = nil
+	legacy.RemoteServerListURL = psiphonRemoteServerListURL
+	legacy.EgressRegion = "NL"
+	legacyBytes, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, legacyBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := repairLegacyPsiphonClientConfig(path, "127.0.0.1:21085")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migrated {
+		t.Fatal("deprecated scalar bootstrap was not upgraded")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got psiphonClientConfig
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.PropagationChannelID != "24BCA4EE20BEB92C" || got.SponsorID != "721AE60D76700F5A" {
+		t.Fatal("valid custom Psiphon identity was not preserved")
+	}
+	if got.EgressRegion != "NL" {
+		t.Fatalf("EgressRegion=%q, want NL", got.EgressRegion)
+	}
+	if err := validatePsiphonClientConfig(path, "127.0.0.1:21085"); err != nil {
+		t.Fatalf("upgraded scalar config is not valid: %v", err)
+	}
+}
+
 func TestRepairLegacyPsiphonConfigLeavesNonPlaceholderConfigAlone(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "valid.json")

@@ -294,9 +294,43 @@ func preparePsiphonAgentProfile(c *Config) error {
 	return nil
 }
 
-// repairLegacyPsiphonClientConfig upgrades the placeholder bootstrap generated
-// by older ShahTunnel 3.0.0 builds. It deliberately migrates only the known
-// all-F placeholder identity; custom Psiphon profiles are left untouched.
+// isUsablePsiphonClientID rejects missing, malformed and known placeholder IDs.
+// Psiphon requires both values to be supplied by its network; the all-F values
+// emitted by legacy ShahTunnel profiles are not usable client identities.
+func isUsablePsiphonClientID(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != 16 || strings.EqualFold(value, "FFFFFFFFFFFFFFFF") || strings.EqualFold(value, "0000000000000000") {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+// psiphonBootstrapNeedsMigration recognizes the old scalar RemoteServerListUrl
+// format and placeholder identities. A valid custom TargetServerEntry remains
+// supported; invalid client IDs are still migrated in that case.
+func psiphonBootstrapNeedsMigration(cfg psiphonClientConfig) bool {
+	if !isUsablePsiphonClientID(cfg.PropagationChannelID) || !isUsablePsiphonClientID(cfg.SponsorID) {
+		return true
+	}
+	if _, err := strconv.Atoi(strings.TrimSpace(cfg.ClientVersion)); err != nil {
+		return true
+	}
+	if cfg.DisableLocalSocksProxy || cfg.UseUnixDomainSockets {
+		return true
+	}
+	keysIncomplete := strings.TrimSpace(cfg.RemoteServerListSignaturePublicKey) == "" ||
+		strings.TrimSpace(cfg.ServerEntrySignaturePublicKey) == "" ||
+		strings.TrimSpace(cfg.ExchangeObfuscationKey) == ""
+	if strings.TrimSpace(cfg.TargetServerEntry) != "" {
+		return keysIncomplete
+	}
+	return keysIncomplete || len(cfg.RemoteServerListURLs) == 0 || len(cfg.ObfuscatedServerListRootURLs) == 0
+}
+
+// repairLegacyPsiphonClientConfig upgrades incomplete legacy bootstraps from
+// older ShahTunnel 3.0.0 builds. It also recognizes the deprecated scalar URL
+// layout. Valid custom identities and region preferences are preserved.
 func repairLegacyPsiphonClientConfig(configPath, proxyAddress string) (bool, error) {
 	if !isLoopbackProxyAddress(proxyAddress) {
 		return false, errors.New("Psiphon SOCKS5 proxy must be loopback-only")
@@ -309,9 +343,7 @@ func repairLegacyPsiphonClientConfig(configPath, proxyAddress string) (bool, err
 	if err := json.Unmarshal(b, &current); err != nil {
 		return false, fmt.Errorf("read legacy Psiphon config: %w", err)
 	}
-	legacyPlaceholder := strings.EqualFold(current.PropagationChannelID, "FFFFFFFFFFFFFFFF") ||
-		strings.EqualFold(current.SponsorID, "FFFFFFFFFFFFFFFF")
-	if !legacyPlaceholder {
+	if !psiphonBootstrapNeedsMigration(current) {
 		return false, nil
 	}
 	_, portText, err := net.SplitHostPort(proxyAddress)
@@ -325,6 +357,20 @@ func repairLegacyPsiphonClientConfig(configPath, proxyAddress string) (bool, err
 	upgraded := newPsiphonClientConfig(port)
 	upgraded.EgressRegion = current.EgressRegion
 	upgraded.TargetServerEntry = current.TargetServerEntry
+	if isUsablePsiphonClientID(current.PropagationChannelID) {
+		upgraded.PropagationChannelID = strings.TrimSpace(current.PropagationChannelID)
+	}
+	if isUsablePsiphonClientID(current.SponsorID) {
+		upgraded.SponsorID = strings.TrimSpace(current.SponsorID)
+	}
+	if strings.TrimSpace(current.ClientPlatform) != "" {
+		upgraded.ClientPlatform = strings.TrimSpace(current.ClientPlatform)
+	}
+	if version := strings.TrimSpace(current.ClientVersion); version != "" {
+		if _, parseErr := strconv.Atoi(version); parseErr == nil {
+			upgraded.ClientVersion = version
+		}
+	}
 	if strings.TrimSpace(current.RemoteServerListDownloadFilename) != "" {
 		upgraded.RemoteServerListDownloadFilename = current.RemoteServerListDownloadFilename
 	}
@@ -386,22 +432,11 @@ func validatePsiphonClientConfig(configPath, proxyAddress string) error {
 	if cfg.UseUnixDomainSockets {
 		return errors.New("Psiphon config must use a loopback TCP SOCKS5 listener")
 	}
-	if cfg.PropagationChannelID == "" || cfg.SponsorID == "" || cfg.ClientVersion == "" {
-		return errors.New("Psiphon client identity/bootstrap configuration is incomplete")
+	if !isUsablePsiphonClientID(cfg.PropagationChannelID) || !isUsablePsiphonClientID(cfg.SponsorID) || cfg.ClientVersion == "" {
+		return errors.New("Psiphon client identity/bootstrap configuration is incomplete or contains placeholder IDs")
 	}
 	if _, err := strconv.Atoi(cfg.ClientVersion); err != nil {
 		return fmt.Errorf("invalid Psiphon ClientVersion: %w", err)
-	}
-	for name, value := range map[string]string{"PropagationChannelId": cfg.PropagationChannelID, "SponsorId": cfg.SponsorID} {
-		if len(value) != 16 {
-			return fmt.Errorf("Psiphon %s must contain exactly 16 hexadecimal characters", name)
-		}
-		if _, err := hex.DecodeString(value); err != nil {
-			return fmt.Errorf("Psiphon %s is not hexadecimal: %w", name, err)
-		}
-		if value == "FFFFFFFFFFFFFFFF" || value == "0000000000000000" {
-			return fmt.Errorf("Psiphon %s contains a placeholder identifier", name)
-		}
 	}
 	decodeKey := func(name, value string, minBytes, exactBytes int) error {
 		decoded, err := base64.StdEncoding.DecodeString(value)
