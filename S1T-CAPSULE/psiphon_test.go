@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -12,11 +14,41 @@ func TestNewPsiphonClientConfigUsesAuthenticatedBootstrap(t *testing.T) {
 	if cfg.LocalSocksProxyPort != 23456 {
 		t.Fatalf("SOCKS port = %d, want 23456", cfg.LocalSocksProxyPort)
 	}
-	if cfg.PropagationChannelID == "" || cfg.SponsorID == "" || cfg.ClientVersion == "" {
-		t.Fatal("Psiphon client identity fields must be populated")
+	if cfg.PropagationChannelID != psiphonPropagationChannelID || cfg.SponsorID != psiphonSponsorID || cfg.ClientVersion == "" {
+		t.Fatal("Psiphon client identity fields must use the configured public client values")
 	}
-	if cfg.RemoteServerListURL == "" || cfg.RemoteServerListSignaturePublicKey == "" {
+	if cfg.PropagationChannelID == "FFFFFFFFFFFFFFFF" || cfg.SponsorID == "FFFFFFFFFFFFFFFF" || cfg.SponsorID == "0000000000000000" {
+		t.Fatal("placeholder Psiphon client identifiers must never be generated")
+	}
+	if cfg.RemoteServerListURL == "" || cfg.RemoteServerListSignaturePublicKey == "" || cfg.ServerEntrySignaturePublicKey == "" || cfg.ExchangeObfuscationKey == "" {
 		t.Fatal("authenticated public server-list bootstrap is incomplete")
+	}
+	if key, err := base64.StdEncoding.DecodeString(cfg.ServerEntrySignaturePublicKey); err != nil || len(key) != 32 {
+		t.Fatalf("server-entry signature key must decode to 32 bytes: len=%d err=%v", len(key), err)
+	}
+	if key, err := base64.StdEncoding.DecodeString(cfg.ExchangeObfuscationKey); err != nil || len(key) != 32 {
+		t.Fatalf("exchange-obfuscation key must decode to 32 bytes: len=%d err=%v", len(key), err)
+	}
+	if key, err := base64.StdEncoding.DecodeString(cfg.RemoteServerListSignaturePublicKey); err != nil || len(key) < 256 {
+		t.Fatalf("remote server-list signature key is malformed: len=%d err=%v", len(key), err)
+	}
+	if len(cfg.RemoteServerListURLs) < 2 || len(cfg.ObfuscatedServerListRootURLs) < 2 {
+		t.Fatal("Psiphon bootstrap must include multiple public list mirrors")
+	}
+	for _, list := range [][]psiphonTransferURL{cfg.RemoteServerListURLs, cfg.ObfuscatedServerListRootURLs} {
+		hasImmediate := false
+		for _, item := range list {
+			decoded, err := base64.StdEncoding.DecodeString(item.URL)
+			if err != nil || !strings.HasPrefix(string(decoded), "https://") || item.SkipVerify {
+				t.Fatalf("invalid authenticated Psiphon transfer URL: %+v", item)
+			}
+			if item.OnlyAfterAttempts == 0 {
+				hasImmediate = true
+			}
+		}
+		if !hasImmediate {
+			t.Fatal("each Psiphon transfer list needs an immediate mirror")
+		}
 	}
 	if !cfg.DisableLocalHTTPProxy || cfg.DisableLocalSocksProxy || cfg.UseUnixDomainSockets {
 		t.Fatal("configuration must expose only a TCP loopback SOCKS5 proxy")
@@ -30,6 +62,78 @@ func TestNewPsiphonClientConfigUsesAuthenticatedBootstrap(t *testing.T) {
 	}
 	if err := validatePsiphonClientConfig(path, "127.0.0.1:23456"); err != nil {
 		t.Fatalf("generated bootstrap config did not validate: %v", err)
+	}
+}
+
+func TestRepairLegacyPsiphonConfigMigratesOnlyPlaceholderBootstrap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.json")
+	legacy := newPsiphonClientConfig(21082)
+	legacy.PropagationChannelID = "FFFFFFFFFFFFFFFF"
+	legacy.SponsorID = "FFFFFFFFFFFFFFFF"
+	legacy.RemoteServerListURLs = nil
+	legacy.ObfuscatedServerListRootURLs = nil
+	legacy.ServerEntrySignaturePublicKey = ""
+	legacy.ExchangeObfuscationKey = ""
+	legacy.EgressRegion = "DE"
+	legacyBytes, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, legacyBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := repairLegacyPsiphonClientConfig(path, "127.0.0.1:21082")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migrated {
+		t.Fatal("legacy placeholder bootstrap was not migrated")
+	}
+	if err := validatePsiphonClientConfig(path, "127.0.0.1:21082"); err != nil {
+		t.Fatalf("migrated config is not valid: %v", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got psiphonClientConfig
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.EgressRegion != "DE" {
+		t.Fatalf("EgressRegion=%q, want DE", got.EgressRegion)
+	}
+	if got.PropagationChannelID == "FFFFFFFFFFFFFFFF" || got.SponsorID == "FFFFFFFFFFFFFFFF" {
+		t.Fatal("placeholder IDs remain after migration")
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0600 {
+		t.Fatalf("migrated config mode=%o, want 600", st.Mode().Perm())
+	}
+}
+
+func TestRepairLegacyPsiphonConfigLeavesNonPlaceholderConfigAlone(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "valid.json")
+	cfg := newPsiphonClientConfig(21083)
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := repairLegacyPsiphonClientConfig(path, "127.0.0.1:21083")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated {
+		t.Fatal("valid non-placeholder config should not be rewritten")
 	}
 }
 

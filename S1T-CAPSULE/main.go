@@ -3023,6 +3023,11 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 	if err != nil || !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("Psiphon config file is unavailable: %s", configPath)
 	}
+	if migrated, migrateErr := repairLegacyPsiphonClientConfig(configPath, cfg.PsiphonProxy); migrateErr != nil {
+		return nil, fmt.Errorf("migrate legacy Psiphon bootstrap: %w", migrateErr)
+	} else if migrated {
+		log.Printf("Psiphon: upgraded legacy placeholder bootstrap to authenticated public server-list configuration")
+	}
 	if err := validatePsiphonClientConfig(configPath, cfg.PsiphonProxy); err != nil {
 		return nil, fmt.Errorf("invalid Psiphon client configuration: %w", err)
 	}
@@ -3886,7 +3891,7 @@ LockPersonality=true
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
-ReadWritePaths=/etc/ravanreverse
+ReadWritePaths=/etc/ravanreverse /var/lib/shah-tunnel/psiphon
 [Install]
 WantedBy=multi-user.target
 `
@@ -4668,15 +4673,19 @@ func ensureTunnelRunning(restartActive bool) error {
 		return fmt.Errorf("could not enable automatic startup for %s: %w", service, err)
 	}
 	var err error
+	serviceStartTime := time.Now()
+	serviceWasStarted := false
 	if tunnelIsActive() {
 		if restartActive {
 			err = runSystemctl("restart", service)
+			serviceWasStarted = true
 		} else {
 			fmt.Printf("Tunnel service %s is already running.\n", service)
 		}
 	} else {
 		_ = exec.Command("systemctl", "reset-failed", service).Run()
 		err = runSystemctl("start", service)
+		serviceWasStarted = true
 	}
 	if err != nil || !tunnelIsActive() {
 		showRecentLogs(40)
@@ -4685,8 +4694,55 @@ func ensureTunnelRunning(restartActive bool) error {
 		}
 		return errors.New("service did not reach active state; recent logs are shown above")
 	}
+	// A systemd Type=simple unit becomes active as soon as the ravanreverse
+	// process starts. For a dedicated Psiphon Agent that is not enough: the
+	// ConsoleClient must report at least one established Psiphon tunnel before
+	// the manager tells the operator that setup succeeded.
+	if data, readErr := os.ReadFile(configPath); readErr == nil {
+		var selected Config
+		if json.Unmarshal(data, &selected) == nil && selected.Role == "agent" && selected.Underlay == underlayPsiphon {
+			if serviceWasStarted {
+				if waitErr := waitForPsiphonAgentReady(service, serviceStartTime, 100*time.Second); waitErr != nil {
+					showRecentLogs(55)
+					return fmt.Errorf("Psiphon Agent did not become ready: %w", waitErr)
+				}
+			}
+		}
+	}
 	fmt.Printf("Tunnel service %s is active; automatic startup at boot is enabled.\n", service)
 	return nil
+}
+
+func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.Duration) error {
+	if timeout <= 0 {
+		return errors.New("invalid Psiphon readiness timeout")
+	}
+	startMarker := fmt.Sprintf("@%d", startedAt.Unix())
+	deadline := time.Now().Add(timeout)
+	psiphonReady := false
+	agentLaneReady := false
+	for time.Now().Before(deadline) {
+		logs, _ := exec.Command("journalctl", "-u", service, "--since", startMarker, "--no-pager", "-o", "cat").CombinedOutput()
+		logText := string(logs)
+		psiphonReady = psiphonReady || strings.Contains(logText, "Psiphon ConsoleClient connected")
+		for _, line := range strings.Split(logText, "\n") {
+			if strings.Contains(line, "tunnel lane ") && strings.Contains(line, " connected via ") && strings.Contains(line, " over psiphon_socks5") {
+				agentLaneReady = true
+				break
+			}
+		}
+		if psiphonReady && agentLaneReady && exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
+	if !psiphonReady {
+		return fmt.Errorf("service %s did not establish a real Psiphon tunnel within %s", service, timeout)
+	}
+	if !agentLaneReady {
+		return fmt.Errorf("Psiphon itself connected, but no Agent lane reached the Hub through psiphon_socks5 within %s", timeout)
+	}
+	return fmt.Errorf("service %s is no longer active after Psiphon startup", service)
 }
 
 func showRecentLogs(n int) {
