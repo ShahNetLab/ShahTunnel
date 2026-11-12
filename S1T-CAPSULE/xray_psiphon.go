@@ -259,10 +259,6 @@ func psiphonPublicEgressIP(proxyAddress string, timeout time.Duration) (string, 
 	return ip.String(), nil
 }
 
-func applyXrayPsiphonEgressToSelectedTunnel() error {
-	return applyXrayPsiphonEgress(true, true)
-}
-
 // applyXrayPsiphonEgress builds an independent Xray sidecar and switches only
 // the selected Agent's mapping targets. X-UI's source config and system routes
 // are never edited. UDP is blocked on this isolated path: Psiphon's local

@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "3.0.7"
+	version                          = "3.0.8"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -5937,7 +5937,6 @@ func menu() {
 		menuItem("7", "🗑️ Delete one tunnel", "Delete this tunnel only")
 		menuItem("8", "💣 Complete uninstall", "Remove all tunnels")
 		menuItem("9", "🌐 WARP egress", "Selected Agent only")
-		menuItem("10", "🛡️ Psiphon user egress", "Selected Agent TCP + DNS")
 		menuItem("0", "🚪 Exit", "Close menu")
 		uiRule()
 		choice := ask("Select an operation", "0")
@@ -5980,10 +5979,6 @@ func menu() {
 		case "9":
 			if chooseTunnel("Select the Agent tunnel to isolate through WARP") {
 				err = applyXrayWarpEgressToSelectedTunnel()
-			}
-		case "10":
-			if chooseTunnel("Select the Agent tunnel to isolate user traffic through Psiphon") {
-				err = applyXrayPsiphonEgressToSelectedTunnel()
 			}
 		case "0":
 			return
