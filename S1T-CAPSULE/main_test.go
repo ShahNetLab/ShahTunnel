@@ -1376,6 +1376,40 @@ func TestWireGuardRejectsWarpProxyMode(t *testing.T) {
 	}
 }
 
+func TestPsiphonTransportKeepsMappingAndControlPortsSeparate(t *testing.T) {
+	cfg := Config{
+		Role:           "agent",
+		Underlay:       underlayPsiphon,
+		HubAddr:        "37.32.12.244:9449",
+		PsiphonHubAddr: "37.32.12.244:2083",
+	}
+	cases := []struct {
+		transport string
+		wantAddr  string
+	}{
+		{transport: transportTCP, wantAddr: "37.32.12.244:2083"},
+		{transport: transportWebSocket, wantAddr: "37.32.12.244:2083"},
+		{transport: transportAuto, wantAddr: "37.32.12.244:2083"},
+		{transport: transportHTTP2, wantAddr: "37.32.12.244:9449"},
+		{transport: transportHTTP1, wantAddr: "37.32.12.244:9449"},
+		{transport: transportHTTPConnectAuto, wantAddr: "37.32.12.244:9449"},
+	}
+	for _, tc := range cases {
+		got := agentHubAddressForTransport(cfg, tc.transport)
+		if got != tc.wantAddr {
+			t.Errorf("transport %s selected Hub address %q; want %q", tc.transport, got, tc.wantAddr)
+		}
+	}
+	h2, err := adjacentPortAddress(agentHubAddressForTransport(cfg, transportHTTP2))
+	if err != nil || h2 != "37.32.12.244:9450" {
+		t.Fatalf("HTTP/2 CONNECT endpoint = %q, err=%v; want 37.32.12.244:9450", h2, err)
+	}
+	h1, err := secondAdjacentPortAddress(agentHubAddressForTransport(cfg, transportHTTP1))
+	if err != nil || h1 != "37.32.12.244:9451" {
+		t.Fatalf("HTTP/1.1 CONNECT endpoint = %q, err=%v; want 37.32.12.244:9451", h1, err)
+	}
+}
+
 func TestPsiphonHubAddressDefaultsToPublicMappingPort(t *testing.T) {
 	cases := []struct {
 		input string

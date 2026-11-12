@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "3.0.3"
+	version                          = "3.0.4"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -2888,9 +2888,6 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 		mode = transportAuto
 	}
 	if mode != transportAuto && mode != transportAdaptive {
-		if cfg.Underlay == underlayPsiphon {
-			cfg.HubAddr = agentHubAddressForUnderlay(cfg, underlayPsiphon)
-		}
 		return connectAndRunAgentWithTransport(cfg, pin, channel, mode)
 	}
 
@@ -2940,9 +2937,6 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 		}
 		routeCfg := cfg
 		routeCfg.Underlay = route
-		if route == underlayPsiphon {
-			routeCfg.HubAddr = agentHubAddressForUnderlay(cfg, underlayPsiphon)
-		}
 		for i, candidate := range transportCandidates {
 			err := connectAndRunAgentWithTransport(routeCfg, pin, channel, candidate)
 			if err == nil {
@@ -2964,14 +2958,22 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 }
 
 func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode string) error {
+	// Psiphon has two distinct Hub destinations: TCP/TLS and WebSocket/TLS
+	// use the public Mapping listener (which advertises the ShahTunnel ALPN),
+	// while HTTP/2 and HTTP/1.1 CONNECT use the dedicated control listeners
+	// at ControlPort+1 and ControlPort+2. Never replace HubAddr globally with
+	// PsiphonHubAddr or the CONNECT ports would incorrectly become Mapping+1/+2.
+	transportCfg := cfg
+	transportCfg.HubAddr = agentHubAddressForTransport(cfg, mode)
 	switch mode {
 	case transportHTTP2:
-		return connectAndRunAgentHTTP2(cfg, channel)
+		return connectAndRunAgentHTTP2(transportCfg, channel)
 	case transportHTTP1:
-		return connectAndRunAgentHTTP1(cfg, channel)
+		return connectAndRunAgentHTTP1(transportCfg, channel)
 	case transportHTTPConnectAuto:
-		return connectAndRunAgentHTTPConnectAuto(cfg, channel)
+		return connectAndRunAgentHTTPConnectAuto(transportCfg, channel)
 	}
+	cfg = transportCfg
 	d := net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
 	sni := strings.TrimSpace(cfg.TLSServerName)
 	if sni == "" {
@@ -3564,6 +3566,16 @@ func agentHubAddressForUnderlay(cfg Config, underlay string) string {
 			return defaultPsiphonHubAddress(cfg.HubAddr)
 		}
 		return configured
+	}
+	return cfg.HubAddr
+}
+
+// agentHubAddressForTransport keeps the control and public Mapping endpoints
+// separate. The Mapping listener multiplexes the native ALPN (TCP/TLS and
+// WebSocket/TLS); CONNECT listeners remain adjacent to the control port.
+func agentHubAddressForTransport(cfg Config, transport string) string {
+	if cfg.Underlay == underlayPsiphon && (transport == transportTCP || transport == transportWebSocket || transport == transportAuto) {
+		return agentHubAddressForUnderlay(cfg, underlayPsiphon)
 	}
 	return cfg.HubAddr
 }
