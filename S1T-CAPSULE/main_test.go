@@ -46,15 +46,42 @@ func TestInstallerPersistsNetlinkPolicyForExistingAndNewUnits(t *testing.T) {
 	installer := string(data)
 	want := "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
 	if got := strings.Count(installer, want); got < 3 {
-		t.Fatalf("installer must set AF_NETLINK in both unit templates and the upgrade drop-in; found %d occurrences", got)
+		t.Fatalf("installer must set AF_NETLINK in both unit templates and the exact systemd drop-in; found %d occurrences", got)
+	}
+	if !strings.Contains(installer, `"$dropin_dir/10-psiphon-netlink.conf"`) {
+		t.Fatalf("installer must generate the same 10-psiphon-netlink.conf override used by the successful manual repair")
 	}
 	if !strings.Contains(installer, "RestrictAddressFamilies=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK") {
-		t.Fatalf("installer upgrade drop-in must reset and then reapply the explicit address-family allow-list")
+		t.Fatalf("installer Netlink drop-in must reset and then reapply the explicit address-family allow-list")
 	}
 	for _, line := range strings.Split(installer, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "CapabilityBoundingSet=") && strings.Contains(line, "CAP_NET_ADMIN") {
 			t.Fatalf("installer must not grant CAP_NET_ADMIN")
 		}
+	}
+}
+
+func TestInstallerRestartsOnlyActivePsiphonOrAdaptiveAgentsAfterDaemonReload(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "S1T-START.sh"))
+	if err != nil {
+		t.Fatalf("read installer: %v", err)
+	}
+	installer := string(data)
+	for _, want := range []string{
+		`cfg.get("role") == "agent"`,
+		`cfg.get("underlay") in ("psiphon_socks5", "adaptive_external")`,
+		`systemctl restart "$unit"`,
+		`systemctl list-units --type=service --state=active`,
+		`10-psiphon-netlink.conf`,
+	} {
+		if !strings.Contains(installer, want) {
+			t.Fatalf("installer missing required automatic Psiphon upgrade behavior: %s", want)
+		}
+	}
+	reload := strings.Index(installer, "systemctl daemon-reload")
+	restart := strings.Index(installer, `systemctl restart "$unit"`)
+	if reload < 0 || restart < 0 || restart < reload {
+		t.Fatalf("active Psiphon Agent profiles must restart after systemd daemon-reload")
 	}
 }
 
