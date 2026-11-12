@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "3.0.4"
+	version                          = "3.0.5"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -4089,12 +4089,8 @@ func ensureNoPortConflicts(c Config, skipPath string) error {
 	return nil
 }
 
-func ensureTunnelTemplateUnit() error {
-	unitPath := "/etc/systemd/system/ravanreverse@.service"
-	if _, err := os.Stat("/usr/local/bin/ravanreverse"); err != nil {
-		return errors.New("Shah Tunnel binary is not installed; run the installer first")
-	}
-	unit := `[Unit]
+func tunnelTemplateUnitContents() string {
+	return `[Unit]
 Description=Shah Tunnel authenticated reverse TCP tunnel (%i)
 Wants=network-online.target
 After=network-online.target
@@ -4126,12 +4122,20 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
 ReadWritePaths=/etc/ravanreverse /var/lib/shah-tunnel/psiphon
 [Install]
 WantedBy=multi-user.target
 `
+}
+
+func ensureTunnelTemplateUnit() error {
+	unitPath := "/etc/systemd/system/ravanreverse@.service"
+	if _, err := os.Stat("/usr/local/bin/ravanreverse"); err != nil {
+		return errors.New("Shah Tunnel binary is not installed; run the installer first")
+	}
+	unit := tunnelTemplateUnitContents()
 	if err := atomicWriteFile(unitPath, []byte(unit), 0644); err != nil {
 		return fmt.Errorf("write tunnel service template: %w", err)
 	}

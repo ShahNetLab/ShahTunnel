@@ -87,10 +87,11 @@ type psiphonClientConfig struct {
 	EmitDiagnosticNotices       bool   `json:"EmitDiagnosticNotices,omitempty"`
 }
 
-// psiphonConsoleClientArgs deliberately leaves ListenInterface unset.
-// Psiphon then binds its local SOCKS proxy to 127.0.0.1 directly. Passing
-// "lo" makes Psiphon enumerate OS interfaces, which can fail inside the
-// hardened systemd sandbox where AF_NETLINK is not permitted.
+// psiphonConsoleClientArgs deliberately leaves ListenInterface unset so the
+// local SOCKS proxy uses Psiphon's built-in loopback binding. Psiphon's WebRTC
+// ICE/in-proxy stack may still enumerate host interfaces through AF_NETLINK;
+// the Agent systemd unit allows that socket family while retaining the narrow
+// capability set (no CAP_NET_ADMIN), so no route or interface is modified.
 func psiphonConsoleClientArgs(configPath, dataDir string) []string {
 	return []string{"-config", configPath, "-dataRootDirectory", dataDir}
 }

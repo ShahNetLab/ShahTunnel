@@ -24,6 +24,40 @@ import (
 	"time"
 )
 
+func TestTunnelTemplateUnitAllowsNetlinkWithoutNetworkAdmin(t *testing.T) {
+	unit := tunnelTemplateUnitContents()
+	want := "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+	if !strings.Contains(unit, want) {
+		t.Fatalf("service template must allow AF_NETLINK for Psiphon WebRTC interface discovery")
+	}
+	if strings.Contains(unit, "CAP_NET_ADMIN") {
+		t.Fatalf("service template must not grant CAP_NET_ADMIN")
+	}
+	if !strings.Contains(unit, "CapabilityBoundingSet=CAP_NET_BIND_SERVICE") {
+		t.Fatalf("service template lost its restricted capability set")
+	}
+}
+
+func TestInstallerPersistsNetlinkPolicyForExistingAndNewUnits(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "S1T-START.sh"))
+	if err != nil {
+		t.Fatalf("read installer: %v", err)
+	}
+	installer := string(data)
+	want := "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+	if got := strings.Count(installer, want); got < 3 {
+		t.Fatalf("installer must set AF_NETLINK in both unit templates and the upgrade drop-in; found %d occurrences", got)
+	}
+	if !strings.Contains(installer, "RestrictAddressFamilies=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK") {
+		t.Fatalf("installer upgrade drop-in must reset and then reapply the explicit address-family allow-list")
+	}
+	for _, line := range strings.Split(installer, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "CapabilityBoundingSet=") && strings.Contains(line, "CAP_NET_ADMIN") {
+			t.Fatalf("installer must not grant CAP_NET_ADMIN")
+		}
+	}
+}
+
 func makeTestClientHelloRecord(alpn string) []byte {
 	body := make([]byte, 0, 128)
 	body = append(body, 0x03, 0x03) // legacy_version
