@@ -3023,25 +3023,8 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 	if err != nil || !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("Psiphon config file is unavailable: %s", configPath)
 	}
-	configBytes, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("read Psiphon config: %w", err)
-	}
-	var psiphonSettings map[string]any
-	if err := json.Unmarshal(configBytes, &psiphonSettings); err != nil {
-		return nil, fmt.Errorf("parse Psiphon config JSON: %w", err)
-	}
-	if disabled, _ := psiphonSettings["DisableLocalSocksProxy"].(bool); disabled {
-		return nil, errors.New("Psiphon config disables its local SOCKS5 proxy")
-	}
-	if unixSockets, _ := psiphonSettings["UseUnixDomainSockets"].(bool); unixSockets {
-		return nil, errors.New("Psiphon config uses Unix sockets; ShahTunnel requires a TCP loopback SOCKS5 listener")
-	}
-	port, ok := psiphonSettings["LocalSocksProxyPort"].(float64)
-	_, proxyPortText, _ := net.SplitHostPort(cfg.PsiphonProxy)
-	proxyPort, _ := strconv.Atoi(proxyPortText)
-	if !ok || int(port) != proxyPort {
-		return nil, fmt.Errorf("Psiphon config LocalSocksProxyPort must equal %d (proxy %s)", proxyPort, cfg.PsiphonProxy)
+	if err := validatePsiphonClientConfig(configPath, cfg.PsiphonProxy); err != nil {
+		return nil, fmt.Errorf("invalid Psiphon client configuration: %w", err)
 	}
 	binary := strings.TrimSpace(cfg.PsiphonClient)
 	if binary == "" {
@@ -3050,7 +3033,7 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 	if !strings.ContainsRune(binary, os.PathSeparator) {
 		resolved, lookErr := exec.LookPath(binary)
 		if lookErr != nil {
-			return nil, fmt.Errorf("official Psiphon ConsoleClient executable %q not found in PATH; install the official Linux binary first", binary)
+			return nil, fmt.Errorf("official Psiphon ConsoleClient executable %q not found; rerun the ShahTunnel installer to provision it automatically", binary)
 		}
 		binary = resolved
 	}
@@ -3066,18 +3049,66 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, binary, "-config", configPath, "-dataRootDirectory", dataDir, "-listenInterface", "lo")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("open Psiphon stdout: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("open Psiphon stderr: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
 		cancel()
 		return nil, fmt.Errorf("start Psiphon ConsoleClient: %w", err)
 	}
 	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	deadline := time.Now().Add(45 * time.Second)
+	tunnelReady := make(chan int, 1)
+	consumeNotices := func(reader io.Reader) {
+		scanner := bufio.NewScanner(reader)
+		scanner.Buffer(make([]byte, 4096), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			log.Printf("Psiphon: %s", line)
+			if count, ok := parsePsiphonTunnelNotice(line); ok {
+				select {
+				case tunnelReady <- count:
+				default:
+				}
+			}
+		}
+		if scanErr := scanner.Err(); scanErr != nil {
+			log.Printf("Psiphon notice stream ended: %v", scanErr)
+		}
+	}
+	var noticeReaders sync.WaitGroup
+	noticeReaders.Add(2)
+	go func() {
+		defer noticeReaders.Done()
+		consumeNotices(stdout)
+	}()
+	go func() {
+		defer noticeReaders.Done()
+		consumeNotices(stderr)
+	}()
+	// Wait only after both StdoutPipe/StderrPipe readers have drained. Calling
+	// Cmd.Wait concurrently with reads can close the pipes before final notices
+	// (including the first Tunnels notice) have been consumed.
+	go func() {
+		noticeReaders.Wait()
+		done <- cmd.Wait()
+	}()
+	deadline := time.Now().Add(90 * time.Second)
+	proxyReady := false
+	connectedTunnels := 0
 	for time.Now().Before(deadline) {
-		if err := probeSOCKS5(cfg.PsiphonProxy, 700*time.Millisecond); err == nil {
-			log.Printf("Psiphon ConsoleClient is ready; TCP egress uses SOCKS5 %s", cfg.PsiphonProxy)
+		if !proxyReady && probeSOCKS5(cfg.PsiphonProxy, 700*time.Millisecond) == nil {
+			proxyReady = true
+			log.Printf("Psiphon local SOCKS5 listener ready at %s; waiting for a real tunnel", cfg.PsiphonProxy)
+		}
+		if proxyReady && connectedTunnels > 0 {
+			log.Printf("Psiphon ConsoleClient connected (%d tunnel(s)); TCP egress uses SOCKS5 %s", connectedTunnels, cfg.PsiphonProxy)
 			return func() {
 				cancel()
 				select {
@@ -3089,10 +3120,15 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 			}, nil
 		}
 		select {
+		case count := <-tunnelReady:
+			connectedTunnels = count
 		case processErr := <-done:
 			cancel()
-			return nil, fmt.Errorf("Psiphon ConsoleClient exited before SOCKS5 became ready: %v", processErr)
-		case <-time.After(350 * time.Millisecond):
+			if processErr == nil {
+				processErr = errors.New("process exited normally before a Psiphon tunnel was established")
+			}
+			return nil, fmt.Errorf("Psiphon ConsoleClient exited before establishing a tunnel: %v", processErr)
+		case <-time.After(400 * time.Millisecond):
 		}
 	}
 	cancel()
@@ -3102,7 +3138,10 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 		_ = cmd.Process.Kill()
 		<-done
 	}
-	return nil, fmt.Errorf("Psiphon SOCKS5 proxy %s did not become ready within 45 seconds", cfg.PsiphonProxy)
+	if !proxyReady {
+		return nil, fmt.Errorf("Psiphon SOCKS5 proxy %s did not become ready within 90 seconds", cfg.PsiphonProxy)
+	}
+	return nil, errors.New("Psiphon ConsoleClient opened SOCKS5 but did not report an established tunnel within 90 seconds")
 }
 
 func warpStatusConnected(output string) bool {
@@ -4274,12 +4313,10 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 		case "2":
 			return transportAdaptive, underlayWARP, "", nil
 		case "3":
-			path := strings.TrimSpace(wizardAsk("Path to official Psiphon ConsoleClient JSON config", "/etc/shah-tunnel/psiphon-client.json"))
-			proxy := strings.TrimSpace(wizardAsk("Local Psiphon SOCKS5 proxy address", "127.0.0.1:1080"))
-			if !isLoopbackProxyAddress(proxy) {
-				return "", "", "", errors.New("Psiphon SOCKS5 proxy must bind to 127.0.0.1 or ::1")
-			}
-			return transportAdaptive, underlayPsiphon, path + "\n" + proxy, nil
+			// ConsoleClient, its pinned upstream source build, a per-profile JSON
+			// config, and a unique loopback SOCKS5 port are prepared automatically
+			// during Agent creation. No manual Psiphon files are requested.
+			return transportAdaptive, underlayPsiphon, "", nil
 		default:
 			return "", "", "", errors.New("invalid external egress selection; enter 1, 2, or 3")
 		}
@@ -4288,12 +4325,8 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent to enable Direct/Psiphon egress failover.")
 			return transportAdaptive, underlayDirect, "", nil
 		}
-		path := strings.TrimSpace(wizardAsk("Path to official Psiphon ConsoleClient JSON config for failover", "/etc/shah-tunnel/psiphon-client.json"))
-		proxy := strings.TrimSpace(wizardAsk("Local Psiphon SOCKS5 proxy address", "127.0.0.1:1080"))
-		if !isLoopbackProxyAddress(proxy) {
-			return "", "", "", errors.New("Psiphon SOCKS5 proxy must bind to 127.0.0.1 or ::1")
-		}
-		return transportAdaptive, underlayAdaptive, path + "\n" + proxy, nil
+		// Option 9 includes Psiphon as an automatically prepared standby egress.
+		return transportAdaptive, underlayAdaptive, "", nil
 	default:
 		return "", "", "", errors.New("invalid transport selection; enter a number from 1 to 9")
 	}
@@ -4487,16 +4520,7 @@ func setup() error {
 		c.Role = "agent"
 		c.TunnelChannels = defaultTunnelChannels
 		c.HubAddr = wizardAsk("Reachable Iran Hub address as IP:PORT or hostname:PORT (control port)", "")
-		var psiphonDetails string
-		c.Transport, c.Underlay, psiphonDetails, err = wizardAskTransport("Agent transport mode (must be allowed by Hub)", "agent")
-		if err == nil && psiphonDetails != "" {
-			parts := strings.SplitN(psiphonDetails, "\n", 2)
-			c.PsiphonConfig = strings.TrimSpace(parts[0])
-			if len(parts) > 1 {
-				c.PsiphonProxy = strings.TrimSpace(parts[1])
-			}
-			c.PsiphonDataDir = filepath.Join("/var/lib/shah-tunnel/psiphon", id)
-		}
+		c.Transport, c.Underlay, _, err = wizardAskTransport("Agent transport mode (must be allowed by Hub)", "agent")
 		if err != nil {
 			return err
 		}
@@ -4528,6 +4552,13 @@ func setup() error {
 				break
 			}
 		}
+		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
+			uiInfo("Preparing the official Psiphon ConsoleClient, verified source build and private per-profile SOCKS5 configuration...")
+			if err = preparePsiphonAgentProfile(&c); err != nil {
+				return fmt.Errorf("automatic Psiphon setup failed; Agent profile was not saved: %w", err)
+			}
+			uiSuccess("Psiphon ConsoleClient installed; per-profile config and loopback SOCKS5 endpoint are ready: " + c.PsiphonProxy)
+		}
 		c = normalizeConfig(c)
 		if err = saveConfig(c); err != nil {
 			return err
@@ -4540,7 +4571,7 @@ func setup() error {
 			uiInfo("WARP WireGuard requires an already-connected system tunnel; Local Proxy mode is MASQUE-only. ShahTunnel never changes host routes or restarts SSH.")
 		}
 		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
-			uiInfo("Install the official Psiphon ConsoleClient and provide its client JSON; ShahTunnel starts it as a child and dials the local SOCKS5 proxy.")
+			uiInfo("Psiphon starts as a loopback-only child process for this Agent profile; no TUN device or host route changes are made. TCP tunnel lanes use its local SOCKS5 endpoint.")
 		}
 		uiSuccess("Agent configuration saved. Reconnection is automatic if a lane drops.")
 	case "3", "relay", "front":
