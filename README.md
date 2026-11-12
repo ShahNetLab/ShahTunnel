@@ -2,9 +2,9 @@
 
 <img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel Galactic emblem" width="100%">
 
-# ShahTunnel 3.0.5
+# ShahTunnel 3.0.6
 
-[![Version](https://img.shields.io/badge/version-3.0.5-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-3.0.6-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -34,7 +34,7 @@ Client → Hub public mapping → authenticated Agent lanes → Agent local targ
 Selected Xray inbound → loopback-only Xray sidecar → WARP SOCKS5 → Internet
 ```
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.5 Network Flow" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v3.png" alt="ShahTunnel 3.0.6 Network Flow" width="100%"></p>
 
 ## Capabilities
 
@@ -190,9 +190,11 @@ sudo shah-tunnel menu
 
 ---
 
-> **Psiphon startup in 3.0.5:** a ready local SOCKS5 listener is not the same as an established Psiphon tunnel. If SOCKS5 is ready but the external tunnel is not yet established, the Agent service remains active and ConsoleClient keeps retrying; the wizard reports a pending connection, not a successful tunnel. Psiphon diagnostic notices are written to the local journal and may include network/server details; do not publish them publicly.
+> **Psiphon startup in 3.0.6:** a ready local SOCKS5 listener is not the same as an established Psiphon tunnel. If SOCKS5 is ready but the external tunnel is not yet established, the Agent service remains active and ConsoleClient keeps retrying; the wizard reports a pending connection, not a successful tunnel. Psiphon diagnostic notices are written to the local journal and may include network/server details; do not publish them publicly.
 
-> **Psiphon endpoint routing in 3.0.5:** TCP/TLS and WebSocket/TLS use the configured public Mapping endpoint through the local SOCKS5 proxy. HTTP/2 CONNECT and HTTP/1.1 CONNECT continue to use the control listener +1 and +2 respectively; the Mapping port is never used as the base for deriving CONNECT ports.
+> **Psiphon endpoint routing in 3.0.6:** TCP/TLS and WebSocket/TLS use the configured public Mapping endpoint through the local SOCKS5 proxy. HTTP/2 CONNECT and HTTP/1.1 CONNECT continue to use the control listener +1 and +2 respectively; the Mapping port is never used as the base for deriving CONNECT ports.
 
 
-> **Psiphon systemd sandbox in 3.0.5:** both the source-generated service template and installer-managed drop-ins allow `AF_NETLINK` for Psiphon's WebRTC ICE interface discovery. The capability set remains unchanged; `CAP_NET_ADMIN` is not granted. This is applied automatically by the installer and is not a manual VPS repair step.
+> **Psiphon systemd sandbox in 3.0.6:** both the source-generated service template and installer-managed drop-ins allow `AF_NETLINK` for Psiphon's WebRTC ICE interface discovery. The capability set remains unchanged; `CAP_NET_ADMIN` is not granted. This is applied automatically by the installer and is not a manual VPS repair step.
+
+> **Upgrade restart in 3.0.6:** after updating the systemd drop-ins, the installer now restarts only already-active Agent instances whose saved configuration selects Psiphon or Adaptive external egress. This is necessary because systemd applies address-family sandbox changes when a service starts; changing a unit file alone does not change the sandbox of an already-running process. Hub, Direct, WARP, and unrelated profile services are not restarted. The affected Agent lanes reconnect automatically.

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 3.0.5 installer.
+# Shah Tunnel 3.0.6 installer.
 # Downloads the pinned Go 1.26.1 toolchain, verifies its SHA-256, fetches the source,
 # and builds the Linux binary on the target server. No prebuilt release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="3.0.5"
+VERSION="3.0.6"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -680,16 +680,81 @@ for unit in ravanreverse.service ravanreverse@.service; do
   cat > "$TMP/psiphon-${unit}.conf" <<'DROPIN'
 [Service]
 ReadWritePaths=/var/lib/shah-tunnel/psiphon
-# Psiphon's WebRTC ICE stack uses AF_NETLINK to enumerate usable interfaces.
-# Keep the allow-list narrow and do not grant CAP_NET_ADMIN.
-RestrictAddressFamilies=
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 DROPIN
   install -o root -g root -m 0644 "$TMP/psiphon-${unit}.conf" "$dropin_dir/psiphon.conf"
+
+  # Keep this as the same standalone override that fixed the live Agent
+  # manually. It is deliberately installed under the template drop-in so
+  # every existing and future ravanreverse@PROFILE.service inherits it.
+  cat > "$TMP/netlink-${unit}.conf" <<'NETLINK'
+[Service]
+RestrictAddressFamilies=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+NETLINK
+  install -o root -g root -m 0644 "$TMP/netlink-${unit}.conf" "$dropin_dir/10-psiphon-netlink.conf"
 done
 if ! timeout --kill-after=3s 15s systemctl daemon-reload; then
   echo "systemd daemon-reload timed out. The binary is installed, but service metadata may need: systemctl daemon-reload" >&2
   exit 1
+fi
+
+# A running systemd service keeps the sandbox policy from the time it was
+# started. Updating its unit/drop-ins is not enough: restart only active Agent
+# profiles configured for Psiphon or Adaptive egress so AF_NETLINK is applied
+# to the running ConsoleClient. Hub, Direct, WARP, and unrelated profiles are
+# left untouched. Restart is required once during this upgrade; lane recovery
+# then proceeds automatically under the existing service.
+is_psiphon_agent_config() {
+  local config="$1"
+  [[ -s "$config" ]] || return 1
+  python3 - "$config" <<'PYCONFIG' >/dev/null 2>&1
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        cfg = json.load(f)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if cfg.get("role") == "agent" and cfg.get("underlay") in ("psiphon_socks5", "adaptive_external") else 1)
+PYCONFIG
+}
+
+restart_active_psiphon_agent() {
+  local unit="$1" config="$2"
+  if ! timeout --kill-after=2s 8s systemctl is-active --quiet "$unit"; then
+    return 0
+  fi
+  if ! is_psiphon_agent_config "$config"; then
+    return 0
+  fi
+  echo "Applying updated Psiphon systemd sandbox and binary to active profile: $unit"
+  if ! timeout --kill-after=5s 45s systemctl restart "$unit"; then
+    echo "ERROR: could not restart $unit after applying the Psiphon Netlink policy." >&2
+    timeout 5s journalctl -u "$unit" -n 35 --no-pager >&2 || true
+    return 1
+  fi
+  if ! timeout --kill-after=2s 8s systemctl is-active --quiet "$unit"; then
+    echo "ERROR: $unit did not return to active state after its automatic upgrade restart." >&2
+    timeout 5s journalctl -u "$unit" -n 35 --no-pager >&2 || true
+    return 1
+  fi
+  echo "Profile $unit restarted; Psiphon and Hub lanes are reconnecting automatically."
+}
+
+# Legacy single-profile Agent support.
+restart_active_psiphon_agent "ravanreverse.service" "/etc/ravanreverse/config.json"
+
+# Named profiles: restart only active Psiphon/Adaptive Agents. The config check
+# prevents interrupting Hub services or other egress profiles.
+if timeout --kill-after=2s 8s systemctl list-units --type=service --state=active --no-legend --no-pager 'ravanreverse@*.service' > "$TMP/active-ravanreverse-units"; then
+  while IFS= read -r unit; do
+    [[ "$unit" == ravanreverse@*.service ]] || continue
+    profile="${unit#ravanreverse@}"
+    profile="${profile%.service}"
+    [[ "$profile" =~ ^[A-Za-z0-9_.-]{1,48}$ ]] || continue
+    restart_active_psiphon_agent "$unit" "/etc/ravanreverse/tunnels/${profile}.json"
+  done < <(awk '{print $1}' "$TMP/active-ravanreverse-units")
+else
+  echo "WARNING: could not enumerate active ShahTunnel profile services for automatic Psiphon upgrade restart." >&2
 fi
 if [[ -f /etc/ravanreverse/config.json ]]; then
   if ! timeout --kill-after=2s 10s systemctl enable ravanreverse >/dev/null; then
