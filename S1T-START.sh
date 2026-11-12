@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 3.0.0 installer.
+# Shah Tunnel 3.0.1 installer.
 # Downloads the pinned Go 1.26.1 toolchain, verifies its SHA-256, fetches the source,
 # and builds the Linux binary on the target server. No prebuilt release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="3.0.0"
+VERSION="3.0.1"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -576,6 +576,9 @@ install -d -o root -g root -m 0755 "$STATE_DIR"
 # built on-demand only when an Agent selects Psiphon; no TUN/routes are created.
 install -o root -g root -m 0750 "$TMP/source/install-psiphon.sh" "$STATE_DIR/install-psiphon.sh.new"
 mv -f "$STATE_DIR/install-psiphon.sh.new" "$STATE_DIR/install-psiphon.sh"
+[[ -s "$TMP/source/repair-psiphon-profile.sh" ]] || { echo "Psiphon profile repair helper is missing from the source archive." >&2; exit 1; }
+install -o root -g root -m 0750 "$TMP/source/repair-psiphon-profile.sh" "$STATE_DIR/repair-psiphon-profile.sh.new"
+mv -f "$STATE_DIR/repair-psiphon-profile.sh.new" "$STATE_DIR/repair-psiphon-profile.sh"
 BIN="/usr/local/bin/ravanreverse"
 if [[ -x "$BIN" ]]; then
   BACKUP="${BIN}.bak-shah-tunnel-$(date +%Y%m%d-%H%M%S)"
