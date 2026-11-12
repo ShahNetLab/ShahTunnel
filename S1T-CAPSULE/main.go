@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "3.0.8"
+	version                          = "3.0.10"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -69,7 +69,6 @@ const (
 	transportHTTPConnectAuto         = "http_connect_auto"
 	underlayDirect                   = "direct"
 	underlayMASQUE                   = "warp_masque"
-	underlayWARP                     = "warp_wireguard"
 	underlayPsiphon                  = "psiphon_socks5"
 	underlayAdaptive                 = "adaptive_external"
 	http2TokenHeader                 = "X-S1T-Token"
@@ -117,7 +116,7 @@ type Config struct {
 	Version        string `json:"version"`
 	Role           string `json:"role"`                       // hub on Iran, agent on outside
 	Transport      string `json:"transport,omitempty"`        // Existing inner transport policy: auto, adaptive, tcp_tls, websocket_tls, http2_connect, http1_connect, or http_connect_auto
-	Underlay       string `json:"underlay,omitempty"`         // Agent egress: direct, warp_masque, warp_wireguard, psiphon_socks5, or adaptive_external
+	Underlay       string `json:"underlay,omitempty"`         // Agent egress: direct, warp_masque, psiphon_socks5, or adaptive_external
 	PsiphonConfig  string `json:"psiphon_config,omitempty"`   // Official Psiphon ConsoleClient JSON config
 	PsiphonProxy   string `json:"psiphon_proxy,omitempty"`    // Loopback SOCKS5 endpoint exposed by Psiphon
 	PsiphonClient  string `json:"psiphon_client,omitempty"`   // ConsoleClient executable name or absolute path
@@ -656,7 +655,7 @@ func validTransportMode(mode string) bool {
 }
 
 func validUnderlayMode(mode string) bool {
-	return mode == underlayDirect || mode == underlayMASQUE || mode == underlayWARP || mode == underlayPsiphon || mode == underlayAdaptive
+	return mode == underlayDirect || mode == underlayMASQUE || mode == underlayPsiphon || mode == underlayAdaptive
 }
 
 func isLoopbackProxyAddress(address string) bool {
@@ -2204,7 +2203,7 @@ func runAgentOverStream(conn net.Conn, cfg Config, channel int, displayTransport
 	if cfg.Transport == transportAdaptive {
 		agentPreferredTransport.Store(channel, displayTransport)
 	}
-	if cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE || cfg.Underlay == underlayWARP {
+	if cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE {
 		agentPreferredUnderlay.Store(channel, cfg.Underlay)
 	}
 	log.Printf("tunnel lane %d/%d connected via %s over %s; forwarding through %d configured port mapping(s)", channel, cfg.TunnelChannels, displayTransport, cfg.Underlay, len(normalizeConfig(cfg).Ports))
@@ -2845,9 +2844,8 @@ func adaptiveTransportCandidates(preferred string) []string {
 }
 
 func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
-	// WARP is only a candidate when its client reports a connected MASQUE
-	// or WireGuard path. verifyWarpUnderlay distinguishes a system route from
-	// a per-application WarpProxy endpoint without changing host routing.
+	// WARP is only a candidate when its client reports a connected MASQUE path.
+	// Other WARP protocols are never selected by adaptive routing.
 	warpMode := detectActiveWarpUnderlay()
 	usesPsiphon := strings.TrimSpace(cfg.PsiphonConfig) != ""
 	all := make([]string, 0, 3)
@@ -2873,7 +2871,7 @@ func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
 		return all
 	}
 	switch preferred {
-	case underlayPsiphon, underlayMASQUE, underlayWARP:
+	case underlayPsiphon, underlayMASQUE:
 		appendCandidate(underlayPsiphon)
 	case underlayDirect, "":
 		appendCandidate(underlayDirect)
@@ -2890,11 +2888,7 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 	// the ordinary route behind the user's back.
 	switch cfg.Underlay {
 	case underlayMASQUE:
-		if err := verifyWarpUnderlay("MASQUE"); err != nil {
-			return err
-		}
-	case underlayWARP:
-		if err := verifyWarpUnderlay("WireGuard"); err != nil {
+		if err := verifyWarpMasqueUnderlay(); err != nil {
 			return err
 		}
 	}
@@ -2940,9 +2934,7 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 			var warpErr error
 			switch route {
 			case underlayMASQUE:
-				warpErr = verifyWarpUnderlay("MASQUE")
-			case underlayWARP:
-				warpErr = verifyWarpUnderlay("WireGuard")
+				warpErr = verifyWarpMasqueUnderlay()
 			}
 			if warpErr != nil {
 				lastErr = warpErr
@@ -3048,7 +3040,7 @@ func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode s
 	if cfg.Transport == transportAdaptive {
 		agentPreferredTransport.Store(channel, mode)
 	}
-	if cfg.Underlay == underlayAdaptive || cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE || cfg.Underlay == underlayWARP {
+	if cfg.Underlay == underlayAdaptive || cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE {
 		agentPreferredUnderlay.Store(channel, cfg.Underlay)
 	}
 	log.Printf("tunnel lane %d/%d connected via %s over %s; forwarding through %d configured port mapping(s)", channel, cfg.TunnelChannels, mode, cfg.Underlay, len(normalizeConfig(cfg).Ports))
@@ -3065,7 +3057,7 @@ func dialAgentUnderlay(ctx context.Context, cfg Config, network, address string)
 	switch cfg.Underlay {
 	case underlayPsiphon:
 		return dialSOCKS5Context(ctx, cfg.PsiphonProxy, address)
-	case underlayMASQUE, underlayWARP:
+	case underlayMASQUE:
 		proxyAddress, localProxyMode, err := warpProxyAddressFromCLI()
 		if err != nil {
 			return nil, err
@@ -3429,9 +3421,6 @@ func detectActiveWarpUnderlay() string {
 	if warpProtocolMatches(string(settings), "MASQUE") {
 		return underlayMASQUE
 	}
-	if warpProtocolMatches(string(settings), "WireGuard") {
-		return underlayWARP
-	}
 	return ""
 }
 
@@ -3532,7 +3521,7 @@ func verifyWarpSystemEgressWithClient(client *http.Client, endpoints []string) e
 	return fmt.Errorf("WARP system egress could not be verified using Cloudflare trace endpoints: %s", strings.Join(diagnostics, "; "))
 }
 
-func verifyWarpUnderlay(expectedProtocol string) error {
+func verifyWarpMasqueUnderlay() error {
 	warpCLI, err := exec.LookPath("warp-cli")
 	if err != nil {
 		return errors.New("warp-cli is not installed. Install Cloudflare WARP first; ShahTunnel will not install or change system routes automatically")
@@ -3548,16 +3537,14 @@ func verifyWarpUnderlay(expectedProtocol string) error {
 	if err != nil {
 		return fmt.Errorf("warp-cli settings failed: %w: %s", err, strings.TrimSpace(string(settings)))
 	}
-	if !warpProtocolMatches(string(settings), expectedProtocol) {
-		return fmt.Errorf("Cloudflare WARP is connected, but its configured tunnel protocol could not be verified as %s; inspect `warp-cli settings`", expectedProtocol)
+	if !warpProtocolMatches(string(settings), "MASQUE") {
+		return errors.New("Cloudflare WARP is connected, but MASQUE could not be verified in `warp-cli settings`; this ShahTunnel build supports MASQUE only")
 	}
 	proxyAddress, localProxyMode, proxyErr := warpProxyAddressFromSettings(string(settings))
 	if proxyErr != nil {
 		return proxyErr
 	}
-	if localProxyMode && !strings.EqualFold(expectedProtocol, "MASQUE") {
-		return errors.New("Cloudflare Local Proxy mode requires MASQUE; WireGuard is not supported by WARP proxy mode")
-	}
+
 	if localProxyMode && !isLoopbackProxyAddress(proxyAddress) {
 		return errors.New("Cloudflare WarpProxy endpoint is not a safe loopback address")
 	}
@@ -3575,7 +3562,7 @@ func verifyWarpUnderlay(expectedProtocol string) error {
 			return fmt.Errorf("Cloudflare WARP local proxy %s is not accepting connections: %w", proxyAddress, dialErr)
 		}
 		_ = conn.Close()
-		log.Printf("Cloudflare WARP local proxy listener reachable (protocol=%s, proxy=%s); each lane will open its Hub stream through the local SOCKS5 proxy; system routes and SSH were not modified", expectedProtocol, proxyAddress)
+		log.Printf("Cloudflare WARP local proxy listener reachable (protocol=%s, proxy=%s); each lane will open its Hub stream through the local SOCKS5 proxy; system routes and SSH were not modified", "MASQUE", proxyAddress)
 		return nil
 	}
 
@@ -3597,7 +3584,7 @@ func verifyWarpUnderlay(expectedProtocol string) error {
 	}); err != nil {
 		return fmt.Errorf("WARP system egress check failed: %w", err)
 	}
-	log.Printf("Cloudflare WARP system egress verified (protocol=%s); ShahTunnel did not modify system routing", expectedProtocol)
+	log.Printf("Cloudflare WARP system egress verified (protocol=%s); ShahTunnel did not modify system routing", "MASQUE")
 	return nil
 }
 
@@ -4599,7 +4586,7 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 	fmt.Printf("  %s\n", paint(ansiGreen, "5) HTTP CONNECT fallback — HTTP/2, then HTTP/1.1"))
 	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
 	fmt.Printf("  %s\n", paint(ansiPinkGlow, "7) FULL ADAPTIVE FAILOVER — all 4 implemented transports"))
-	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "8) EXTERNAL EGRESS — Cloudflare MASQUE / WARP / Psiphon"))
+	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "8) EXTERNAL EGRESS — Cloudflare MASQUE / Psiphon"))
 	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) ALL-PROTOCOL ADAPTIVE — all 4 transports + Direct/Psiphon egress failover"))
 	choice := wizardAsk(prompt+" (1-9)", "7")
 	switch choice {
@@ -4623,22 +4610,23 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 			return transportAdaptive, underlayDirect, "", nil
 		}
 		fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "EXTERNAL EGRESS PROVIDER"))
-		fmt.Println("  1) Cloudflare WARP over MASQUE (system tunnel or Local Proxy; already Connected)")
-		fmt.Println("  2) Cloudflare WARP over WireGuard (system-tunnel mode; already Connected)")
-		fmt.Println("  3) Psiphon ConsoleClient via local SOCKS5")
-		sub := wizardAsk("Select external egress (1-3)", "1")
+		fmt.Println("  1) Cloudflare WARP over MASQUE (WarpProxy / Local Proxy required; already Connected)")
+		fmt.Println("  2) Psiphon ConsoleClient via local SOCKS5")
+		sub := wizardAsk("Select external egress (1-2)", "1")
 		switch sub {
 		case "1":
+			if _, err := verifyWarpPerTunnelPrerequisites(); err != nil {
+				return "", "", "", fmt.Errorf("WARP user egress cannot be attached to this Agent profile: %w", err)
+			}
+			uiInfo("WARP and DNS will be attached automatically to this Agent profile before startup; other profiles and host routes remain unchanged.")
 			return transportAdaptive, underlayMASQUE, "", nil
 		case "2":
-			return transportAdaptive, underlayWARP, "", nil
-		case "3":
 			// ConsoleClient, its pinned upstream source build, a per-profile JSON
 			// config, and a unique loopback SOCKS5 port are prepared automatically
 			// during Agent creation. No manual Psiphon files are requested.
 			return transportAdaptive, underlayPsiphon, "", nil
 		default:
-			return "", "", "", errors.New("invalid external egress selection; enter 1, 2, or 3")
+			return "", "", "", errors.New("invalid external egress selection; enter 1 or 2")
 		}
 	case "9":
 		if role != "agent" {
@@ -4893,10 +4881,7 @@ func setup() error {
 		}
 		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s; egress=%s.", c.TunnelChannels, c.Transport, c.Underlay))
 		if c.Underlay == underlayMASQUE {
-			uiInfo("WARP MASQUE may use an existing system tunnel or the detected Local Proxy (WarpProxy); ShahTunnel never changes host routes or restarts SSH.")
-		}
-		if c.Underlay == underlayWARP {
-			uiInfo("WARP WireGuard requires an already-connected system tunnel; Local Proxy mode is MASQUE-only. ShahTunnel never changes host routes or restarts SSH.")
+			uiInfo("This Agent's Xray mappings and DNS use its isolated WARP Local Proxy sidecar; system routes and SSH are untouched.")
 		}
 		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
 			uiInfo("Psiphon starts as a loopback-only child process. The Agent-to-Hub lanes and the isolated Xray user TCP/DNS egress use its SOCKS5 endpoint; UDP is blocked on the isolated user path to prevent direct-IP leaks. No TUN device or host route changes are made.")
@@ -5979,7 +5964,6 @@ func menu() {
 		menuItem("6", "⏰ Scheduled restart", "Restart active tunnels on interval")
 		menuItem("7", "🗑️ Delete one tunnel", "Delete this tunnel only")
 		menuItem("8", "💣 Complete uninstall", "Remove all tunnels")
-		menuItem("9", "🌐 WARP egress", "Selected Agent only")
 		menuItem("0", "🚪 Exit", "Close menu")
 		uiRule()
 		choice := ask("Select an operation", "0")
@@ -6018,10 +6002,6 @@ func menu() {
 			}
 			if errors.Is(err, errUninstallCancelled) {
 				err = nil
-			}
-		case "9":
-			if chooseTunnel("Select the Agent tunnel to isolate through WARP") {
-				err = applyXrayWarpEgressToSelectedTunnel()
 			}
 		case "0":
 			return

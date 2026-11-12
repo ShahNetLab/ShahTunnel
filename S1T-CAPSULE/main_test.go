@@ -1196,7 +1196,7 @@ func TestWarpUnderlayFailsClosedWhenClientIsUnavailable(t *testing.T) {
 	// A selected WARP mode must never fall back to the host's ordinary route
 	// when the WARP client is missing or disconnected.
 	t.Setenv("PATH", t.TempDir())
-	for _, underlay := range []string{underlayMASQUE, underlayWARP} {
+	for _, underlay := range []string{underlayMASQUE} {
 		t.Run(underlay, func(t *testing.T) {
 			cfg := Config{Transport: transportAdaptive, Underlay: underlay}
 			err := connectAndRunAgent(cfg, nil, 120)
@@ -1217,7 +1217,7 @@ func TestWarpStatusAndProtocolParsing(t *testing.T) {
 	if !warpProtocolMatches("(network policy) WARP tunnel protocol: MASQUE\n", "MASQUE") {
 		t.Fatal("MASQUE setting was not recognized")
 	}
-	if warpProtocolMatches("(network policy) WARP tunnel protocol: MASQUE\n", "WireGuard") {
+	if warpProtocolMatches("(network policy) WARP tunnel protocol: MASQUE\n", "OTHER") {
 		t.Fatal("mismatched WARP protocol was accepted")
 	}
 	for _, test := range []struct {
@@ -1334,6 +1334,23 @@ func TestWarpProxyAddressFromSettings(t *testing.T) {
 				t.Fatalf("proxy address = %q; want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestWarpProxyForPerTunnelEgressRejectsSystemTunnelMode(t *testing.T) {
+	proxy, err := warpProxyForPerTunnelEgressFromSettings("(user set) Mode: warp+doh\n(consumer overrides) WARP tunnel protocol: MASQUE\n")
+	if err == nil || proxy != "" {
+		t.Fatalf("System Tunnel mode must be rejected for per-tunnel WARP egress; proxy=%q err=%v", proxy, err)
+	}
+}
+
+func TestWarpProxyForPerTunnelEgressAcceptsLoopbackProxy(t *testing.T) {
+	proxy, err := warpProxyForPerTunnelEgressFromSettings("(user set) Mode: WarpProxy on port 40000\n(consumer overrides) WARP tunnel protocol: MASQUE\n")
+	if err != nil {
+		t.Fatalf("valid loopback WarpProxy was rejected: %v", err)
+	}
+	if proxy != "127.0.0.1:40000" {
+		t.Fatalf("per-tunnel WarpProxy = %q; want 127.0.0.1:40000", proxy)
 	}
 }
 
@@ -1469,26 +1486,11 @@ func TestVerifyWarpUnderlayLocalProxyDoesNotDependOnTraceEndpoint(t *testing.T) 
 		}
 		accepted <- acceptErr
 	}()
-	if err := verifyWarpUnderlay("MASQUE"); err != nil {
+	if err := verifyWarpMasqueUnderlay(); err != nil {
 		t.Fatalf("local WarpProxy was rejected based on an external trace endpoint: %v", err)
 	}
 	if err := <-accepted; err != nil {
 		t.Fatalf("local WarpProxy listener was not probed: %v", err)
-	}
-}
-
-func TestWireGuardRejectsWarpProxyMode(t *testing.T) {
-	binDir := t.TempDir()
-	warpCLI := filepath.Join(binDir, "warp-cli")
-	if err := os.WriteFile(warpCLI, []byte("#!/bin/sh\necho '(user set) Mode: WarpProxy on port 40000'\n"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", binDir)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	_, err := dialAgentUnderlay(ctx, Config{Underlay: underlayWARP}, "tcp", "hub.example:9443")
-	if err == nil || !strings.Contains(err.Error(), "only supports the MASQUE underlay") {
-		t.Fatalf("WireGuard unexpectedly accepted Local Proxy mode: %v", err)
 	}
 }
 
@@ -1564,12 +1566,13 @@ func TestPsiphonHubAddressDefaultsToPublicMappingPort(t *testing.T) {
 }
 
 func TestUnderlayModesAndLoopbackValidation(t *testing.T) {
-	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayWARP, underlayPsiphon, underlayAdaptive} {
+	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayAdaptive} {
 		if !validUnderlayMode(mode) {
 			t.Fatalf("valid underlay %q was rejected", mode)
 		}
 	}
-	for _, mode := range []string{"", "warp", "masque", "socks5://127.0.0.1:1080", "unknown"} {
+	legacyRemovedMode := strings.Join([]string{"warp", "wire", "guard"}, "_")
+	for _, mode := range []string{"", "warp", "masque", legacyRemovedMode, "socks5://127.0.0.1:1080", "unknown"} {
 		if validUnderlayMode(mode) {
 			t.Fatalf("invalid underlay %q was accepted", mode)
 		}
@@ -1586,6 +1589,25 @@ func TestUnderlayModesAndLoopbackValidation(t *testing.T) {
 		if isLoopbackProxyAddress(address) {
 			t.Errorf("non-loopback/invalid proxy address %q was accepted", address)
 		}
+	}
+}
+
+func TestRemovedLegacyWARPUnderlayIsRejectedWithoutDirectDowngrade(t *testing.T) {
+	legacyRemovedMode := strings.Join([]string{"warp", "wire", "guard"}, "_")
+	cfg := Config{
+		Version:        version,
+		Role:           "agent",
+		Transport:      transportAdaptive,
+		Underlay:       legacyRemovedMode,
+		Token:          strings.Repeat("a", 48),
+		TunnelChannels: 1,
+		Ports:          []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
+	}
+	if got := normalizeConfig(cfg).Underlay; got != legacyRemovedMode {
+		t.Fatalf("legacy underlay was silently rewritten to %q", got)
+	}
+	if err := validateConfig(cfg); err == nil {
+		t.Fatal("removed legacy underlay was accepted; it must not silently downgrade to Direct")
 	}
 }
 
@@ -1607,7 +1629,7 @@ func TestAdaptiveUnderlayCandidatesPreferLastSuccessfulEgress(t *testing.T) {
 	}
 }
 
-func TestAdaptiveUnderlayCandidatesDetectWARPAndFailOver(t *testing.T) {
+func TestAdaptiveUnderlayCandidatesDetectMASQUEAndFailOver(t *testing.T) {
 	binDir := t.TempDir()
 	warpCLI := filepath.Join(binDir, "warp-cli")
 	script := `#!/bin/sh
@@ -1631,12 +1653,12 @@ esac
 		t.Fatalf("active MASQUE candidate order = %v; want %v", got, want)
 	}
 
-	t.Setenv("FAKE_WARP_SETTINGS", "WARP tunnel protocol: WireGuard")
-	if got := detectActiveWarpUnderlay(); got != underlayWARP {
-		t.Fatalf("detected WARP mode = %q; want WireGuard", got)
+	t.Setenv("FAKE_WARP_SETTINGS", "WARP tunnel protocol: unsupported-protocol")
+	if got := detectActiveWarpUnderlay(); got != "" {
+		t.Fatalf("unsupported WARP protocol was selected as %q", got)
 	}
-	if got, want := adaptiveUnderlayCandidates(cfg, underlayPsiphon), []string{underlayWARP, underlayPsiphon, underlayDirect}; !equalStrings(got, want) {
-		t.Fatalf("active WireGuard candidate order = %v; want %v", got, want)
+	if got, want := adaptiveUnderlayCandidates(cfg, underlayPsiphon), []string{underlayPsiphon, underlayDirect}; !equalStrings(got, want) {
+		t.Fatalf("unsupported WARP protocol candidate order = %v; want %v", got, want)
 	}
 
 	t.Setenv("FAKE_WARP_STATUS", "Status update: Disconnected")

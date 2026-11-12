@@ -683,14 +683,10 @@ func removeXrayWarpSidecar(meta *XrayWarpIntegration) error {
 	return nil
 }
 
-func applyXrayWarpEgressToSelectedTunnel() error {
-	return applyXrayWarpEgress(true, true)
-}
-
-// applyXrayWarpEgress installs the isolated sidecar. During a new Agent setup,
-// restartAgent is false so setup starts the Agent once after its local target
-// has been switched; from the manager menu it restarts only the selected Agent.
-func applyXrayWarpEgress(restartAgent, confirm bool) error {
+// applyXrayWarpEgress installs the isolated sidecar during new Agent creation.
+// The Agent service has not started yet, so it will start only after the
+// profile's Xray targets have been switched to the sidecar.
+func applyXrayWarpEgress() error {
 	if !isRoot() {
 		return errors.New("run the manager as root to safely create the dedicated Xray service")
 	}
@@ -707,31 +703,10 @@ func applyXrayWarpEgress(restartAgent, confirm bool) error {
 	if cfg.XrayWARP != nil {
 		return errors.New("this tunnel already has a dedicated Xray WARP route")
 	}
-	proxy, isProxy, err := warpProxyAddressFromCLI()
+	proxy, err := verifyWarpPerTunnelPrerequisites()
 	if err != nil {
 		return err
 	}
-	if !isProxy {
-		return errors.New("per-tunnel WARP isolation requires Cloudflare WarpProxy / Local Proxy mode; system-wide WARP routing is intentionally not changed")
-	}
-	if err := verifyWarpUnderlay("MASQUE"); err != nil {
-		return err
-	}
-	if confirm {
-		fmt.Println()
-		uiWarn("A private Xray sidecar will isolate only this Agent profile.")
-		uiWarn("X-UI, other profiles and option 7 stay Direct; SSH and host routes are untouched.")
-		if !askYN("Enable WARP for this Agent tunnel? (y/N)", "n") {
-			uiInfo("No changes made.")
-			return nil
-		}
-	}
-
-	oldProfile, err := os.ReadFile(configPath)
-	if err != nil {
-		return fmt.Errorf("read ShahTunnel profile for transaction: %w", err)
-	}
-
 	var runtime xrayRuntime
 	for i, mapping := range cfg.Ports {
 		_, portText, splitErr := net.SplitHostPort(mapping.Target)
@@ -819,23 +794,10 @@ func applyXrayWarpEgress(restartAgent, confirm bool) error {
 		rollbackSidecar()
 		return fmt.Errorf("save isolated Agent targets: %w", err)
 	}
-	if restartAgent {
-		service := currentServiceName()
-		if err = runSystemctl("restart", service); err != nil {
-			_ = atomicReplaceFile(configPath, oldProfile, 0600)
-			_ = runSystemctl("restart", service)
-			rollbackSidecar()
-			return fmt.Errorf("restart ShahTunnel profile %s failed; previous Agent config was restored: %w", service, err)
-		}
-	}
-	if restartAgent {
-		uiSuccess("Per-tunnel WARP egress is active. DNS is routed through WARP automatically for this profile.")
-	} else {
-		uiSuccess("Per-tunnel WARP and DNS are prepared automatically; the new Agent will start on this route.")
-	}
+	uiSuccess("Per-tunnel WARP and DNS are prepared automatically; the new Agent will start on this route.")
 	uiInfo("Dedicated Xray service: " + sidecarService)
 	uiInfo("X-UI's original config and service were not modified or restarted.")
-	uiInfo("Other Xray inbounds and option 7 profiles remain Direct.")
+	uiInfo("Other Xray inbounds and other ShahTunnel profiles remain unchanged.")
 	return nil
 }
 
@@ -858,9 +820,50 @@ func removeXrayWarpIntegration(cfg *Config) error {
 	return nil
 }
 
-// autoApplyXrayWarpForNewAgent enables isolated WARP during Agent creation
-// whenever the administrator already has Cloudflare Local Proxy (WarpProxy)
-// active. System-wide WARP is deliberately not converted or re-routed.
+// warpProxyForPerTunnelEgressFromSettings rejects host-wide System Tunnel
+// mode and accepts only a loopback WarpProxy listener that can isolate one
+// Agent profile without touching the host routing table.
+func warpProxyForPerTunnelEgressFromSettings(settings string) (string, error) {
+	proxy, isProxy, err := warpProxyAddressFromSettings(settings)
+	if err != nil {
+		return "", err
+	}
+	if !isProxy || !isLoopbackProxyAddress(proxy) {
+		return "", errors.New("Cloudflare is in System Tunnel mode. Per-tunnel WARP egress requires WarpProxy / Local Proxy mode; switch WARP to Local Proxy and reconnect before creating this Agent")
+	}
+	return proxy, nil
+}
+
+// verifyWarpPerTunnelPrerequisites proves that WARP is connected over MASQUE
+// and exposes a reachable loopback WarpProxy listener. System-tunnel mode is
+// intentionally rejected here: it changes routing at host scope and cannot
+// guarantee that only this Agent profile uses WARP.
+func verifyWarpPerTunnelPrerequisites() (string, error) {
+	if err := verifyWarpMasqueUnderlay(); err != nil {
+		return "", err
+	}
+	warpCLI, err := exec.LookPath("warp-cli")
+	if err != nil {
+		return "", errors.New("warp-cli is not installed")
+	}
+	settings, err := runWarpCLI(warpCLI, "settings")
+	if err != nil {
+		return "", fmt.Errorf("warp-cli settings failed: %w: %s", err, strings.TrimSpace(string(settings)))
+	}
+	proxy, err := warpProxyForPerTunnelEgressFromSettings(string(settings))
+	if err != nil {
+		return "", err
+	}
+	conn, err := net.DialTimeout("tcp", proxy, 3*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("Cloudflare WarpProxy listener %s is not reachable: %w", proxy, err)
+	}
+	_ = conn.Close()
+	return proxy, nil
+}
+
+// autoApplyXrayWarpForNewAgent installs the isolated WARP sidecar before the
+// new Agent service starts. The wizard validates Local Proxy before saving.
 func autoApplyXrayWarpForNewAgent() error {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -869,18 +872,9 @@ func autoApplyXrayWarpForNewAgent() error {
 	if cfg.Role != "agent" || cfg.Underlay != underlayMASQUE || cfg.XrayWARP != nil {
 		return nil
 	}
-	_, isProxy, proxyErr := warpProxyAddressFromCLI()
-	if proxyErr != nil {
-		uiWarn("Per-tunnel WARP was not auto-enabled because Local Proxy mode could not be verified; the Agent profile remains in its selected egress mode.")
-		return nil
-	}
-	if !isProxy {
-		uiInfo("WARP Local Proxy is not active; no system routes were changed. Per-tunnel WARP can be enabled later after Local Proxy is available.")
-		return nil
-	}
-	uiInfo("Cloudflare Local Proxy detected. Enabling isolated WARP and WARP-routed DNS automatically before Agent startup…")
-	if err := applyXrayWarpEgress(false, false); err != nil {
-		return fmt.Errorf("Agent profile was saved, but automatic per-tunnel WARP setup failed: %w", err)
+	uiInfo("Enabling isolated WARP and WARP-routed DNS automatically before Agent startup…")
+	if err := applyXrayWarpEgress(); err != nil {
+		return fmt.Errorf("automatic per-tunnel WARP setup failed: %w", err)
 	}
 	return nil
 }
