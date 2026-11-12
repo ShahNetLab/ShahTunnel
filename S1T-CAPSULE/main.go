@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "3.0.1"
+	version                          = "3.0.2"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -73,6 +73,7 @@ const (
 	underlayPsiphon                  = "psiphon_socks5"
 	underlayAdaptive                 = "adaptive_external"
 	http2TokenHeader                 = "X-S1T-Token"
+	controlALPN                      = "shah-tunnel-control/1"
 	webSocketPath                    = "/s1t-tunnel"
 	webSocketGUID                    = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 	maxWebSocketHeaders              = 16 * 1024
@@ -121,6 +122,7 @@ type Config struct {
 	PsiphonProxy   string `json:"psiphon_proxy,omitempty"`    // Loopback SOCKS5 endpoint exposed by Psiphon
 	PsiphonClient  string `json:"psiphon_client,omitempty"`   // ConsoleClient executable name or absolute path
 	PsiphonDataDir string `json:"psiphon_data_dir,omitempty"` // Per-profile Psiphon persistent data directory
+	PsiphonHubAddr string `json:"psiphon_hub_addr,omitempty"` // Hub public Mapping endpoint used only through Psiphon SOCKS5
 	ControlListen  string `json:"control_listen,omitempty"`
 	PublicListen   string `json:"public_listen,omitempty"`
 	HubAddr        string `json:"hub_addr,omitempty"`
@@ -229,6 +231,129 @@ type bufferedConn struct {
 }
 
 func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+// sniffS1TControlClientHello checks the ALPN extension of the first TLS
+// ClientHello without terminating TLS or consuming bytes from the connection.
+// Public Mapping traffic is returned byte-for-byte unchanged. The short read
+// deadline prevents idle/non-TLS clients from being held by protocol detection.
+func sniffS1TControlClientHello(conn net.Conn) (bool, net.Conn) {
+	reader := bufio.NewReaderSize(conn, 64*1024)
+	_ = conn.SetReadDeadline(time.Now().Add(350 * time.Millisecond))
+	header, err := reader.Peek(5)
+	if err != nil {
+		_ = conn.SetReadDeadline(time.Time{})
+		return false, &bufferedConn{Conn: conn, r: reader}
+	}
+	if header[0] != 22 || header[1] != 3 {
+		_ = conn.SetReadDeadline(time.Time{})
+		return false, &bufferedConn{Conn: conn, r: reader}
+	}
+	recordLen := int(binary.BigEndian.Uint16(header[3:5]))
+	if recordLen < 4 || recordLen > 18432 {
+		_ = conn.SetReadDeadline(time.Time{})
+		return false, &bufferedConn{Conn: conn, r: reader}
+	}
+	record, err := reader.Peek(5 + recordLen)
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		return false, &bufferedConn{Conn: conn, r: reader}
+	}
+	return tlsClientHelloOffersALPN(record, controlALPN), &bufferedConn{Conn: conn, r: reader}
+}
+
+// tlsClientHelloOffersALPN parses only the bounded ClientHello fields required
+// for ALPN routing. It rejects malformed/truncated vectors and never allocates
+// based on an unchecked length from the peer.
+func tlsClientHelloOffersALPN(record []byte, wanted string) bool {
+	if len(record) < 9 || record[0] != 22 || record[1] != 3 {
+		return false
+	}
+	recordLen := int(binary.BigEndian.Uint16(record[3:5]))
+	if recordLen != len(record)-5 || recordLen < 4 {
+		return false
+	}
+	handshake := record[5:]
+	if handshake[0] != 1 { // ClientHello
+		return false
+	}
+	handshakeLen := int(handshake[1])<<16 | int(handshake[2])<<8 | int(handshake[3])
+	if handshakeLen != len(handshake)-4 {
+		return false
+	}
+	b := handshake[4:]
+	if len(b) < 2+32+1 {
+		return false
+	}
+	i := 2 + 32
+	sessionLen := int(b[i])
+	i++
+	if sessionLen > len(b)-i {
+		return false
+	}
+	i += sessionLen
+	if len(b)-i < 2 {
+		return false
+	}
+	cipherLen := int(binary.BigEndian.Uint16(b[i : i+2]))
+	i += 2
+	if cipherLen < 2 || cipherLen > len(b)-i {
+		return false
+	}
+	i += cipherLen
+	if len(b)-i < 1 {
+		return false
+	}
+	compressionLen := int(b[i])
+	i++
+	if compressionLen < 1 || compressionLen > len(b)-i {
+		return false
+	}
+	i += compressionLen
+	if len(b)-i < 2 {
+		return false
+	}
+	extensionsLen := int(binary.BigEndian.Uint16(b[i : i+2]))
+	i += 2
+	if extensionsLen != len(b)-i {
+		return false
+	}
+	end := i + extensionsLen
+	for i < end {
+		if end-i < 4 {
+			return false
+		}
+		typ := binary.BigEndian.Uint16(b[i : i+2])
+		extLen := int(binary.BigEndian.Uint16(b[i+2 : i+4]))
+		i += 4
+		if extLen > end-i {
+			return false
+		}
+		if typ == 16 { // application_layer_protocol_negotiation
+			ext := b[i : i+extLen]
+			if len(ext) < 2 {
+				return false
+			}
+			listLen := int(binary.BigEndian.Uint16(ext[:2]))
+			if listLen != len(ext)-2 {
+				return false
+			}
+			for j := 2; j < len(ext); {
+				n := int(ext[j])
+				j++
+				if n == 0 || n > len(ext)-j {
+					return false
+				}
+				if string(ext[j:j+n]) == wanted {
+					return true
+				}
+				j += n
+			}
+			return false
+		}
+		i += extLen
+	}
+	return false
+}
 
 // websocketConn exposes WebSocket binary messages as a net.Conn stream. The
 // tunnel remains protected by TLS 1.3; extensions and fragmentation are not negotiated.
@@ -1581,11 +1706,22 @@ func (s *agentSession) run() {
 }
 
 type hubServer struct {
-	cfg           Config
-	mu            sync.RWMutex
-	sessions      map[*hubSession]struct{}
-	pendingPublic chan struct{}
-	pickCursor    atomic.Uint64
+	cfg              Config
+	controlTLSConfig *tls.Config
+	mu               sync.RWMutex
+	sessions         map[*hubSession]struct{}
+	pendingPublic    chan struct{}
+	controlSlots     chan struct{}
+	pickCursor       atomic.Uint64
+}
+
+func (h *hubServer) controlSemaphore() chan struct{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.controlSlots == nil {
+		h.controlSlots = make(chan struct{}, 16)
+	}
+	return h.controlSlots
 }
 
 // registerSession keeps every authenticated Agent lane alive independently.
@@ -1713,11 +1849,27 @@ func (h *hubServer) acceptPublic(ln net.Listener, portID string) {
 		}
 		go func() {
 			defer func() { <-pending }()
-			if _, _, err := h.openStream(c, portID); err != nil {
+			isControl, wrapped := sniffS1TControlClientHello(c)
+			if isControl && h.controlTLSConfig != nil {
+				// A public Mapping listener can also carry ShahTunnel control lanes.
+				// The private ALPN makes this unambiguous; ordinary client TLS bytes
+				// remain buffered and are forwarded exactly as received.
+				log.Printf("ShahTunnel control connection detected on public Mapping %s via private ALPN", portID)
+				controlSlots := h.controlSemaphore()
+				select {
+				case controlSlots <- struct{}{}:
+					defer func() { <-controlSlots }()
+					h.serveAgent(wrapped, h.controlTLSConfig)
+				default:
+					_ = wrapped.Close()
+				}
+				return
+			}
+			if _, _, err := h.openStream(wrapped, portID); err != nil {
 				if !errors.Is(err, net.ErrClosed) {
 					log.Printf("open reverse stream: %v", err)
 				}
-				_ = c.Close()
+				_ = wrapped.Close()
 			}
 		}()
 	}
@@ -2240,9 +2392,15 @@ func (h *hubServer) serveAuthorizedAgent(c net.Conn, observed string) {
 // hubTLSConfig requires TLS 1.3 for the private Hub↔Agent control channel.
 // The public forwarding ports are generic TCP and are not implicitly TLS-wrapped.
 func hubTLSConfig(cert tls.Certificate) *tls.Config {
-	// Preserve the legacy no-ALPN TLS profile for raw TCP/TLS. A client explicitly
-	// selecting WebSocket/TLS offers HTTP/1.1 and gets the matching ALPN profile.
-	webSocketConfig := &tls.Config{
+	// New clients negotiate a private ALPN which can be safely multiplexed over
+	// an existing public TCP Mapping port. Legacy TCP/TLS clients without ALPN
+	// and older WebSocket clients offering http/1.1 remain accepted.
+	controlConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{controlALPN},
+	}
+	legacyWebSocketConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS13,
 		NextProtos:   []string{"http/1.1"},
@@ -2250,11 +2408,17 @@ func hubTLSConfig(cert tls.Certificate) *tls.Config {
 	base := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{controlALPN},
 	}
 	base.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 		for _, proto := range hello.SupportedProtos {
+			if proto == controlALPN {
+				return controlConfig, nil
+			}
+		}
+		for _, proto := range hello.SupportedProtos {
 			if proto == "http/1.1" {
-				return webSocketConfig, nil
+				return legacyWebSocketConfig, nil
 			}
 		}
 		return nil, nil
@@ -2269,6 +2433,7 @@ func agentTLSConfig(pin []byte, serverName string) *tls.Config {
 	return &tls.Config{
 		MinVersion:         tls.VersionTLS13,
 		ServerName:         serverName,
+		NextProtos:         []string{controlALPN},
 		InsecureSkipVerify: true, // verification is performed by the constant-time fingerprint pin below
 		VerifyConnection: func(cs tls.ConnectionState) error {
 			if len(cs.PeerCertificates) == 0 {
@@ -2340,10 +2505,13 @@ func runHub(cfg Config) error {
 			_ = p.listener.Close()
 		}
 	}()
+	tlsCfg := hubTLSConfig(cert)
 	h := &hubServer{
-		cfg:           cfg,
-		sessions:      make(map[*hubSession]struct{}),
-		pendingPublic: make(chan struct{}, maxPendingPublicConnections),
+		cfg:              cfg,
+		controlTLSConfig: tlsCfg,
+		sessions:         make(map[*hubSession]struct{}),
+		pendingPublic:    make(chan struct{}, maxPendingPublicConnections),
+		controlSlots:     make(chan struct{}, 16),
 	}
 	var h2Server *http.Server
 	if transportModeAllowsHTTP2(cfg.Transport) {
@@ -2400,11 +2568,10 @@ func runHub(cfg Config) error {
 	for _, p := range listeners {
 		go h.acceptPublic(p.listener, p.id)
 	}
-	tlsCfg := hubTLSConfig(cert)
-	log.Printf("HUB listening for agent on configured control port; public mappings=%d", len(listeners))
+	log.Printf("HUB listening for agent on configured control port; public mappings=%d; public Mapping listeners also accept authenticated ShahTunnel ALPN", len(listeners))
 	// Bound concurrent unauthenticated control connections so a burst of
 	// slow handshakes cannot create an unbounded number of goroutines.
-	controlSlots := make(chan struct{}, 16)
+	controlSlots := h.controlSemaphore()
 	acceptErrors := 0
 	for {
 		c, err := control.Accept()
@@ -2721,6 +2888,9 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 		mode = transportAuto
 	}
 	if mode != transportAuto && mode != transportAdaptive {
+		if cfg.Underlay == underlayPsiphon {
+			cfg.HubAddr = agentHubAddressForUnderlay(cfg, underlayPsiphon)
+		}
 		return connectAndRunAgentWithTransport(cfg, pin, channel, mode)
 	}
 
@@ -2770,6 +2940,9 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 		}
 		routeCfg := cfg
 		routeCfg.Underlay = route
+		if route == underlayPsiphon {
+			routeCfg.HubAddr = agentHubAddressForUnderlay(cfg, underlayPsiphon)
+		}
 		for i, candidate := range transportCandidates {
 			err := connectAndRunAgentWithTransport(routeCfg, pin, channel, candidate)
 			if err == nil {
@@ -2807,9 +2980,10 @@ func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode s
 		}
 	}
 	tlsCfg := agentTLSConfig(pin, sni)
-	if mode == transportWebSocket {
-		tlsCfg.NextProtos = []string{"http/1.1"}
-	}
+	// The same ALPN is used for TCP/TLS and WebSocket/TLS. A Hub can therefore
+	// recognize an Agent connection arriving on a public Mapping port (for
+	// example TCP/443) without disrupting ordinary TLS clients.
+	tlsCfg.NextProtos = []string{controlALPN}
 	ctx, cancel := context.WithTimeout(context.Background(), d.Timeout)
 	rawConn, err := dialAgentUnderlay(ctx, cfg, "tcp", cfg.HubAddr)
 	cancel()
@@ -3351,11 +3525,38 @@ func verifyWarpUnderlay(expectedProtocol string) error {
 	return nil
 }
 
+func defaultPsiphonHubAddress(hubAddr string) string {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(hubAddr))
+	if err != nil {
+		return hubAddr
+	}
+	// 9443 is the standard private control port. The default public HTTPS
+	// Mapping port 443 can carry the authenticated S1T ALPN through its existing
+	// listener, so Psiphon does not need to CONNECT to filtered high ports.
+	if port == "9443" {
+		return net.JoinHostPort(host, "443")
+	}
+	return hubAddr
+}
+
+func agentHubAddressForUnderlay(cfg Config, underlay string) string {
+	if underlay == underlayPsiphon {
+		if strings.TrimSpace(cfg.PsiphonHubAddr) != "" {
+			return strings.TrimSpace(cfg.PsiphonHubAddr)
+		}
+		return defaultPsiphonHubAddress(cfg.HubAddr)
+	}
+	return cfg.HubAddr
+}
+
 func normalizeConfig(c Config) Config {
 	if c.Role == "agent" {
 		c.Underlay = strings.ToLower(strings.TrimSpace(c.Underlay))
 		if c.Underlay == "" {
 			c.Underlay = underlayDirect
+		}
+		if (c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive) && strings.TrimSpace(c.PsiphonHubAddr) == "" && strings.TrimSpace(c.HubAddr) != "" {
+			c.PsiphonHubAddr = defaultPsiphonHubAddress(c.HubAddr)
 		}
 		if c.PsiphonProxy == "" {
 			c.PsiphonProxy = "127.0.0.1:1080"
@@ -3513,6 +3714,11 @@ func validateConfig(c Config) error {
 	} else if c.Role == "agent" {
 		if err := validateTCPAddress("hub address", c.HubAddr); err != nil {
 			return err
+		}
+		if c.PsiphonHubAddr != "" {
+			if err := validateTCPAddress("Psiphon Hub Mapping address", c.PsiphonHubAddr); err != nil {
+				return err
+			}
 		}
 		if c.TLSServerName != "" && !validTLSServerName(c.TLSServerName) {
 			return errors.New("tls_server_name must be a DNS hostname (no URL, port, IP, or whitespace)")
@@ -4528,6 +4734,14 @@ func setup() error {
 		c.Transport, c.Underlay, _, err = wizardAskTransport("Agent transport mode (must be allowed by Hub)", "agent")
 		if err != nil {
 			return err
+		}
+		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
+			defaultEndpoint := defaultPsiphonHubAddress(c.HubAddr)
+			c.PsiphonHubAddr = wizardAsk("Hub public Mapping address reachable through Psiphon SOCKS5 (IP:PORT)", defaultEndpoint)
+			if strings.TrimSpace(c.PsiphonHubAddr) == "" {
+				c.PsiphonHubAddr = defaultEndpoint
+			}
+			uiInfo("The dedicated ShahTunnel ALPN is multiplexed on this public Mapping port; ordinary HTTPS traffic remains unchanged.")
 		}
 		if transportModeAllowsHTTP2(c.Transport) {
 			uiInfo("HTTP/2 CONNECT uses TCP port " + nextPortLabel(c.HubAddr) + ". Open it in the Hub firewall if selected.")

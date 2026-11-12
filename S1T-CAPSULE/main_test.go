@@ -24,6 +24,155 @@ import (
 	"time"
 )
 
+func makeTestClientHelloRecord(alpn string) []byte {
+	body := make([]byte, 0, 128)
+	body = append(body, 0x03, 0x03) // legacy_version
+	body = append(body, make([]byte, 32)...)
+	body = append(body, 0x00)                   // session ID length
+	body = append(body, 0x00, 0x02, 0x13, 0x01) // cipher suites: TLS_AES_128_GCM_SHA256
+	body = append(body, 0x01, 0x00)             // compression methods
+	alpnBytes := []byte(alpn)
+	alpnList := append([]byte{byte(len(alpnBytes))}, alpnBytes...)
+	alpnPayload := make([]byte, 2, 2+len(alpnList))
+	binary.BigEndian.PutUint16(alpnPayload, uint16(len(alpnList)))
+	alpnPayload = append(alpnPayload, alpnList...)
+	extensions := []byte{0x00, 0x10, byte(len(alpnPayload) >> 8), byte(len(alpnPayload))}
+	extensions = append(extensions, alpnPayload...)
+	body = append(body, byte(len(extensions)>>8), byte(len(extensions)))
+	body = append(body, extensions...)
+	handshake := []byte{0x01, byte(len(body) >> 16), byte(len(body) >> 8), byte(len(body))}
+	handshake = append(handshake, body...)
+	record := []byte{0x16, 0x03, 0x01, byte(len(handshake) >> 8), byte(len(handshake))}
+	return append(record, handshake...)
+}
+
+func TestTLSClientHelloALPNSnifferPreservesAllBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		alpn string
+		want bool
+	}{
+		{name: "ShahTunnel control", alpn: controlALPN, want: true},
+		{name: "ordinary HTTPS h2", alpn: "h2", want: false},
+		{name: "ordinary HTTPS http1", alpn: "http/1.1", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := makeTestClientHelloRecord(tc.alpn)
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+			writeDone := make(chan error, 1)
+			go func() {
+				_, err := client.Write(raw)
+				writeDone <- err
+			}()
+			isControl, wrapped := sniffS1TControlClientHello(server)
+			if isControl != tc.want {
+				t.Fatalf("control classification = %v; want %v", isControl, tc.want)
+			}
+			got := make([]byte, len(raw))
+			if _, err := io.ReadFull(wrapped, got); err != nil {
+				t.Fatalf("read preserved ClientHello: %v", err)
+			}
+			if !bytes.Equal(got, raw) {
+				t.Fatal("ClientHello bytes changed during protocol sniffing")
+			}
+			if err := <-writeDone; err != nil {
+				t.Fatalf("write ClientHello: %v", err)
+			}
+		})
+	}
+}
+
+func TestAdaptivePsiphonUsesPublicMappingPortAndALPNMultiplex(t *testing.T) {
+	certDir := t.TempDir()
+	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
+	fingerprint, err := generateCertificate(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("generate certificate: %v", err)
+	}
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("load certificate: %v", err)
+	}
+	pin, err := normalizeFingerprint(fingerprint)
+	if err != nil {
+		t.Fatalf("normalize fingerprint: %v", err)
+	}
+	public, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer public.Close()
+	const token = "ce2fce5d4b8d4678a9478d0caa9ec7f2ce2fce5d4b8d4678a9478d0caa9ec7f2"
+	h := &hubServer{
+		cfg:              Config{Role: "hub", Transport: transportTCP, Token: token},
+		controlTLSConfig: hubTLSConfig(cert),
+		sessions:         make(map[*hubSession]struct{}),
+		pendingPublic:    make(chan struct{}, maxPendingPublicConnections),
+	}
+	go h.acceptPublic(public, "main")
+	proxyAddress := startTestSOCKS5Relay(t, public.Addr().String())
+
+	// Direct is intentionally unavailable; Psiphon must reach the Hub through
+	// the already-open public Mapping endpoint using the dedicated ALPN.
+	binDir := t.TempDir()
+	t.Setenv("PATH", binDir)
+	cfg := Config{
+		Role:           "agent",
+		Transport:      transportAdaptive,
+		Underlay:       underlayAdaptive,
+		PsiphonConfig:  filepath.Join(t.TempDir(), "profile.json"),
+		PsiphonProxy:   proxyAddress,
+		HubAddr:        "127.0.0.1:1",
+		PsiphonHubAddr: public.Addr().String(),
+		TLSServerName:  "localhost",
+		Token:          token,
+		Fingerprint:    fingerprint,
+		TunnelChannels: 1,
+		Ports:          []PortMapping{},
+	}
+	const channel = 122
+	agentPreferredTransport.Delete(channel)
+	agentPreferredUnderlay.Delete(channel)
+	t.Cleanup(func() {
+		agentPreferredTransport.Delete(channel)
+		agentPreferredUnderlay.Delete(channel)
+	})
+	agentDone := make(chan error, 1)
+	go func() { agentDone <- connectAndRunAgent(cfg, pin, channel) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.sessionCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h.sessionCount() == 0 {
+		t.Fatal("adaptive Agent did not authenticate through Psiphon on the public Mapping listener")
+	}
+	if got, ok := agentPreferredUnderlay.Load(channel); !ok || got != underlayPsiphon {
+		t.Fatalf("successful route preference = %v (present=%v); want Psiphon", got, ok)
+	}
+	if got, ok := agentPreferredTransport.Load(channel); !ok || got != transportTCP {
+		t.Fatalf("successful transport preference = %v (present=%v); want TCP/TLS", got, ok)
+	}
+	h.mu.RLock()
+	var active *hubSession
+	for session := range h.sessions {
+		active = session
+		break
+	}
+	h.mu.RUnlock()
+	if active == nil {
+		t.Fatal("expected one authenticated multiplexed Hub session")
+	}
+	_ = public.Close() // prevent the reconnect loop from opening another transport in this test
+	active.shutdown()
+	select {
+	case <-agentDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Agent did not stop after the multiplexed Hub session was shut down")
+	}
+}
+
 func TestWebSocketUpgradeAndBidirectionalStream(t *testing.T) {
 	serverRaw, clientRaw := net.Pipe()
 	defer serverRaw.Close()
@@ -138,24 +287,19 @@ func TestTLSAgentTransportsInteroperateWithHub(t *testing.T) {
 
 			d := net.Dialer{Timeout: 2 * time.Second}
 			tlsConfig := agentTLSConfig(pin, "localhost")
-			if mode == transportWebSocket {
-				tlsConfig.NextProtos = []string{"http/1.1"}
-			}
 			tlsConn, err := tls.DialWithDialer(&d, "tcp", listener.Addr().String(), tlsConfig)
 			if err != nil {
 				t.Fatalf("TLS dial: %v", err)
 			}
 			var c net.Conn = tlsConn
+			if got := tlsConn.ConnectionState().NegotiatedProtocol; got != controlALPN {
+				t.Fatalf("Agent tunnel TLS ALPN = %q; want %s", got, controlALPN)
+			}
 			if mode == transportWebSocket {
-				if got := tlsConn.ConnectionState().NegotiatedProtocol; got != "http/1.1" {
-					t.Fatalf("WebSocket TLS ALPN = %q; want http/1.1", got)
-				}
 				c, err = clientWebSocketUpgrade(tlsConn, listener.Addr().String())
 				if err != nil {
 					t.Fatalf("WebSocket upgrade: %v", err)
 				}
-			} else if got := tlsConn.ConnectionState().NegotiatedProtocol; got != "" {
-				t.Fatalf("raw TLS ALPN = %q; want empty for compatibility", got)
 			}
 			defer c.Close()
 			_ = c.SetDeadline(time.Now().Add(3 * time.Second))
@@ -1232,6 +1376,34 @@ func TestWireGuardRejectsWarpProxyMode(t *testing.T) {
 	}
 }
 
+func TestPsiphonHubAddressDefaultsToPublicMappingPort(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{input: "37.32.12.244:9443", want: "37.32.12.244:443"},
+		{input: "hub.example.net:9443", want: "hub.example.net:443"},
+		{input: "[2001:db8::1]:9443", want: "[2001:db8::1]:443"},
+		{input: "hub.example.net:10443", want: "hub.example.net:10443"},
+	}
+	for _, tc := range cases {
+		if got := defaultPsiphonHubAddress(tc.input); got != tc.want {
+			t.Errorf("defaultPsiphonHubAddress(%q) = %q; want %q", tc.input, got, tc.want)
+		}
+	}
+	legacy := normalizeConfig(Config{Role: "agent", Underlay: underlayAdaptive, HubAddr: "37.32.12.244:9443"})
+	if legacy.PsiphonHubAddr != "37.32.12.244:443" {
+		t.Fatalf("legacy adaptive profile PsiphonHubAddr = %q; want 37.32.12.244:443", legacy.PsiphonHubAddr)
+	}
+	explicit := Config{Role: "agent", Underlay: underlayPsiphon, HubAddr: "37.32.12.244:9443", PsiphonHubAddr: "37.32.12.244:8443"}
+	if got := agentHubAddressForUnderlay(explicit, underlayPsiphon); got != "37.32.12.244:8443" {
+		t.Fatalf("explicit Psiphon endpoint = %q; want 37.32.12.244:8443", got)
+	}
+	if got := agentHubAddressForUnderlay(explicit, underlayDirect); got != explicit.HubAddr {
+		t.Fatalf("Direct endpoint = %q; want unchanged %q", got, explicit.HubAddr)
+	}
+}
+
 func TestUnderlayModesAndLoopbackValidation(t *testing.T) {
 	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayWARP, underlayPsiphon, underlayAdaptive} {
 		if !validUnderlayMode(mode) {
@@ -1848,8 +2020,8 @@ func TestTLSConfigRequiresTLS13AndAgentPinsCertificate(t *testing.T) {
 	if serverConfig.MinVersion != tls.VersionTLS13 {
 		t.Fatalf("Hub minimum TLS version = %d; want TLS 1.3", serverConfig.MinVersion)
 	}
-	if len(serverConfig.NextProtos) != 0 {
-		t.Fatalf("raw tunnel control channel should not advertise HTTP ALPN: %v", serverConfig.NextProtos)
+	if len(serverConfig.NextProtos) != 1 || serverConfig.NextProtos[0] != controlALPN {
+		t.Fatalf("Hub must advertise the private control ALPN: %v", serverConfig.NextProtos)
 	}
 
 	der := []byte("synthetic DER bytes used for a callback unit test")
@@ -1860,6 +2032,9 @@ func TestTLSConfigRequiresTLS13AndAgentPinsCertificate(t *testing.T) {
 	}
 	if clientConfig.ServerName != "edge.example.net" {
 		t.Fatalf("Agent TLS SNI = %q; want edge.example.net", clientConfig.ServerName)
+	}
+	if len(clientConfig.NextProtos) != 1 || clientConfig.NextProtos[0] != controlALPN {
+		t.Fatalf("Agent must offer the private control ALPN: %v", clientConfig.NextProtos)
 	}
 	if err := clientConfig.VerifyConnection(tls.ConnectionState{}); err == nil {
 		t.Fatal("certificate pin callback accepted a connection with no peer certificate")
