@@ -107,6 +107,9 @@ grep -Fq 'TestBuildXrayWarpConfigIsolatesOnlyClonedInbound' S1T-CAPSULE/main_tes
 grep -Fq 'func buildXrayPsiphonConfig(' S1T-CAPSULE/xray_psiphon.go || fail "Per-profile Xray Psiphon egress builder is missing."
 grep -Fq 'func autoApplyXrayPsiphonForNewAgent() error' S1T-CAPSULE/xray_psiphon.go || fail "Automatic Psiphon user-egress setup is missing."
 grep -Fq 'autoApplyXrayPsiphonForNewAgent()' S1T-CAPSULE/main.go || fail "New-Agent setup does not invoke automatic Psiphon user egress."
+grep -Fq 'ensureSelectedTunnelRunningWithPsiphon(true)' S1T-CAPSULE/main.go || fail "New Agent setup must start Psiphon before configuring its Xray sidecar."
+grep -Fq 'ensureSelectedTunnelRunningWithPsiphon(false)' S1T-CAPSULE/main.go || fail "Starting an existing profile must repair incomplete Psiphon Xray setup."
+grep -Fq 'waitForPsiphonProxy(proxy, 30*time.Second)' S1T-CAPSULE/xray_psiphon.go || fail "Psiphon Xray setup must wait for the loopback SOCKS5 listener."
 if grep -Fq 'menuItem("10", "🛡️ Psiphon user egress"' S1T-CAPSULE/main.go; then fail "Redundant Psiphon menu option must not be present."; fi
 grep -Fq 'TestBuildXrayPsiphonConfigIsolatesTCPAndBlocksUDP' S1T-CAPSULE/main_test.go || fail "Psiphon TCP/DNS isolation and UDP fail-closed coverage is missing."
 grep -Fq 'TestXrayPsiphonManagedPathsAndUnitAreRestricted' S1T-CAPSULE/main_test.go || fail "Psiphon sidecar service/path safety coverage is missing."

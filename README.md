@@ -3,6 +3,7 @@
 - Psiphon region policy now defaults to Germany and allows only the approved non-US region set: AE, TR, DE, RS, RO, BG, GR, GE, AM, AZ, NL, CH, AT, PL, CZ, SK, HU, FR, SE and FI. US and unrestricted/blank region configurations are rejected.
 - Before applying the dedicated Psiphon Xray egress, ShahTunnel verifies the live exit country through the Psiphon SOCKS proxy. If the country is US, outside the allowlist, or cannot be verified, the route is refused.
 - Cron scheduled restarts are now scoped to one selected tunnel profile. Each profile gets separate config, state, lock, checker and `/etc/cron.d` entry; configuring or removing one profile does not restart or alter another profile.
+- Psiphon startup hotfix: the selected Agent service and a real Psiphon tunnel are brought up before the dedicated Xray sidecar is created. The sidecar setup waits for the loopback SOCKS5 listener instead of racing the child-process startup. Starting an incomplete profile with menu option 2 automatically retries the missing per-profile Xray setup.
 - Important limitation: `EgressRegion` is a Psiphon region preference, not a guarantee of server availability. This release enforces the non-US safety boundary, but does not yet run parallel country trials or automatically switch to the highest measured-throughput country. Keep the currently healthy Germany route until a measured replacement is available.
 
 
