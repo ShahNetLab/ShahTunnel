@@ -7,7 +7,7 @@
 3) فایل‌ها و پوشه‌های استخراج‌شده را در ریشهٔ مخزن جایگزین نسخهٔ فعلی کنید؛ پوشهٔ S1T-CAPSULE و docs را هم حفظ کنید.
 4) تغییرات را در شاخهٔ main ثبت و Push کنید. خود فایل ZIP را به‌عنوان یک فایل داخل مخزن آپلود نکنید.
 
-در منوی ساخت Agent، بخش EXTERNAL EGRESS PROVIDER شامل `1) Cloudflare WARP over MASQUE`، `2) Psiphon ConsoleClient via local SOCKS5` و `3) OpenVPN TCP + tls-crypt` است. گزینهٔ جداگانهٔ `[9] WARP egress` از منوی اصلی مدیریت حذف شده است؛ انتخاب هر خروجی هنگام ساخت Agent، Integration اختصاصی همان پروفایل را آماده می‌کند. برای خروجی مجزای هر پروفایل، Cloudflare باید در حالت MASQUE و WarpProxy / Local Proxy باشد؛ System Tunnel رد می‌شود. OpenVPN به فایل TCP `.ovpn` کشور موردنظر از ارائه‌دهنده و در صورت نیاز فایل نام کاربری/رمز عبور نیاز دارد؛ این فایل‌ها در ZIP وجود ندارند.
+در منوی ساخت Agent، بخش EXTERNAL EGRESS PROVIDER شامل `1) Cloudflare WARP over MASQUE`، `2) Psiphon ConsoleClient via local SOCKS5` و `3) OpenVPN TCP + tls-crypt` است. گزینهٔ جداگانهٔ `[9] WARP egress` از منوی اصلی مدیریت حذف شده است؛ انتخاب هر خروجی هنگام ساخت Agent، Integration اختصاصی همان پروفایل را آماده می‌کند. برای خروجی مجزای هر پروفایل، Cloudflare باید در حالت MASQUE و WarpProxy / Local Proxy باشد؛ System Tunnel رد می‌شود. OpenVPN به فایل TCP `.ovpn` کشور موردنظر از ارائه‌دهنده و در صورت نیاز فایل نام کاربری/رمز عبور نیاز دارد؛ این فایل‌ها در ZIP وجود ندارند. ویزارد ابتدا مسیر و دسترسی این فایل‌ها را می‌گیرد؛ سپس اگر OpenVPN/iproute2 نصب نباشد، نصب APT را با نمایش زندهٔ پیشرفت و Timeout هشت‌دقیقه‌ای اجرا می‌کند.
 
 پس از انتشار سورس، روی Agent خارج از ایران نصب/ارتقا را اجرا کنید:
 
