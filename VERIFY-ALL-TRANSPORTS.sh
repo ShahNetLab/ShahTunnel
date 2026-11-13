@@ -111,8 +111,8 @@ grep -Fq 'underlayOpenVPN' S1T-CAPSULE/main.go || fail "OpenVPN underlay is not 
 grep -Fq 'TestSanitizeOpenVPNProviderProfileIsTCPIsolatedAndFailClosed' S1T-CAPSULE/main_test.go || fail "OpenVPN profile sanitizer regression coverage is missing."
 grep -Fq 'TestOpenVPNRouteHelperIsValidShellAndHasFailClosedRules' S1T-CAPSULE/main_test.go || fail "OpenVPN fail-closed policy route coverage is missing."
 grep -Fq 'TestAdaptiveUnderlayCandidatesIncludeConfiguredOpenVPN' S1T-CAPSULE/main_test.go || fail "Option 9 OpenVPN failover coverage is missing."
-grep -Fq 'OpenVPN TCP + tls-crypt' README.md || fail "English OpenVPN egress documentation is missing."
-grep -Fq 'OpenVPN TCP + tls-crypt' README-fa.md || fail "Persian OpenVPN egress documentation is missing."
+grep -Fq 'Free OpenVPN egress via VPN Gate' README.md || fail "English OpenVPN egress documentation is missing."
+grep -Fq 'VPN Gate' README-fa.md || fail "Persian OpenVPN egress documentation is missing."
 
 pass "Shell syntax, docs layout, Psiphon bootstrap/runtime, public-Mapping ALPN multiplex, MASQUE Local Proxy, and failover coverage"
 
@@ -141,3 +141,7 @@ pass "Linux amd64 and arm64 binaries built and checksum-checked in a temporary d
 
 echo
 echo "ALL CHECKS PASSED using Go ${GO_VERSION}."
+
+grep -Fq 'func fetchVPNGateServers(ctx context.Context)' S1T-CAPSULE/vpngate.go || fail "Automatic VPN Gate server discovery is missing."
+grep -Fq 'func chooseVPNGateCountry(servers []vpnGateServer)' S1T-CAPSULE/vpngate.go || fail "VPN Gate country selector is missing."
+grep -Fq 'TestVPNGateCSVParsesFreeTCPServersAndSkipsUDP' S1T-CAPSULE/main_test.go || fail "VPN Gate API parser tests are missing."
