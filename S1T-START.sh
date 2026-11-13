@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 4.0.6 installer.
+# Shah Tunnel 4.0.7 installer.
 # Downloads the pinned Go 1.26.1 toolchain, verifies its SHA-256, fetches the source,
 # and builds the Linux binary on the target server. No prebuilt release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="4.0.6"
+VERSION="4.0.7"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -500,12 +500,19 @@ build_from_official_go_toolchain() {
   if [[ -n "$script_dir" && -s "$script_dir/go.mod" && -s "$script_dir/S1T-CAPSULE/main.go" ]]; then
     echo "Building from the local ShahTunnel source beside S1T-START.sh..." >&2
     if ! cp -a "$script_dir/go.mod" "$source_dir/" ||
-       ! cp -a "$script_dir/S1T-CAPSULE" "$source_dir/" ||
-       ! cp -a "$script_dir/install-psiphon.sh" "$source_dir/" ||
-       ! cp -a "$script_dir/install-tor.sh" "$source_dir/" ||
-       ! cp -a "$script_dir/repair-psiphon-profile.sh" "$source_dir/"; then
-      echo "Could not copy the local ShahTunnel source tree or egress auto-installers." >&2
+       ! cp -a "$script_dir/S1T-CAPSULE" "$source_dir/"; then
+      echo "Could not copy the local ShahTunnel source tree." >&2
       return 1
+    fi
+    if [[ -d "$script_dir/scripts" ]]; then
+      cp -a "$script_dir/scripts" "$source_dir/" || return 1
+    else
+      mkdir -p "$source_dir/scripts"
+      for helper in install-psiphon.sh install-tor.sh repair-psiphon-profile.sh; do
+        [[ -s "$script_dir/$helper" ]] && cp -a "$script_dir/$helper" "$source_dir/scripts/" || {
+          echo "Missing required helper: $helper" >&2; return 1;
+        }
+      done
     fi
     if [[ -f "$script_dir/go.sum" ]]; then
       cp -a "$script_dir/go.sum" "$source_dir/" || return 1
@@ -524,6 +531,17 @@ build_from_official_go_toolchain() {
   fi
   [[ -s "$source_dir/go.mod" && -s "$source_dir/S1T-CAPSULE/main.go" ]] \
     || { echo "The downloaded repository does not contain the expected ShahTunnel source files." >&2; return 1; }
+  mkdir -p "$source_dir/scripts"
+  for helper in install-psiphon.sh install-tor.sh repair-psiphon-profile.sh; do
+    if [[ -s "$source_dir/scripts/$helper" ]]; then
+      cp -f "$source_dir/scripts/$helper" "$source_dir/$helper" || return 1
+    elif [[ -s "$source_dir/$helper" ]]; then
+      cp -f "$source_dir/$helper" "$source_dir/scripts/$helper" || return 1
+    else
+      echo "Required helper $helper is missing from scripts/." >&2
+      return 1
+    fi
+  done
   if ! grep -Fq "module github.com/${OWNER}/${REPO}" "$source_dir/go.mod"; then
     echo "The source module path does not match github.com/${OWNER}/${REPO}; refusing to build." >&2
     return 1
