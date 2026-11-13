@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -9,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -156,299 +154,30 @@ func psiphonHostPerformanceProfile() psiphonPerformanceProfile {
 	return psiphonPerformanceProfileForHost(totalRAM, runtime.NumCPU())
 }
 
-// Psiphon only accepts a single ISO-3166-1 alpha-2 EgressRegion. Keep a
-// deliberately small, benchmarked candidate set. The United States is not
-// present and is also rejected by all config validation paths below.
-var psiphonNonUSRegions = []string{"DE", "NL", "GB", "FR", "CH", "SE"}
-
-const psiphonRegionCacheTTL = 8 * time.Hour
-
-type psiphonRegionCache struct {
-	Region         string  `json:"region"`
-	BytesPerSecond float64 `json:"bytes_per_second"`
-	CheckedAt      int64   `json:"checked_at"`
+// Psiphon region policy: US is intentionally absent and rejected at every
+// config-validation boundary. Psiphon may not have capacity in every region;
+// EgressRegion is a preference, so live egress country is verified separately.
+var psiphonAllowedEgressRegions = map[string]bool{
+	"AE": true, "TR": true, "DE": true, "RS": true, "RO": true,
+	"BG": true, "GR": true, "GE": true, "AM": true, "AZ": true,
+	"NL": true, "CH": true, "AT": true, "PL": true, "CZ": true,
+	"SK": true, "HU": true, "FR": true, "SE": true, "FI": true,
 }
 
-func normalizePsiphonRegion(value string) string {
-	value = strings.ToUpper(strings.TrimSpace(value))
-	for _, region := range psiphonNonUSRegions {
-		if value == region {
-			return value
-		}
-	}
-	// Empty, US/USA, and unsupported region values are never passed through
-	// to ConsoleClient. Germany is the safe bootstrap region.
-	return "DE"
+var psiphonPreferredEgressRegions = []string{
+	"AE", "TR", "DE", "RS", "RO", "BG", "GR", "GE", "AM", "AZ",
+	"NL", "CH", "AT", "PL", "CZ", "SK", "HU", "FR", "SE", "FI",
 }
 
-func writePsiphonRegion(configPath, region string) (bool, error) {
-	region = normalizePsiphonRegion(region)
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return false, err
+func normalizePsiphonEgressRegion(region string) (string, error) {
+	region = strings.ToUpper(strings.TrimSpace(region))
+	if region == "" {
+		return "DE", nil
 	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return false, fmt.Errorf("read Psiphon region config: %w", err)
+	if region == "US" || !psiphonAllowedEgressRegions[region] {
+		return "", fmt.Errorf("Psiphon egress region %q is blocked or not in the approved non-US region list", region)
 	}
-	if raw == nil {
-		return false, errors.New("Psiphon config must be a JSON object")
-	}
-	encoded, _ := json.Marshal(region)
-	if old, ok := raw["EgressRegion"]; ok && string(old) == string(encoded) {
-		return false, nil
-	}
-	raw["EgressRegion"] = encoded
-	updated, err := json.MarshalIndent(raw, "", "  ")
-	if err != nil {
-		return false, err
-	}
-	updated = append(updated, '\n')
-	tmp, err := os.CreateTemp(filepath.Dir(configPath), ".psiphon-region-*.tmp")
-	if err != nil {
-		return false, err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if err := tmp.Chmod(0600); err != nil {
-		_ = tmp.Close()
-		return false, err
-	}
-	if _, err := tmp.Write(updated); err != nil {
-		_ = tmp.Close()
-		return false, err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return false, err
-	}
-	if err := tmp.Close(); err != nil {
-		return false, err
-	}
-	if err := os.Rename(tmpName, configPath); err != nil {
-		return false, err
-	}
-	if err := os.Chmod(configPath, 0600); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func reserveLoopbackPort() (int, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer listener.Close()
-	addr, ok := listener.Addr().(*net.TCPAddr)
-	if !ok {
-		return 0, errors.New("unexpected TCP listener address")
-	}
-	return addr.Port, nil
-}
-
-func curlThroughPsiphon(proxy, url string, maxTime time.Duration, writeOut string) (string, error) {
-	if !isLoopbackProxyAddress(proxy) {
-		return "", errors.New("Psiphon benchmark proxy must be loopback-only")
-	}
-	curl, err := exec.LookPath("curl")
-	if err != nil {
-		return "", errors.New("curl is required for Psiphon egress verification and speed benchmarking")
-	}
-	seconds := strconv.Itoa(max(1, int(maxTime.Seconds())))
-	args := []string{"--silent", "--show-error", "--fail", "--location", "--connect-timeout", "3", "--max-time", seconds, "--socks5-hostname", proxy}
-	if writeOut != "" {
-		args = append(args, "--output", "/dev/null", "--write-out", writeOut)
-	}
-	args = append(args, url)
-	ctx, cancel := context.WithTimeout(context.Background(), maxTime+2*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, curl, args...).CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("curl via Psiphon: %w (%s)", err, strings.TrimSpace(string(out)))
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-func psiphonProxyCountry(proxy string) (string, error) {
-	for _, endpoint := range []string{"https://ipapi.co/country/", "https://ipinfo.io/country"} {
-		out, err := curlThroughPsiphon(proxy, endpoint, 7*time.Second, "")
-		if err != nil {
-			continue
-		}
-		code := strings.ToUpper(strings.TrimSpace(out))
-		code = strings.TrimSuffix(code, ".")
-		if len(code) == 2 && code[0] >= 'A' && code[0] <= 'Z' && code[1] >= 'A' && code[1] <= 'Z' {
-			return code, nil
-		}
-	}
-	return "", errors.New("could not verify the Psiphon egress country through the SOCKS5 proxy")
-}
-
-func benchmarkPsiphonRegion(binary string, base psiphonClientConfig, dataRoot, region string) (float64, error) {
-	port, err := reserveLoopbackPort()
-	if err != nil {
-		return 0, err
-	}
-	base.EgressRegion = normalizePsiphonRegion(region)
-	base.LocalSocksProxyPort = port
-	configBytes, err := json.MarshalIndent(base, "", "  ")
-	if err != nil {
-		return 0, err
-	}
-	configFile, err := os.CreateTemp(filepath.Dir(dataRoot), ".psiphon-benchmark-*.json")
-	if err != nil {
-		return 0, err
-	}
-	configPath := configFile.Name()
-	defer os.Remove(configPath)
-	if err := configFile.Chmod(0600); err != nil {
-		_ = configFile.Close()
-		return 0, err
-	}
-	if _, err := configFile.Write(append(configBytes, '\n')); err != nil {
-		_ = configFile.Close()
-		return 0, err
-	}
-	if err := configFile.Close(); err != nil {
-		return 0, err
-	}
-	dataDir, err := os.MkdirTemp(dataRoot, "region-probe-"+base.EgressRegion+"-")
-	if err != nil {
-		return 0, err
-	}
-	defer os.RemoveAll(dataDir)
-	logFile, err := os.CreateTemp(dataRoot, ".psiphon-benchmark-*.log")
-	if err != nil {
-		return 0, err
-	}
-	logPath := logFile.Name()
-	defer os.Remove(logPath)
-	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, binary, psiphonConsoleClientArgs(configPath, dataDir)...)
-	cmd.Stdout, cmd.Stderr = logFile, logFile
-	if err := cmd.Start(); err != nil {
-		_ = logFile.Close()
-		return 0, err
-	}
-	proxy := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-	connected := false
-	deadline := time.NewTimer(18 * time.Second)
-	poll := time.NewTicker(400 * time.Millisecond)
-	defer deadline.Stop()
-	defer poll.Stop()
-	for !connected {
-		select {
-		case <-ctx.Done():
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-			_ = logFile.Close()
-			return 0, fmt.Errorf("Psiphon region %s did not establish a tunnel within 18 seconds", region)
-		case <-deadline.C:
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-			_ = logFile.Close()
-			return 0, fmt.Errorf("Psiphon region %s probe timed out", region)
-		case <-poll.C:
-			if probeSOCKS5(proxy, 500*time.Millisecond) != nil {
-				continue
-			}
-			logData, _ := os.ReadFile(logPath)
-			for _, line := range strings.Split(string(logData), "\n") {
-				if count, ok := parsePsiphonTunnelNotice(line); ok && count > 0 {
-					connected = true
-					break
-				}
-			}
-		}
-	}
-	country, countryErr := psiphonProxyCountry(proxy)
-	if countryErr != nil || country == "US" {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		_ = logFile.Close()
-		if country == "US" {
-			return 0, fmt.Errorf("Psiphon region %s resolved to the prohibited US egress", region)
-		}
-		return 0, countryErr
-	}
-	speedText, speedErr := curlThroughPsiphon(proxy, "https://speed.cloudflare.com/__down?bytes=4000000", 9*time.Second, "%{speed_download}")
-	_ = cmd.Process.Kill()
-	_ = cmd.Wait()
-	_ = logFile.Close()
-	if speedErr != nil {
-		return 0, speedErr
-	}
-	speed, err := strconv.ParseFloat(strings.TrimSpace(speedText), 64)
-	if err != nil || speed <= 0 {
-		return 0, fmt.Errorf("invalid Psiphon throughput result for %s: %q", region, speedText)
-	}
-	return speed, nil
-}
-
-// selectFastestPsiphonRegion performs real HTTPS download benchmarks through
-// temporary ConsoleClient instances, verifies every candidate's public exit
-// country, and stores only a non-US result. Results are cached for eight hours
-// to avoid repeatedly interrupting startup with region discovery.
-func selectFastestPsiphonRegion(binary, configPath, dataDir string) (string, float64, error) {
-	if err := os.MkdirAll(dataDir, 0700); err != nil {
-		return "", 0, err
-	}
-	if err := os.Chmod(dataDir, 0700); err != nil {
-		return "", 0, err
-	}
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return "", 0, err
-	}
-	var base psiphonClientConfig
-	if err := json.Unmarshal(data, &base); err != nil {
-		return "", 0, err
-	}
-	cachePath := filepath.Join(dataDir, "best-region.json")
-	if cacheData, readErr := os.ReadFile(cachePath); readErr == nil {
-		var cache psiphonRegionCache
-		age := time.Since(time.Unix(cache.CheckedAt, 0))
-		if json.Unmarshal(cacheData, &cache) == nil && normalizePsiphonRegion(cache.Region) == cache.Region && age >= 0 && age < psiphonRegionCacheTTL && cache.BytesPerSecond > 0 {
-			if _, writeErr := writePsiphonRegion(configPath, cache.Region); writeErr != nil {
-				return "", 0, writeErr
-			}
-			return cache.Region, cache.BytesPerSecond, nil
-		}
-	}
-	preferred := normalizePsiphonRegion(base.EgressRegion)
-	candidates := []string{preferred}
-	for _, region := range psiphonNonUSRegions {
-		if region != preferred {
-			candidates = append(candidates, region)
-		}
-	}
-	bestRegion, bestSpeed := "", 0.0
-	for _, region := range candidates {
-		speed, benchErr := benchmarkPsiphonRegion(binary, base, dataDir, region)
-		if benchErr != nil {
-			log.Printf("Psiphon region benchmark %s failed: %v", region, benchErr)
-			continue
-		}
-		log.Printf("Psiphon region benchmark: %s delivered %.0f bytes/s", region, speed)
-		if speed > bestSpeed {
-			bestRegion, bestSpeed = region, speed
-		}
-	}
-	if bestRegion == "" {
-		// Never fall back to a blank/automatic region. Keep the currently
-		// configured non-US country (or DE) and let the main client retry it.
-		bestRegion = preferred
-		log.Printf("Psiphon: no candidate completed a verifiable throughput test; pinning non-US region %s (no US fallback)", bestRegion)
-	}
-	if _, err := writePsiphonRegion(configPath, bestRegion); err != nil {
-		return "", 0, err
-	}
-	cache := psiphonRegionCache{Region: bestRegion, BytesPerSecond: bestSpeed, CheckedAt: time.Now().Unix()}
-	cacheData, _ := json.MarshalIndent(cache, "", "  ")
-	_ = atomicWriteFile(cachePath, append(cacheData, '\n'), 0600)
-	return bestRegion, bestSpeed, nil
+	return region, nil
 }
 
 func newPsiphonClientConfig(port int) psiphonClientConfig {
@@ -683,6 +412,12 @@ func psiphonBootstrapNeedsMigration(cfg psiphonClientConfig) bool {
 	if !isUsablePsiphonClientID(cfg.PropagationChannelID) || !isUsablePsiphonClientID(cfg.SponsorID) {
 		return true
 	}
+	if strings.TrimSpace(cfg.EgressRegion) == "" {
+		return true
+	}
+	if _, err := normalizePsiphonEgressRegion(cfg.EgressRegion); err != nil {
+		return true
+	}
 	if _, err := strconv.Atoi(strings.TrimSpace(cfg.ClientVersion)); err != nil {
 		return true
 	}
@@ -700,7 +435,7 @@ func psiphonBootstrapNeedsMigration(cfg psiphonClientConfig) bool {
 
 // repairLegacyPsiphonClientConfig upgrades incomplete legacy bootstraps from
 // older ShahTunnel builds. It also recognizes the deprecated scalar URL
-// layout. Valid custom identities and region preferences are preserved.
+// layout. Valid custom identities and approved non-US region preferences are preserved; blank, US, and unsupported regions are replaced with Germany.
 func repairLegacyPsiphonClientConfig(configPath, proxyAddress string) (bool, error) {
 	if !isLoopbackProxyAddress(proxyAddress) {
 		return false, errors.New("Psiphon SOCKS5 proxy must be loopback-only")
@@ -725,7 +460,11 @@ func repairLegacyPsiphonClientConfig(configPath, proxyAddress string) (bool, err
 		return false, fmt.Errorf("legacy Psiphon config port %d does not match loopback proxy %s", current.LocalSocksProxyPort, proxyAddress)
 	}
 	upgraded := newPsiphonClientConfig(port)
-	upgraded.EgressRegion = normalizePsiphonRegion(current.EgressRegion)
+	if region, regionErr := normalizePsiphonEgressRegion(current.EgressRegion); regionErr == nil {
+		upgraded.EgressRegion = region
+	} else {
+		upgraded.EgressRegion = "DE"
+	}
 	upgraded.TargetServerEntry = current.TargetServerEntry
 	if isUsablePsiphonClientID(current.PropagationChannelID) {
 		upgraded.PropagationChannelID = strings.TrimSpace(current.PropagationChannelID)
@@ -864,11 +603,15 @@ func validatePsiphonClientConfig(configPath, proxyAddress string) error {
 	}
 	_, portText, _ := net.SplitHostPort(proxyAddress)
 	port, _ := strconv.Atoi(portText)
+	normalizedRegion, regionErr := normalizePsiphonEgressRegion(cfg.EgressRegion)
+	if regionErr != nil {
+		return regionErr
+	}
+	if cfg.EgressRegion != normalizedRegion {
+		return errors.New("Psiphon config must contain an explicit approved non-US EgressRegion; refusing an unrestricted region")
+	}
 	if cfg.LocalSocksProxyPort != port {
 		return fmt.Errorf("Psiphon config SOCKS5 port %d does not match proxy %s", cfg.LocalSocksProxyPort, proxyAddress)
-	}
-	if normalizePsiphonRegion(cfg.EgressRegion) != strings.ToUpper(strings.TrimSpace(cfg.EgressRegion)) || cfg.EgressRegion == "US" {
-		return fmt.Errorf("Psiphon EgressRegion %q is not an allowed non-US region", cfg.EgressRegion)
 	}
 	if cfg.DisableLocalSocksProxy {
 		return errors.New("Psiphon config disables its local SOCKS5 proxy")

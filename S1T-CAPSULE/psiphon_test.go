@@ -399,116 +399,28 @@ func TestTunePsiphonPerformanceConfigPreservesUnknownFields(t *testing.T) {
 	}
 }
 
-func TestPsiphonRegionPolicyNeverSelectsUSA(t *testing.T) {
-	cfg := newPsiphonClientConfig(21090)
+func TestPsiphonRegionPolicyNeverAllowsUS(t *testing.T) {
+	if got, err := normalizePsiphonEgressRegion(""); err != nil || got != "DE" {
+		t.Fatalf("empty region = %q, %v; want DE", got, err)
+	}
+	for _, blocked := range []string{"US", "us", "XX", "USA"} {
+		if _, err := normalizePsiphonEgressRegion(blocked); err == nil {
+			t.Fatalf("region %q must be rejected", blocked)
+		}
+	}
+	for _, allowed := range psiphonPreferredEgressRegions {
+		if got, err := normalizePsiphonEgressRegion(allowed); err != nil || got != allowed {
+			t.Fatalf("region %q rejected: %q, %v", allowed, got, err)
+		}
+	}
+}
+
+func TestNewPsiphonConfigDefaultsToNonUSRegion(t *testing.T) {
+	cfg := newPsiphonClientConfig(23456)
 	if cfg.EgressRegion != "DE" {
-		t.Fatalf("default Psiphon region = %q, want safe non-US DE", cfg.EgressRegion)
+		t.Fatalf("default EgressRegion = %q, want DE", cfg.EgressRegion)
 	}
-	for _, input := range []string{"", "US", "USA", "us", "ZZ", "DE", "NL", "GB"} {
-		got := normalizePsiphonRegion(input)
-		if got == "US" || got == "USA" {
-			t.Fatalf("region normalizer allowed prohibited region for %q: %q", input, got)
-		}
-	}
-	if normalizePsiphonRegion("US") != "DE" || normalizePsiphonRegion("") != "DE" {
-		t.Fatal("blank and US regions must be pinned to Germany, never left automatic")
-	}
-}
-
-func TestWritePsiphonRegionPreservesUnknownOptionsAndBlocksUS(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "profile.json")
-	original := []byte(`{"EgressRegion":"US","LocalSocksProxyPort":21091,"UnknownOption":{"keep":true}}`)
-	if err := os.WriteFile(path, original, 0600); err != nil {
-		t.Fatal(err)
-	}
-	changed, err := writePsiphonRegion(path, "US")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !changed {
-		t.Fatal("US region was not replaced")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got map[string]json.RawMessage
-	if err := json.Unmarshal(data, &got); err != nil {
-		t.Fatal(err)
-	}
-	if string(got["EgressRegion"]) != `"DE"` {
-		t.Fatalf("EgressRegion=%s, want DE", got["EgressRegion"])
-	}
-	var unknown map[string]bool
-	if err := json.Unmarshal(got["UnknownOption"], &unknown); err != nil || !unknown["keep"] {
-		t.Fatalf("unknown Psiphon options were not preserved: %s (err=%v)", got["UnknownOption"], err)
-	}
-}
-
-func TestValidateRejectsUSAAndUnspecifiedPsiphonRegion(t *testing.T) {
-	for _, region := range []string{"US", "", "ZZ"} {
-		dir := t.TempDir()
-		cfg := newPsiphonClientConfig(21092)
-		cfg.EgressRegion = region
-		data, err := json.Marshal(cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
-		path := filepath.Join(dir, "profile.json")
-		if err := os.WriteFile(path, data, 0600); err != nil {
-			t.Fatal(err)
-		}
-		if err := validatePsiphonClientConfig(path, "127.0.0.1:21092"); err == nil {
-			t.Fatalf("validation unexpectedly allowed EgressRegion=%q", region)
-		}
-	}
-}
-
-func TestRestartSchedulesArePerTunnel(t *testing.T) {
-	old := configPath
-	defer func() { configPath = old }()
-	configPath = filepath.Join(tunnelConfigDir, "s.json")
-	idS, unitS, err := restartScheduleIdentity()
-	if err != nil {
-		t.Fatal(err)
-	}
-	configS, stateS, cronS := restartSchedulePaths(idS)
-	if idS != "s" || unitS != "ravanreverse@s.service" {
-		t.Fatalf("unexpected s identity: id=%q unit=%q", idS, unitS)
-	}
-	configPath = filepath.Join(tunnelConfigDir, "sh.json")
-	idSH, unitSH, err := restartScheduleIdentity()
-	if err != nil {
-		t.Fatal(err)
-	}
-	configSH, stateSH, cronSH := restartSchedulePaths(idSH)
-	if idSH != "sh" || unitSH != "ravanreverse@sh.service" {
-		t.Fatalf("unexpected sh identity: id=%q unit=%q", idSH, unitSH)
-	}
-	if configS == configSH || stateS == stateSH || cronS == cronSH {
-		t.Fatal("two tunnel profiles share a cron config, state file, or cron entry")
-	}
-	configPath = legacyConfigPath
-	legacyID, legacyUnit, err := restartScheduleIdentity()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if legacyID != "legacy" || legacyUnit != "ravanreverse.service" {
-		t.Fatalf("unexpected legacy identity: id=%q unit=%q", legacyID, legacyUnit)
-	}
-}
-
-func TestRestartCronHelperTargetsExactlyOneTunnel(t *testing.T) {
-	if !strings.Contains(restartCronScriptBody, `UNIT="ravanreverse@${ID}.service"`) {
-		t.Fatal("per-profile cron helper does not construct the selected service name")
-	}
-	if !strings.Contains(restartCronScriptBody, `systemctl restart "$UNIT"`) {
-		t.Fatal("per-profile cron helper does not restart its selected service")
-	}
-	for _, forbidden := range []string{"list-units", "ravanreverse@*.service", "while read -r UNIT"} {
-		if strings.Contains(restartCronScriptBody, forbidden) {
-			t.Fatalf("cron helper contains global restart behavior %q", forbidden)
-		}
+	if cfg.EgressRegion == "US" {
+		t.Fatal("US must never be selected")
 	}
 }

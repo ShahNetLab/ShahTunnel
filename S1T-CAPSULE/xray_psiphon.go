@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -259,6 +260,46 @@ func psiphonPublicEgressIP(proxyAddress string, timeout time.Duration) (string, 
 	return ip.String(), nil
 }
 
+func psiphonPublicEgressCountry(proxyAddress string, timeout time.Duration) (string, error) {
+	if !isLoopbackProxyAddress(proxyAddress) {
+		return "", errors.New("Psiphon proxy must be loopback-only")
+	}
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return dialSOCKS5Context(ctx, proxyAddress, address)
+		},
+		ForceAttemptHTTP2: false,
+		DisableKeepAlives: true,
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: timeout}
+	// Two independent geolocation endpoints are tried; failure is fail-closed.
+	for _, endpoint := range []string{"https://ipapi.co/json/", "https://ipwho.is/"} {
+		resp, err := client.Get(endpoint)
+		if err != nil {
+			continue
+		}
+		var payload map[string]any
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 32*1024)).Decode(&payload)
+		resp.Body.Close()
+		if decodeErr != nil || resp.StatusCode != http.StatusOK {
+			continue
+		}
+		code := ""
+		for _, key := range []string{"country_code", "country"} {
+			if value, ok := payload[key].(string); ok && len(value) == 2 {
+				code = strings.ToUpper(strings.TrimSpace(value))
+				break
+			}
+		}
+		if code != "" {
+			return code, nil
+		}
+	}
+	return "", errors.New("could not verify Psiphon exit country through either geolocation endpoint")
+}
+
 // applyXrayPsiphonEgress builds an independent Xray sidecar and switches only
 // the selected Agent's mapping targets. X-UI's source config and system routes
 // are never edited. UDP is blocked on this isolated path: Psiphon's local
@@ -287,7 +328,7 @@ func applyXrayPsiphonEgress(restartAgent, confirm bool) error {
 	if !isLoopbackProxyAddress(proxy) {
 		return errors.New("Agent config does not contain a valid loopback Psiphon SOCKS5 endpoint")
 	}
-	if restartAgent {
+	{
 		if err := probeSOCKS5(proxy, 2*time.Second); err != nil {
 			return fmt.Errorf("Psiphon SOCKS5 is not ready at %s: %w; start the Agent/Psiphon service first", proxy, err)
 		}
@@ -295,7 +336,14 @@ func applyXrayPsiphonEgress(restartAgent, confirm bool) error {
 		if err != nil {
 			return err
 		}
-		uiSuccess("Verified live Psiphon HTTPS exit IP: " + ip)
+		country, err := psiphonPublicEgressCountry(proxy, 12*time.Second)
+		if err != nil {
+			return fmt.Errorf("refusing Psiphon egress because exit country could not be verified: %w", err)
+		}
+		if country == "US" || !psiphonAllowedEgressRegions[country] {
+			return fmt.Errorf("refusing Psiphon exit %s (%s): US is prohibited and only approved non-US regions are allowed", ip, country)
+		}
+		uiSuccess(fmt.Sprintf("Verified live Psiphon HTTPS exit IP: %s (country %s)", ip, country))
 	}
 	if confirm {
 		fmt.Println()

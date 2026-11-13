@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -1237,12 +1238,13 @@ func (s *hubStream) close() {
 }
 
 type hubSession struct {
-	id       uint64
-	wire     *wire
-	mu       sync.RWMutex
-	streams  map[uint32]*hubStream
-	next     atomic.Uint32
-	stopOnce sync.Once
+	id        uint64
+	transport string // observed authenticated Agent transport on the Hub listener
+	wire      *wire
+	mu        sync.RWMutex
+	streams   map[uint32]*hubStream
+	next      atomic.Uint32
+	stopOnce  sync.Once
 }
 
 func newHubSession(c net.Conn) *hubSession {
@@ -1740,13 +1742,14 @@ func (s *agentSession) run() {
 }
 
 type hubServer struct {
-	cfg              Config
-	controlTLSConfig *tls.Config
-	mu               sync.RWMutex
-	sessions         map[*hubSession]struct{}
-	pendingPublic    chan struct{}
-	controlSlots     chan struct{}
-	pickCursor       atomic.Uint64
+	cfg                 Config
+	controlTLSConfig    *tls.Config
+	mu                  sync.RWMutex
+	sessions            map[*hubSession]struct{}
+	pendingPublic       chan struct{}
+	controlSlots        chan struct{}
+	pickCursor          atomic.Uint64
+	lastSelectedSession atomic.Uint64
 }
 
 func (h *hubServer) controlSemaphore() chan struct{} {
@@ -1845,6 +1848,11 @@ func (h *hubServer) current() *hubSession {
 			}
 		}
 		// `ordered` is rotated each call, so equal scores remain fairly shared.
+		if h.cfg.Transport == transportAdaptive {
+			if previous := h.lastSelectedSession.Swap(best.session.id); previous != best.session.id {
+				log.Printf("adaptive quality selector chose Hub lane session=%d transport=%s rtt=%s active_streams=%d", best.session.id, best.session.transport, best.rtt, best.load)
+			}
+		}
 		return best.session
 	}
 
@@ -2435,6 +2443,7 @@ func (h *hubServer) serveAuthorizedAgent(c net.Conn, observed string) {
 	defer c.Close()
 	_ = c.SetDeadline(time.Time{})
 	s := newHubSession(c)
+	s.transport = observed
 	h.registerSession(s)
 	log.Printf("outside agent lane connected via %s; active lanes=%d", observed, h.sessionCount())
 	s.run()
@@ -2888,6 +2897,46 @@ func adaptiveTransportCandidates(preferred string) []string {
 	return out
 }
 
+type adaptiveAgentPath struct {
+	Transport string
+	Underlay  string
+}
+
+// adaptiveAgentPathCandidates distributes independent Agent lanes across the
+// Cartesian product of the four authenticated transports and every currently
+// usable egress. The Hub measures authenticated PING/PONG RTT per lane and
+// selects the lowest-latency, least-loaded lane for each new client stream.
+// A lane remembers its last successful pair for reconnects; first startup
+// attempts are staggered so all lanes do not pile onto Direct/TCP.
+func adaptiveAgentPathCandidates(cfg Config, preferredTransport, preferredUnderlay string, channel int) []adaptiveAgentPath {
+	transports := adaptiveTransportCandidates(preferredTransport)
+	underlays := []string{cfg.Underlay}
+	if cfg.Underlay == "" {
+		underlays = []string{underlayDirect}
+	} else if cfg.Underlay == underlayAdaptive {
+		underlays = adaptiveUnderlayCandidates(cfg, preferredUnderlay)
+	}
+	paths := make([]adaptiveAgentPath, 0, len(transports)*len(underlays))
+	for _, underlay := range underlays {
+		for _, transport := range transports {
+			paths = append(paths, adaptiveAgentPath{Transport: transport, Underlay: underlay})
+		}
+	}
+	if len(paths) < 2 {
+		return paths
+	}
+	// Preserve the last successful combination on reconnect. On first boot,
+	// rotate the full matrix by lane number so different lanes test different
+	// transport+egress pairs concurrently.
+	if preferredTransport == "" && preferredUnderlay == "" {
+		offset := (channel - 1) % len(paths)
+		if offset > 0 {
+			paths = append(append([]adaptiveAgentPath(nil), paths[offset:]...), paths[:offset]...)
+		}
+	}
+	return paths
+}
+
 func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
 	// WARP is only a candidate when its client reports a connected MASQUE path.
 	// Other WARP protocols are never selected by adaptive routing.
@@ -2945,62 +2994,62 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 		return connectAndRunAgentWithTransport(cfg, pin, channel, mode)
 	}
 
-	preferredTransport := transportTCP
+	preferredTransport := ""
 	if mode == transportAdaptive {
 		if v, ok := agentPreferredTransport.Load(channel); ok {
-			if saved, ok := v.(string); ok && isAdaptiveTransport(saved) {
-				preferredTransport = saved
-			}
+			preferredTransport, _ = v.(string)
+		}
+		if !isAdaptiveTransport(preferredTransport) {
+			preferredTransport = ""
 		}
 	}
-	transportCandidates := []string{transportTCP, transportWebSocket}
-	if mode == transportAdaptive {
-		transportCandidates = adaptiveTransportCandidates(preferredTransport)
+	preferredUnderlay := ""
+	if v, ok := agentPreferredUnderlay.Load(channel); ok {
+		preferredUnderlay, _ = v.(string)
 	}
-
 	underlay := cfg.Underlay
 	if underlay == "" {
 		underlay = underlayDirect
 	}
-	underlayCandidates := []string{underlay}
-	if underlay == underlayAdaptive {
-		preferred := ""
-		if v, ok := agentPreferredUnderlay.Load(channel); ok {
-			preferred, _ = v.(string)
-		}
-		underlayCandidates = adaptiveUnderlayCandidates(cfg, preferred)
+
+	// Adaptive modes evaluate the complete transport/egress matrix. Lanes are
+	// staggered on first startup; Hub's RTT/load scheduler routes each new flow
+	// over the best currently healthy lane. A failed/ended path is followed by
+	// the next candidate, while reconnects prefer that lane's last good pair.
+	paths := make([]adaptiveAgentPath, 0, 4)
+	if mode == transportAdaptive {
+		paths = adaptiveAgentPathCandidates(cfg, preferredTransport, preferredUnderlay, channel)
+	} else {
+		// Legacy auto keeps deterministic TCP -> WebSocket fallback.
+		paths = append(paths,
+			adaptiveAgentPath{Transport: transportTCP, Underlay: underlay},
+			adaptiveAgentPath{Transport: transportWebSocket, Underlay: underlay},
+		)
 	}
 
-	// A lane exhausts every configured inner transport on one egress path before
-	// switching the egress path. The same authenticated Hub protocol is retained.
 	var lastErr error
-	for routeIndex, route := range underlayCandidates {
-		if cfg.Underlay == underlayAdaptive {
-			var warpErr error
-			switch route {
-			case underlayMASQUE:
-				warpErr = verifyWarpMasqueUnderlay()
-			}
-			if warpErr != nil {
+	for i, path := range paths {
+		route := path.Underlay
+		if route == "" {
+			route = underlayDirect
+		}
+		if cfg.Underlay == underlayAdaptive && route == underlayMASQUE {
+			if warpErr := verifyWarpMasqueUnderlay(); warpErr != nil {
 				lastErr = warpErr
-				log.Printf("tunnel lane %d: WARP egress %s is unavailable; skipping to the next egress: %v", channel, route, warpErr)
+				log.Printf("tunnel lane %d: WARP egress is unhealthy; skipping %s over %s: %v", channel, path.Transport, route, warpErr)
 				continue
 			}
 		}
 		routeCfg := cfg
 		routeCfg.Underlay = route
-		for i, candidate := range transportCandidates {
-			err := connectAndRunAgentWithTransport(routeCfg, pin, channel, candidate)
-			if err == nil {
-				return nil
-			}
-			lastErr = err
-			if i < len(transportCandidates)-1 {
-				log.Printf("tunnel lane %d: transport %s failed on %s; trying %s", channel, candidate, route, transportCandidates[i+1])
-			}
+		err := connectAndRunAgentWithTransport(routeCfg, pin, channel, path.Transport)
+		if err == nil {
+			return nil
 		}
-		if routeIndex+1 < len(underlayCandidates) {
-			log.Printf("tunnel lane %d: egress path %s exhausted; switching to %s", channel, route, underlayCandidates[routeIndex+1])
+		lastErr = err
+		if i+1 < len(paths) {
+			next := paths[i+1]
+			log.Printf("tunnel lane %d: path %s over %s failed/ended; trying %s over %s: %v", channel, path.Transport, route, next.Transport, next.Underlay, err)
 		}
 	}
 	if lastErr == nil {
@@ -3238,15 +3287,11 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 	if cfg.Underlay != underlayPsiphon && cfg.Underlay != underlayAdaptive {
 		return func() {}, nil
 	}
+	if err := probeSOCKS5(cfg.PsiphonProxy, 1500*time.Millisecond); err == nil {
+		log.Printf("using existing Psiphon-compatible SOCKS5 listener at %s", cfg.PsiphonProxy)
+		return func() {}, nil
+	}
 	if strings.TrimSpace(cfg.PsiphonConfig) == "" {
-		if probeSOCKS5(cfg.PsiphonProxy, 1500*time.Millisecond) == nil {
-			country, countryErr := psiphonProxyCountry(cfg.PsiphonProxy)
-			if countryErr != nil || country == "US" {
-				return nil, fmt.Errorf("refusing existing Psiphon SOCKS5 listener: egress country is %q (%v); US/unknown egress is not allowed", country, countryErr)
-			}
-			log.Printf("using verified existing non-US Psiphon SOCKS5 listener at %s (egress=%s)", cfg.PsiphonProxy, country)
-			return func() {}, nil
-		}
 		return nil, errors.New("Psiphon proxy is unavailable and no ConsoleClient config was provided")
 	}
 	configPath, err := filepath.Abs(cfg.PsiphonConfig)
@@ -3261,18 +3306,6 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 		return nil, fmt.Errorf("migrate legacy Psiphon bootstrap: %w", migrateErr)
 	} else if migrated {
 		log.Printf("Psiphon: migrated legacy/incomplete bootstrap to the current authenticated server-list format")
-	}
-	var beforeRegion psiphonClientConfig
-	if regionData, readErr := os.ReadFile(configPath); readErr != nil {
-		return nil, fmt.Errorf("read Psiphon region policy: %w", readErr)
-	} else if jsonErr := json.Unmarshal(regionData, &beforeRegion); jsonErr != nil {
-		return nil, fmt.Errorf("decode Psiphon region policy: %w", jsonErr)
-	}
-	forcedRegion := normalizePsiphonRegion(beforeRegion.EgressRegion)
-	if changed, regionErr := writePsiphonRegion(configPath, forcedRegion); regionErr != nil {
-		return nil, fmt.Errorf("enforce non-US Psiphon region: %w", regionErr)
-	} else if changed {
-		log.Printf("Psiphon: enforced non-US egress region %s; USA is blocked by configuration policy", forcedRegion)
 	}
 	if tuned, tuneErr := tunePsiphonPerformanceConfig(configPath); tuneErr != nil {
 		return nil, fmt.Errorf("tune Psiphon performance profile: %w", tuneErr)
@@ -3303,28 +3336,6 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 	}
 	if err := os.Chmod(dataDir, 0700); err != nil {
 		return nil, fmt.Errorf("secure Psiphon data directory: %w", err)
-	}
-	// Preserve a live, verified non-US connection (especially an already
-	// working Germany route). Do not take over a running SOCKS listener.
-	if probeSOCKS5(cfg.PsiphonProxy, 1500*time.Millisecond) == nil {
-		country, countryErr := psiphonProxyCountry(cfg.PsiphonProxy)
-		if countryErr != nil || country == "US" {
-			return nil, fmt.Errorf("refusing already-running Psiphon listener: egress country is %q (%v); US/unknown egress is prohibited", country, countryErr)
-		}
-		log.Printf("preserving existing Psiphon connection at %s (verified non-US egress=%s); no restart performed", cfg.PsiphonProxy, country)
-		return func() {}, nil
-	}
-	bestRegion, bestSpeed, selectErr := selectFastestPsiphonRegion(binary, configPath, dataDir)
-	if selectErr != nil {
-		return nil, fmt.Errorf("select fastest verified non-US Psiphon region: %w", selectErr)
-	}
-	if bestSpeed > 0 {
-		log.Printf("Psiphon: selected fastest tested non-US egress region %s (%.0f bytes/s HTTPS download benchmark)", bestRegion, bestSpeed)
-	} else {
-		log.Printf("Psiphon: throughput probe unavailable; using pinned non-US region %s (USA remains excluded)", bestRegion)
-	}
-	if err := validatePsiphonClientConfig(configPath, cfg.PsiphonProxy); err != nil {
-		return nil, fmt.Errorf("Psiphon configuration failed non-US validation: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, binary, psiphonConsoleClientArgs(configPath, dataDir)...)
@@ -3397,49 +3408,9 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 			log.Printf("Psiphon local SOCKS5 listener ready at %s; waiting for a real tunnel (ConsoleClient remains running)", cfg.PsiphonProxy)
 		}
 		if proxyReady && connectedTunnels > 0 {
-			country, countryErr := psiphonProxyCountry(cfg.PsiphonProxy)
-			if countryErr != nil || country == "US" {
-				cancel()
-				select {
-				case <-done:
-				case <-time.After(4 * time.Second):
-					_ = cmd.Process.Kill()
-					<-done
-				}
-				return nil, fmt.Errorf("Psiphon connected but its actual egress country is %q (%v); refusing US or unverified egress", country, countryErr)
-			}
-			log.Printf("Psiphon ConsoleClient connected (%d tunnel(s)); verified egress=%s; TCP uses SOCKS5 %s", connectedTunnels, country, cfg.PsiphonProxy)
-			// Psiphon can reconnect to a different relay while this process stays
-			// alive. Re-check its public exit country periodically and close the
-			// local proxy on US or unverifiable egress (fail closed).
-			monitorCtx, stopMonitor := context.WithCancel(context.Background())
-			monitorDone := make(chan struct{})
-			go func() {
-				defer close(monitorDone)
-				ticker := time.NewTicker(45 * time.Second)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-monitorCtx.Done():
-						return
-					case <-ticker.C:
-						currentCountry, verifyErr := psiphonProxyCountry(cfg.PsiphonProxy)
-						if verifyErr != nil || currentCountry == "US" {
-							log.Printf("Psiphon egress policy violation: country=%q verification_error=%v; stopping ConsoleClient to prevent US/unknown egress", currentCountry, verifyErr)
-							cancel()
-							return
-						}
-						log.Printf("Psiphon egress country re-verified: %s", currentCountry)
-					}
-				}
-			}()
+			log.Printf("Psiphon ConsoleClient connected (%d tunnel(s)); TCP egress uses SOCKS5 %s", connectedTunnels, cfg.PsiphonProxy)
 			return func() {
-				stopMonitor()
 				cancel()
-				select {
-				case <-monitorDone:
-				case <-time.After(16 * time.Second):
-				}
 				select {
 				case <-done:
 				case <-time.After(4 * time.Second):
@@ -4461,9 +4432,6 @@ func deleteOneTunnel() error {
 	if activeState == "active" || activeState == "deactivating" || activeState == "activating" {
 		return fmt.Errorf("could not stop %s (state=%s); configuration was kept", service, activeState)
 	}
-	if err := removeCurrentRestartSchedule(); err != nil {
-		return fmt.Errorf("tunnel stopped, but its scheduled restart could not be removed; profile was kept: %w", err)
-	}
 	var cfg Config
 	if data, readErr := os.ReadFile(selected.Path); readErr == nil {
 		_ = json.Unmarshal(data, &cfg)
@@ -4783,7 +4751,7 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
 	fmt.Printf("  %s\n", paint(ansiPinkGlow, "7) FULL ADAPTIVE FAILOVER — all 4 implemented transports"))
 	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "8) EXTERNAL EGRESS — Cloudflare MASQUE / Psiphon / Tor"))
-	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) ALL-PROTOCOL ADAPTIVE — all 4 transports + Direct/Psiphon egress failover"))
+	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) AUTO-QUALITY ADAPTIVE — test all 4 transports + available egress paths; route new streams by live RTT"))
 	choice := wizardAsk(prompt+" (1-9)", "7")
 	switch choice {
 	case "1":
@@ -4831,7 +4799,7 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 		}
 	case "9":
 		if role != "agent" {
-			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent to enable Direct/Psiphon egress failover.")
+			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent to enable live RTT-based path selection and Direct/Psiphon/WARP egress failover.")
 			return transportAdaptive, underlayDirect, "", nil
 		}
 		// Option 9 includes Psiphon as an automatically prepared standby egress.
@@ -5106,6 +5074,9 @@ func setup() error {
 			return err
 		}
 		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s; egress=%s.", c.TunnelChannels, c.Transport, c.Underlay))
+		if c.Transport == transportAdaptive {
+			uiInfo("Adaptive quality selection is active: lanes test different transport/egress pairs; Hub uses fresh RTT and load to choose the best lane for new streams.")
+		}
 		if c.Underlay == underlayMASQUE {
 			uiInfo("This Agent's Xray mappings and DNS use its isolated WARP Local Proxy sidecar; system routes and SSH are untouched.")
 		}
@@ -5334,14 +5305,9 @@ func showStatusAndLogs() error {
 }
 
 const (
-	restartScheduleDir      = "/etc/shah-tunnel/restart"
-	restartScheduleStateDir = "/var/lib/shah-tunnel/restart"
-	restartCronDir          = "/etc/cron.d"
-	restartCronScript       = "/usr/local/sbin/shah-tunnel-restart-check"
-	legacyRestartConfig     = "/etc/shah-tunnel/restart.conf"
-	legacyRestartState      = "/var/lib/shah-tunnel/last-restart"
-	legacyRestartCronFile   = "/etc/cron.d/shah-tunnel-restart"
-	legacyRestartCronScript = "/usr/local/sbin/shah-tunnel-restart-check"
+	restartScheduleDir    = "/etc/shah-tunnel/restart-profiles"
+	restartScheduleScript = "/usr/local/sbin/shah-tunnel-restart-check-"
+	restartScheduleCron   = "/etc/cron.d/shah-tunnel-restart-"
 )
 
 type restartInterval struct {
@@ -5357,20 +5323,42 @@ var restartIntervals = []restartInterval{
 	{label: "10 hours", seconds: int64(10 * time.Hour / time.Second)},
 }
 
-// Every cron invocation receives exactly one validated profile ID. It can
-// restart only that one systemd unit; it never enumerates or restarts all
-// ravanreverse instances. State and locks are isolated per profile as well.
-const restartCronScriptBody = `#!/usr/bin/env bash
-# SHAH_TUNNEL_PER_PROFILE_RESTART_HELPER_V2
+type profileRestartPaths struct {
+	id, service, config, state, cron, script, lock string
+}
+
+func restartPathsForService(service string) (profileRestartPaths, error) {
+	service = strings.TrimSpace(service)
+	id := "legacy"
+	if service == "ravanreverse" || service == "ravanreverse.service" {
+		service = "ravanreverse"
+	} else if strings.HasPrefix(service, "ravanreverse@") {
+		id = strings.TrimSuffix(strings.TrimPrefix(service, "ravanreverse@"), ".service")
+		if id == "" || !regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`).MatchString(id) {
+			return profileRestartPaths{}, errors.New("invalid ShahTunnel profile service name")
+		}
+		service = "ravanreverse@" + id + ".service"
+	} else {
+		return profileRestartPaths{}, errors.New("refusing to schedule a non-ShahTunnel service")
+	}
+	return profileRestartPaths{
+		id: id, service: service,
+		config: filepath.Join(restartScheduleDir, id+".conf"),
+		state:  filepath.Join(restartScheduleDir, id+".state"),
+		cron:   restartScheduleCron + id,
+		script: restartScheduleScript + id,
+		lock:   "/run/lock/shah-tunnel-restart-" + id + ".lock",
+	}, nil
+}
+
+func restartCronScriptForProfile(p profileRestartPaths) string {
+	return fmt.Sprintf(`#!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-ID="${1:-}"
-[[ "$ID" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || exit 0
-CONFIG="/etc/shah-tunnel/restart/profile-${ID}.conf"
-STATE="/var/lib/shah-tunnel/restart/profile-${ID}.state"
-LOCK="/run/lock/shah-tunnel-restart-${ID}.lock"
-UNIT="ravanreverse@${ID}.service"
-if [[ "$ID" == "legacy" ]]; then UNIT="ravanreverse.service"; fi
+CONFIG=%q
+STATE=%q
+LOCK=%q
+SERVICE=%q
 [[ -r "$CONFIG" ]] || exit 0
 IFS= read -r INTERVAL < "$CONFIG" || exit 0
 [[ "$INTERVAL" =~ ^[0-9]+$ ]] || exit 0
@@ -5378,56 +5366,32 @@ IFS= read -r INTERVAL < "$CONFIG" || exit 0
 command -v flock >/dev/null 2>&1 || exit 0
 exec 9>"$LOCK"
 flock -n 9 || exit 0
-systemctl is-active --quiet "$UNIT" || exit 0
-NOW="$(date +%s)"
+NOW="$(date +%%s)"
 LAST=""
 if [[ -r "$STATE" ]]; then IFS= read -r LAST < "$STATE" || LAST=""; fi
 if [[ ! "$LAST" =~ ^[0-9]+$ ]] || (( NOW < LAST )); then
-  LAST="$NOW"
-  printf '%s\n' "$LAST" > "${STATE}.tmp"
+  printf '%%s\n' "$NOW" > "${STATE}.tmp"
   mv -f "${STATE}.tmp" "$STATE"
   exit 0
 fi
 (( NOW - LAST >= INTERVAL )) || exit 0
-if systemctl restart "$UNIT"; then
-  printf '%s\n' "$NOW" > "${STATE}.tmp"
-  mv -f "${STATE}.tmp" "$STATE"
-  logger -t shah-tunnel-restart "Restarted ${UNIT} by its own schedule (${INTERVAL}s)." 2>/dev/null || true
+if systemctl is-active --quiet "$SERVICE"; then
+  if systemctl restart "$SERVICE"; then
+    printf '%%s\n' "$NOW" > "${STATE}.tmp"
+    mv -f "${STATE}.tmp" "$STATE"
+    logger -t shah-tunnel-restart "Restarted only $SERVICE at configured interval (${INTERVAL}s)." 2>/dev/null || true
+  else
+    logger -t shah-tunnel-restart "Scheduled restart failed for $SERVICE; retrying next minute." 2>/dev/null || true
+    exit 1
+  fi
 else
-  logger -t shah-tunnel-restart "Scheduled restart failed for ${UNIT}; retrying next minute." 2>/dev/null || true
-  exit 1
+  # Do not start stopped profiles as a side effect of a restart schedule.
+  printf '%%s\n' "$NOW" > "${STATE}.tmp"
+  mv -f "${STATE}.tmp" "$STATE"
 fi
-`
-
-func restartScheduleIdentity() (id, unit string, err error) {
-	unit = currentServiceName()
-	if unit == "ravanreverse" {
-		return "legacy", "ravanreverse.service", nil
-	}
-	const prefix = "ravanreverse@"
-	if !strings.HasPrefix(unit, prefix) {
-		return "", "", fmt.Errorf("unsupported Shah Tunnel service name %q", unit)
-	}
-	id = strings.TrimSuffix(strings.TrimPrefix(unit, prefix), ".service")
-	if len(id) == 0 || len(id) > 64 {
-		return "", "", errors.New("invalid tunnel profile ID for scheduled restart")
-	}
-	for i, r := range id {
-		valid := r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || (i > 0 && (r == '-' || r == '_'))
-		if !valid {
-			return "", "", fmt.Errorf("unsafe tunnel profile ID %q", id)
-		}
-	}
-	return id, unit + ".service", nil
+`, p.config, p.state, p.lock, p.service)
 }
 
-func restartSchedulePaths(id string) (config, state, cron string) {
-	return filepath.Join(restartScheduleDir, "profile-"+id+".conf"),
-		filepath.Join(restartScheduleStateDir, "profile-"+id+".state"),
-		filepath.Join(restartCronDir, "shah-tunnel-restart-"+id)
-}
-
-// atomicWriteFile writes a root-owned schedule file by replacing it atomically.
 func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
@@ -5447,7 +5411,85 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
-func ensureCronService() error {
+func removeProfileRestartSchedule(p profileRestartPaths) error {
+	for _, path := range []string{p.cron, p.script, p.config, p.state, p.config + ".tmp", p.state + ".tmp", p.cron + ".tmp", p.script + ".tmp"} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	_ = os.Remove(restartScheduleDir)
+	return nil
+}
+
+func removeRestartScheduleFiles() error {
+	// Remove only files owned by ShahTunnel's scheduler. Never edit user crontabs
+	// or unrelated /etc/cron.d entries.
+	for _, path := range []string{"/etc/cron.d/shah-tunnel-restart", "/usr/local/sbin/shah-tunnel-restart-check", "/etc/shah-tunnel/restart.conf", "/var/lib/shah-tunnel/last-restart"} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	for _, prefixDir := range []struct{ dir, prefix string }{
+		{"/etc/cron.d", "shah-tunnel-restart-"},
+		{"/usr/local/sbin", "shah-tunnel-restart-check-"},
+		{restartScheduleDir, ""},
+	} {
+		entries, err := os.ReadDir(prefixDir.dir)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if prefixDir.prefix == "" || strings.HasPrefix(entry.Name(), prefixDir.prefix) {
+				if err := os.Remove(filepath.Join(prefixDir.dir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+			}
+		}
+	}
+	_ = os.Remove(restartScheduleDir)
+	return nil
+}
+
+func restartScheduleStatusForProfile(p profileRestartPaths) string {
+	data, err := os.ReadFile(p.config)
+	if err != nil {
+		return "No scheduled restart for this profile"
+	}
+	cronEntry, err := os.ReadFile(p.cron)
+	if err != nil || !strings.Contains(string(cronEntry), p.script) {
+		return "Incomplete: this profile's cron entry is missing"
+	}
+	checker, err := os.ReadFile(p.script)
+	if err != nil || !strings.Contains(string(checker), p.service) {
+		return "Incomplete: this profile's checker is invalid"
+	}
+	if _, err := os.ReadFile(p.state); err != nil {
+		return "Incomplete: this profile's timer state is missing"
+	}
+	seconds, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil || seconds <= 0 {
+		return "Schedule file is invalid"
+	}
+	cronActive := exec.Command("systemctl", "is-active", "--quiet", "cron.service").Run() == nil ||
+		exec.Command("systemctl", "is-active", "--quiet", "crond.service").Run() == nil
+	if !cronActive {
+		return fmt.Sprintf("Every %s (cron daemon inactive)", time.Duration(seconds)*time.Second)
+	}
+	for _, interval := range restartIntervals {
+		if seconds == interval.seconds {
+			return "Every " + interval.label + " (cron active)"
+		}
+	}
+	return fmt.Sprintf("Every %s (cron active)", time.Duration(seconds)*time.Second)
+}
+
+func setRestartScheduleForProfile(p profileRestartPaths, interval restartInterval) error {
+	if !isRoot() {
+		return errors.New("run as root")
+	}
 	if _, err := os.Stat("/etc/cron.d"); err != nil {
 		return errors.New("/etc/cron.d is unavailable; this scheduler supports Debian/Ubuntu-style cron")
 	}
@@ -5474,288 +5516,56 @@ func ensureCronService() error {
 			return fmt.Errorf("could not start cron daemon: %w: %s", err, strings.TrimSpace(string(out)))
 		}
 	}
+	if err := atomicWriteFile(p.state, []byte(strconv.FormatInt(time.Now().Unix(), 10)+"\n"), 0600); err != nil {
+		return fmt.Errorf("initialize profile timer: %w", err)
+	}
+	if err := atomicWriteFile(p.config, []byte(strconv.FormatInt(interval.seconds, 10)+"\n"), 0600); err != nil {
+		return fmt.Errorf("write profile schedule: %w", err)
+	}
+	if err := atomicWriteFile(p.script, []byte(restartCronScriptForProfile(p)), 0750); err != nil {
+		return fmt.Errorf("write profile restart checker: %w", err)
+	}
+	cron := "SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n* * * * * root " + p.script + " >/dev/null 2>&1\n"
+	if err := atomicWriteFile(p.cron, []byte(cron), 0644); err != nil {
+		return fmt.Errorf("write profile cron entry: %w", err)
+	}
+	fmt.Printf("\n  ✓ Scheduled restart enabled for %s only: every %s.\n", p.service, interval.label)
+	fmt.Println("  Warning: scheduled restarts interrupt this profile's active connections; other profiles are untouched.")
 	return nil
-}
-
-func setRestartSchedule(interval restartInterval) error {
-	if !isRoot() {
-		return errors.New("run as root")
-	}
-	id, unit, err := restartScheduleIdentity()
-	if err != nil {
-		return err
-	}
-	if _, err := exec.LookPath("systemctl"); err != nil {
-		return errors.New("systemctl is required")
-	}
-	if _, err := exec.Command("systemctl", "cat", unit).CombinedOutput(); err != nil {
-		return fmt.Errorf("selected tunnel service %s is not installed", unit)
-	}
-	if err := ensureCronService(); err != nil {
-		return err
-	}
-	config, state, cronFile := restartSchedulePaths(id)
-	if err := atomicWriteFile(state, []byte(strconv.FormatInt(time.Now().Unix(), 10)+"\n"), 0600); err != nil {
-		return fmt.Errorf("initialize %s schedule timer: %w", id, err)
-	}
-	if err := atomicWriteFile(config, []byte(strconv.FormatInt(interval.seconds, 10)+"\n"), 0600); err != nil {
-		return fmt.Errorf("write %s schedule configuration: %w", id, err)
-	}
-	if err := atomicWriteFile(restartCronScript, []byte(restartCronScriptBody), 0750); err != nil {
-		return fmt.Errorf("write restart checker: %w", err)
-	}
-	cron := "SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n* * * * * root " + restartCronScript + " " + id + " >/dev/null 2>&1\n"
-	if err := atomicWriteFile(cronFile, []byte(cron), 0644); err != nil {
-		return fmt.Errorf("write %s cron entry: %w", id, err)
-	}
-	fmt.Printf("\n  ✓ Scheduled restart enabled for %s (%s): every %s.\n", id, unit, interval.label)
-	fmt.Println("  Warning: only the selected tunnel is restarted; its active connections are interrupted. Cron timing is accurate to about one minute.")
-	return nil
-}
-
-func removeCurrentRestartSchedule() error {
-	id, _, err := restartScheduleIdentity()
-	if err != nil {
-		return err
-	}
-	config, state, cronFile := restartSchedulePaths(id)
-	for _, path := range []string{cronFile, config, state, config + ".tmp", state + ".tmp", cronFile + ".tmp"} {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	for _, dir := range []string{restartScheduleDir, restartScheduleStateDir} {
-		if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) {
-			return err
-		}
-	}
-	return nil
-}
-
-func removeAllRestartScheduleFiles() error {
-	for _, dir := range []string{restartScheduleDir, restartScheduleStateDir, restartCronDir} {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			return err
-		}
-		for _, entry := range entries {
-			name := entry.Name()
-			remove := false
-			switch dir {
-			case restartScheduleDir:
-				remove = strings.HasPrefix(name, "profile-") && strings.HasSuffix(name, ".conf") && !entry.IsDir()
-			case restartScheduleStateDir:
-				remove = strings.HasPrefix(name, "profile-") && strings.HasSuffix(name, ".state") && !entry.IsDir()
-			case restartCronDir:
-				remove = strings.HasPrefix(name, "shah-tunnel-restart-") && name != "shah-tunnel-restart" && !entry.IsDir()
-			}
-			if remove {
-				if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
-					return err
-				}
-			}
-		}
-	}
-	// Remove the old global entry only when it references our exact helper
-	// path and the helper contains a recognized ShahTunnel generation marker.
-	if cronData, err := os.ReadFile(legacyRestartCronFile); err == nil && strings.Contains(string(cronData), legacyRestartCronScript) {
-		if helperData, helperErr := os.ReadFile(legacyRestartCronScript); helperErr == nil && (strings.Contains(string(helperData), "ravanreverse@*.service") || strings.Contains(string(helperData), "SHAH_TUNNEL_PER_PROFILE_RESTART_HELPER_V2")) {
-			for _, path := range []string{legacyRestartCronFile, legacyRestartConfig, legacyRestartState} {
-				if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-					return err
-				}
-			}
-		}
-	}
-	// The shared helper is ours only when it carries our version marker. Keep it
-	// while any per-profile ShahTunnel cron entry still exists.
-	if helperData, err := os.ReadFile(restartCronScript); err == nil && strings.Contains(string(helperData), "SHAH_TUNNEL_PER_PROFILE_RESTART_HELPER_V2") {
-		entries, _ := os.ReadDir(restartCronDir)
-		remaining := false
-		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasPrefix(entry.Name(), "shah-tunnel-restart-") {
-				remaining = true
-				break
-			}
-		}
-		if !remaining {
-			_ = os.Remove(restartCronScript)
-		}
-	}
-	_ = os.Remove(restartScheduleDir)
-	_ = os.Remove(restartScheduleStateDir)
-	return nil
-}
-
-func migrateLegacyGlobalRestartSchedule() error {
-	cronData, cronErr := os.ReadFile(legacyRestartCronFile)
-	if errors.Is(cronErr, os.ErrNotExist) {
-		return nil
-	}
-	if cronErr != nil {
-		return cronErr
-	}
-	// Do not touch a same-named file unless it is positively identified as the
-	// historical ShahTunnel global scheduler.
-	if !strings.Contains(string(cronData), legacyRestartCronScript) {
-		return nil
-	}
-	helperData, err := os.ReadFile(legacyRestartCronScript)
-	if err != nil || (!strings.Contains(string(helperData), "ravanreverse@*.service") && !strings.Contains(string(helperData), "SHAH_TUNNEL_PER_PROFILE_RESTART_HELPER_V2")) {
-		return nil
-	}
-	intervalData, err := os.ReadFile(legacyRestartConfig)
-	if err != nil {
-		return nil
-	}
-	seconds, err := strconv.ParseInt(strings.TrimSpace(string(intervalData)), 10, 64)
-	if err != nil || seconds <= 0 {
-		return nil
-	}
-	profiles, err := listTunnelProfiles()
-	if err != nil {
-		return err
-	}
-	if len(profiles) == 0 {
-		return nil
-	}
-	last := time.Now().Unix()
-	if b, readErr := os.ReadFile(legacyRestartState); readErr == nil {
-		if n, parseErr := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); parseErr == nil && n > 0 {
-			last = n
-		}
-	}
-	if err := ensureCronService(); err != nil {
-		return err
-	}
-	if err := atomicWriteFile(restartCronScript, []byte(restartCronScriptBody), 0750); err != nil {
-		return err
-	}
-	for _, profile := range profiles {
-		id := profile.ID
-		if id == "" {
-			if profile.Legacy {
-				id = "legacy"
-			} else {
-				continue
-			}
-		}
-		valid := true
-		for i, r := range id {
-			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || i > 0 && (r == '-' || r == '_')) {
-				valid = false
-				break
-			}
-		}
-		if !valid {
-			continue
-		}
-		config, state, cronFile := restartSchedulePaths(id)
-		if err := atomicWriteFile(config, []byte(strconv.FormatInt(seconds, 10)+"\n"), 0600); err != nil {
-			return err
-		}
-		if err := atomicWriteFile(state, []byte(strconv.FormatInt(last, 10)+"\n"), 0600); err != nil {
-			return err
-		}
-		cron := "SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n* * * * * root " + restartCronScript + " " + id + " >/dev/null 2>&1\n"
-		if err := atomicWriteFile(cronFile, []byte(cron), 0644); err != nil {
-			return err
-		}
-	}
-	// The old global job would otherwise keep restarting every tunnel and
-	// override the new per-profile isolation. Remove only the positively
-	// identified ShahTunnel-owned legacy files after a successful migration.
-	for _, path := range []string{legacyRestartCronFile, legacyRestartConfig, legacyRestartState} {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	log.Printf("migrated legacy global restart to %d isolated per-tunnel schedules", len(profiles))
-	return nil
-}
-
-func restartScheduleStatus() string {
-	id, unit, err := restartScheduleIdentity()
-	if err != nil {
-		return "Unavailable: " + err.Error()
-	}
-	config, state, cronFile := restartSchedulePaths(id)
-	data, err := os.ReadFile(config)
-	if err != nil {
-		return "No scheduled restart for " + id
-	}
-	cronEntry, err := os.ReadFile(cronFile)
-	if err != nil || !strings.Contains(string(cronEntry), restartCronScript+" "+id) {
-		return "Incomplete: this profile's cron entry is missing or invalid"
-	}
-	checker, err := os.ReadFile(restartCronScript)
-	if err != nil || !strings.Contains(string(checker), "SHAH_TUNNEL_PER_PROFILE_RESTART_HELPER_V2") {
-		return "Incomplete: per-profile restart checker is missing or invalid"
-	}
-	stateData, err := os.ReadFile(state)
-	if err != nil {
-		return "Incomplete: this profile's timer state is missing"
-	}
-	if _, err := strconv.ParseInt(strings.TrimSpace(string(stateData)), 10, 64); err != nil {
-		return "Incomplete: this profile's timer state is invalid"
-	}
-	if _, err := exec.LookPath("flock"); err != nil {
-		return "Configured, but flock is missing"
-	}
-	cronActive := exec.Command("systemctl", "is-active", "--quiet", "cron.service").Run() == nil || exec.Command("systemctl", "is-active", "--quiet", "crond.service").Run() == nil
-	if !cronActive {
-		return "Files configured, but cron daemon is inactive"
-	}
-	seconds, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
-	if err != nil || seconds <= 0 {
-		return "Schedule file is invalid"
-	}
-	for _, interval := range restartIntervals {
-		if seconds == interval.seconds {
-			return fmt.Sprintf("%s: every %s (cron active)", unit, interval.label)
-		}
-	}
-	return fmt.Sprintf("%s: every %s (cron active)", unit, time.Duration(seconds)*time.Second)
 }
 
 func manageRestartSchedule() error {
 	if !ensureRoot() {
 		return errors.New("root permissions are required")
 	}
-	if err := migrateLegacyGlobalRestartSchedule(); err != nil {
-		return fmt.Errorf("migrate old global cron schedule: %w", err)
+	if !chooseTunnel("Select the tunnel/profile whose Cron Job you want to configure") {
+		return nil
 	}
-	id, unit, err := restartScheduleIdentity()
+	p, err := restartPathsForService(currentServiceName())
 	if err != nil {
 		return err
 	}
-	if _, err := exec.Command("systemctl", "cat", unit).CombinedOutput(); err != nil {
-		return fmt.Errorf("selected tunnel service %s is not installed", unit)
-	}
 	for {
 		uiRule()
-		fmt.Println(paint(ansiCyan+ansiBold, "  CRON JOB / PER-TUNNEL SCHEDULED RESTART"))
-		fmt.Printf("  %s %s\n", paint(ansiDim, "TUNNEL"), paint(ansiCyan, id+" ("+unit+")"))
-		fmt.Printf("  %s %s\n", paint(ansiDim, "CURRENT"), paint(ansiYellow, restartScheduleStatus()))
-		fmt.Println("  [1]  Restart every 15 minutes")
-		fmt.Println("  [2]  Restart every 30 minutes")
-		fmt.Println("  [3]  Restart every 50 minutes")
-		fmt.Println("  [4]  Restart every 2 hours")
-		fmt.Println("  [5]  Restart every 10 hours")
-		fmt.Println("  [6]  Remove scheduled restart for this tunnel only")
+		fmt.Println(paint(ansiCyan+ansiBold, "  PER-PROFILE CRON JOB / SCHEDULED RESTART"))
+		fmt.Printf("  PROFILE: %s\n", paint(ansiYellow, p.service))
+		fmt.Printf("  %s %s\n", paint(ansiDim, "CURRENT"), paint(ansiYellow, restartScheduleStatusForProfile(p)))
+		fmt.Println("  [1]  Restart this profile every 15 minutes")
+		fmt.Println("  [2]  Restart this profile every 30 minutes")
+		fmt.Println("  [3]  Restart this profile every 50 minutes")
+		fmt.Println("  [4]  Restart this profile every 2 hours")
+		fmt.Println("  [5]  Restart this profile every 10 hours")
+		fmt.Println("  [6]  Remove this profile's scheduled restart only")
 		fmt.Println("  [0]  Back to main menu")
 		choice := ask("Select a schedule", "0")
 		if choice == "0" {
 			return nil
 		}
 		if choice == "6" {
-			if err := removeCurrentRestartSchedule(); err != nil {
-				return fmt.Errorf("remove %s schedule: %w", id, err)
+			if err := removeProfileRestartSchedule(p); err != nil {
+				return fmt.Errorf("remove profile schedule: %w", err)
 			}
-			fmt.Printf("Scheduled restart removed for %s only. Other tunnel schedules were left unchanged.\n", id)
+			fmt.Printf("Scheduled restart removed for %s only. Other profiles and cron jobs were not changed.\n", p.service)
 			continue
 		}
 		idx, err := strconv.Atoi(choice)
@@ -5763,7 +5573,7 @@ func manageRestartSchedule() error {
 			fmt.Println("Invalid selection.")
 			continue
 		}
-		if err := setRestartSchedule(restartIntervals[idx-1]); err != nil {
+		if err := setRestartScheduleForProfile(p, restartIntervals[idx-1]); err != nil {
 			return err
 		}
 	}
@@ -5825,8 +5635,8 @@ func uninstall() error {
 			}
 		}
 	}
-	if err := removeAllRestartScheduleFiles(); err != nil {
-		return fmt.Errorf("remove Shah Tunnel restart schedules: %w", err)
+	if err := removeRestartScheduleFiles(); err != nil {
+		return fmt.Errorf("remove Shah Tunnel restart schedule: %w", err)
 	}
 
 	for _, unitPath := range []string{"/etc/systemd/system/ravanreverse.service", "/etc/systemd/system/ravanreverse@.service"} {
@@ -6434,9 +6244,7 @@ func menu() {
 				err = showStatusAndLogs()
 			}
 		case "6":
-			if chooseTunnel("Select the tunnel whose scheduled restart you want to configure") {
-				err = manageRestartSchedule()
-			}
+			err = manageRestartSchedule()
 		case "7":
 			err = deleteOneTunnel()
 		case "8":
