@@ -1,6 +1,11 @@
-## 4.0.4 safety and profile scheduling
+## 4.0.5 safety and profile scheduling
 
 - Psiphon region policy now defaults to Germany and allows only the approved non-US region set: AE, TR, DE, RS, RO, BG, GR, GE, AM, AZ, NL, CH, AT, PL, CZ, SK, HU, FR, SE and FI. US and unrestricted/blank region configurations are rejected.
+
+### Psiphon concurrency / هم‌زمانی Psiphon
+
+4.0.5 tunes Psiphon `TunnelPoolSize` from host RAM/CPU so Xray port-forward streams can use multiple Psiphon tunnels instead of the upstream default of one. On a host with at least 4 GiB RAM and 2 CPUs the target is 8. This is separate from ShahTunnel’s 12 Agent lanes; actual throughput still depends on VPS and Psiphon network capacity.
+
 - Before applying the dedicated Psiphon Xray egress, ShahTunnel verifies the live exit country through the Psiphon SOCKS proxy. If the country is US, outside the allowlist, or cannot be verified, the route is refused.
 - Cron scheduled restarts are now scoped to one selected tunnel profile. Each profile gets separate config, state, lock, checker and `/etc/cron.d` entry; configuring or removing one profile does not restart or alter another profile.
 - Psiphon startup hotfix: the selected Agent service and a real Psiphon tunnel are brought up before the dedicated Xray sidecar is created. The sidecar setup waits for the loopback SOCKS5 listener instead of racing the child-process startup. Starting an incomplete profile with menu option 2 automatically retries the missing per-profile Xray setup.
@@ -11,9 +16,9 @@
 
 <img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel Galactic emblem" width="100%">
 
-# ShahTunnel 4.0.4
+# ShahTunnel 4.0.5
 
-[![Version](https://img.shields.io/badge/version-4.0.4-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-4.0.5-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -43,7 +48,7 @@ Client → Hub public mapping → authenticated Agent lanes → Agent local targ
 Selected Xray inbound → loopback-only Xray sidecar → WARP / Psiphon / Tor SOCKS5 → Internet
 ```
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v4.png" alt="ShahTunnel 4.0.4 Network Flow" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v4.png" alt="ShahTunnel 4.0.5 Network Flow" width="100%"></p>
 
 ## Capabilities
 
@@ -115,7 +120,7 @@ The Agent's `EXTERNAL EGRESS` menu can use Tor. On profile creation, ShahTunnel 
 
 When Psiphon cannot reach the Hub control port (for example, a custom `9448`), the Agent uses the Hub public Mapping endpoint on `443` for Psiphon egress only; the Direct path continues to use the configured control port. The Step 06 default is independent of the control port and points to TCP/443. The Hub distinguishes ShahTunnel control traffic from ordinary TLS with the dedicated `shah-tunnel-control/1` ALPN and forwards normal ClientHello bytes unchanged. This does not take over the public port, move a Mapping, or modify X-UI.
 
-For the complete ShahTunnel 4.0.4 feature set, run **4.0.4 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
+For the complete ShahTunnel 4.0.5 feature set, run **4.0.5 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
 
 ### Automatic Psiphon setup
 
@@ -234,4 +239,4 @@ sudo shah-tunnel menu
 - Psiphon buffer limits remain enabled on hosts with less than 3 GiB RAM. On hosts with at least 3 GiB RAM, the Meek and relay buffer caps are removed and the SSH channel window is set to 16 (512 KiB); low-memory hosts retain the documented default window of 4 (128 KiB). CPU thread limiting remains enabled on single-core hosts. The Psiphon tunnel-pool default is retained.
 - These settings target TCP throughput and more responsive lane selection. They cannot remove the physical latency of the client's route to the Hub, the Psiphon relay, or the selected destination. A client-reported value such as 635 ms must be measured end-to-end before and after deployment; no fixed reduction is guaranteed.
 
-Full-feature deployments should keep Hub and Agent on the same ShahTunnel 4.0.4 release. Historical version numbers are retained only in migration/repair code where they are needed to recognize existing installations; they are not separate current releases.
+Full-feature deployments should keep Hub and Agent on the same ShahTunnel 4.0.5 release. Historical version numbers are retained only in migration/repair code where they are needed to recognize existing installations; they are not separate current releases.
