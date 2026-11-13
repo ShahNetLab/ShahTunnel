@@ -1,9 +1,9 @@
 <div align="center">
-# ShahTunnel 4.0.9
+# ShahTunnel 5.0.0
 
 <p align="center"><img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel logo" width="72%"></p>
 
-[![Version](https://img.shields.io/badge/version-4.0.9-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-5.0.0-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -26,7 +26,7 @@
 <a id="network-flow"></a>
 ## Network Flow
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v4.png" alt="ShahTunnel network flow diagram" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow.png" alt="ShahTunnel network flow diagram" width="100%"></p>
 
 The Hub-to-Agent forwarding path and optional per-profile Internet egress are separate: the tunnel forwards mapped TCP services to Agent-side targets, while the optional Xray sidecar sends only the selected inbound through that Agent profile’s WARP, Psiphon or Tor SOCKS5 egress.
 
@@ -39,6 +39,7 @@ Selected Xray inbound → loopback-only Xray sidecar → WARP / Psiphon / Tor SO
 | | Capability | What it does |
 |:--:|---|---|
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Hub–Agent reverse relay** | The Hub exposes public TCP listeners; Agents connect outward and forward each mapping to its local target. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Emergency Tor profile** | Creates an independent backup Agent by cloning an existing Agent's Hub credentials and mappings, using only Snowflake or WebTunnel; the source profile is not changed. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Independent tunnel profiles** | Each named profile has its own configuration and systemd service. Start, stop and restart operations are profile-scoped. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Adaptive transport lanes** | Four implemented transports can be selected individually or used by adaptive failover modes. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Lane-level recovery** | Each Agent lane reconnects independently; one failed lane does not require dropping every healthy lane. New Agent profiles use 12 independent lanes by default (maximum 16). |
@@ -57,7 +58,7 @@ When a new Agent profile is created with Psiphon egress, ShahTunnel first instal
 
 For a newly created Tor Agent profile, ShahTunnel clones only the mapped Xray inbounds into a dedicated sidecar. User TCP and DNS traffic use that profile's isolated Tor SOCKS5 endpoint. UDP and unknown network types are blackholed instead of falling back to the server's direct route; UDP/QUIC applications and ICMP ping are therefore unsupported. The sidecar listens only on `127.0.0.1`, is stopped with its Agent service, and does not edit the original X-UI/Xray config or unrelated inbounds. Existing profiles are not modified automatically.
 
-**4.0.0 Psiphon performance tuning:** Tunnel-lane PING/PONG sampling runs every 5 seconds, uses a quicker 1/4 EWMA, and ranks only RTT samples fresher than 15 seconds; stale measurements cannot keep a degraded lane selected. Active-stream load remains part of the score. The isolated Xray sidecar keeps DNS caching enabled. Psiphon buffer limits are selected from actual host resources: below 3 GiB RAM, conservative Meek/relay limits and the documented SSH channel window default of 4 (128 KiB) are retained; at or above 3 GiB, Meek/relay caps are lifted and the SSH channel window is set to 16 (512 KiB) to improve TCP throughput on high-RTT paths. CPU-thread limiting is lifted only on hosts with at least 2 CPUs, and Psiphon's default tunnel-pool size is preserved. These are throughput and path-selection optimisations, not a promise that the physical Psiphon route or a client app's end-to-end connection time will have a lower RTT. The SOCKS5 user path carries TCP/DNS only; UDP/QUIC and ICMP ping are not supported and are blocked rather than sent Direct.
+**Psiphon performance tuning:** Tunnel-lane PING/PONG sampling runs every 5 seconds, uses a quicker 1/4 EWMA, and ranks only RTT samples fresher than 15 seconds; stale measurements cannot keep a degraded lane selected. Active-stream load remains part of the score. The isolated Xray sidecar keeps DNS caching enabled. Psiphon buffer limits are selected from actual host resources: below 3 GiB RAM, conservative Meek/relay limits and the documented SSH channel window default of 4 (128 KiB) are retained; at or above 3 GiB, Meek/relay caps are lifted and the SSH channel window is set to 16 (512 KiB) to improve TCP throughput on high-RTT paths. CPU-thread limiting is lifted only on hosts with at least 2 CPUs, and Psiphon's default tunnel-pool size is preserved. These are throughput and path-selection optimisations, not a promise that the physical Psiphon route or a client app's end-to-end connection time will have a lower RTT. The SOCKS5 user path carries TCP/DNS only; UDP/QUIC and ICMP ping are not supported and are blocked rather than sent Direct.
 
 ## Hub↔Agent transport modes
 
@@ -86,9 +87,15 @@ Choose a mode during tunnel creation. The Hub and Agent must use compatible sett
 | `Tor / WebTunnel` | Uses the same Tor path with a user-supplied Tor WebTunnel bridge line. |
 | `Adaptive` | Uses an already-active MASQUE path, configured Psiphon, and Direct failover; unsupported WARP protocols are not selected. |
 
+### Emergency Tor profiles from the manager menu
+
+The main manager exposes a separate `T` entry with exactly two transport choices: **Tor Snowflake** and **Tor WebTunnel**. Choose an existing Agent profile and ShahTunnel creates a new, independent backup profile by copying its Hub address, token, certificate fingerprint, transport policy, and mappings. Existing WARP/Psiphon/Tor Xray sidecar targets are restored to their original Xray targets in the new copy, then a new profile-scoped Tor SOCKS5 endpoint and Xray sidecar are prepared. The selected source Agent, its service, its Psiphon process, and its Xray sidecars are not altered.
+
+Snowflake uses the built-in default bridge. WebTunnel requires a current bridge line from Tor Bridges. The selected Hub public Mapping address is requested separately because the Tor path reaches the Mapping listener, not the Hub control listener. The manager waits for Tor bootstrap and an authenticated Agent lane; if that path cannot be confirmed, the new profile is retained for retry and is not reported as connected. Tor SOCKS5 carries TCP only; the isolated Xray sidecar routes DNS with TCP and blocks UDP/QUIC/ICMP to prevent direct-route leakage.
+
 ### Tor transport underlay: Snowflake and WebTunnel
 
-The Agent's `EXTERNAL EGRESS` menu can use Tor. On profile creation, ShahTunnel downloads the official Tor Expert Bundle 16.0 for amd64 or arm64, verifies its SHA-256 against the Tor Project's signed build manifest, and uses Tor with Lyrebird for Snowflake and WebTunnel. Installation occurs only when Tor is selected, so create and prepare the profile while the server still has download access.
+The Agent's `EXTERNAL EGRESS` menu can use Tor. On profile creation, ShahTunnel downloads the official Tor Expert Bundle 16.0.1 for amd64 or arm64, verifies its SHA-256 against the Tor Project's signed build manifest, and uses Tor with Lyrebird for Snowflake and WebTunnel. Installation occurs only when Tor is selected, so create and prepare the profile while the server still has download access.
 
 - **Snowflake** uses the documented default Tor bridge.
 - **WebTunnel** requires a valid bridge line obtained from Tor Bridges and entered in the wizard.
@@ -96,13 +103,11 @@ The Agent's `EXTERNAL EGRESS` menu can use Tor. On profile creation, ShahTunnel 
 - Tor routes both Agent-to-Hub TCP lanes and TCP/DNS from that Agent's selected Xray inbounds through its local SOCKS5 endpoint. The user sidecar sends UDP and unknown network types to a Blackhole outbound, preventing direct-IP fallback; UDP/QUIC and ICMP are unsupported. The Xray sidecar listens only on loopback and is stopped with its Agent service. The original X-UI/Xray config, unrelated inbounds, TUN devices, default routes, SSH and firewall rules are not changed.
 - Tor cannot create a network path when all IP/DNS connectivity between Agent and Hub is unavailable.
 
-**DNSTT and Slipstream are not included in this release.** Both require a delegated DNS domain, keys and a matching server on the opposite side. They cannot work as a standalone SOCKS underlay in the current Agent-to-Hub topology. A real integration needs a coordinated inside/outside endpoint and connection-flow design; adding menu entries without that server would be non-functional. Psiphon was already present in the previous source and remains available.
-
 ### Psiphon through the public TCP/443 Mapping
 
 When Psiphon cannot reach the Hub control port (for example, a custom `9448`), the Agent uses the Hub public Mapping endpoint on `443` for Psiphon egress only; the Direct path continues to use the configured control port. The Step 06 default is independent of the control port and points to TCP/443. The Hub distinguishes ShahTunnel control traffic from ordinary TLS with the dedicated `shah-tunnel-control/1` ALPN and forwards normal ClientHello bytes unchanged. This does not take over the public port, move a Mapping, or modify X-UI.
 
-For the complete ShahTunnel 4.0.9 feature set, run **4.0.9 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
+For the complete ShahTunnel feature set, run **5.0.0 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
 
 ### Automatic Psiphon setup
 
@@ -212,7 +217,7 @@ sudo shah-tunnel menu
 
 ---
 
-## Psiphon behavior and performance introduced in 4.0.0
+## Psiphon behavior and performance
 
 - A local SOCKS5 listener is not treated as proof that Psiphon has established an external tunnel. The Agent remains active while ConsoleClient retries, and the wizard reports a pending state until a real tunnel and Agent lanes are ready.
 - For the selected Agent profile, TCP and DNS from its cloned Xray inbounds use that profile's loopback Psiphon SOCKS5 proxy. UDP, QUIC and unknown network types are blocked in the isolated sidecar rather than falling back to the server's direct route. ICMP ping is not carried by this SOCKS5 path.
@@ -221,10 +226,10 @@ sudo shah-tunnel menu
 - Psiphon buffer limits remain enabled on hosts with less than 3 GiB RAM. On hosts with at least 3 GiB RAM, the Meek and relay buffer caps are removed and the SSH channel window is set to 16 (512 KiB); low-memory hosts retain the documented default window of 4 (128 KiB). CPU thread limiting remains enabled on single-core hosts. The Psiphon tunnel-pool default is retained.
 - These settings target TCP throughput and more responsive lane selection. They cannot remove the physical latency of the client's route to the Hub, the Psiphon relay, or the selected destination. A client-reported value such as 635 ms must be measured end-to-end before and after deployment; no fixed reduction is guaranteed.
 
-Full-feature deployments should keep Hub and Agent on the same ShahTunnel 4.0.9 release. Historical version numbers are retained only in migration/repair code where they are needed to recognize existing installations; they are not separate current releases.
+Full-feature deployments should keep Hub and Agent on the same ShahTunnel 5.0.0 release.
 
 
-## Multi-user performance notes (4.0.9)
+## Multi-user performance notes
 
 The Hub lane scheduler now considers authenticated RTT, active stream count, pending payload bytes, and recent data-write wait. The existing process-wide 64 MiB queued-payload ceiling is retained; queue-pressure and write-wait telemetry steer new flows away from congested lanes. Psiphon `TunnelPoolSize` is selected conservatively from RAM/CPU (2–16) and the US region is rejected; live egress-country verification remains mandatory. WARP per-tunnel proxy integration currently supports Cloudflare MASQUE Local Proxy only; WireGuard is not advertised as a compatible Xray Local Proxy underlay. Tor/Snowflake/WebTunnel remain fallback transports, not a high-throughput primary for large user populations.
 

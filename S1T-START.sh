@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 4.0.9 installer.
+# Shah Tunnel 5.0.0 installer.
 # Downloads the pinned Go 1.26.1 toolchain, verifies its SHA-256, fetches the source,
 # and builds the Linux binary on the target server. No prebuilt release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="4.0.9"
+VERSION="5.0.0"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
