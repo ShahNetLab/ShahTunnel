@@ -27,11 +27,11 @@
 <a id="network-flow"></a>
 ## Network Flow
 
-The Hub-to-Agent forwarding path and optional per-profile Internet egress are separate: the tunnel forwards mapped TCP services to Agent-side targets, while the optional Xray sidecar sends only the selected inbound through that Agent profile’s WARP or Psiphon SOCKS5 egress.
+The Hub-to-Agent forwarding path and optional per-profile Internet egress are separate: the tunnel forwards mapped TCP services to Agent-side targets, while the optional Xray sidecar sends only the selected inbound through that Agent profile’s WARP/MASQUE, Psiphon SOCKS5 or OpenVPN TCP egress.
 
 ```text
 Client → Hub public mapping → authenticated Agent lanes → Agent local target
-Selected Xray inbound → loopback-only Xray sidecar → WARP or Psiphon SOCKS5 → Internet
+Selected Xray inbound → loopback-only Xray sidecar → profile-scoped WARP / Psiphon SOCKS5 / OpenVPN TUN → Internet
 ```
 
 <p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v4.png" alt="ShahTunnel 4.0.0 Network Flow" width="100%"></p>
@@ -45,15 +45,26 @@ Selected Xray inbound → loopback-only Xray sidecar → WARP or Psiphon SOCKS5 
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Adaptive transport lanes** | Four implemented transports can be selected individually or used by adaptive failover modes. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Lane-level recovery** | Each Agent lane reconnects independently; one failed lane does not require dropping every healthy lane. New Agent profiles use 12 independent lanes by default (maximum 16). |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Multiple port mappings** | Mapping IDs pair Hub public listeners with Agent-side local targets. IDs must match on both ends. |
-| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **External Agent egress** | Agent traffic can use Direct, Cloudflare WARP/MASQUE or Psiphon/SOCKS5. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **External Agent egress** | Agent profiles can use Direct, Cloudflare WARP/MASQUE, Psiphon/SOCKS5 or a provider-supplied OpenVPN TCP profile. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Per-profile Xray WARP** | A selected Xray inbound is cloned to a loopback-only sidecar and routed through the local WARP SOCKS5 proxy. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Automatic WARP DNS path** | The isolated sidecar handles client DNS and routes its DoH resolver traffic through the same WARP egress. |
 | **Per-profile Psiphon user egress** | Selected Agent Xray inbounds are cloned into an isolated sidecar; TCP and DNS use Psiphon SOCKS5, while UDP is blocked to prevent direct leakage. |
+| **Per-profile OpenVPN egress** | A provider-supplied TCP `.ovpn` profile runs on a dedicated TUN, policy table and socket mark; only the selected Agent/Xray profile uses it. A blackhole policy rule prevents direct fallback if the VPN goes down. |
 
 
 ### Automatic Psiphon egress for user traffic
 
 When a new Agent profile is created with Psiphon egress, ShahTunnel automatically clones only the mapped Xray inbounds into a dedicated loopback-only sidecar before starting the Agent. TCP and DNS traffic use that profile's Psiphon SOCKS5 proxy. Psiphon's local port-forward SOCKS proxy carries TCP streams, not UDP; UDP and unknown network types are routed to a Blackhole outbound so they cannot silently fall back to the Agent's direct Internet connection. Consequently UDP/QUIC apps and ICMP ping are not supported on this Psiphon-only user path. No separate Psiphon action is added to the manager menu. Existing profiles are left untouched; this automatic setup applies to newly created Agent profiles. The X-UI source config, unrelated inbounds, other profiles, SSH and host routes are left unchanged.
+
+### OpenVPN TCP egress for one Agent profile
+
+Option `8` offers `OpenVPN TCP + tls-crypt` as its third external egress choice. In Option `9` (All-protocol adaptive), the Agent wizard can add the configured OpenVPN profile as another Hub-lane egress candidate. The country/server is selected by the provider-specific `.ovpn` file you download for that country; ShahTunnel does not bundle a VPN account, subscription, provider configuration or credentials.
+
+On the Agent, upload the provider's **TCP** `.ovpn` file and any required username/password file first. The wizard asks for the absolute `.ovpn` path and, when needed, a credentials file whose first line is the username and second line is the password. The manager installs `openvpn` and `iproute2` on Debian/Ubuntu when missing, validates that the profile uses TCP and `tls-crypt`/`tls-crypt-v2`, removes provider route/script overrides, copies referenced key material into a private per-profile directory, and verifies the actual public exit IP through a marked socket before accepting the profile.
+
+Each OpenVPN Agent gets its own TUN device, routing table, fwmark and systemd service. Only sockets marked by that Agent and its isolated Xray sidecar use that policy route; the host default route, SSH, X-UI and other profiles are not changed. The policy installs an explicit blackhole rule before the VPN starts and keeps it as the fallback, including for IPv6 when enabled. If the VPN is unavailable, the Xray sidecar cannot start and the Agent refuses to run with a missing OpenVPN user-egress integration.
+
+`tls-crypt`/`tls-crypt-v2` encrypts and authenticates OpenVPN control-channel packets; it is **not a guarantee of full-stream DPI camouflage**. A true OpenVPN-over-Stunnel/obfuscation service requires a compatible server-side endpoint from the provider. Also, TCP-mode OpenVPN can suffer TCP-over-TCP head-of-line effects on lossy networks, so it is a reachability option rather than a promise of lower latency. To change country, use the provider's TCP profile for the desired country when creating/recreating that Agent profile.
 
 **4.0.0 Psiphon performance tuning:** Tunnel-lane PING/PONG sampling runs every 5 seconds, uses a quicker 1/4 EWMA, and ranks only RTT samples fresher than 15 seconds; stale measurements cannot keep a degraded lane selected. Active-stream load remains part of the score. The isolated Xray sidecar keeps DNS caching enabled. Psiphon buffer limits are selected from actual host resources: below 3 GiB RAM, conservative Meek/relay limits and the documented SSH channel window default of 4 (128 KiB) are retained; at or above 3 GiB, Meek/relay caps are lifted and the SSH channel window is set to 16 (512 KiB) to improve TCP throughput on high-RTT paths. CPU-thread limiting is lifted only on hosts with at least 2 CPUs, and Psiphon's default tunnel-pool size is preserved. These are throughput and path-selection optimisations, not a promise that the physical Psiphon route or a client app's end-to-end connection time will have a lower RTT. The SOCKS5 user path carries TCP/DNS only; UDP/QUIC and ICMP ping are not supported and are blocked rather than sent Direct.
 
@@ -70,8 +81,8 @@ Choose a mode during tunnel creation. The Hub and Agent must use compatible sett
 | `5` | HTTP CONNECT fallback | Tries HTTP/2 CONNECT, then HTTP/1.1 CONNECT. |
 | `6` | Automatic fallback | Tries TCP/TLS, then WebSocket/TLS. |
 | `7` | Full Adaptive Failover | Uses all four implemented transports; each lane remembers its last successful transport. |
-| `8` | External egress | On an Agent, select Cloudflare MASQUE or Psiphon/SOCKS5. |
-| `9` | All-protocol adaptive | On an Agent, combines all four transports with active MASQUE, configured Psiphon and Direct egress failover. |
+| `8` | External egress | On an Agent, select Cloudflare MASQUE, Psiphon/SOCKS5 or provider-supplied OpenVPN TCP + tls-crypt. |
+| `9` | All-protocol adaptive | On an Agent, combines all four transports with active MASQUE, configured Psiphon, optional configured OpenVPN and Direct egress failover for Hub lanes. |
 
 ### Agent egress providers
 
@@ -80,7 +91,8 @@ Choose a mode during tunnel creation. The Hub and Agent must use compatible sett
 | `Direct` | Agent connects to the Hub through its normal network route. |
 | `Cloudflare WARP / MASQUE` | Requires WARP Connected over MASQUE and a reachable loopback WarpProxy / Local Proxy. System Tunnel mode is rejected for per-profile user egress. |
 | `Psiphon / SOCKS5` | ShahTunnel builds the official ConsoleClient on first use, creates a signed-server-list bootstrap config and an isolated loopback SOCKS5 endpoint. No manual binary or JSON is required. |
-| `Adaptive` | Uses an already-active MASQUE path, configured Psiphon, and Direct failover; unsupported WARP protocols are not selected. |
+| `OpenVPN TCP + tls-crypt` | Requires a country-specific provider TCP `.ovpn` file with `tls-crypt` or `tls-crypt-v2`; optional credentials are stored privately. Uses a dedicated per-profile TUN/policy route. |
+| `Adaptive` | Uses an already-active MASQUE path, configured OpenVPN (when added), configured Psiphon, and Direct failover for the Agent-to-Hub lanes; unsupported WARP protocols are not selected. |
 
 ### Psiphon through the public TCP/443 Mapping
 

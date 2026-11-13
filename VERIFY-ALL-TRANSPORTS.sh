@@ -52,7 +52,7 @@ printf '\n== 1/7: Resolve Go module metadata ==\n'
 pass "Module metadata resolved"
 
 printf '\n== 2/7: Formatting ==\n'
-unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go S1T-CAPSULE/xray_warp.go S1T-CAPSULE/xray_psiphon.go S1T-CAPSULE/psiphon.go S1T-CAPSULE/psiphon_test.go)"
+unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go S1T-CAPSULE/openvpn.go S1T-CAPSULE/xray_openvpn.go S1T-CAPSULE/xray_warp.go S1T-CAPSULE/xray_psiphon.go S1T-CAPSULE/psiphon.go S1T-CAPSULE/psiphon_test.go)"
 [[ -z "$unformatted" ]] || fail "gofmt required for: $unformatted"
 pass "Go source formatting"
 
@@ -104,6 +104,16 @@ grep -Fq 'TestPsiphonPerformanceProfileIsMemoryAndCPUAware' S1T-CAPSULE/psiphon_
 grep -Fq 'TestTunePsiphonPerformanceConfigPreservesUnknownFields' S1T-CAPSULE/psiphon_test.go || fail "Psiphon profile tuning compatibility coverage is missing."
 grep -Fq 'lanePingInterval = 5 * time.Second' S1T-CAPSULE/main.go || fail "Five-second lane RTT sampling is missing."
 grep -Fq 'dnsConfig["disableCache"] = false' S1T-CAPSULE/xray_warp.go || fail "Xray DNS cache is not explicitly enabled."
+grep -Fq 'func prepareOpenVPNAgentProfile(c *Config) error' S1T-CAPSULE/openvpn.go || fail "OpenVPN Agent profile setup is missing."
+grep -Fq 'func openVPNRouteHelperScript() []byte' S1T-CAPSULE/openvpn.go || fail "OpenVPN profile-scoped policy-routing helper is missing."
+grep -Fq 'func buildXrayOpenVPNConfig(' S1T-CAPSULE/xray_openvpn.go || fail "Per-profile Xray OpenVPN sidecar builder is missing."
+grep -Fq 'underlayOpenVPN' S1T-CAPSULE/main.go || fail "OpenVPN underlay is not wired into the Agent transport."
+grep -Fq 'TestSanitizeOpenVPNProviderProfileIsTCPIsolatedAndFailClosed' S1T-CAPSULE/main_test.go || fail "OpenVPN profile sanitizer regression coverage is missing."
+grep -Fq 'TestOpenVPNRouteHelperIsValidShellAndHasFailClosedRules' S1T-CAPSULE/main_test.go || fail "OpenVPN fail-closed policy route coverage is missing."
+grep -Fq 'TestAdaptiveUnderlayCandidatesIncludeConfiguredOpenVPN' S1T-CAPSULE/main_test.go || fail "Option 9 OpenVPN failover coverage is missing."
+grep -Fq 'OpenVPN TCP + tls-crypt' README.md || fail "English OpenVPN egress documentation is missing."
+grep -Fq 'OpenVPN TCP + tls-crypt' README-fa.md || fail "Persian OpenVPN egress documentation is missing."
+
 pass "Shell syntax, docs layout, Psiphon bootstrap/runtime, public-Mapping ALPN multiplex, MASQUE Local Proxy, and failover coverage"
 
 printf '\n== 4/7: Transport loopback suite ==\n'

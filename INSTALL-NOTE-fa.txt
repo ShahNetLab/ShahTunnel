@@ -4,13 +4,16 @@
 نکات این انتشار
 ---------------
 - برای مجموعهٔ کامل قابلیت‌ها، Hub و Agent هر دو باید نسخهٔ 4.0.0 را اجرا کنند.
-- گزینه‌های خروجی Agent شامل Cloudflare WARP over MASQUE با WarpProxy/Local Proxy و Psiphon ConsoleClient از طریق SOCKS5 محلی است. WireGuard از گزینه‌های پروژه حذف شده است.
-- انتخاب خروجی در زمان ساخت Agent اعمال می‌شود. WARP و Psiphon برای همان پروفایل Sidecar مستقل Xray می‌سازند؛ X-UI، فایل اصلی Xray، SSH، Routeهای میزبان و سایر پروفایل‌ها تغییر نمی‌کنند.
+- گزینه‌های خروجی Agent شامل Cloudflare WARP over MASQUE با WarpProxy/Local Proxy، ‏Psiphon ConsoleClient از طریق SOCKS5 محلی و OpenVPN TCP + tls-crypt است. WireGuard از گزینه‌های پروژه حذف شده است.
+- انتخاب خروجی در زمان ساخت Agent اعمال می‌شود. WARP، Psiphon و OpenVPN برای همان پروفایل Sidecar مستقل Xray می‌سازند؛ X-UI، فایل اصلی Xray، SSH، Route پیش‌فرض میزبان و سایر پروفایل‌ها تغییر نمی‌کنند.
+- OpenVPN به فایل TCP `.ovpn` کشور موردنظر از ارائه‌دهنده نیاز دارد؛ فایل و اطلاعات ورود ارائه‌دهنده داخل بسته نیست. ویزارد مسیر فایل را می‌گیرد، تنظیمات Route/Script ناخواسته را حذف می‌کند و IP خروجی را از طریق Socket دارای Mark بررسی می‌کند.
 - Psiphon از ConsoleClient رسمی و SOCKS5 فقط روی Loopback استفاده می‌کند. برای هر Agent تنظیمات JSON خصوصی، پورت SOCKS5 مستقل و پوشه دادهٔ مستقل ایجاد می‌شود. هیچ TUN یا مسیر پیش‌فرضی در میزبان ایجاد نمی‌شود.
 - خروجی Psiphon برای TCP و DNS همان Mapping از Sidecar مستقل Xray عبور می‌کند. UDP، QUIC و شبکه‌های ناشناخته به‌صورت fail-closed مسدود می‌شوند تا از مسیر مستقیم سرور خارج نشوند. ICMP ping از SOCKS5 عبور نمی‌کند.
 - اتصال Agent به Hub در حالت Psiphon نیز از SOCKS5 همان پروفایل استفاده می‌کند. اگر پورت کنترل از این مسیر قابل دسترسی نباشد، Endpoint جایگزین Mapping عمومی TCP/443 با ALPN اختصاصی ShahTunnel استفاده می‌شود؛ ترافیک عادی Mapping بدون تغییر عبور می‌کند.
 - آماده‌شدن Listener محلی SOCKS5 به‌تنهایی اتصال واقعی Psiphon محسوب نمی‌شود. سرویس Agent در وضعیت انتظار روشن می‌ماند تا Psiphon واقعاً متصل شود و Laneهای Agent آماده شوند.
 - در حالت WARP، اتصال MASQUE و Listener محلی WarpProxy بررسی می‌شوند. System Tunnel برای خروجی مستقل هر پروفایل پذیرفته نمی‌شود، چون مسیر آن در سطح میزبان است. ShahTunnel مسیر سیستم را تغییر نمی‌دهد و WARP را خودکار قطع یا وصل نمی‌کند.
+- OpenVPN برای هر Agent یک سرویس/TUN/جدول Policy/Mark مستقل می‌سازد. قانون Blackhole پیش از اتصال نصب می‌شود و با قطع VPN مسیر علامت‌گذاری‌شده را می‌بندد؛ Default Route میزبان و SSH تغییر نمی‌کنند. Sidecar Xray به سرویس OpenVPN وابسته است و اگر Integration خروجی ناقص باشد Agent شروع نمی‌شود.
+- `tls-crypt` یا `tls-crypt-v2` کانال کنترل OpenVPN را رمزگذاری و احراز می‌کند، اما Obfuscation کامل DPI نیست؛ OpenVPN-over-Stunnel به Endpoint سازگار سمت ارائه‌دهنده نیاز دارد. OpenVPN TCP ممکن است روی مسیرهای دارای Packet Loss به‌دلیل TCP-over-TCP تأخیر بیشتری داشته باشد.
 
 بهینه‌سازی Psiphon در نسخهٔ 4.0.0
 --------------------------------

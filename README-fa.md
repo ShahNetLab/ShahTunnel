@@ -29,13 +29,13 @@
 
 <div dir="rtl">
 
-مسیر انتقال Hub به Agent و خروجی اینترنت اختیاری هر پروفایل مستقل از یکدیگرند: تونل، Mappingهای TCP را به مقصد محلی Agent می‌رساند؛ مسیر اختیاری Xray فقط Inbound انتخاب‌شده را از خروجی SOCKS5 WARP یا Psiphon همان پروفایل عبور می‌دهد.
+مسیر انتقال Hub به Agent و خروجی اینترنت اختیاری هر پروفایل مستقل از یکدیگرند: تونل، Mappingهای TCP را به مقصد محلی Agent می‌رساند؛ Sidecar اختیاری Xray فقط Inbound انتخاب‌شده را از خروجی WARP/MASQUE، ‏Psiphon/SOCKS5 یا OpenVPN TCP همان پروفایل عبور می‌دهد.
 
 </div>
 
 ```text
 کاربر → پورت عمومی Hub → Laneهای احرازشده Agent → مقصد محلی Agent
-Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCKS5 خروجی WARP یا Psiphon → اینترنت
+Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → خروجی اختصاصی WARP / Psiphon SOCKS5 / OpenVPN TUN → اینترنت
 ```
 
 <p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v4-fa.png" alt="جریان شبکه ShahTunnel 4.0.0" width="100%"></p>
@@ -51,7 +51,7 @@ Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCK
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Laneهای انتقال تطبیقی** | چهار انتقال پیاده‌سازی‌شده به‌صورت جدا یا در حالت‌های Failover قابل استفاده‌اند. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **بازیابی مستقل Lane** | هر Lane جداگانه دوباره متصل می‌شود؛ خرابی یک Lane الزاماً Laneهای سالم را قطع نمی‌کند. پروفایل Agent جدید به‌صورت پیش‌فرض ۱۲ Lane مستقل دارد (حداکثر ۱۶). |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **چند Mapping پورت** | شناسه هر Mapping، Listener عمومی Hub را به مقصد محلی Agent متصل می‌کند و باید در دو سمت یکسان باشد. |
-| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **خروجی مستقل Agent** | خروجی Agent می‌تواند Direct، ‏WARP/MASQUE یا Psiphon/SOCKS5 باشد. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **خروجی مستقل Agent** | خروجی هر Agent می‌تواند Direct، ‏WARP/MASQUE، ‏Psiphon/SOCKS5 یا OpenVPN TCP ارائه‌دهنده باشد. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **WARP اختصاصی Xray** | Inbound انتخاب‌شده به Sidecar محدود به Loopback کپی و از SOCKS5 محلی WARP عبور داده می‌شود. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **خروجی کاربر از Psiphon** | Inboundهای همان Agent در Sidecar مستقل Xray کپی می‌شوند؛ TCP و DNS از SOCKS5 سایفون می‌روند و UDP برای جلوگیری از نشت مستقیم مسدود می‌شود. |
 
@@ -59,6 +59,16 @@ Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCK
 ### خروجی خودکار کاربران از Psiphon
 
 برای Agent جدیدی که هنگام ساخت، خروجی Psiphon را انتخاب می‌کند، Inboundهای Xray متناظر با Mappingها به‌صورت خودکار و پیش از شروع Agent در Sidecar مجزا و فقط روی `127.0.0.1` کپی می‌شوند. ترافیک TCP و DNS از SOCKS5 همان پروفایل عبور می‌کند. چون SOCKS5 محلی Psiphon یک پراکسی port-forward برای جریان TCP است و UDP را حمل نمی‌کند، UDP و هر نوع شبکهٔ ناشناخته در Sidecar به Blackhole می‌روند؛ بنابراین از خروج مستقیم UDP جلوگیری می‌شود، اما برنامه‌های UDP/QUIC و ICMP ping از این مسیر پشتیبانی نمی‌شوند. گزینهٔ جداگانه‌ای به منوی مدیریت اضافه نمی‌شود. پروفایل‌های قبلی دست‌نخورده باقی می‌مانند و این راه‌اندازی خودکار مخصوص Agentهای جدید است. این عملیات X-UI، کانفیگ اصلی Xray، سایر Inboundها، SSH و Routeهای میزبان را تغییر نمی‌دهد.
+
+### خروجی OpenVPN TCP برای یک پروفایل Agent
+
+گزینهٔ `8` در بخش External Egress، انتخاب سوم `OpenVPN TCP + tls-crypt` را ارائه می‌کند. در گزینهٔ `9` یعنی All-protocol adaptive نیز هنگام ساخت Agent می‌توان OpenVPN پیکربندی‌شده را به‌عنوان مسیر اضافهٔ Laneهای ارتباط با Hub فعال کرد. کشور و سرور خروجی با فایل `.ovpn` اختصاصی همان کشور که از ارائه‌دهنده دریافت می‌کنید مشخص می‌شود؛ ShahTunnel حساب VPN، اشتراک، فایل کانفیگ ارائه‌دهنده یا رمز عبور را همراه خود ندارد.
+
+قبل از ساخت Agent، فایل TCP ارائه‌دهنده و در صورت نیاز فایل نام کاربری/رمز عبور را به سرور Agent منتقل کنید. ویزارد مسیر مطلق فایل `.ovpn` و در صورت نیاز مسیر فایل اطلاعات ورود را می‌پرسد؛ فایل اطلاعات ورود باید نام کاربری را در خط اول و رمز را در خط دوم داشته باشد. در سیستم‌های Debian/Ubuntu، در صورت نبودن OpenVPN و iproute2، مدیر آن‌ها را نصب می‌کند. فایل ارائه‌دهنده از نظر TCP و وجود `tls-crypt`/`tls-crypt-v2` بررسی می‌شود؛ Routeها و اسکریپت‌های ناخواستهٔ ارائه‌دهنده حذف، کلیدهای ارجاع‌شده به پوشهٔ خصوصی همان پروفایل کپی و IP خروجی واقعی از طریق Socket علامت‌گذاری‌شده بررسی می‌شود.
+
+برای هر Agent یک TUN، جدول Route، ‏fwmark و سرویس systemd مستقل ساخته می‌شود. فقط Socketهای علامت‌گذاری‌شدهٔ همان Agent و Sidecar اختصاصی Xray از این مسیر استفاده می‌کنند؛ Default Route سرور، SSH، X-UI و پروفایل‌های دیگر تغییر نمی‌کنند. پیش از اتصال VPN یک قانون Blackhole نصب می‌شود و در زمان قطع VPN نیز به‌عنوان مسیر جایگزین باقی می‌ماند؛ این محافظت برای IPv6 فعال نیز اعمال می‌شود. اگر VPN برقرار نشود، Sidecar خروجی کاربر شروع نمی‌شود و Agent با Integration ناقص اجرا نخواهد شد.
+
+`tls-crypt`/`tls-crypt-v2` بسته‌های کانال کنترل OpenVPN را رمزگذاری و احراز می‌کند، اما **تضمین پنهان‌سازی کامل تمام ترافیک در برابر DPI نیست**. برای OpenVPN-over-Stunnel یا Obfuscation واقعی در سطح کل جریان، Endpoint سازگار سمت سرور باید توسط ارائه‌دهنده فراهم شده باشد. همچنین OpenVPN روی TCP در شبکهٔ دارای Packet Loss ممکن است به‌دلیل TCP-over-TCP تأخیر بیشتری ایجاد کند؛ پس گزینهٔ دسترسی‌پذیری است، نه تضمین پینگ پایین‌تر. برای تغییر کشور، فایل TCP کشور موردنظر را هنگام ساخت یا بازسازی همان پروفایل Agent انتخاب کنید.
 
 **بهینه‌سازی Psiphon در نسخه ۴٫۰٫۰:** اندازه‌گیری PING/PONG بین Hub و Agent هر ۵ ثانیه تازه می‌شود؛ میانگین‌گیری سریع‌تر (EWMA یک‌چهارم) است و فقط نمونه‌های تازه‌تر از ۱۵ ثانیه در انتخاب Lane نقش دارند. بار Streamهای فعال هم در امتیاز باقی می‌ماند و Cache DNS در Sidecar اختصاصی Xray فعال است. تنظیمات انتقال Psiphon متناسب با منابع میزبان است: زیر ۳ GiB RAM محدودیت محافظه‌کارانهٔ Meek/Relay و مقدار پیش‌فرض پنجرهٔ کانال SSH یعنی ۴ واحد (۱۲۸ KiB) حفظ می‌شود؛ از ۳ GiB به بالا محدودیت Meek/Relay برداشته و پنجرهٔ کانال SSH روی ۱۶ واحد (۵۱۲ KiB) تنظیم می‌شود تا توان TCP در مسیرهای دارای RTT زیاد بهتر شود. محدودیت Threadهای CPU فقط روی میزبان‌های حداقل دو هسته‌ای برداشته می‌شود و اندازهٔ پیش‌فرض Tunnel Pool سایفون حفظ می‌شود. این تغییرها برای انتخاب Lane بهتر و افزایش توان TCP هستند؛ زمان اتصال انتهابه‌انتهای برنامهٔ کاربر یا تأخیر فیزیکی مسیر Psiphon را تضمینی کاهش نمی‌دهند. SOCKS5 سایفون فقط TCP/DNS را حمل می‌کند؛ UDP/QUIC و ICMP ping پشتیبانی نمی‌شوند و به‌جای خروج مستقیم مسدود می‌شوند.
 ## انتقال‌های Hub↔Agent
@@ -74,8 +84,8 @@ Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCK
 | `5` | HTTP CONNECT fallback | ابتدا HTTP/2 و در صورت نیاز HTTP/1.1. |
 | `6` | Automatic fallback | ابتدا TCP/TLS و سپس WebSocket/TLS. |
 | `7` | Full Adaptive Failover | هر چهار انتقال؛ هر Lane آخرین انتقال موفق خود را ترجیح می‌دهد. |
-| `8` | External egress | در Agent انتخاب Cloudflare MASQUE یا Psiphon/SOCKS5. |
-| `9` | All-protocol adaptive | در Agent ترکیب هر چهار انتقال با Failover خروجی MASQUE فعال، Psiphon پیکربندی‌شده و Direct. |
+| `8` | External egress | در Agent انتخاب Cloudflare MASQUE، ‏Psiphon/SOCKS5 یا OpenVPN TCP + tls-crypt ارائه‌دهنده. |
+| `9` | All-protocol adaptive | در Agent ترکیب هر چهار انتقال با MASQUE فعال، Psiphon، OpenVPN اختیاری و Failover مسیرهای ارتباط Agent با Hub. |
 
 ### روش‌های خروجی Agent
 
@@ -84,7 +94,8 @@ Inbound انتخاب‌شده Xray → Sidecar محدود به Loopback → SOCK
 | `Direct` | اتصال Agent به Hub از مسیر عادی سرور. |
 | `WARP / MASQUE` | WARP باید با MASQUE متصل باشد و Listener محلی WarpProxy / Local Proxy داشته باشد؛ حالت System Tunnel برای جداسازی خروجی یک پروفایل پذیرفته نمی‌شود. |
 | `Psiphon / SOCKS5` | ShahTunnel در اولین استفاده ConsoleClient رسمی را می‌سازد، تنظیمات امضاشدهٔ دریافت فهرست سرورها و SOCKS5 اختصاصی را خودکار آماده می‌کند؛ نیازی به فایل باینری یا JSON دستی نیست. |
-| `Adaptive` | از MASQUE فعال، Psiphon پیکربندی‌شده و مسیر جایگزین Direct استفاده می‌کند؛ پروتکل‌های پشتیبانی‌نشدهٔ WARP انتخاب نمی‌شوند. |
+| `OpenVPN TCP + tls-crypt` | به فایل TCP `.ovpn` اختصاصی کشور از ارائه‌دهنده نیاز دارد؛ در صورت نیاز اعتبارنامه به‌صورت خصوصی نگهداری می‌شود و TUN/Policy مستقل همان Agent ساخته می‌شود. |
+| `Adaptive` | از MASQUE فعال، OpenVPN پیکربندی‌شده، Psiphon و Direct برای مسیرهای Agent به Hub استفاده می‌کند؛ پروتکل‌های پشتیبانی‌نشدهٔ WARP انتخاب نمی‌شوند. |
 
 ### اتصال Psiphon از پورت عمومی ۴۴۳
 
