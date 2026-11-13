@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "4.0.9"
+	version                          = "5.0.0"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -4899,6 +4899,317 @@ func generateCertificate(certPath, keyPath string) (string, error) {
 	sum := sha256.Sum256(der)
 	return hex.EncodeToString(sum[:]), nil
 }
+func emergencyTorModeFromChoice(choice string) (string, error) {
+	switch strings.TrimSpace(choice) {
+	case "1":
+		return torModeSnowflake, nil
+	case "2":
+		return torModeWebTunnel, nil
+	default:
+		return "", errors.New("select 1 for Tor Snowflake or 2 for Tor WebTunnel")
+	}
+}
+
+// cloneAgentConfigForEmergencyTor creates an independent Agent profile from an
+// existing Agent. It restores original mapping targets from any sidecar metadata
+// before switching only the clone to Tor; the source profile is never modified.
+func cloneAgentConfigForEmergencyTor(base Config, newName, mode string) (Config, error) {
+	if base.Role != "agent" {
+		return Config{}, errors.New("an emergency Tor profile can only be cloned from an Agent profile")
+	}
+	newName = strings.TrimSpace(newName)
+	if newName == "" || len([]rune(newName)) > 64 || strings.ContainsAny(newName, "/\\\r\n\x00") {
+		return Config{}, errors.New("emergency profile name is empty, too long, or contains an invalid path character")
+	}
+	if mode != torModeSnowflake && mode != torModeWebTunnel {
+		return Config{}, errors.New("emergency Tor mode must be snowflake or webtunnel")
+	}
+	cloned := base
+	// Config contains a slice; make it independent before restoring mapping
+	// targets so the source Agent remains byte-for-byte unchanged in memory.
+	cloned.Ports = append([]PortMapping(nil), base.Ports...)
+	cloned.Name = newName
+	cloned.Version = version
+	// Sidecar targets in a source profile are loopback inbounds. Restore each
+	// mapping to the original Xray target so this profile can build its own Tor
+	// sidecar without touching the source profile's services or files.
+	if base.XrayWARP != nil {
+		for _, binding := range base.XrayWARP.Bindings {
+			for i := range cloned.Ports {
+				if cloned.Ports[i].ID == binding.MappingID {
+					cloned.Ports[i].Target = binding.OriginalTarget
+				}
+			}
+		}
+	}
+	if base.XrayPsiphon != nil {
+		for _, binding := range base.XrayPsiphon.Bindings {
+			for i := range cloned.Ports {
+				if cloned.Ports[i].ID == binding.MappingID {
+					cloned.Ports[i].Target = binding.OriginalTarget
+				}
+			}
+		}
+	}
+	if base.XrayTor != nil {
+		for _, binding := range base.XrayTor.Bindings {
+			for i := range cloned.Ports {
+				if cloned.Ports[i].ID == binding.MappingID {
+					cloned.Ports[i].Target = binding.OriginalTarget
+				}
+			}
+		}
+	}
+	cloned.XrayWARP = nil
+	cloned.XrayPsiphon = nil
+	cloned.XrayTor = nil
+	cloned.Underlay = underlayTor
+	cloned.TorMode = mode
+	cloned.TorBridge = ""
+	cloned.TorProxy = ""
+	cloned.TorDataDir = ""
+	cloned.TorConfigPath = ""
+	cloned.TorBinary = ""
+	cloned.TorPTBinary = ""
+	if strings.TrimSpace(base.TorHubAddr) != "" {
+		cloned.TorHubAddr = base.TorHubAddr
+	} else if strings.TrimSpace(base.PsiphonHubAddr) != "" {
+		cloned.TorHubAddr = base.PsiphonHubAddr
+	} else {
+		cloned.TorHubAddr = defaultPsiphonHubAddress(base.HubAddr)
+	}
+	// Psiphon configuration is not part of the Tor clone. Keep the installed
+	// source profile's ConsoleClient service untouched.
+	cloned.PsiphonConfig = ""
+	cloned.PsiphonHubAddr = ""
+	cloned.PsiphonDataDir = ""
+	cloned = normalizeConfig(cloned)
+	if err := validateConfigBeforeTorPreparation(cloned); err != nil {
+		return Config{}, err
+	}
+	return cloned, nil
+}
+
+// validateConfigBeforeTorPreparation performs the checks that do not depend on
+// Tor binaries/allocated ports; validateConfig runs again after preparation.
+func validateConfigBeforeTorPreparation(c Config) error {
+	if c.Role != "agent" || !validTransportMode(c.Transport) || c.Underlay != underlayTor {
+		return errors.New("cloned emergency profile has an invalid Agent role or transport")
+	}
+	if err := validateTCPAddress("Hub address", c.HubAddr); err != nil {
+		return err
+	}
+	if err := validateTCPAddress("Tor Hub Mapping address", c.TorHubAddr); err != nil {
+		return err
+	}
+	if len(c.Token) < 48 || len(c.Token) > 240 || strings.ContainsAny(c.Token, "\r\n") {
+		return errors.New("source Agent token is invalid")
+	}
+	if len(c.Ports) == 0 {
+		return errors.New("source Agent has no port mappings")
+	}
+	for _, mapping := range c.Ports {
+		if !validMappingID(mapping.ID) {
+			return fmt.Errorf("source Agent has an invalid mapping ID %q", mapping.ID)
+		}
+		if err := validateTCPAddress("target for mapping "+mapping.ID, mapping.Target); err != nil {
+			return err
+		}
+	}
+	if _, err := normalizeFingerprint(c.Fingerprint); err != nil {
+		return err
+	}
+	return nil
+}
+
+func waitForTorAgentReady(service string, startedAt time.Time, timeout time.Duration) error {
+	if strings.TrimSpace(service) == "" || timeout <= 0 {
+		return errors.New("invalid Tor readiness wait parameters")
+	}
+	startMarker := fmt.Sprintf("@%d", startedAt.Unix())
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		logs, _ := exec.Command("journalctl", "-u", service, "--since", startMarker, "--no-pager", "-o", "cat").CombinedOutput()
+		logText := string(logs)
+		bootstrapped := strings.Contains(strings.ToLower(logText), "bootstrapped 100%")
+		laneReady := false
+		for _, line := range strings.Split(logText, "\n") {
+			if strings.Contains(line, "tunnel lane ") && strings.Contains(line, " connected via ") && strings.Contains(line, " over tor_socks5") {
+				laneReady = true
+				break
+			}
+		}
+		if bootstrapped && laneReady && exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
+			return nil
+		}
+		if exec.Command("systemctl", "is-active", "--quiet", service).Run() != nil {
+			return fmt.Errorf("emergency Agent service %s stopped before a Tor lane connected; recent logs:\n%s", service, strings.TrimSpace(logText))
+		}
+		time.Sleep(time.Second)
+	}
+	logs, _ := exec.Command("journalctl", "-u", service, "-n", "60", "--no-pager", "-o", "cat").CombinedOutput()
+	return fmt.Errorf("Tor did not establish an authenticated Agent lane within %s; the emergency profile remains saved for retry. Recent logs:\n%s", timeout.Round(time.Second), strings.TrimSpace(string(logs)))
+}
+
+func emergencyTorMenu() error {
+	uiRule()
+	fmt.Println(paint(ansiCyan+ansiBold, "  EMERGENCY TOR TRANSPORT"))
+	fmt.Println("  1) Tor Snowflake")
+	fmt.Println("  2) Tor WebTunnel")
+	fmt.Println("  0) Back")
+	choice := ask("Select the emergency Tor transport", "0")
+	if strings.TrimSpace(choice) == "0" {
+		return nil
+	}
+	mode, err := emergencyTorModeFromChoice(choice)
+	if err != nil {
+		return err
+	}
+	profiles, err := listTunnelProfiles()
+	if err != nil {
+		return err
+	}
+	agents := make([]TunnelProfile, 0, len(profiles))
+	for _, profile := range profiles {
+		if profile.Role == "agent" {
+			agents = append(agents, profile)
+		}
+	}
+	if len(agents) == 0 {
+		return errors.New("no Agent profile exists; create the primary Agent tunnel first")
+	}
+	fmt.Println(paint(ansiCyan+ansiBold, "\n  SOURCE AGENT PROFILES"))
+	for i, profile := range agents {
+		state := paint(ansiYellow, "○ STOPPED")
+		if exec.Command("systemctl", "is-active", "--quiet", profile.Service).Run() == nil {
+			state = paint(ansiGreen+ansiBold, "● RUNNING")
+		}
+		fmt.Printf("  [%d] %-24s %s\n", i+1, profile.Name, state)
+	}
+	selectedText := strings.TrimSpace(ask("Clone which Agent as an emergency Tor profile (number or name)", "1"))
+	selected := -1
+	if n, parseErr := strconv.Atoi(selectedText); parseErr == nil && n >= 1 && n <= len(agents) {
+		selected = n - 1
+	} else {
+		for i, profile := range agents {
+			if strings.EqualFold(selectedText, profile.Name) || strings.EqualFold(selectedText, profile.ID) {
+				selected = i
+				break
+			}
+		}
+	}
+	if selected < 0 {
+		return errors.New("selected Agent profile was not found")
+	}
+	data, err := os.ReadFile(agents[selected].Path)
+	if err != nil {
+		return fmt.Errorf("read source Agent profile: %w", err)
+	}
+	base, ok := parseTunnelProfileConfig(data)
+	if !ok || base.Role != "agent" {
+		return errors.New("selected source profile is not a valid Agent configuration")
+	}
+	defaultName := "emergency-tor-" + mode
+	newName := strings.TrimSpace(wizardAsk("Name for the independent emergency profile", defaultName))
+	newPath := tunnelConfigPath(newName)
+	if info, statErr := os.Stat(newPath); statErr == nil || !errors.Is(statErr, os.ErrNotExist) {
+		if statErr == nil && info != nil {
+			return fmt.Errorf("profile %q already exists; choose a different emergency profile name", newName)
+		}
+		return statErr
+	}
+	for _, profile := range profiles {
+		if strings.EqualFold(profile.Name, newName) || profile.ID == tunnelID(newName) {
+			return fmt.Errorf("profile %q already exists; choose a different emergency profile name", profile.Name)
+		}
+	}
+	cloned, err := cloneAgentConfigForEmergencyTor(base, newName, mode)
+	if err != nil {
+		return err
+	}
+	if mode == torModeWebTunnel {
+		cloned.TorBridge = strings.TrimSpace(wizardAsk("Paste one Tor WebTunnel bridge line from the Tor Bridges service", ""))
+		if err := validateTorBridgeLine(cloned.TorBridge); err != nil {
+			return fmt.Errorf("invalid WebTunnel bridge: %w", err)
+		}
+	}
+	defaultEndpoint := cloned.TorHubAddr
+	cloned.TorHubAddr = strings.TrimSpace(wizardAsk("Hub public Mapping address reachable through Tor SOCKS5 (IP:PORT)", defaultEndpoint))
+	if cloned.TorHubAddr == "" {
+		cloned.TorHubAddr = defaultEndpoint
+	}
+	if err := validateTCPAddress("Tor Hub Mapping address", cloned.TorHubAddr); err != nil {
+		return err
+	}
+	if err := prepareTorAgentProfile(&cloned); err != nil {
+		return fmt.Errorf("prepare emergency Tor profile: %w", err)
+	}
+	oldConfigPath := configPath
+	configPath = newPath
+	defer func() { configPath = oldConfigPath }()
+	rollback := func(c Config) error {
+		service := currentServiceName()
+		_ = exec.Command("systemctl", "disable", "--now", service).Run()
+		if saved, readErr := os.ReadFile(newPath); readErr == nil {
+			var persisted Config
+			if json.Unmarshal(saved, &persisted) == nil {
+				c = persisted
+			}
+		}
+		if c.XrayTor != nil {
+			if removeErr := removeXrayTorIntegration(&c); removeErr != nil {
+				return fmt.Errorf("remove emergency Xray Tor sidecar: %w", removeErr)
+			}
+		}
+		if err := os.Remove(newPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if c.TorDataDir != "" && filepath.Clean(filepath.Dir(c.TorDataDir)) == filepath.Clean(torDataRoot) {
+			if err := os.RemoveAll(c.TorDataDir); err != nil {
+				return err
+			}
+		}
+		if c.TorConfigPath != "" && filepath.Clean(filepath.Dir(c.TorConfigPath)) == filepath.Clean(torConfigDir) {
+			if err := os.Remove(c.TorConfigPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := saveConfig(cloned); err != nil {
+		_ = rollback(cloned)
+		return fmt.Errorf("save emergency Agent profile: %w", err)
+	}
+	uiInfo("Preparing the isolated Xray TCP/DNS sidecar for the emergency Tor profile...")
+	if err := autoApplyXrayTorForNewAgent(); err != nil {
+		if rollbackErr := rollback(cloned); rollbackErr != nil {
+			return fmt.Errorf("emergency Tor setup failed: %w; rollback also failed: %v", err, rollbackErr)
+		}
+		return fmt.Errorf("emergency Tor setup failed; the new profile was rolled back and the source Agent was preserved: %w", err)
+	}
+	startedAt := time.Now()
+	if _, err := ensureTunnelRunning(true); err != nil {
+		if rollbackErr := rollback(cloned); rollbackErr != nil {
+			return fmt.Errorf("start emergency Tor profile: %w; rollback also failed: %v", err, rollbackErr)
+		}
+		return fmt.Errorf("start emergency Tor profile failed; the new profile was rolled back and the source Agent was preserved: %w", err)
+	}
+	service := currentServiceName()
+	if err := waitForTorAgentReady(service, startedAt, torBootstrapTimeout+30*time.Second); err != nil {
+		uiWarn(err.Error())
+		uiInfo("The emergency profile was retained and remains available in the normal tunnel manager for another start attempt.")
+		return nil
+	}
+	modeLabel := "Tor Snowflake"
+	if mode == torModeWebTunnel {
+		modeLabel = "Tor WebTunnel"
+	}
+	uiSuccess(fmt.Sprintf("%s profile '%s' was created and started independently.", modeLabel, newName))
+	uiInfo("The original Agent profile and its services were not changed. Use the normal Start/Stop menu to control each profile independently.")
+	uiWarn("Tor carries TCP and DNS only on the isolated user path; UDP, QUIC and ICMP are blocked. A running Agent lane is required before treating the backup as ready.")
+	return nil
+}
+
 func setup() error {
 	wizardStep = 0
 	uiHeader("SHAH TUNNEL // SPACE SETUP", "MULTI-TUNNEL MANAGER   •   TLS 1.3   •   ZERO TRUST")
@@ -6207,6 +6518,7 @@ func menu() {
 		menuItem("6", "⏰ Scheduled restart", "Restart active tunnels on interval")
 		menuItem("7", "🗑️ Delete one tunnel", "Delete this tunnel only")
 		menuItem("8", "💣 Complete uninstall", "Remove all tunnels")
+		menuItem("T", "🛟 Emergency Tor profile", "Create backup Agent with Snowflake or WebTunnel")
 		menuItem("0", "🚪 Exit", "Close menu")
 		uiRule()
 		choice := ask("Select an operation", "0")
@@ -6246,6 +6558,8 @@ func menu() {
 			if errors.Is(err, errUninstallCancelled) {
 				err = nil
 			}
+		case "t", "T":
+			err = emergencyTorMenu()
 		case "0":
 			return
 		default:

@@ -2947,3 +2947,63 @@ func TestStartSelectedTunnelRepairsMissingPsiphonSidecar(t *testing.T) {
 		t.Fatal("start/restart must repair the Psiphon Xray sidecar after the Agent service starts")
 	}
 }
+
+func TestEmergencyTorModeFromChoice(t *testing.T) {
+	for choice, want := range map[string]string{"1": torModeSnowflake, "2": torModeWebTunnel} {
+		got, err := emergencyTorModeFromChoice(choice)
+		if err != nil || got != want {
+			t.Errorf("emergencyTorModeFromChoice(%q) = %q, %v; want %q", choice, got, err, want)
+		}
+	}
+	for _, choice := range []string{"", "0", "3", "snowflake", "webtunnel"} {
+		if _, err := emergencyTorModeFromChoice(choice); err == nil {
+			t.Errorf("invalid emergency Tor choice %q was accepted", choice)
+		}
+	}
+}
+
+func TestCloneAgentConfigForEmergencyTorRestoresSidecarTargets(t *testing.T) {
+	base := Config{
+		Name: "primary-agent", Version: "5.0.0", Role: "agent", Transport: transportAdaptive,
+		Underlay: underlayPsiphon, HubAddr: "203.0.113.10:9443", PsiphonHubAddr: "203.0.113.10:443",
+		PsiphonConfig: "/etc/ravanreverse/psiphon/primary-agent.json", Token: strings.Repeat("a", 64),
+		Fingerprint: strings.Repeat("b", 64), TunnelChannels: defaultTunnelChannels,
+		Ports: []PortMapping{{ID: "main", Target: "127.0.0.1:25001"}},
+		XrayPsiphon: &XrayPsiphonIntegration{Proxy: "127.0.0.1:1080", Bindings: []XrayPsiphonBinding{{
+			MappingID: "main", OriginalTarget: "127.0.0.1:443", PsiphonTarget: "127.0.0.1:25001",
+		}}},
+	}
+	cloned, err := cloneAgentConfigForEmergencyTor(base, "emergency-snowflake", torModeSnowflake)
+	if err != nil {
+		t.Fatalf("cloneAgentConfigForEmergencyTor failed: %v", err)
+	}
+	if cloned.Version != "5.0.0" || cloned.Underlay != underlayTor || cloned.TorMode != torModeSnowflake {
+		t.Fatalf("emergency clone has wrong release/underlay/mode: %+v", cloned)
+	}
+	if cloned.Transport != base.Transport || cloned.HubAddr != base.HubAddr || cloned.Token != base.Token || cloned.Fingerprint != base.Fingerprint {
+		t.Fatal("emergency clone changed the source Agent's transport credentials")
+	}
+	if cloned.TorHubAddr != base.PsiphonHubAddr {
+		t.Fatalf("Tor mapping endpoint = %q; want source public Mapping endpoint %q", cloned.TorHubAddr, base.PsiphonHubAddr)
+	}
+	if cloned.Ports[0].Target != "127.0.0.1:443" {
+		t.Fatalf("sidecar target was not restored: %q", cloned.Ports[0].Target)
+	}
+	if cloned.XrayPsiphon != nil || cloned.XrayWARP != nil || cloned.XrayTor != nil || cloned.PsiphonConfig != "" {
+		t.Fatal("emergency clone retained source-profile sidecar metadata")
+	}
+	if base.Version != "5.0.0" || base.Ports[0].Target != "127.0.0.1:25001" || base.XrayPsiphon == nil {
+		t.Fatal("source Agent config was modified while cloning")
+	}
+}
+
+func TestCloneAgentConfigForEmergencyTorRejectsNonAgentAndUnsafeMode(t *testing.T) {
+	base := Config{Role: "hub"}
+	if _, err := cloneAgentConfigForEmergencyTor(base, "backup", torModeSnowflake); err == nil {
+		t.Fatal("Hub profile was accepted as an emergency Agent source")
+	}
+	base.Role = "agent"
+	if _, err := cloneAgentConfigForEmergencyTor(base, "backup", "unknown"); err == nil {
+		t.Fatal("unsupported emergency transport was accepted")
+	}
+}
