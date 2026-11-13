@@ -1,7 +1,7 @@
 <div align="center">
-# ShahTunnel 4.0.7
+# ShahTunnel 4.0.8
 
-[![Version](https://img.shields.io/badge/version-4.0.7-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-4.0.8-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -24,7 +24,9 @@
 <a id="network-flow"></a>
 ## Network Flow
 
-The Hub-to-Agent forwarding path and optional per-profile Internet egress are separate: the tunnel forwards mapped TCP services to Agent-side targets, while the optional Xray sidecar sends only the selected inbound through that Agent profile’s WARP, Psiphon or Tor SOCKS5 egress.
+The Hub-to-Agent forwarding path and final user Internet egress are separate layers: the tunnel forwards mapped TCP services to Agent-side targets, while the optional Xray sidecar sends the selected inbound through that Agent profile’s SOCKS5 egress. In 4.0.8, when final user egress is Psiphon, Agent→Hub lanes prefer Direct or WARP/MASQUE where reachable so Psiphon is not needlessly nested twice; the users' final public IP remains Psiphon. Psiphon remains the last-resort outer path only when the other routes cannot reach the Hub.
+
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v4.png" alt="ShahTunnel network flow diagram" width="100%"></p>
 
 ```text
 Client → Hub public mapping → authenticated Agent lanes → Agent local target
@@ -98,7 +100,7 @@ The Agent's `EXTERNAL EGRESS` menu can use Tor. On profile creation, ShahTunnel 
 
 When Psiphon cannot reach the Hub control port (for example, a custom `9448`), the Agent uses the Hub public Mapping endpoint on `443` for Psiphon egress only; the Direct path continues to use the configured control port. The Step 06 default is independent of the control port and points to TCP/443. The Hub distinguishes ShahTunnel control traffic from ordinary TLS with the dedicated `shah-tunnel-control/1` ALPN and forwards normal ClientHello bytes unchanged. This does not take over the public port, move a Mapping, or modify X-UI.
 
-For the complete ShahTunnel 4.0.7 feature set, run **4.0.7 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
+For the complete ShahTunnel 4.0.8 feature set, run **4.0.8 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
 
 ### Automatic Psiphon setup
 
@@ -217,10 +219,12 @@ sudo shah-tunnel menu
 - Psiphon buffer limits remain enabled on hosts with less than 3 GiB RAM. On hosts with at least 3 GiB RAM, the Meek and relay buffer caps are removed and the SSH channel window is set to 16 (512 KiB); low-memory hosts retain the documented default window of 4 (128 KiB). CPU thread limiting remains enabled on single-core hosts. The Psiphon tunnel-pool default is retained.
 - These settings target TCP throughput and more responsive lane selection. They cannot remove the physical latency of the client's route to the Hub, the Psiphon relay, or the selected destination. A client-reported value such as 635 ms must be measured end-to-end before and after deployment; no fixed reduction is guaranteed.
 
-Full-feature deployments should keep Hub and Agent on the same ShahTunnel 4.0.7 release. Historical version numbers are retained only in migration/repair code where they are needed to recognize existing installations; they are not separate current releases.
+Full-feature deployments should keep Hub and Agent on the same ShahTunnel 4.0.8 release. Historical version numbers are retained only in migration/repair code where they are needed to recognize existing installations; they are not separate current releases.
 
 
-## Multi-user performance notes (4.0.7)
+With final Psiphon user egress enabled, the outer Agent→Hub lane is now kept separate: Direct or active WARP/MASQUE is preferred for the lane, while the Xray sidecar continues to send user traffic through Psiphon. Psiphon is retained as an outer last resort only when Direct/WARP cannot reach the Hub; that double-Psiphon fallback is logged explicitly.
+
+## Multi-user performance notes (4.0.8)
 
 The Hub lane scheduler now considers authenticated RTT, active stream count, pending payload bytes, and recent data-write wait. The existing process-wide 64 MiB queued-payload ceiling is retained; queue-pressure and write-wait telemetry steer new flows away from congested lanes. Psiphon `TunnelPoolSize` is selected conservatively from RAM/CPU (2–16) and the US region is rejected; live egress-country verification remains mandatory. WARP per-tunnel proxy integration currently supports Cloudflare MASQUE Local Proxy only; WireGuard is not advertised as a compatible Xray Local Proxy underlay. Tor/Snowflake/WebTunnel remain fallback transports, not a high-throughput primary for large user populations.
 
