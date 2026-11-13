@@ -154,10 +154,10 @@ func buildTorClientConfig(cfg Config) (string, error) {
 	geo4, geo6 := torGeoIPFilePaths()
 	b.WriteString("GeoIPFile " + geo4 + "\n")
 	b.WriteString("GeoIPv6File " + geo6 + "\n")
-	// Exclude US relays at every Tor circuit position, not merely the exit.
-	// Unknown-country relays are also rejected; strict mode makes this fail closed.
-	b.WriteString("ExcludeNodes {us},{??}\n")
-	b.WriteString("GeoIPExcludeUnknown 1\n")
+	// Restrict only exit relays: Snowflake/WebTunnel bridges and guards may have
+	// unknown GeoIP metadata and must remain usable as non-exit circuit hops.
+	// The live SOCKS egress verifier independently rejects US/unknown exits.
+	b.WriteString("ExcludeExitNodes {us},{??}\n")
 	b.WriteString("StrictNodes 1\n")
 	b.WriteString("DataDirectory " + cfg.TorDataDir + "\n")
 	b.WriteString("SocksPort " + cfg.TorProxy + " IsolateSOCKSAuth\n")

@@ -5334,7 +5334,7 @@ func emergencyTorMenu() error {
 		return fmt.Errorf("could not isolate the emergency Tor Agent; the new profile was rolled back: %w", pauseErr)
 	}
 	if len(pausedServices) > 0 {
-		uiWarn(fmt.Sprintf("Paused %d other Agent profile(s) sharing this Hub/token. They remain saved and enabled; this prevents the Hub from sending user traffic over non-Tor lanes.", len(pausedServices)))
+		uiWarn(fmt.Sprintf("Paused %d conflicting Agent profile(s) sharing this Hub/token. Their profile files are preserved, but the services are stopped; any previously enabled auto-start entries are disabled while this Tor profile is active.", len(pausedServices)))
 	}
 	rollbackAndRestore := func(cause error, stage string) error {
 		cleanupErr := rollback(cloned)
