@@ -154,10 +154,12 @@ func buildTorClientConfig(cfg Config) (string, error) {
 	geo4, geo6 := torGeoIPFilePaths()
 	b.WriteString("GeoIPFile " + geo4 + "\n")
 	b.WriteString("GeoIPv6File " + geo6 + "\n")
-	// Exclude every Tor relay geolocated in the United States at every circuit
-	// position, not only exits. Do not exclude {??}: Snowflake/WebTunnel bridges
-	// can legitimately have unknown GeoIP metadata and must remain usable.
-	b.WriteString("ExcludeNodes {us}\n")
+	// Strict emergency policy: exclude U.S. and unknown-country nodes at every
+	// circuit position. Emergency mode is WebTunnel-only because Snowflake's
+	// rotating volunteer proxies cannot be country-pinned or guaranteed non-US.
+	// A WebTunnel bridge must therefore have a known non-US GeoIP entry too.
+	b.WriteString("ExcludeNodes {us},{??}\n")
+	b.WriteString("GeoIPExcludeUnknown 1\n")
 	b.WriteString("StrictNodes 1\n")
 	b.WriteString("DataDirectory " + cfg.TorDataDir + "\n")
 	b.WriteString("SocksPort " + cfg.TorProxy + " IsolateSOCKSAuth\n")

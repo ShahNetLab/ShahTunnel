@@ -68,7 +68,8 @@ func TestBuildTorClientConfigIsLoopbackOnlyAndProfileScoped(t *testing.T) {
 		"UseBridges 1\n",
 		"GeoIPFile " + geo4 + "\n",
 		"GeoIPv6File " + geo6 + "\n",
-		"ExcludeNodes {us}\n",
+		"ExcludeNodes {us},{??}\n",
+		"GeoIPExcludeUnknown 1\n",
 		"StrictNodes 1\n",
 		"DataDirectory " + cfg.TorDataDir + "\n",
 		"SocksPort 127.0.0.1:19050 IsolateSOCKSAuth\n",
@@ -82,8 +83,8 @@ func TestBuildTorClientConfigIsLoopbackOnlyAndProfileScoped(t *testing.T) {
 	if strings.Contains(got, "SocksPort 0.0.0.0") || strings.Contains(got, "SocksPort 0\n") {
 		t.Fatal("Tor SOCKS endpoint must never listen on a public interface")
 	}
-	if strings.Contains(got, "{??}") || strings.Contains(got, "ExcludeExitNodes") {
-		t.Fatal("unknown-country exclusion or exit-only exclusion can break Snowflake and does not enforce all-position US blocking")
+	if !strings.Contains(got, "ExcludeNodes {us},{??}\n") || strings.Contains(got, "ExcludeExitNodes") {
+		t.Fatal("strict Tor policy must exclude US and unknown-country nodes at every circuit position")
 	}
 }
 

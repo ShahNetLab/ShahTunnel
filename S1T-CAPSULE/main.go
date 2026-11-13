@@ -5041,11 +5041,11 @@ func generateCertificate(certPath, keyPath string) (string, error) {
 func emergencyTorModeFromChoice(choice string) (string, error) {
 	switch strings.TrimSpace(choice) {
 	case "1":
-		return torModeSnowflake, nil
-	case "2":
+		// The only available emergency transport is WebTunnel. Snowflake uses
+		// rotating volunteer proxies whose country cannot be guaranteed.
 		return torModeWebTunnel, nil
 	default:
-		return "", errors.New("select 1 for Tor Snowflake or 2 for Tor WebTunnel")
+		return "", errors.New("strict no-US emergency mode supports WebTunnel only; Snowflake is disabled because volunteer proxy geography cannot be guaranteed")
 	}
 }
 
@@ -5193,11 +5193,10 @@ func waitForTorAgentReady(service string, startedAt time.Time, timeout time.Dura
 func emergencyTorMenu() error {
 	uiRule()
 	fmt.Println(paint(ansiCyan+ansiBold, "  EMERGENCY TOR TRANSPORT"))
-	fmt.Println("  1) Tor Snowflake")
-	fmt.Println("  2) Tor WebTunnel")
-	fmt.Println("  3) Back")
-	choice := ask("Select the emergency Tor transport", "3")
-	if strings.TrimSpace(choice) == "3" || strings.TrimSpace(choice) == "0" {
+	fmt.Println("  1) Tor WebTunnel (strict no-US; verified non-US bridge required)")
+	fmt.Println("  2) Back")
+	choice := ask("Select the emergency Tor transport", "2")
+	if strings.TrimSpace(choice) == "2" || strings.TrimSpace(choice) == "0" {
 		return nil
 	}
 	mode, err := emergencyTorModeFromChoice(choice)

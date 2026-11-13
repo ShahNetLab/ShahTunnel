@@ -2949,13 +2949,10 @@ func TestStartSelectedTunnelRepairsMissingPsiphonSidecar(t *testing.T) {
 }
 
 func TestEmergencyTorModeFromChoice(t *testing.T) {
-	for choice, want := range map[string]string{"1": torModeSnowflake, "2": torModeWebTunnel} {
-		got, err := emergencyTorModeFromChoice(choice)
-		if err != nil || got != want {
-			t.Errorf("emergencyTorModeFromChoice(%q) = %q, %v; want %q", choice, got, err, want)
-		}
+	if got, err := emergencyTorModeFromChoice("1"); err != nil || got != torModeWebTunnel {
+		t.Errorf("emergencyTorModeFromChoice(1) = %q, %v; want strict WebTunnel", got, err)
 	}
-	for _, choice := range []string{"", "0", "3", "snowflake", "webtunnel"} {
+	for _, choice := range []string{"", "0", "2", "3", "snowflake", "webtunnel"} {
 		if _, err := emergencyTorModeFromChoice(choice); err == nil {
 			t.Errorf("invalid emergency Tor choice %q was accepted", choice)
 		}
