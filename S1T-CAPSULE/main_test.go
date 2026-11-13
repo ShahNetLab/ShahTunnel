@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -1566,7 +1567,7 @@ func TestPsiphonHubAddressDefaultsToPublicMappingPort(t *testing.T) {
 }
 
 func TestUnderlayModesAndLoopbackValidation(t *testing.T) {
-	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayAdaptive} {
+	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayAdaptive, underlayOpenVPN} {
 		if !validUnderlayMode(mode) {
 			t.Fatalf("valid underlay %q was rejected", mode)
 		}
@@ -2783,5 +2784,207 @@ func TestHubPrefersFreshRTTOverStaleLowRTT(t *testing.T) {
 	h := &hubServer{sessions: map[*hubSession]struct{}{staleFormerlyFast: {}, freshHealthy: {}}}
 	if got := h.current(); got != freshHealthy {
 		t.Fatalf("selected lane %d; want fresh lane %d despite stale lower RTT", got.id, freshHealthy.id)
+	}
+}
+
+func TestSanitizeOpenVPNProviderProfileIsTCPIsolatedAndFailClosed(t *testing.T) {
+	dir := t.TempDir()
+	ca := filepath.Join(dir, "ca.crt")
+	tlsCrypt := filepath.Join(dir, "tls-crypt.key")
+	auth := filepath.Join(dir, "credentials.txt")
+	for path, data := range map[string]string{ca: "test-ca", tlsCrypt: "test-tls-crypt", auth: "user-example\npass-example\n"} {
+		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	profile := filepath.Join(dir, "country-tcp.ovpn")
+	content := "client\nproto tcp-client\nremote vpn.example 443\nca ca.crt\ntls-crypt tls-crypt.key\nauth-user-pass credentials.txt\ndev tun\nredirect-gateway def1\nroute 10.0.0.0 255.0.0.0\nup /tmp/attacker.sh\ntls-verify /tmp/attacker-verify.sh\nauth-user-pass-verify /tmp/attacker-auth.sh via-file\nclient-connect /tmp/attacker-connect.sh\nscript-security 2\n"
+	if err := os.WriteFile(profile, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	managed := filepath.Join(dir, "managed", "client.ovpn")
+	route := openVPNRouteInfo{Table: 21001, Mark: 5500001, Priority: 11001, Device: "tuntest01"}
+	if _, err := sanitizeOpenVPNProfile(profile, managed, "", "profile", openVPNRouteHelperPath, route); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(managed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(got)
+	for _, want := range []string{"proto tcp-client", "route-nopull", "dev tuntest01", "tls-crypt", "remote-cert-tls server", "auth-user-pass", "openvpn-route.sh up 21001 5500001 11001", "openvpn-route.sh down 21001 5500001 11001"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("sanitized OpenVPN config missing %q:\n%s", want, text)
+		}
+	}
+	for _, forbidden := range []string{"redirect-gateway", "route 10.0.0.0", "up /tmp/attacker.sh", "tls-verify /tmp/attacker-verify.sh", "auth-user-pass-verify", "client-connect /tmp/attacker-connect.sh"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("unsafe/provider routing directive %q survived sanitization:\n%s", forbidden, text)
+		}
+	}
+	managedAuth, err := os.ReadFile(filepath.Join(filepath.Dir(managed), "auth.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(managedAuth) != "user-example\npass-example\n" {
+		t.Fatalf("managed credentials differ: %q", managedAuth)
+	}
+	st, err := os.Stat(filepath.Join(filepath.Dir(managed), "auth.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0600 {
+		t.Fatalf("credentials permissions=%o; want 0600", st.Mode().Perm())
+	}
+	for _, name := range []string{"ca.crt-", "tls-crypt.key-"} {
+		matches, _ := filepath.Glob(filepath.Join(filepath.Dir(managed), name+"*"))
+		if len(matches) == 0 {
+			t.Fatalf("referenced provider key material %q was not bundled", name)
+		}
+	}
+}
+
+func TestSanitizeOpenVPNRejectsUDPAndMissingTLSCrypt(t *testing.T) {
+	dir := t.TempDir()
+	for name, content := range map[string]string{
+		"udp.ovpn":         "client\nproto udp\nremote vpn.example 1194\n<tls-crypt>\nsecret\n</tls-crypt>\n",
+		"notls.ovpn":       "client\nproto tcp-client\nremote vpn.example 443\n",
+		"wrongverify.ovpn": "client\nproto tcp-client\nremote vpn.example 443\nremote-cert-tls client\n<tls-crypt>\nsecret\n</tls-crypt>\n",
+	} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := sanitizeOpenVPNProfile(path, filepath.Join(dir, name+".managed"), "", "test", openVPNRouteHelperPath, openVPNRouteInfo{Table: 21001, Mark: 5500001, Priority: 11001, Device: "tuntest"})
+		if err == nil {
+			t.Fatalf("unsafe/incompatible profile %s was accepted", name)
+		}
+	}
+}
+
+func TestBuildXrayOpenVPNConfigMarksOnlyClonedProfileAndDNS(t *testing.T) {
+	original := []byte(`{"inbounds":[{"tag":"users","listen":"0.0.0.0","port":2083,"protocol":"vless","settings":{"clients":[{"id":"test"}]}}],"outbounds":[{"tag":"direct","protocol":"freedom"}],"routing":{"rules":[]}}`)
+	before := append([]byte(nil), original...)
+	generated, bindings, outTag, err := buildXrayOpenVPNConfig(original, "ovpn-profile", 5511223, []PortMapping{{ID: "main", Target: "127.0.0.1:2083"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(original, before) {
+		t.Fatal("source X-UI config was mutated")
+	}
+	if len(bindings) != 1 || bindings[0].OriginalTarget != "127.0.0.1:2083" || bindings[0].OpenVPNTarget == bindings[0].OriginalTarget {
+		t.Fatalf("unexpected OpenVPN bindings: %#v", bindings)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(generated, &got); err != nil {
+		t.Fatal(err)
+	}
+	outbounds := got["outbounds"].([]any)
+	found := false
+	dnsMarked := false
+	for _, raw := range outbounds {
+		x := raw.(map[string]any)
+		if x["tag"] == outTag {
+			found = true
+			if x["protocol"] != "freedom" {
+				t.Fatalf("OpenVPN outbound protocol=%v", x["protocol"])
+			}
+			stream := x["streamSettings"].(map[string]any)
+			sock := stream["sockopt"].(map[string]any)
+			if sock["mark"] != float64(5511223) {
+				t.Fatalf("user outbound mark=%v", sock["mark"])
+			}
+		}
+		if x["tag"] == "s1t-openvpn-ovpn-profile-dns-out" {
+			dnsMarked = true
+			stream := x["streamSettings"].(map[string]any)
+			sock := stream["sockopt"].(map[string]any)
+			if sock["mark"] != float64(5511223) {
+				t.Fatalf("DNS outbound mark=%v", sock["mark"])
+			}
+		}
+	}
+	if !found || !dnsMarked {
+		t.Fatal("OpenVPN and DNS marked outbounds were not created")
+	}
+}
+
+func TestAdaptiveUnderlayCandidatesIncludeConfiguredOpenVPN(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // No host WARP CLI is visible to this deterministic test.
+	cfg := Config{Underlay: underlayAdaptive, PsiphonConfig: "/etc/shah-tunnel/psiphon.json", OpenVPNConfig: "/etc/ravanreverse/openvpn/a/client.ovpn"}
+	got := adaptiveUnderlayCandidates(cfg, "")
+	want := []string{underlayOpenVPN, underlayPsiphon, underlayDirect}
+	if !equalStrings(got, want) {
+		t.Fatalf("configured OpenVPN candidates=%v, want %v", got, want)
+	}
+	got = adaptiveUnderlayCandidates(cfg, underlayPsiphon)
+	want = []string{underlayPsiphon, underlayOpenVPN, underlayDirect}
+	if !equalStrings(got, want) {
+		t.Fatalf("OpenVPN with preferred Psiphon candidates=%v, want %v", got, want)
+	}
+}
+
+func TestOpenVPNRouteHelperIsValidShellAndHasFailClosedRules(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "openvpn-route.sh")
+	if err := os.WriteFile(path, openVPNRouteHelperScript(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sh", "-n", path).CombinedOutput(); err != nil {
+		t.Fatalf("OpenVPN route helper has invalid shell syntax: %v: %s", err, out)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, marker := range []string{"fwmark \"$MARK\"/0xffffffff blackhole", "fwmark \"$MARK\"/0xffffffff lookup \"$TABLE\"", "remove_lookup_rules", "blackhole_routes"} {
+		if !strings.Contains(text, marker) {
+			t.Fatalf("OpenVPN route helper is missing fail-closed behavior %q", marker)
+		}
+	}
+}
+
+func TestRunAgentRefusesOpenVPNWithoutUserEgressSidecar(t *testing.T) {
+	cfg := Config{Role: "agent", Underlay: underlayOpenVPN, OpenVPNConfig: "/etc/ravanreverse/openvpn/s/client.ovpn"}
+	err := runAgent(cfg)
+	if err == nil || !strings.Contains(err.Error(), "isolated Xray sidecar is missing") {
+		t.Fatalf("Agent without its OpenVPN user-egress sidecar was not refused: %v", err)
+	}
+}
+
+func TestXrayOpenVPNUnitRequiresItsOpenVPNService(t *testing.T) {
+	openVPNService := "shah-tunnel-openvpn-agent-a.service"
+	unit, err := renderXrayOpenVPNUnit(xrayRuntime{Binary: "/usr/bin/xray", CWD: "/usr/bin"}, "/etc/ravanreverse/xray-openvpn/agent-a/config.json", "shah-tunnel-xray-openvpn-agent-a.service", openVPNService)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(unit)
+	if !strings.Contains(text, "After=network-online.target "+openVPNService) || !strings.Contains(text, "Requires="+openVPNService) {
+		t.Fatalf("Xray sidecar must not start without its OpenVPN service:\n%s", text)
+	}
+}
+
+func TestOpenVPNRouteInfoIsProfileScopedAndValid(t *testing.T) {
+	a := openVPNRouteInfoForProfile("agent-a")
+	b := openVPNRouteInfoForProfile("agent-b")
+	if a.Table < 20000 || a.Table > 1_000_020_000 || a.Mark < 0x53000000 || a.Mark > 0x53ffffff || a.Priority < 10000 || a.Priority > 19_999 || a.Priority+10000 >= 32766 {
+		t.Fatalf("invalid route metadata: %#v", a)
+	}
+	if a.Table == b.Table || a.Mark == b.Mark || a.Device == b.Device {
+		t.Fatalf("profile route metadata collided: a=%#v b=%#v", a, b)
+	}
+	if len(a.Device) > 15 {
+		t.Fatalf("Linux interface name too long: %q", a.Device)
+	}
+	seenTables, seenMarks, seenDevices := map[int]bool{}, map[int]bool{}, map[string]bool{}
+	for i := 0; i < 250; i++ {
+		r := openVPNRouteInfoForProfile(fmt.Sprintf("agent-profile-%03d", i))
+		if r.Priority < 10000 || r.Priority > 19_999 || r.Priority+10000 >= 32766 {
+			t.Fatalf("route rule priority is outside the safe pre-main window at profile %d: %#v", i, r)
+		}
+		if seenTables[r.Table] || seenMarks[r.Mark] || seenDevices[r.Device] {
+			t.Fatalf("route metadata collision at profile %d: %#v", i, r)
+		}
+		seenTables[r.Table], seenMarks[r.Mark], seenDevices[r.Device] = true, true, true
 	}
 }

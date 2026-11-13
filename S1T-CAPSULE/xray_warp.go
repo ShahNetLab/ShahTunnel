@@ -233,11 +233,17 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 // inbounds for the selected ShahTunnel mappings. The original X-UI config is
 // never modified. For Psiphon, UDP is explicitly blackholed because its local
 // SOCKS proxy is a TCP port-forward proxy and does not implement UDP ASSOCIATE.
-func buildXrayEgressConfig(original []byte, profileID, proxyAddress string, mappings []PortMapping, kind string, blockUDP bool) ([]byte, []XrayWarpBinding, string, error) {
-	if kind != "warp" && kind != "psiphon" {
+func buildXrayEgressConfig(original []byte, profileID, proxyAddress string, mappings []PortMapping, kind string, blockUDP bool, openVPNMarks ...int) ([]byte, []XrayWarpBinding, string, error) {
+	if kind != "warp" && kind != "psiphon" && kind != "openvpn" {
 		return nil, nil, "", fmt.Errorf("unsupported isolated Xray egress kind %q", kind)
 	}
-	if _, _, err := net.SplitHostPort(proxyAddress); err != nil || !isLoopbackProxyAddress(proxyAddress) {
+	var openVPNMark int
+	if kind == "openvpn" {
+		if len(openVPNMarks) == 0 || openVPNMarks[0] <= 0 || openVPNMarks[0] > 0x7fffffff {
+			return nil, nil, "", errors.New("OpenVPN Xray egress requires a valid socket mark")
+		}
+		openVPNMark = openVPNMarks[0]
+	} else if _, _, err := net.SplitHostPort(proxyAddress); err != nil || !isLoopbackProxyAddress(proxyAddress) {
 		return nil, nil, "", errors.New("isolated Xray SOCKS proxy must be a loopback IP:PORT endpoint")
 	}
 	var root map[string]any
@@ -366,13 +372,21 @@ func buildXrayEgressConfig(original []byte, profileID, proxyAddress string, mapp
 	if err != nil {
 		return nil, nil, "", err
 	}
-	root["outbounds"] = append(outbounds,
-		map[string]any{
+	var isolatedOutbound map[string]any
+	if kind == "openvpn" {
+		sockopt := map[string]any{"mark": openVPNMark, "tcpFastOpen": true}
+		stream := map[string]any{"sockopt": sockopt}
+		isolatedOutbound = map[string]any{"tag": outTag, "protocol": "freedom", "settings": map[string]any{"domainStrategy": "UseIPv4"}, "streamSettings": stream}
+		// Xray's DNS outbound must use the same mark as user flows; otherwise
+		// resolver connections could bypass the per-profile VPN policy table.
+		dnsOutbound["streamSettings"] = map[string]any{"sockopt": map[string]any{"mark": openVPNMark}}
+	} else {
+		isolatedOutbound = map[string]any{
 			"tag": outTag, "protocol": "socks",
 			"settings": map[string]any{"servers": []any{map[string]any{"address": "127.0.0.1", "port": mustPortNumber(proxyAddress)}}},
-		},
-		dnsOutbound,
-	)
+		}
+	}
+	root["outbounds"] = append(outbounds, isolatedOutbound, dnsOutbound)
 	if blockUDP {
 		root["outbounds"] = append(root["outbounds"].([]any), map[string]any{
 			"tag": blockTag, "protocol": "blackhole", "settings": map[string]any{"response": map[string]any{"type": "none"}},

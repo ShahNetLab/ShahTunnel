@@ -437,7 +437,7 @@ func autoApplyXrayPsiphonForNewAgent() error {
 	if err != nil {
 		return err
 	}
-	if cfg.Role != "agent" || (cfg.Underlay != underlayPsiphon && cfg.Underlay != underlayAdaptive) || cfg.XrayPsiphon != nil {
+	if cfg.Role != "agent" || (cfg.Underlay != underlayPsiphon && cfg.Underlay != underlayAdaptive) || cfg.XrayPsiphon != nil || cfg.XrayOpenVPN != nil {
 		return nil
 	}
 	uiInfo("Preparing isolated Xray user egress through the Agent's Psiphon SOCKS5 proxy...")
