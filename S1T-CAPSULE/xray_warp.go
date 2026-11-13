@@ -106,21 +106,57 @@ func xrayConfigArgument(args []string, cwd string) (string, error) {
 	return "", errors.New("Xray command line does not expose a config file and no config.json exists in its working directory")
 }
 
+// xrayListenerPIDsForPort extracts process IDs only from TCP LISTEN rows whose
+// local address uses the requested port. We deliberately inspect the complete
+// ss listing instead of relying on ss filter-expression parsing: different
+// iproute2 builds have returned empty results for the same "sport = :PORT"
+// expression even while the listener was visible in an unfiltered listing.
+func xrayListenerPIDsForPort(output string, port int) []int {
+	if port < 1 || port > 65535 {
+		return nil
+	}
+	seen := make(map[int]bool)
+	var pids []int
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		// `ss -H -lntp` columns: State Recv-Q Send-Q Local Peer Process.
+		if len(fields) < 5 || !strings.EqualFold(fields[0], "LISTEN") {
+			continue
+		}
+		local := fields[3]
+		colon := strings.LastIndexByte(local, ':')
+		if colon < 0 {
+			continue
+		}
+		localPort, err := strconv.Atoi(strings.Trim(local[colon+1:], "[]"))
+		if err != nil || localPort != port {
+			continue
+		}
+		for _, match := range xrayPIDPattern.FindAllStringSubmatch(line, -1) {
+			pid, err := strconv.Atoi(match[1])
+			if err == nil && pid > 0 && !seen[pid] {
+				seen[pid] = true
+				pids = append(pids, pid)
+			}
+		}
+	}
+	return pids
+}
+
 func findXrayRuntimeForPort(port int) (xrayRuntime, map[string]any, error) {
 	if port < 1 || port > 65535 {
 		return xrayRuntime{}, nil, fmt.Errorf("invalid local Xray target port %d", port)
 	}
-	out, err := exec.Command("ss", "-H", "-lntp", fmt.Sprintf("sport = :%d", port)).CombinedOutput()
+	out, err := exec.Command("ss", "-H", "-lntp").CombinedOutput()
 	if err != nil {
-		return xrayRuntime{}, nil, fmt.Errorf("cannot inspect listener on port %d with ss: %w: %s", port, err, strings.TrimSpace(string(out)))
+		return xrayRuntime{}, nil, fmt.Errorf("cannot inspect TCP listeners with ss: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	matches := xrayPIDPattern.FindAllStringSubmatch(string(out), -1)
-	if len(matches) == 0 {
-		return xrayRuntime{}, nil, fmt.Errorf("no process PID found listening on local target port %d", port)
+	pids := xrayListenerPIDsForPort(string(out), port)
+	if len(pids) == 0 {
+		return xrayRuntime{}, nil, fmt.Errorf("no process PID found in TCP LISTEN rows for local target port %d", port)
 	}
 	seen := map[int]bool{}
-	for _, match := range matches {
-		pid, _ := strconv.Atoi(match[1])
+	for _, pid := range pids {
 		if pid <= 0 || seen[pid] {
 			continue
 		}

@@ -2519,6 +2519,35 @@ exit 1
 	}
 }
 
+func TestXrayConfigArgumentResolvesXUIRelativePath(t *testing.T) {
+	got, err := xrayConfigArgument([]string{"bin/xray-linux-amd64", "-c", "bin/config.json"}, "/usr/local/x-ui")
+	if err != nil {
+		t.Fatalf("resolve x-ui relative config argument: %v", err)
+	}
+	if got != "/usr/local/x-ui/bin/config.json" {
+		t.Fatalf("resolved config path = %q; want /usr/local/x-ui/bin/config.json", got)
+	}
+}
+
+func TestXrayListenerPIDsForPortParsesUnfilteredSSOutput(t *testing.T) {
+	output := `LISTEN 0 4096 *:2083 *:* users:(("xray-linux-amd6",pid=335141,fd=7))
+LISTEN 0 128 127.0.0.1:21083 0.0.0.0:* users:(("psiphon-console",pid=701936,fd=6))
+LISTEN 0 128 [::]:2083 [::]:* users:(("xray-linux-amd64",pid=335141,fd=8))
+ESTAB 0 0 127.0.0.1:2083 127.0.0.1:55210 users:(("not-a-listener",pid=999,fd=3))
+LISTEN 0 128 *:20831 *:* users:(("other",pid=444,fd=3))
+`
+	got := xrayListenerPIDsForPort(output, 2083)
+	if len(got) != 1 || got[0] != 335141 {
+		t.Fatalf("listener PIDs for 2083 = %v; want [335141]", got)
+	}
+	if got := xrayListenerPIDsForPort(output, 21083); len(got) != 1 || got[0] != 701936 {
+		t.Fatalf("listener PIDs for 21083 = %v; want [701936]", got)
+	}
+	if got := xrayListenerPIDsForPort(output, 2082); len(got) != 0 {
+		t.Fatalf("listener PIDs for 2082 = %v; want none", got)
+	}
+}
+
 func TestBuildXrayAdaptiveEgressUsesLeastPingAndFailsClosed(t *testing.T) {
 	original := []byte(`{
       "log": {"loglevel":"warning"},
