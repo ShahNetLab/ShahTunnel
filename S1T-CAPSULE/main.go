@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "4.0.8"
+	version                          = "4.0.9"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -2936,12 +2936,9 @@ func adaptiveTransportCandidates(preferred string) []string {
 }
 
 func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
-	return adaptiveUnderlayCandidatesWithWarp(cfg, preferred, detectActiveWarpUnderlay())
-}
-
-func adaptiveUnderlayCandidatesWithWarp(cfg Config, preferred, warpMode string) []string {
 	// WARP is only a candidate when its client reports a connected MASQUE path.
 	// Other WARP protocols are never selected by adaptive routing.
+	warpMode := detectActiveWarpUnderlay()
 	usesPsiphon := strings.TrimSpace(cfg.PsiphonConfig) != ""
 	all := make([]string, 0, 3)
 	appendCandidate := func(candidate string) {
@@ -2956,25 +2953,9 @@ func adaptiveUnderlayCandidatesWithWarp(cfg Config, preferred, warpMode string) 
 		all = append(all, candidate)
 	}
 
-	// When the final user egress is already Psiphon (isolated Xray SOCKS
-	// sidecar), do NOT prefer Psiphon for the Agent->Hub transport as well.
-	// Doing so nests a second Psiphon hop in front of the user Psiphon hop,
-	// adding latency and TCP-over-TCP head-of-line blocking. The users' public
-	// exit remains Psiphon because their mapped Xray traffic is still routed
-	// through cfg.XrayPsiphon. Prefer active MASQUE, then Direct; keep Psiphon
-	// as a last-resort Hub-reachability fallback only.
-	if cfg.XrayPsiphon != nil && usesPsiphon {
-		if warpMode == underlayMASQUE {
-			appendCandidate(underlayMASQUE)
-		}
-		appendCandidate(underlayDirect)
-		appendCandidate(underlayPsiphon)
-		return all
-	}
-
-	// Without a separate Psiphon user-egress sidecar, preserve the existing
-	// adaptive behavior: an active WARP path is preferred, then Psiphon and
-	// Direct; otherwise the last successful path is tried first.
+	// An active WARP route is always checked first, then fails over to
+	// Psiphon and Direct. When WARP is down, retain the last successful
+	// non-WARP route; a lost WARP preference hands off to Psiphon first.
 	if warpMode != "" {
 		appendCandidate(warpMode)
 		appendCandidate(underlayPsiphon)
@@ -3153,9 +3134,6 @@ func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode s
 	}
 	if cfg.Underlay == underlayAdaptive || cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE || cfg.Underlay == underlayTor {
 		agentPreferredUnderlay.Store(channel, cfg.Underlay)
-	}
-	if cfg.Underlay == underlayPsiphon && cfg.XrayPsiphon != nil {
-		log.Printf("WARNING: lane %d uses Psiphon for Agent->Hub while mapped user egress also uses Psiphon; this is a double Psiphon hop and may increase latency. Direct/WARP is preferred for the outer lane when reachable.", channel)
 	}
 	log.Printf("tunnel lane %d/%d connected via %s over %s; forwarding through %d configured port mapping(s)", channel, cfg.TunnelChannels, mode, cfg.Underlay, len(normalizeConfig(cfg).Ports))
 	targets := make(map[string]string, len(cfg.Ports))
@@ -3440,17 +3418,26 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 			}, nil
 		}
 		if !adaptiveDeadline.IsZero() && time.Now().After(adaptiveDeadline) {
-			cancel()
-			select {
-			case <-done:
-			case <-time.After(4 * time.Second):
-				_ = cmd.Process.Kill()
-				<-done
-			}
+			// In option 9 Psiphon is both an adaptive Agent underlay candidate and
+			// the isolated Xray user-egress provider. Do not cancel ConsoleClient
+			// merely because its first tunnel missed this startup window: doing so
+			// closes the loopback SOCKS listener just before Xray setup checks it.
+			// Keep the child alive under the Agent service; adaptive lanes can use
+			// Direct/WARP meanwhile and Xray setup can wait for verified Psiphon.
 			if !proxyReady {
-				return nil, fmt.Errorf("Psiphon SOCKS5 proxy %s did not become ready within 90 seconds", cfg.PsiphonProxy)
+				log.Printf("Psiphon SOCKS5 listener is not ready after 90 seconds; keeping ConsoleClient alive for background retries")
+			} else {
+				log.Printf("Psiphon SOCKS5 listener is ready but no tunnel notice arrived after 90 seconds; keeping ConsoleClient alive for background retries")
 			}
-			return nil, errors.New("Psiphon did not establish a tunnel within 90 seconds; adaptive mode will keep direct egress available")
+			return func() {
+				cancel()
+				select {
+				case <-done:
+				case <-time.After(4 * time.Second):
+					_ = cmd.Process.Kill()
+					<-done
+				}
+			}, nil
 		}
 		select {
 		case count := <-tunnelReady:
@@ -5141,11 +5128,6 @@ func setup() error {
 			return err
 		}
 	}
-	if c.Role == "agent" && (c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive) {
-		if err := autoApplyXrayPsiphonForNewAgent(); err != nil {
-			return err
-		}
-	}
 	if c.Role == "agent" && c.Underlay == underlayTor {
 		if err := autoApplyXrayTorForNewAgent(); err != nil {
 			if rollbackErr := rollbackFailedTorAgentSetup(configPath, c); rollbackErr != nil {
@@ -5159,6 +5141,15 @@ func setup() error {
 	connected, startErr := ensureTunnelRunning(true)
 	if startErr != nil {
 		return fmt.Errorf("configuration was saved, but automatic startup failed: %w", startErr)
+	}
+	// The profile-bound Psiphon systemd unit is prepared before Agent startup.
+	// Configure isolated Xray user egress only after Agent and SOCKS readiness
+	// have both been confirmed, then verify Psiphon again after the restart.
+	if c.Role == "agent" && (c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive) {
+		if err := autoApplyXrayPsiphonForNewAgent(); err != nil {
+			_ = runSystemctl("stop", currentServiceName()) // fail closed: do not leave the new mapping on its original target
+			return fmt.Errorf("Agent service started, but Psiphon user-egress setup failed; Agent was stopped fail-closed: %w", err)
+		}
 	}
 	if c.Underlay == underlayPsiphon && !connected {
 		uiInfo("Agent service and local Psiphon SOCKS5 are running. Psiphon egress and/or the Agent-to-Hub lane may still be connecting; end-to-end connectivity is not yet confirmed.")
@@ -5203,6 +5194,19 @@ func tunnelIsActive() bool {
 func ensureTunnelRunning(restartActive bool) (bool, error) {
 	if !isRoot() {
 		return false, errors.New("run as root")
+	}
+	// Psiphon must be supervised independently of the Agent process. This
+	// guarantees the loopback SOCKS endpoint exists before Agent/Xray setup and
+	// that a ConsoleClient exit is restarted by systemd rather than leaving an
+	// active Agent with a permanently closed SOCKS port.
+	if data, readErr := os.ReadFile(configPath); readErr == nil {
+		var selected Config
+		if json.Unmarshal(data, &selected) == nil {
+			selected = normalizeConfig(selected)
+			if err := ensurePsiphonSystemdService(selected); err != nil {
+				return false, fmt.Errorf("prepare per-profile Psiphon service before Agent startup: %w", err)
+			}
+		}
 	}
 	service := currentServiceName()
 	if filepath.Clean(configPath) != filepath.Clean(legacyConfigPath) {
@@ -5258,6 +5262,20 @@ func ensureTunnelRunning(restartActive bool) (bool, error) {
 	}
 	fmt.Printf("Tunnel service %s is active; automatic startup at boot is enabled.\n", service)
 	return psiphonTunnelReady, nil
+}
+
+// startSelectedTunnel ensures profile-local dependencies are ready, starts the
+// Agent, and repairs the automatic Psiphon Xray sidecar if an earlier setup
+// attempt saved the profile but failed before the sidecar was committed.
+func startSelectedTunnel(restartActive bool) error {
+	if _, err := ensureTunnelRunning(restartActive); err != nil {
+		return err
+	}
+	if err := autoApplyXrayPsiphonForNewAgent(); err != nil {
+		_ = runSystemctl("stop", currentServiceName())
+		return fmt.Errorf("selected Agent started but automatic Psiphon Xray repair failed; Agent stopped fail-closed: %w", err)
+	}
+	return nil
 }
 
 func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.Duration) (bool, error) {
@@ -6198,7 +6216,7 @@ func menu() {
 			err = setup()
 		case "2":
 			if chooseTunnel("Select the tunnel to start (number or name)") {
-				_, err = ensureTunnelRunning(false)
+				err = startSelectedTunnel(false)
 			}
 		case "3":
 			if chooseTunnel("Select the tunnel to stop (number or name)") {
@@ -6210,7 +6228,7 @@ func menu() {
 			}
 		case "4":
 			if chooseTunnel("Select the tunnel to restart (number or name)") {
-				_, err = ensureTunnelRunning(true)
+				err = startSelectedTunnel(true)
 			}
 		case "5":
 			if chooseTunnel("Select the tunnel to inspect (number or name)") {

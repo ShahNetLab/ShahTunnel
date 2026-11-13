@@ -261,6 +261,31 @@ func psiphonPublicEgressIP(proxyAddress string, timeout time.Duration) (string, 
 	return ip.String(), nil
 }
 
+// waitForPsiphonPublicEgressIP tolerates the normal gap between a SOCKS5
+// listener opening and the first usable Psiphon tunnel. The listener alone is
+// not considered proof of Internet egress.
+func waitForPsiphonPublicEgressIP(proxyAddress string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		attemptTimeout := 5 * time.Second
+		if remaining < attemptTimeout {
+			attemptTimeout = remaining
+		}
+		ip, err := psiphonPublicEgressIP(proxyAddress, attemptTimeout)
+		if err == nil {
+			return ip, nil
+		}
+		lastErr = err
+		time.Sleep(1 * time.Second)
+	}
+	if lastErr != nil {
+		return "", fmt.Errorf("Psiphon SOCKS5 is listening but no verified HTTPS egress became available within %s: %w", timeout, lastErr)
+	}
+	return "", fmt.Errorf("Psiphon HTTPS egress did not become available within %s", timeout)
+}
+
 // parsePsiphonEgressGeo accepts only a geolocation response that echoes the
 // exact public IP already observed through the Psiphon SOCKS5 connection.
 func parsePsiphonEgressGeo(body []byte, expectedIP string) (string, bool) {
@@ -430,10 +455,10 @@ func applyXrayPsiphonEgress(restartAgent, confirm bool) error {
 	}
 	// Always prove readiness and verify the real exit before creating user
 	// egress, including automatic first-time setup after the Agent service starts.
-	if err := waitForPsiphonProxy(proxy, 45*time.Second); err != nil {
-		return fmt.Errorf("Psiphon SOCKS5 did not become ready at %s: %w; the selected Agent service must be active", proxy, err)
+	if err := waitForPsiphonProxy(proxy, 120*time.Second); err != nil {
+		return fmt.Errorf("Psiphon SOCKS5 did not become ready at %s: %w; ConsoleClient may still be bootstrapping, so keep the Agent service running and retry", proxy, err)
 	}
-	ip, err := psiphonPublicEgressIP(proxy, 15*time.Second)
+	ip, err := waitForPsiphonPublicEgressIP(proxy, 90*time.Second)
 	if err != nil {
 		return err
 	}
@@ -449,6 +474,14 @@ func applyXrayPsiphonEgress(restartAgent, confirm bool) error {
 	}
 	if country == "US" || !psiphonAllowedEgressRegions[country] {
 		return fmt.Errorf("refusing Psiphon exit %s (%s): US is prohibited and only approved non-US regions are allowed", ip, country)
+	}
+	var requested psiphonClientConfig
+	if raw, readErr := os.ReadFile(cfg.PsiphonConfig); readErr == nil {
+		if json.Unmarshal(raw, &requested) == nil {
+			if wanted, normalizeErr := normalizePsiphonEgressRegion(requested.EgressRegion); normalizeErr == nil && wanted != country {
+				uiWarn(fmt.Sprintf("Psiphon preferred %s but returned an approved alternate exit in %s (%s); continuing because the actual country is allowlisted.", wanted, country, ip))
+			}
+		}
 	}
 	uiSuccess(fmt.Sprintf("Verified live Psiphon HTTPS exit IP: %s (country %s)", ip, country))
 	if confirm {
@@ -555,6 +588,29 @@ func applyXrayPsiphonEgress(restartAgent, confirm bool) error {
 			rollbackSidecar()
 			return fmt.Errorf("restart ShahTunnel profile %s failed; previous Agent config was restored: %w", service, err)
 		}
+		// The Agent restart also restarts its PartOf Psiphon unit. Do not report
+		// success merely because systemd accepted the restart: wait for the SOCKS
+		// listener and a real, newly verified public exit before exposing Xray.
+		if err = waitForPsiphonProxy(proxy, 120*time.Second); err == nil {
+			var refreshedIP string
+			refreshedIP, err = waitForPsiphonPublicEgressIP(proxy, 90*time.Second)
+			if err == nil {
+				var refreshedCountry string
+				refreshedCountry, err = psiphonPublicEgressCountry(proxy, refreshedIP, 10*time.Second)
+				if err != nil {
+					refreshedCountry, err = psiphonCountryFromDirectIPLookup(refreshedIP)
+				}
+				if err == nil && (refreshedCountry == "US" || !psiphonAllowedEgressRegions[refreshedCountry]) {
+					err = fmt.Errorf("reconnected Psiphon exit %s (%s) is not in the approved non-US country list", refreshedIP, refreshedCountry)
+				}
+			}
+		}
+		if err != nil {
+			_ = atomicReplaceFile(configPath, oldProfile, 0600)
+			_ = runSystemctl("restart", service)
+			rollbackSidecar()
+			return fmt.Errorf("Psiphon did not recover with a verified approved exit after Agent restart; previous profile was restored: %w", err)
+		}
 	}
 	if restartAgent {
 		uiSuccess("Per-tunnel Psiphon TCP egress is active. DNS is also routed through Psiphon; UDP is fail-closed.")
@@ -594,8 +650,8 @@ func autoApplyXrayPsiphonForNewAgent() error {
 	if cfg.Role != "agent" || (cfg.Underlay != underlayPsiphon && cfg.Underlay != underlayAdaptive) || cfg.XrayPsiphon != nil {
 		return nil
 	}
-	uiInfo("Preparing isolated Xray user egress through the Agent's Psiphon SOCKS5 proxy...")
-	if err := applyXrayPsiphonEgress(false, false); err != nil {
+	uiInfo("Preparing isolated Xray user egress through the Agent's verified Psiphon SOCKS5 proxy...")
+	if err := applyXrayPsiphonEgress(true, false); err != nil {
 		return fmt.Errorf("Agent profile was saved, but automatic per-tunnel Psiphon user-egress setup failed: %w", err)
 	}
 	return nil

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -179,12 +180,24 @@ func psiphonHostPerformanceProfile() psiphonPerformanceProfile {
 // Psiphon region preferences intentionally exclude the United States.
 // A requested region is only a preference; the live exit country is verified
 // independently before Xray user egress is enabled.
-var psiphonAllowedEgressRegions = map[string]bool{
-	"AE": true, "TR": true, "DE": true, "RS": true, "RO": true,
-	"BG": true, "GR": true, "GE": true, "AM": true, "AZ": true,
-	"NL": true, "CH": true, "AT": true, "PL": true, "CZ": true,
-	"SK": true, "HU": true, "FR": true, "SE": true, "FI": true,
+// The ordered region list is the approved candidate order. Psiphon accepts
+// one EgressRegion per ConsoleClient instance; DE is the initial preference,
+// while the complete list is used to validate permitted exit countries. The
+// actual country is always verified because availability is network-dependent.
+var psiphonEgressRegionPriority = []string{
+	// Priority 1: nearer alternatives to Iran.
+	"DE", "TR", "AE", "RS", "RO", "BG", "GR", "GE", "AM", "AZ",
+	// Priority 2: secondary alternatives.
+	"NL", "CH", "AT", "PL", "CZ", "SK", "HU", "FR", "SE", "FI",
 }
+
+var psiphonAllowedEgressRegions = func() map[string]bool {
+	allowed := make(map[string]bool, len(psiphonEgressRegionPriority))
+	for _, region := range psiphonEgressRegionPriority {
+		allowed[region] = true
+	}
+	return allowed
+}()
 
 func normalizePsiphonEgressRegion(region string) (string, error) {
 	region = strings.ToUpper(strings.TrimSpace(region))
@@ -240,6 +253,195 @@ func makePsiphonTransferURLs(urls []string) []psiphonTransferURL {
 		})
 	}
 	return out
+}
+
+func psiphonServiceName(profileName string) string {
+	if strings.TrimSpace(profileName) == "" {
+		profileName = "legacy-agent"
+	}
+	return "shah-tunnel-psiphon-" + tunnelID(profileName) + ".service"
+}
+
+func psiphonServiceUnitPath(service string) (string, error) {
+	if filepath.Base(service) != service || !strings.HasPrefix(service, "shah-tunnel-psiphon-") || !strings.HasSuffix(service, ".service") {
+		return "", fmt.Errorf("refusing to manage non-ShahTunnel Psiphon unit %q", service)
+	}
+	return filepath.Join("/etc/systemd/system", service), nil
+}
+
+func renderPsiphonServiceUnit(cfg Config, service, agentService string) ([]byte, error) {
+	if filepath.Base(service) != service || !strings.HasPrefix(service, "shah-tunnel-psiphon-") || !strings.HasSuffix(service, ".service") {
+		return nil, errors.New("invalid ShahTunnel Psiphon service name")
+	}
+	if filepath.Base(agentService) != agentService || (!strings.HasPrefix(agentService, "ravanreverse@") && agentService != "ravanreverse") {
+		return nil, errors.New("invalid Agent service dependency")
+	}
+	configPath, err := filepath.Abs(strings.TrimSpace(cfg.PsiphonConfig))
+	if err != nil || configPath == "." {
+		return nil, errors.New("invalid Psiphon configuration path")
+	}
+	client := strings.TrimSpace(cfg.PsiphonClient)
+	if client == "" {
+		client = psiphonConsoleClientPath
+	}
+	if !filepath.IsAbs(client) {
+		resolved, lookErr := exec.LookPath(client)
+		if lookErr != nil {
+			return nil, fmt.Errorf("Psiphon ConsoleClient %q not found: %w", client, lookErr)
+		}
+		client = resolved
+	}
+	dataDir := strings.TrimSpace(cfg.PsiphonDataDir)
+	if dataDir == "" {
+		dataDir = filepath.Join(psiphonDataRoot, tunnelID(cfg.Name))
+	}
+	dataDir, err = filepath.Abs(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve Psiphon data directory: %w", err)
+	}
+	for _, value := range []string{client, configPath, dataDir, service, agentService} {
+		if strings.ContainsAny(value, "\x00\n\r") {
+			return nil, errors.New("Psiphon service parameters contain unsupported control characters")
+		}
+	}
+	args := psiphonConsoleClientArgs(configPath, dataDir)
+	execStart := systemdExecQuote(client)
+	for _, arg := range args {
+		execStart += " " + systemdExecQuote(arg)
+	}
+	unit := fmt.Sprintf(`[Unit]
+Description=ShahTunnel per-profile Psiphon ConsoleClient (%s)
+After=network-online.target
+Wants=network-online.target
+PartOf=%s.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=%s
+ExecStart=%s
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+LimitNOFILE=1048576
+KillSignal=SIGINT
+TimeoutStopSec=12
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+`, strings.TrimSuffix(service, ".service"), agentService, dataDir, execStart)
+	return []byte(unit), nil
+}
+
+func ensurePsiphonSystemdService(cfg Config) error {
+	if cfg.Role != "agent" || (cfg.Underlay != underlayPsiphon && cfg.Underlay != underlayAdaptive) {
+		return nil
+	}
+	if !isRoot() {
+		return errors.New("starting the per-profile Psiphon service requires root")
+	}
+	if err := ensurePsiphonConsoleClient(); err != nil {
+		return fmt.Errorf("ensure official Psiphon ConsoleClient before service start: %w", err)
+	}
+	if strings.TrimSpace(cfg.PsiphonConfig) == "" || !isLoopbackProxyAddress(cfg.PsiphonProxy) {
+		return errors.New("Agent Psiphon profile is missing its config or loopback SOCKS5 endpoint")
+	}
+	configPath, err := filepath.Abs(cfg.PsiphonConfig)
+	if err != nil {
+		return err
+	}
+	if migrated, migrateErr := repairLegacyPsiphonClientConfig(configPath, cfg.PsiphonProxy); migrateErr != nil {
+		return fmt.Errorf("repair Psiphon bootstrap before service start: %w", migrateErr)
+	} else if migrated {
+		log.Printf("Psiphon: migrated legacy bootstrap before systemd service start")
+	}
+	if _, tuneErr := tunePsiphonPerformanceConfig(configPath); tuneErr != nil {
+		return fmt.Errorf("tune Psiphon performance before service start: %w", tuneErr)
+	}
+	if err := validatePsiphonClientConfig(configPath, cfg.PsiphonProxy); err != nil {
+		return fmt.Errorf("validate Psiphon service config: %w", err)
+	}
+	dataDir := strings.TrimSpace(cfg.PsiphonDataDir)
+	if dataDir == "" {
+		dataDir = filepath.Join(psiphonDataRoot, tunnelID(cfg.Name))
+	}
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		return fmt.Errorf("create Psiphon data directory: %w", err)
+	}
+	if err := os.Chmod(dataDir, 0700); err != nil {
+		return fmt.Errorf("secure Psiphon data directory: %w", err)
+	}
+	service := psiphonServiceName(cfg.Name)
+	unitPath, err := psiphonServiceUnitPath(service)
+	if err != nil {
+		return err
+	}
+	agentService := currentServiceName()
+	unit, err := renderPsiphonServiceUnit(cfg, service, agentService)
+	if err != nil {
+		return err
+	}
+	oldUnit, readErr := os.ReadFile(unitPath)
+	unitChanged := readErr != nil || string(oldUnit) != string(unit)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return fmt.Errorf("read existing Psiphon unit: %w", readErr)
+	}
+	// If an older Agent process owns this SOCKS port, stop only that profile
+	// before transferring supervision to the dedicated per-profile unit.
+	if exec.Command("systemctl", "is-active", "--quiet", service).Run() != nil &&
+		exec.Command("systemctl", "is-active", "--quiet", agentService).Run() == nil {
+		if err := runSystemctl("stop", agentService); err != nil {
+			return fmt.Errorf("stop selected Agent while migrating Psiphon supervision: %w", err)
+		}
+	}
+	if unitChanged {
+		if err := atomicReplaceFile(unitPath, unit, 0644); err != nil {
+			return fmt.Errorf("write per-profile Psiphon systemd unit: %w", err)
+		}
+	}
+	// Make Agent startup depend on the independently supervised Psiphon unit.
+	dropInDir := filepath.Join("/etc/systemd/system", agentService+".service.d")
+	if err := os.MkdirAll(dropInDir, 0755); err != nil {
+		return fmt.Errorf("create Agent Psiphon dependency drop-in: %w", err)
+	}
+	dropIn := []byte(fmt.Sprintf("[Unit]\nRequires=%s\nAfter=%s\n", service, service))
+	if err := atomicReplaceFile(filepath.Join(dropInDir, "shah-tunnel-psiphon.conf"), dropIn, 0644); err != nil {
+		return fmt.Errorf("write Agent Psiphon dependency drop-in: %w", err)
+	}
+	if unitChanged {
+		if err := systemdReload(); err != nil {
+			return err
+		}
+	} else {
+		// The drop-in may have been added after the Psiphon unit was installed.
+		if err := systemdReload(); err != nil {
+			return err
+		}
+	}
+	if exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
+		if unitChanged {
+			if err := runSystemctl("restart", service); err != nil {
+				return fmt.Errorf("restart updated Psiphon service: %w", err)
+			}
+		}
+	} else if err := runSystemctl("start", service); err != nil {
+		return fmt.Errorf("start per-profile Psiphon service: %w", err)
+	}
+	if err := waitForPsiphonProxy(cfg.PsiphonProxy, 120*time.Second); err != nil {
+		journal, _ := exec.Command("journalctl", "-u", service, "-n", "50", "--no-pager", "-o", "cat").CombinedOutput()
+		return fmt.Errorf("per-profile Psiphon service %s is enabled but SOCKS5 %s is not ready: %w; journal: %s", service, cfg.PsiphonProxy, err, strings.TrimSpace(string(journal)))
+	}
+	log.Printf("Psiphon SOCKS5 is supervised by %s and is ready at %s", service, cfg.PsiphonProxy)
+	return nil
 }
 
 func ensurePsiphonConsoleClient() error {

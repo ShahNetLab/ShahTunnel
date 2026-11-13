@@ -1644,25 +1644,6 @@ func TestAdaptiveUnderlayCandidatesPreferLastSuccessfulEgress(t *testing.T) {
 	}
 }
 
-func TestAdaptiveUnderlayAvoidsDoublePsiphonWhenFinalUserExitIsPsiphon(t *testing.T) {
-	cfg := Config{
-		Underlay:      underlayAdaptive,
-		PsiphonConfig: "/etc/shah-tunnel/psiphon-client.json",
-		XrayPsiphon:   &XrayPsiphonIntegration{Proxy: "127.0.0.1:21082"},
-	}
-	if got, want := adaptiveUnderlayCandidatesWithWarp(cfg, underlayPsiphon, ""), []string{underlayDirect, underlayPsiphon}; !equalStrings(got, want) {
-		t.Fatalf("outer candidates with Psiphon final user exit = %v; want Direct first and Psiphon only as last resort: %v", got, want)
-	}
-	if got, want := adaptiveUnderlayCandidatesWithWarp(cfg, underlayPsiphon, underlayMASQUE), []string{underlayMASQUE, underlayDirect, underlayPsiphon}; !equalStrings(got, want) {
-		t.Fatalf("outer candidates with active MASQUE and Psiphon final user exit = %v; want %v", got, want)
-	}
-	// The user-facing Xray sidecar remains configured to use the same Psiphon
-	// loopback proxy; only the Agent->Hub underlay preference changes.
-	if cfg.XrayPsiphon == nil || cfg.XrayPsiphon.Proxy != "127.0.0.1:21082" {
-		t.Fatal("test fixture lost the final Psiphon user-egress integration")
-	}
-}
-
 func TestAdaptiveUnderlayCandidatesDetectMASQUEAndFailOver(t *testing.T) {
 	binDir := t.TempDir()
 	warpCLI := filepath.Join(binDir, "warp-cli")
@@ -2895,5 +2876,74 @@ func TestHubPrefersFreshRTTOverStaleLowRTT(t *testing.T) {
 	h := &hubServer{sessions: map[*hubSession]struct{}{staleFormerlyFast: {}, freshHealthy: {}}}
 	if got := h.current(); got != freshHealthy {
 		t.Fatalf("selected lane %d; want fresh lane %d despite stale lower RTT", got.id, freshHealthy.id)
+	}
+}
+
+func TestNewAgentStartsBeforeAutomaticPsiphonXraySetup(t *testing.T) {
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate test source")
+	}
+	source, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "connected, startErr := ensureTunnelRunning(true)")
+	setup := strings.Index(text, "autoApplyXrayPsiphonForNewAgent()")
+	if start < 0 || setup < 0 || setup < start {
+		t.Fatal("automatic Psiphon Xray sidecar setup must run after the selected Agent service is started")
+	}
+}
+
+func TestPsiphonSupervisorPreparedBeforeAgentServiceStart(t *testing.T) {
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate test source")
+	}
+	source, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func ensureTunnelRunning(")
+	if start < 0 {
+		t.Fatal("ensureTunnelRunning was not found")
+	}
+	body := text[start:]
+	prepare := strings.Index(body, "ensurePsiphonSystemdService(selected)")
+	startAgent := strings.Index(body, `runSystemctl("start", service)`)
+	if prepare < 0 || startAgent < 0 || prepare > startAgent {
+		t.Fatal("per-profile Psiphon systemd service must be prepared before the Agent service is started")
+	}
+	psiphonSource, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "psiphon.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(psiphonSource), `Requires=%s\nAfter=%s\n`) {
+		t.Fatal("Agent must have systemd Requires/After ordering for the Psiphon service")
+	}
+}
+
+func TestStartSelectedTunnelRepairsMissingPsiphonSidecar(t *testing.T) {
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate test source")
+	}
+	source, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func startSelectedTunnel(")
+	end := strings.Index(text[start:], "func waitForPsiphonAgentReady(")
+	if start < 0 || end < 0 {
+		t.Fatal("startSelectedTunnel function was not found")
+	}
+	body := text[start : start+end]
+	ensure := strings.Index(body, "ensureTunnelRunning(restartActive)")
+	apply := strings.Index(body, "autoApplyXrayPsiphonForNewAgent()")
+	if ensure < 0 || apply < 0 || apply < ensure {
+		t.Fatal("start/restart must repair the Psiphon Xray sidecar after the Agent service starts")
 	}
 }

@@ -425,3 +425,54 @@ func TestTunePsiphonPerformanceConfigPreservesUnknownFields(t *testing.T) {
 		t.Fatalf("second tune should be a no-op: changed=%t err=%v", changed, err)
 	}
 }
+
+func TestPsiphonEgressRegionPriorityAndUSBlock(t *testing.T) {
+	want := []string{"DE", "TR", "AE", "RS", "RO", "BG", "GR", "GE", "AM", "AZ", "NL", "CH", "AT", "PL", "CZ", "SK", "HU", "FR", "SE", "FI"}
+	if !reflect.DeepEqual(psiphonEgressRegionPriority, want) {
+		t.Fatalf("Psiphon region priority = %v; want %v", psiphonEgressRegionPriority, want)
+	}
+	for _, region := range want {
+		if _, err := normalizePsiphonEgressRegion(region); err != nil {
+			t.Fatalf("priority region %s was rejected: %v", region, err)
+		}
+	}
+	for _, blocked := range []string{"US", "us", "USA"} {
+		if _, err := normalizePsiphonEgressRegion(blocked); err == nil {
+			t.Fatalf("blocked region %q was accepted", blocked)
+		}
+	}
+}
+
+func TestRenderPsiphonSystemdServiceIsRestartedAndTiedToAgent(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{
+		Name:           "profile-s",
+		PsiphonConfig:  filepath.Join(dir, "psiphon.json"),
+		PsiphonClient:  "/usr/local/bin/psiphon-console-client",
+		PsiphonDataDir: filepath.Join(dir, "data"),
+	}
+	service := psiphonServiceName(cfg.Name)
+	unit, err := renderPsiphonServiceUnit(cfg, service, "ravanreverse@s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(unit)
+	for _, want := range []string{
+		"PartOf=ravanreverse@s.service",
+		"Restart=always",
+		"RestartSec=5",
+		`ExecStart="/usr/local/bin/psiphon-console-client" "-config"`,
+		"-dataRootDirectory",
+		"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("Psiphon unit missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "[Install]") || strings.Contains(text, "WantedBy=multi-user.target") {
+		t.Fatalf("per-profile Psiphon service must be started through its Agent dependency, not enabled globally:\n%s", text)
+	}
+	if strings.Contains(text, "0.0.0.0") || strings.Contains(text, "CAP_NET_ADMIN") {
+		t.Fatalf("Psiphon unit must not expose a public proxy or grant network-admin capability:\n%s", text)
+	}
+}
