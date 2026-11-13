@@ -71,7 +71,6 @@ const (
 	underlayMASQUE                   = "warp_masque"
 	underlayPsiphon                  = "psiphon_socks5"
 	underlayAdaptive                 = "adaptive_external"
-	underlayOpenVPN                  = "openvpn_tcp_marked"
 	http2TokenHeader                 = "X-S1T-Token"
 	controlALPN                      = "shah-tunnel-control/1"
 	webSocketPath                    = "/s1t-tunnel"
@@ -113,43 +112,31 @@ type XrayWarpIntegration struct {
 }
 
 type Config struct {
-	Name            string `json:"name,omitempty"`
-	Version         string `json:"version"`
-	Role            string `json:"role"`                        // hub on Iran, agent on outside
-	Transport       string `json:"transport,omitempty"`         // Existing inner transport policy: auto, adaptive, tcp_tls, websocket_tls, http2_connect, http1_connect, or http_connect_auto
-	Underlay        string `json:"underlay,omitempty"`          // Agent egress: direct, warp_masque, psiphon_socks5, openvpn_tcp_marked, or adaptive_external
-	PsiphonConfig   string `json:"psiphon_config,omitempty"`    // Official Psiphon ConsoleClient JSON config
-	PsiphonProxy    string `json:"psiphon_proxy,omitempty"`     // Loopback SOCKS5 endpoint exposed by Psiphon
-	PsiphonClient   string `json:"psiphon_client,omitempty"`    // ConsoleClient executable name or absolute path
-	PsiphonDataDir  string `json:"psiphon_data_dir,omitempty"`  // Per-profile Psiphon persistent data directory
-	PsiphonHubAddr  string `json:"psiphon_hub_addr,omitempty"`  // Hub public Mapping endpoint used only through Psiphon SOCKS5
-	OpenVPNConfig   string `json:"openvpn_config,omitempty"`    // ShahTunnel-managed, sanitized VPN Gate .ovpn profile
-	OpenVPNAuthFile string `json:"openvpn_auth_file,omitempty"` // Private VPN Gate public credentials file
-	OpenVPNService  string `json:"openvpn_service,omitempty"`   // Dedicated profile-scoped OpenVPN systemd service
-	OpenVPNProvider string `json:"openvpn_provider,omitempty"`
-	OpenVPNCountry  string `json:"openvpn_country,omitempty"`
-	OpenVPNServer   string `json:"openvpn_server,omitempty"`
-	OpenVPNServerIP string `json:"openvpn_server_ip,omitempty"`
-	OpenVPNDevice   string `json:"openvpn_device,omitempty"`   // Dedicated TUN device
-	OpenVPNTable    int    `json:"openvpn_table,omitempty"`    // Per-profile policy-routing table
-	OpenVPNMark     int    `json:"openvpn_mark,omitempty"`     // SO_MARK used only by this profile
-	OpenVPNPriority int    `json:"openvpn_priority,omitempty"` // Per-profile fwmark rule priority
-	ControlListen   string `json:"control_listen,omitempty"`
-	PublicListen    string `json:"public_listen,omitempty"`
-	HubAddr         string `json:"hub_addr,omitempty"`
-	TLSServerName   string `json:"tls_server_name,omitempty"`
-	Target          string `json:"target,omitempty"`
-	Token           string `json:"token"`
-	CertFile        string `json:"cert_file,omitempty"`
-	KeyFile         string `json:"key_file,omitempty"`
-	Fingerprint     string `json:"fingerprint,omitempty"`
+	Name           string `json:"name,omitempty"`
+	Version        string `json:"version"`
+	Role           string `json:"role"`                       // hub on Iran, agent on outside
+	Transport      string `json:"transport,omitempty"`        // Existing inner transport policy: auto, adaptive, tcp_tls, websocket_tls, http2_connect, http1_connect, or http_connect_auto
+	Underlay       string `json:"underlay,omitempty"`         // Agent egress: direct, warp_masque, psiphon_socks5, or adaptive_external
+	PsiphonConfig  string `json:"psiphon_config,omitempty"`   // Official Psiphon ConsoleClient JSON config
+	PsiphonProxy   string `json:"psiphon_proxy,omitempty"`    // Loopback SOCKS5 endpoint exposed by Psiphon
+	PsiphonClient  string `json:"psiphon_client,omitempty"`   // ConsoleClient executable name or absolute path
+	PsiphonDataDir string `json:"psiphon_data_dir,omitempty"` // Per-profile Psiphon persistent data directory
+	PsiphonHubAddr string `json:"psiphon_hub_addr,omitempty"` // Hub public Mapping endpoint used only through Psiphon SOCKS5
+	ControlListen  string `json:"control_listen,omitempty"`
+	PublicListen   string `json:"public_listen,omitempty"`
+	HubAddr        string `json:"hub_addr,omitempty"`
+	TLSServerName  string `json:"tls_server_name,omitempty"`
+	Target         string `json:"target,omitempty"`
+	Token          string `json:"token"`
+	CertFile       string `json:"cert_file,omitempty"`
+	KeyFile        string `json:"key_file,omitempty"`
+	Fingerprint    string `json:"fingerprint,omitempty"`
 	// TunnelChannels controls the number of independent authenticated TCP/TLS lanes
 	// between Agent and Hub. Missing values on old configs are upgraded in memory to the current default.
 	TunnelChannels int                     `json:"tunnel_channels,omitempty"`
 	Ports          []PortMapping           `json:"ports,omitempty"`
 	XrayWARP       *XrayWarpIntegration    `json:"xray_warp,omitempty"`
 	XrayPsiphon    *XrayPsiphonIntegration `json:"xray_psiphon,omitempty"`
-	XrayOpenVPN    *XrayOpenVPNIntegration `json:"xray_openvpn,omitempty"`
 }
 
 type RuntimeSnapshot struct {
@@ -668,7 +655,7 @@ func validTransportMode(mode string) bool {
 }
 
 func validUnderlayMode(mode string) bool {
-	return mode == underlayDirect || mode == underlayMASQUE || mode == underlayPsiphon || mode == underlayAdaptive || mode == underlayOpenVPN
+	return mode == underlayDirect || mode == underlayMASQUE || mode == underlayPsiphon || mode == underlayAdaptive
 }
 
 func isLoopbackProxyAddress(address string) bool {
@@ -2245,7 +2232,7 @@ func runAgentOverStream(conn net.Conn, cfg Config, channel int, displayTransport
 	if cfg.Transport == transportAdaptive {
 		agentPreferredTransport.Store(channel, displayTransport)
 	}
-	if cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE || cfg.Underlay == underlayOpenVPN {
+	if cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE {
 		agentPreferredUnderlay.Store(channel, cfg.Underlay)
 	}
 	log.Printf("tunnel lane %d/%d connected via %s over %s; forwarding through %d configured port mapping(s)", channel, cfg.TunnelChannels, displayTransport, cfg.Underlay, len(normalizeConfig(cfg).Ports))
@@ -2770,20 +2757,11 @@ func validAuth(line, token string) bool { return authProtocol(line, token) != ""
 
 func runAgent(cfg Config) error {
 	cfg = normalizeConfig(cfg)
-	if cfg.Role == "agent" && strings.TrimSpace(cfg.OpenVPNConfig) != "" && cfg.XrayOpenVPN == nil {
-		return errors.New("OpenVPN egress is configured but its isolated Xray sidecar is missing; refusing to start this Agent to prevent direct-IP fallback")
-	}
 	var cleanupUnderlay func()
 	cleanupUnderlay = func() {}
 	switch cfg.Underlay {
 	case underlayPsiphon:
 		cleanup, err := startPsiphonForAgent(cfg)
-		if err != nil {
-			return err
-		}
-		cleanupUnderlay = cleanup
-	case underlayOpenVPN:
-		cleanup, err := startOpenVPNForAgent(cfg)
 		if err != nil {
 			return err
 		}
@@ -2797,15 +2775,6 @@ func runAgent(cfg Config) error {
 			log.Printf("Psiphon is not ready at startup; direct egress remains enabled: %v", err)
 		} else {
 			cleanupUnderlay = cleanup
-		}
-		if strings.TrimSpace(cfg.OpenVPNConfig) != "" {
-			openvpnCleanup, openvpnErr := startOpenVPNForAgent(cfg)
-			if openvpnErr != nil {
-				log.Printf("OpenVPN adaptive egress is unavailable; other configured egresses remain available: %v", openvpnErr)
-			} else {
-				previousCleanup := cleanupUnderlay
-				cleanupUnderlay = func() { openvpnCleanup(); previousCleanup() }
-			}
 		}
 	}
 	defer cleanupUnderlay()
@@ -2905,17 +2874,12 @@ func adaptiveTransportCandidates(preferred string) []string {
 
 func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
 	// WARP is only a candidate when its client reports a connected MASQUE path.
-	// A previously healthy non-WARP route is preferred, followed by the other
-	// configured egresses. Direct remains the last-resort adaptive fallback.
+	// Other WARP protocols are never selected by adaptive routing.
 	warpMode := detectActiveWarpUnderlay()
 	usesPsiphon := strings.TrimSpace(cfg.PsiphonConfig) != ""
-	usesOpenVPN := strings.TrimSpace(cfg.OpenVPNConfig) != ""
-	all := make([]string, 0, 4)
+	all := make([]string, 0, 3)
 	appendCandidate := func(candidate string) {
 		if candidate == underlayPsiphon && !usesPsiphon {
-			return
-		}
-		if candidate == underlayOpenVPN && !usesOpenVPN {
 			return
 		}
 		for _, existing := range all {
@@ -2926,23 +2890,21 @@ func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
 		all = append(all, candidate)
 	}
 
+	// An active WARP route is always checked first, then fails over to
+	// Psiphon and Direct. When WARP is down, retain the last successful
+	// non-WARP route; a lost WARP preference hands off to Psiphon first.
 	if warpMode != "" {
 		appendCandidate(warpMode)
+		appendCandidate(underlayPsiphon)
+		appendCandidate(underlayDirect)
+		return all
 	}
 	switch preferred {
-	case underlayOpenVPN, underlayPsiphon, underlayDirect:
-		appendCandidate(preferred)
-	case underlayMASQUE:
-		// If MASQUE just went down, do not repeatedly select it; try the
-		// configured non-WARP paths instead.
-	case "":
-		// Preserve the legacy Direct-first order when no OpenVPN profile was
-		// configured. A new OpenVPN adaptive profile prefers OpenVPN first.
-		if warpMode == "" && !usesOpenVPN {
-			appendCandidate(underlayDirect)
-		}
+	case underlayPsiphon, underlayMASQUE:
+		appendCandidate(underlayPsiphon)
+	case underlayDirect, "":
+		appendCandidate(underlayDirect)
 	}
-	appendCandidate(underlayOpenVPN)
 	appendCandidate(underlayPsiphon)
 	appendCandidate(underlayDirect)
 	return all
@@ -2956,10 +2918,6 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 	switch cfg.Underlay {
 	case underlayMASQUE:
 		if err := verifyWarpMasqueUnderlay(); err != nil {
-			return err
-		}
-	case underlayOpenVPN:
-		if err := verifyOpenVPNRoute(&cfg); err != nil {
 			return err
 		}
 	}
@@ -3006,8 +2964,6 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 			switch route {
 			case underlayMASQUE:
 				warpErr = verifyWarpMasqueUnderlay()
-			case underlayOpenVPN:
-				warpErr = verifyOpenVPNRoute(&cfg)
 			}
 			if warpErr != nil {
 				lastErr = warpErr
@@ -3113,7 +3069,7 @@ func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode s
 	if cfg.Transport == transportAdaptive {
 		agentPreferredTransport.Store(channel, mode)
 	}
-	if cfg.Underlay == underlayAdaptive || cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE || cfg.Underlay == underlayOpenVPN {
+	if cfg.Underlay == underlayAdaptive || cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE {
 		agentPreferredUnderlay.Store(channel, cfg.Underlay)
 	}
 	log.Printf("tunnel lane %d/%d connected via %s over %s; forwarding through %d configured port mapping(s)", channel, cfg.TunnelChannels, mode, cfg.Underlay, len(normalizeConfig(cfg).Ports))
@@ -3130,8 +3086,6 @@ func dialAgentUnderlay(ctx context.Context, cfg Config, network, address string)
 	switch cfg.Underlay {
 	case underlayPsiphon:
 		return dialSOCKS5Context(ctx, cfg.PsiphonProxy, address)
-	case underlayOpenVPN:
-		return dialMarkedContext(ctx, "tcp", address, cfg.OpenVPNMark)
 	case underlayMASQUE:
 		proxyAddress, localProxyMode, err := warpProxyAddressFromCLI()
 		if err != nil {
@@ -3795,18 +3749,6 @@ func validateConfig(c Config) error {
 		if c.Underlay == underlayAdaptive && c.Transport != transportAdaptive {
 			return errors.New("all-protocol adaptive egress requires transport=adaptive so all four inner transports can fail over")
 		}
-		if c.Underlay == underlayOpenVPN && strings.TrimSpace(c.OpenVPNConfig) == "" {
-			return errors.New("OpenVPN managed client profile is required for the selected underlay")
-		}
-		if strings.TrimSpace(c.OpenVPNConfig) != "" {
-			route := openVPNRouteInfoForProfile(c.Name)
-			if filepath.Clean(c.OpenVPNConfig) != filepath.Join(openVPNProfileDir(c.Name), "client.ovpn") || c.OpenVPNService != openVPNServiceName(c.Name) {
-				return errors.New("OpenVPN profile paths/service do not match this Agent profile")
-			}
-			if c.OpenVPNTable != route.Table || c.OpenVPNMark != route.Mark || c.OpenVPNPriority != route.Priority || c.OpenVPNDevice != route.Device {
-				return errors.New("OpenVPN per-profile policy routing metadata is invalid")
-			}
-		}
 		usesPsiphon := c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive
 		if usesPsiphon {
 			if strings.TrimSpace(c.PsiphonConfig) == "" {
@@ -3907,21 +3849,8 @@ func validateConfig(c Config) error {
 		if _, err := normalizeFingerprint(c.Fingerprint); err != nil {
 			return err
 		}
-		integrations := 0
-		if c.XrayWARP != nil {
-			integrations++
-		}
-		if c.XrayPsiphon != nil {
-			integrations++
-		}
-		if c.XrayOpenVPN != nil {
-			integrations++
-		}
-		if integrations > 1 {
-			return errors.New("an Agent profile can have only one isolated Xray egress sidecar")
-		}
-		if c.XrayOpenVPN != nil && strings.TrimSpace(c.OpenVPNConfig) == "" {
-			return errors.New("isolated Xray OpenVPN egress requires a managed OpenVPN profile")
+		if c.XrayWARP != nil && c.XrayPsiphon != nil {
+			return errors.New("an Agent profile cannot have both isolated WARP and Psiphon Xray egress")
 		}
 		if c.XrayPsiphon != nil {
 			if c.Underlay != underlayPsiphon && c.Underlay != underlayAdaptive {
@@ -3929,14 +3858,6 @@ func validateConfig(c Config) error {
 			}
 			if !isLoopbackProxyAddress(c.XrayPsiphon.Proxy) {
 				return errors.New("isolated Xray Psiphon proxy must be loopback-only")
-			}
-		}
-		if c.XrayOpenVPN != nil {
-			if c.OpenVPNConfig == "" || c.OpenVPNMark != c.XrayOpenVPN.Mark || c.XrayOpenVPN.Mark <= 0 {
-				return errors.New("isolated Xray OpenVPN metadata does not match the managed OpenVPN route")
-			}
-			if c.Underlay != underlayOpenVPN && c.Underlay != underlayAdaptive {
-				return errors.New("isolated Xray OpenVPN egress requires OpenVPN or adaptive underlay mode")
 			}
 		}
 	} else {
@@ -4401,16 +4322,6 @@ func deleteOneTunnel() error {
 			return fmt.Errorf("tunnel stopped, but its isolated Xray Psiphon route could not be removed; tunnel profile was kept: %w", err)
 		}
 	}
-	if cfg.XrayOpenVPN != nil {
-		if err := removeXrayOpenVPNIntegration(&cfg); err != nil {
-			return fmt.Errorf("tunnel stopped, but its isolated Xray OpenVPN route could not be removed; tunnel profile was kept: %w", err)
-		}
-	}
-	if cfg.OpenVPNService != "" {
-		if err := removeOpenVPNProfile(&cfg); err != nil {
-			return fmt.Errorf("OpenVPN profile cleanup failed; ShahTunnel config was kept: %w", err)
-		}
-	}
 	if !selected.Legacy {
 		for _, certPath := range []string{cfg.CertFile, cfg.KeyFile} {
 			if certPath != "" && filepath.Clean(filepath.Dir(certPath)) == filepath.Clean(tunnelConfigDir) {
@@ -4710,8 +4621,8 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 	fmt.Printf("  %s\n", paint(ansiGreen, "5) HTTP CONNECT fallback — HTTP/2, then HTTP/1.1"))
 	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
 	fmt.Printf("  %s\n", paint(ansiPinkGlow, "7) FULL ADAPTIVE FAILOVER — all 4 implemented transports"))
-	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "8) EXTERNAL EGRESS — Cloudflare MASQUE / Psiphon / Free VPN Gate OpenVPN"))
-	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) ALL-PROTOCOL ADAPTIVE — all 4 transports + Direct/WARP/Psiphon/VPN Gate failover"))
+	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "8) EXTERNAL EGRESS — Cloudflare MASQUE / Psiphon"))
+	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) ALL-PROTOCOL ADAPTIVE — all 4 transports + Direct/Psiphon egress failover"))
 	choice := wizardAsk(prompt+" (1-9)", "7")
 	switch choice {
 	case "1":
@@ -4736,8 +4647,7 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 		fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "EXTERNAL EGRESS PROVIDER"))
 		fmt.Println("  1) Cloudflare WARP over MASQUE (WarpProxy / Local Proxy required; already Connected)")
 		fmt.Println("  2) Psiphon ConsoleClient via local SOCKS5")
-		fmt.Println("  3) Free OpenVPN via VPN Gate (automatic server list and country selection)")
-		sub := wizardAsk("Select external egress (1-3)", "1")
+		sub := wizardAsk("Select external egress (1-2)", "1")
 		switch sub {
 		case "1":
 			if _, err := verifyWarpPerTunnelPrerequisites(); err != nil {
@@ -4747,19 +4657,18 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 			return transportAdaptive, underlayMASQUE, "", nil
 		case "2":
 			// ConsoleClient, its pinned upstream source build, a per-profile JSON
-			// config, and a unique loopback SOCKS5 port are prepared automatically.
+			// config, and a unique loopback SOCKS5 port are prepared automatically
+			// during Agent creation. No manual Psiphon files are requested.
 			return transportAdaptive, underlayPsiphon, "", nil
-		case "3":
-			return transportAdaptive, underlayOpenVPN, "", nil
 		default:
-			return "", "", "", errors.New("invalid external egress selection; enter 1, 2 or 3")
+			return "", "", "", errors.New("invalid external egress selection; enter 1 or 2")
 		}
 	case "9":
 		if role != "agent" {
-			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent to enable Direct/WARP/Psiphon/VPN Gate egress failover.")
+			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent to enable Direct/Psiphon egress failover.")
 			return transportAdaptive, underlayDirect, "", nil
 		}
-		// VPN Gate OpenVPN is offered as an additional isolated candidate later in the Agent wizard.
+		// Option 9 includes Psiphon as an automatically prepared standby egress.
 		return transportAdaptive, underlayAdaptive, "", nil
 	default:
 		return "", "", "", errors.New("invalid transport selection; enter a number from 1 to 9")
@@ -4958,33 +4867,6 @@ func setup() error {
 		if err != nil {
 			return err
 		}
-		if c.Underlay == underlayOpenVPN || c.Underlay == underlayAdaptive {
-			configureOpenVPN := c.Underlay == underlayOpenVPN || wizardYesNo("Add free VPN Gate OpenVPN as an additional Option 9 egress candidate? (Y/n)", "y")
-			if configureOpenVPN {
-				if err = prepareOpenVPNAgentProfile(&c); err != nil {
-					if c.Underlay != underlayAdaptive {
-						return fmt.Errorf("OpenVPN egress setup failed; Agent profile was not saved: %w", err)
-					}
-					// VPN Gate is an optional candidate in adaptive mode. If its public
-					// directory is temporarily unavailable, preserve the rest of the
-					// adaptive wizard instead of failing MASQUE/Psiphon configuration.
-					uiWarn("VPN Gate could not be prepared; continuing Option 9 without this optional candidate: " + err.Error())
-					c.OpenVPNConfig = ""
-					c.OpenVPNAuthFile = ""
-					c.OpenVPNService = ""
-					c.OpenVPNProvider = ""
-					c.OpenVPNCountry = ""
-					c.OpenVPNServer = ""
-					c.OpenVPNServerIP = ""
-					c.OpenVPNDevice = ""
-					c.OpenVPNTable = 0
-					c.OpenVPNMark = 0
-					c.OpenVPNPriority = 0
-				} else {
-					uiSuccess("Free OpenVPN via VPN Gate profile and isolated policy-routing service prepared.")
-				}
-			}
-		}
 		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
 			defaultEndpoint := defaultPsiphonHubAddress(c.HubAddr)
 			c.PsiphonHubAddr = wizardAsk("Hub public Mapping address reachable through Psiphon SOCKS5 (IP:PORT)", defaultEndpoint)
@@ -5039,9 +4921,6 @@ func setup() error {
 		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
 			uiInfo("Psiphon starts as a loopback-only child process. The Agent-to-Hub lanes and the isolated Xray user TCP/DNS egress use its SOCKS5 endpoint; UDP is blocked on the isolated user path to prevent direct-IP leaks. No TUN device or host route changes are made.")
 		}
-		if c.OpenVPNConfig != "" {
-			uiInfo("OpenVPN runs on a profile-specific TUN and policy-routing table. Only marked sockets from this Agent/Xray sidecar use it; the VPS main route and SSH are unchanged. If OpenVPN drops, this profile's marked route is blackholed.")
-		}
 		uiSuccess("Agent configuration saved. Reconnection is automatic if a lane drops.")
 	case "3", "relay", "front":
 		c.Role = "relay"
@@ -5074,11 +4953,6 @@ func setup() error {
 		uiWarn("Relay changes the client entry point only. The Relay operator and network path may still see the Iran destination IP.")
 	default:
 		return errors.New("invalid role; enter 1 for HUB, 2 for Agent, or 3 for Relay")
-	}
-	if c.Role == "agent" && strings.TrimSpace(c.OpenVPNConfig) != "" {
-		if err := autoApplyXrayOpenVPNForNewAgent(); err != nil {
-			return err
-		}
 	}
 	if c.Role == "agent" && c.Underlay == underlayMASQUE {
 		if err := autoApplyXrayWarpForNewAgent(); err != nil {
