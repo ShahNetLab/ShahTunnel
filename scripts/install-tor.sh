@@ -17,7 +17,8 @@ done
 # Reuse a complete previously installed bundle, including an alternative official layout.
 if grep -Fxq "version=${TOR_VERSION}" "${STATE_DIR}/tor-bundle.info" 2>/dev/null && \
    find "$BUNDLE_DIR" -type f -name tor -perm /111 -print -quit 2>/dev/null | grep -q . && \
-   find "$BUNDLE_DIR" -type f -name lyrebird -perm /111 -print -quit 2>/dev/null | grep -q .; then
+   find "$BUNDLE_DIR" -type f -name lyrebird -perm /111 -print -quit 2>/dev/null | grep -q . && \
+   [[ -s "${BUNDLE_DIR}/data/geoip" && -s "${BUNDLE_DIR}/data/geoip6" ]]; then
   echo "Official Tor Expert Bundle ${TOR_VERSION} is already installed."
   exit 0
 fi
@@ -52,6 +53,8 @@ printf '%s  %s\n' "$EXPECTED_SHA256" "$ARCHIVE_PATH" | sha256sum -c - \
   || fail "Tor Expert Bundle SHA-256 mismatch; refusing to install the archive."
 tar -tzf "$ARCHIVE_PATH" >/dev/null 2>&1 || fail "downloaded Tor Expert Bundle is not a valid tar.gz archive."
 tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR" || fail "could not extract Tor Expert Bundle."
+[[ -s "${EXTRACT_DIR}/data/geoip" && -s "${EXTRACT_DIR}/data/geoip6" ]] \
+  || fail "official Tor Expert Bundle is missing its IPv4/IPv6 GeoIP databases; refusing to install without non-US relay enforcement."
 
 # Prefer the real Expert Bundle daemon. Some bundles also ship a file named
 # debug/tor; selecting the first filesystem match can pick an incompatible
@@ -86,6 +89,7 @@ find "$NEW_DIR" -type f ! -perm /111 -exec chmod 0644 {} +
 # Verify that the expected executables survived the staged copy before swapping.
 [[ -x "${NEW_DIR}/${TOR_BIN#"$EXTRACT_DIR"/}" ]] || fail "staged Tor executable is missing."
 [[ -x "${NEW_DIR}/${LYREBIRD_BIN#"$EXTRACT_DIR"/}" ]] || fail "staged Lyrebird executable is missing."
+[[ -s "${NEW_DIR}/data/geoip" && -s "${NEW_DIR}/data/geoip6" ]] || fail "staged Tor GeoIP databases are missing."
 
 if [[ -e "$BUNDLE_DIR" ]]; then mv "$BUNDLE_DIR" "$BACKUP_DIR"; fi
 if mv "$NEW_DIR" "$BUNDLE_DIR"; then
