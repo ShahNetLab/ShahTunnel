@@ -93,6 +93,26 @@ func torBridgeLine(cfg Config) (string, error) {
 	}
 }
 
+func torGeoIPFilePaths() (string, string) {
+	return filepath.Join(torBundleRoot, "data", "geoip"), filepath.Join(torBundleRoot, "data", "geoip6")
+}
+
+// verifyTorGeoIPFiles fails closed: country-based relay exclusions are unsafe
+// if Tor cannot load the IPv4 and IPv6 relay-country databases.
+func verifyTorGeoIPFiles() error {
+	geo4, geo6 := torGeoIPFilePaths()
+	for label, path := range map[string]string{"IPv4 GeoIP database": geo4, "IPv6 GeoIP database": geo6} {
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("required Tor %s is missing at %s: %w; reinstall the official Tor Expert Bundle", label, path, err)
+		}
+		if !info.Mode().IsRegular() || info.Size() == 0 {
+			return fmt.Errorf("required Tor %s is empty or not a regular file: %s", label, path)
+		}
+	}
+	return nil
+}
+
 func buildTorClientConfig(cfg Config) (string, error) {
 	bridge, err := torBridgeLine(cfg)
 	if err != nil {
@@ -131,6 +151,14 @@ func buildTorClientConfig(cfg Config) (string, error) {
 	b.WriteString("AvoidDiskWrites 1\n")
 	b.WriteString("Log notice stdout\n")
 	b.WriteString("UseBridges 1\n")
+	geo4, geo6 := torGeoIPFilePaths()
+	b.WriteString("GeoIPFile " + geo4 + "\n")
+	b.WriteString("GeoIPv6File " + geo6 + "\n")
+	// Exclude US relays at every Tor circuit position, not merely the exit.
+	// Unknown-country relays are also rejected; strict mode makes this fail closed.
+	b.WriteString("ExcludeNodes {us},{??}\n")
+	b.WriteString("GeoIPExcludeUnknown 1\n")
+	b.WriteString("StrictNodes 1\n")
 	b.WriteString("DataDirectory " + cfg.TorDataDir + "\n")
 	b.WriteString("SocksPort " + cfg.TorProxy + " IsolateSOCKSAuth\n")
 	b.WriteString("ClientTransportPlugin snowflake,webtunnel exec " + cfg.TorPTBinary + "\n")
@@ -307,6 +335,9 @@ func prepareTorAgentProfile(cfg *Config) error {
 	if err != nil {
 		return err
 	}
+	if err := verifyTorGeoIPFiles(); err != nil {
+		return err
+	}
 	port, err := allocateTorSocksPort(cfg.Name)
 	if err != nil {
 		return err
@@ -449,6 +480,9 @@ func startTorForAgent(cfg Config) (func(), error) {
 	}
 	if !executableFile(cfg.TorBinary) || !executableFile(cfg.TorPTBinary) || !compatibleLinuxELF(cfg.TorBinary) || !compatibleLinuxELF(cfg.TorPTBinary) {
 		return nil, errors.New("compatible Linux Tor/lyrebird executables are missing; rerun the updated ShahTunnel installer")
+	}
+	if err := verifyTorGeoIPFiles(); err != nil {
+		return nil, err
 	}
 	if !isLoopbackProxyAddress(cfg.TorProxy) {
 		return nil, errors.New("Tor SOCKS5 proxy must be loopback-only")

@@ -4189,6 +4189,145 @@ func parseTunnelProfileConfig(data []byte) (Config, bool) {
 	return c, true
 }
 
+// normalizedHubSessionAddress canonicalizes a Hub control endpoint so profile
+// comparisons are stable across DNS case, IPv6 brackets, and numeric port forms.
+func normalizedHubSessionAddress(addr string) string {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return ""
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return ""
+	}
+	host = strings.TrimSuffix(strings.ToLower(strings.Trim(host, "[]")), ".")
+	if host == "" {
+		return ""
+	}
+	return net.JoinHostPort(host, strconv.Itoa(portNumber))
+}
+
+func sameAgentHubSessionScope(a, b Config) bool {
+	if a.Role != "agent" || b.Role != "agent" {
+		return false
+	}
+	if strings.TrimSpace(a.Token) == "" || a.Token != b.Token {
+		return false
+	}
+	aHub := normalizedHubSessionAddress(a.HubAddr)
+	bHub := normalizedHubSessionAddress(b.HubAddr)
+	return aHub != "" && aHub == bHub
+}
+
+// agentProfilesConflictForTor prevents a Hub's shared authenticated lane pool
+// from mixing direct and Tor-backed Agents for the same mapping/token. The Hub
+// load-balances new public streams across every authenticated session, so a Tor
+// profile must run alone within this Hub+token scope.
+func agentProfilesConflictForTor(target, candidate Config) bool {
+	if !sameAgentHubSessionScope(target, candidate) {
+		return false
+	}
+	if target.Underlay == underlayTor {
+		return true
+	}
+	return candidate.Underlay == underlayTor
+}
+
+type pausedAgentService struct {
+	Name       string
+	WasActive  bool
+	WasEnabled bool
+}
+
+// pauseConflictingAgentProfiles stops and disables conflicting Agent services
+// that share the selected Agent's Hub and token. Disabling is necessary too:
+// otherwise systemd could restart a direct peer beside a Tor Agent after reboot.
+// Profile JSON, credentials, and the units' original enabled/running state are
+// recorded so a failed switch can restore them exactly.
+func pauseConflictingAgentProfiles(target Config, targetPath string) ([]pausedAgentService, error) {
+	target = normalizeConfig(target)
+	if target.Role != "agent" {
+		return nil, nil
+	}
+	profiles, err := listTunnelProfiles()
+	if err != nil {
+		return nil, fmt.Errorf("list Agent profiles before applying isolated egress: %w", err)
+	}
+	paused := make([]pausedAgentService, 0)
+	restoreOnError := func(cause error) ([]pausedAgentService, error) {
+		if restoreErr := restorePausedAgentServices(paused); restoreErr != nil {
+			return nil, fmt.Errorf("%w; failed to restore previous Agent service states: %v", cause, restoreErr)
+		}
+		return nil, cause
+	}
+	for _, profile := range profiles {
+		if filepath.Clean(profile.Path) == filepath.Clean(targetPath) || profile.Service == currentServiceName() {
+			continue
+		}
+		data, readErr := os.ReadFile(profile.Path)
+		if readErr != nil {
+			continue
+		}
+		candidate, ok := parseTunnelProfileConfig(data)
+		if !ok || !agentProfilesConflictForTor(target, candidate) {
+			continue
+		}
+		state := pausedAgentService{
+			Name:       profile.Service,
+			WasActive:  exec.Command("systemctl", "is-active", "--quiet", profile.Service).Run() == nil,
+			WasEnabled: exec.Command("systemctl", "is-enabled", "--quiet", profile.Service).Run() == nil,
+		}
+		if !state.WasActive && !state.WasEnabled {
+			continue
+		}
+		// Record the original state before mutating systemd so even a partially
+		// successful stop/disable can be rolled back if a later command fails.
+		paused = append(paused, state)
+		if state.WasActive {
+			if err := runSystemctl("stop", profile.Service); err != nil {
+				return restoreOnError(fmt.Errorf("could not stop conflicting Agent service %s: %w", profile.Service, err))
+			}
+			if exec.Command("systemctl", "is-active", "--quiet", profile.Service).Run() == nil {
+				return restoreOnError(fmt.Errorf("conflicting Agent service %s remained active after stop", profile.Service))
+			}
+		}
+		if state.WasEnabled {
+			if err := runSystemctl("disable", profile.Service); err != nil {
+				return restoreOnError(fmt.Errorf("could not disable conflicting Agent auto-start %s: %w", profile.Service, err))
+			}
+			if exec.Command("systemctl", "is-enabled", "--quiet", profile.Service).Run() == nil {
+				return restoreOnError(fmt.Errorf("conflicting Agent service %s remains enabled after disable", profile.Service))
+			}
+		}
+	}
+	return paused, nil
+}
+
+func restorePausedAgentServices(services []pausedAgentService) error {
+	var failures []string
+	for i := len(services) - 1; i >= 0; i-- {
+		state := services[i]
+		if strings.TrimSpace(state.Name) == "" {
+			continue
+		}
+		if state.WasEnabled {
+			if err := runSystemctl("enable", state.Name); err != nil {
+				failures = append(failures, fmt.Sprintf("enable %s: %v", state.Name, err))
+				continue
+			}
+		}
+		if state.WasActive && exec.Command("systemctl", "is-active", "--quiet", state.Name).Run() != nil {
+			if err := runSystemctl("start", state.Name); err != nil {
+				failures = append(failures, fmt.Sprintf("start %s: %v", state.Name, err))
+			}
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("%s", strings.Join(failures, "; "))
+	}
+	return nil
+}
+
 func listTunnelProfiles() ([]TunnelProfile, error) {
 	profiles := make([]TunnelProfile, 0)
 	if data, err := os.ReadFile(legacyConfigPath); err == nil {
@@ -5056,9 +5195,9 @@ func emergencyTorMenu() error {
 	fmt.Println(paint(ansiCyan+ansiBold, "  EMERGENCY TOR TRANSPORT"))
 	fmt.Println("  1) Tor Snowflake")
 	fmt.Println("  2) Tor WebTunnel")
-	fmt.Println("  0) Back")
-	choice := ask("Select the emergency Tor transport", "0")
-	if strings.TrimSpace(choice) == "0" {
+	fmt.Println("  3) Back")
+	choice := ask("Select the emergency Tor transport", "3")
+	if strings.TrimSpace(choice) == "3" || strings.TrimSpace(choice) == "0" {
 		return nil
 	}
 	mode, err := emergencyTorModeFromChoice(choice)
@@ -5187,25 +5326,46 @@ func emergencyTorMenu() error {
 		}
 		return fmt.Errorf("emergency Tor setup failed; the new profile was rolled back and the source Agent was preserved: %w", err)
 	}
+	pausedServices, pauseErr := pauseConflictingAgentProfiles(cloned, newPath)
+	if pauseErr != nil {
+		if rollbackErr := rollback(cloned); rollbackErr != nil {
+			return fmt.Errorf("could not isolate the emergency Tor Agent: %w; profile rollback also failed: %v", pauseErr, rollbackErr)
+		}
+		return fmt.Errorf("could not isolate the emergency Tor Agent; the new profile was rolled back: %w", pauseErr)
+	}
+	if len(pausedServices) > 0 {
+		uiWarn(fmt.Sprintf("Paused %d other Agent profile(s) sharing this Hub/token. They remain saved and enabled; this prevents the Hub from sending user traffic over non-Tor lanes.", len(pausedServices)))
+	}
+	rollbackAndRestore := func(cause error, stage string) error {
+		cleanupErr := rollback(cloned)
+		restoreErr := restorePausedAgentServices(pausedServices)
+		if cleanupErr != nil || restoreErr != nil {
+			return fmt.Errorf("%s: %w; rollback error: %v; restoring previous Agent services: %v", stage, cause, cleanupErr, restoreErr)
+		}
+		return fmt.Errorf("%s: %w", stage, cause)
+	}
 	startedAt := time.Now()
 	if _, err := ensureTunnelRunning(true); err != nil {
-		if rollbackErr := rollback(cloned); rollbackErr != nil {
-			return fmt.Errorf("start emergency Tor profile: %w; rollback also failed: %v", err, rollbackErr)
-		}
-		return fmt.Errorf("start emergency Tor profile failed; the new profile was rolled back and the source Agent was preserved: %w", err)
+		return rollbackAndRestore(err, "start emergency Tor profile failed; previous Agent services were restored")
 	}
 	service := currentServiceName()
 	if err := waitForTorAgentReady(service, startedAt, torBootstrapTimeout+30*time.Second); err != nil {
-		uiWarn(err.Error())
-		uiInfo("The emergency profile was retained and remains available in the normal tunnel manager for another start attempt.")
-		return nil
+		return rollbackAndRestore(err, "emergency Tor Agent did not become ready; the incomplete profile was removed and previous Agent services were restored")
+	}
+	exitIP, exitCountry, exitErr := verifyTorPublicEgress(cloned.TorProxy, 90*time.Second)
+	if exitErr != nil {
+		return rollbackAndRestore(exitErr, "emergency Tor exit was US or could not be verified as non-US; the profile was removed and previous Agent services were restored")
 	}
 	modeLabel := "Tor Snowflake"
 	if mode == torModeWebTunnel {
 		modeLabel = "Tor WebTunnel"
 	}
-	uiSuccess(fmt.Sprintf("%s profile '%s' was created and started independently.", modeLabel, newName))
-	uiInfo("The original Agent profile and its services were not changed. Use the normal Start/Stop menu to control each profile independently.")
+	uiSuccess(fmt.Sprintf("%s profile '%s' is ready; verified Tor exit: %s (%s), non-US.", modeLabel, newName, exitIP, exitCountry))
+	if len(pausedServices) > 0 {
+		uiInfo("Other Agent services with the same Hub/token remain stopped and disabled from auto-start while this Tor profile is active. Their profile files are preserved. Starting one of them later will pause this Tor profile to prevent mixed egress.")
+	} else {
+		uiInfo("No competing Agent service with the same Hub/token was running.")
+	}
 	uiWarn("Tor carries TCP and DNS only on the isolated user path; UDP, QUIC and ICMP are blocked. A running Agent lane is required before treating the backup as ready.")
 	return nil
 }
@@ -5449,9 +5609,16 @@ func setup() error {
 	}
 	fmt.Printf("\n  %s %s\n", paint(ansiGreen+ansiBold, "✓"), "Configuration saved: "+configPath)
 	uiInfo("Enabling the independent service and automatic startup after VPS reboot…")
+	pausedServices, pauseErr := pauseConflictingAgentProfiles(c, configPath)
+	if pauseErr != nil {
+		return fmt.Errorf("could not isolate this Agent from conflicting Tor lanes: %w", pauseErr)
+	}
 	connected, startErr := ensureTunnelRunning(true)
 	if startErr != nil {
-		return fmt.Errorf("configuration was saved, but automatic startup failed: %w", startErr)
+		if restoreErr := restorePausedAgentServices(pausedServices); restoreErr != nil {
+			return fmt.Errorf("configuration was saved, but automatic startup failed: %w; previous Agent services could not all be restored: %v", startErr, restoreErr)
+		}
+		return fmt.Errorf("configuration was saved, but automatic startup failed; previous Agent services were restored: %w", startErr)
 	}
 	// The profile-bound Psiphon systemd unit is prepared before Agent startup.
 	// Configure isolated Xray user egress only after Agent and SOCKS readiness
@@ -5459,13 +5626,19 @@ func setup() error {
 	if c.Role == "agent" && (c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive) {
 		if err := autoApplyXrayPsiphonForNewAgent(); err != nil {
 			_ = runSystemctl("stop", currentServiceName()) // fail closed: do not leave the new mapping on its original target
-			return fmt.Errorf("Agent service started, but Psiphon user-egress setup failed; Agent was stopped fail-closed: %w", err)
+			if restoreErr := restorePausedAgentServices(pausedServices); restoreErr != nil {
+				return fmt.Errorf("Agent service started, but Psiphon user-egress setup failed; Agent was stopped and previous services were restored with errors: %w; %v", err, restoreErr)
+			}
+			return fmt.Errorf("Agent service started, but Psiphon user-egress setup failed; Agent was stopped and previous Agent services were restored: %w", err)
 		}
 	}
 	if c.Underlay == underlayPsiphon && !connected {
 		uiInfo("Agent service and local Psiphon SOCKS5 are running. Psiphon egress and/or the Agent-to-Hub lane may still be connecting; end-to-end connectivity is not yet confirmed.")
 	} else {
-		uiSuccess("Tunnel '" + name + "' is active. Existing tunnels were not changed.")
+		uiSuccess("Tunnel '" + name + "' is active.")
+		if len(pausedServices) > 0 {
+			uiInfo(fmt.Sprintf("Paused %d conflicting Agent service(s) with the same Hub/token. Their profile files are preserved; auto-start is switched to this Agent only.", len(pausedServices)))
+		}
 	}
 	return nil
 }
@@ -5579,12 +5752,33 @@ func ensureTunnelRunning(restartActive bool) (bool, error) {
 // Agent, and repairs the automatic Psiphon Xray sidecar if an earlier setup
 // attempt saved the profile but failed before the sidecar was committed.
 func startSelectedTunnel(restartActive bool) error {
+	selectedData, readErr := os.ReadFile(configPath)
+	if readErr != nil {
+		return fmt.Errorf("read selected tunnel before start: %w", readErr)
+	}
+	selected, ok := parseTunnelProfileConfig(selectedData)
+	if !ok {
+		return errors.New("selected tunnel configuration is invalid")
+	}
+	pausedServices, pauseErr := pauseConflictingAgentProfiles(selected, configPath)
+	if pauseErr != nil {
+		return pauseErr
+	}
+	restorePeers := func(cause error, message string) error {
+		if restoreErr := restorePausedAgentServices(pausedServices); restoreErr != nil {
+			return fmt.Errorf("%s: %w; failed to restore previous Agent services: %v", message, cause, restoreErr)
+		}
+		return fmt.Errorf("%s: %w; previous Agent services were restored", message, cause)
+	}
 	if _, err := ensureTunnelRunning(restartActive); err != nil {
-		return err
+		return restorePeers(err, "selected tunnel failed to start")
 	}
 	if err := autoApplyXrayPsiphonForNewAgent(); err != nil {
 		_ = runSystemctl("stop", currentServiceName())
-		return fmt.Errorf("selected Agent started but automatic Psiphon Xray repair failed; Agent stopped fail-closed: %w", err)
+		return restorePeers(err, "selected Agent started but automatic Psiphon Xray repair failed; Agent stopped fail-closed")
+	}
+	if len(pausedServices) > 0 {
+		uiWarn(fmt.Sprintf("Paused %d conflicting Agent service(s) sharing this Hub/token. Their profile files are preserved; auto-start is switched to the selected Agent only.", len(pausedServices)))
 	}
 	return nil
 }
@@ -6518,7 +6712,7 @@ func menu() {
 		menuItem("6", "⏰ Scheduled restart", "Restart active tunnels on interval")
 		menuItem("7", "🗑️ Delete one tunnel", "Delete this tunnel only")
 		menuItem("8", "💣 Complete uninstall", "Remove all tunnels")
-		menuItem("T", "🛟 Emergency Tor profile", "Create backup Agent with Snowflake or WebTunnel")
+		menuItem("T", "🛟 Emergency Tor", "Snowflake / WebTunnel backup")
 		menuItem("0", "🚪 Exit", "Close menu")
 		uiRule()
 		choice := ask("Select an operation", "0")

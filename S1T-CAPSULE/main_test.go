@@ -3007,3 +3007,77 @@ func TestCloneAgentConfigForEmergencyTorRejectsNonAgentAndUnsafeMode(t *testing.
 		t.Fatal("unsupported emergency transport was accepted")
 	}
 }
+
+func TestAgentProfilesConflictForTorIsolation(t *testing.T) {
+	base := Config{
+		Role:     "agent",
+		HubAddr:  "hub.example.com:9443",
+		Token:    strings.Repeat("a", 64),
+		Underlay: underlayDirect,
+	}
+	tests := []struct {
+		name      string
+		target    Config
+		candidate Config
+		want      bool
+	}{
+		{
+			name:      "Tor target pauses direct peer",
+			target:    func() Config { c := base; c.Underlay = underlayTor; return c }(),
+			candidate: base,
+			want:      true,
+		},
+		{
+			name:      "Tor target pauses another Tor peer",
+			target:    func() Config { c := base; c.Underlay = underlayTor; return c }(),
+			candidate: func() Config { c := base; c.Underlay = underlayTor; return c }(),
+			want:      true,
+		},
+		{
+			name:      "direct target pauses Tor peer",
+			target:    base,
+			candidate: func() Config { c := base; c.Underlay = underlayTor; return c }(),
+			want:      true,
+		},
+		{
+			name:      "direct peers may coexist",
+			target:    base,
+			candidate: base,
+			want:      false,
+		},
+		{
+			name:      "different token is isolated",
+			target:    func() Config { c := base; c.Underlay = underlayTor; return c }(),
+			candidate: func() Config { c := base; c.Token = strings.Repeat("b", 64); return c }(),
+			want:      false,
+		},
+		{
+			name:      "different Hub is isolated",
+			target:    func() Config { c := base; c.Underlay = underlayTor; return c }(),
+			candidate: func() Config { c := base; c.HubAddr = "other.example.com:9443"; return c }(),
+			want:      false,
+		},
+		{
+			name:      "non-Agent is isolated",
+			target:    func() Config { c := base; c.Underlay = underlayTor; return c }(),
+			candidate: func() Config { c := base; c.Role = "hub"; return c }(),
+			want:      false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := agentProfilesConflictForTor(tt.target, tt.candidate); got != tt.want {
+				t.Fatalf("agentProfilesConflictForTor() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizedHubSessionAddress(t *testing.T) {
+	if got, want := normalizedHubSessionAddress("HUB.Example.COM.:09443"), "hub.example.com:9443"; got != want {
+		t.Fatalf("normalizedHubSessionAddress() = %q, want %q", got, want)
+	}
+	if got := normalizedHubSessionAddress("not-an-endpoint"); got != "" {
+		t.Fatalf("invalid endpoint should not match a Hub session scope; got %q", got)
+	}
+}

@@ -61,10 +61,16 @@ func TestBuildTorClientConfigIsLoopbackOnlyAndProfileScoped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildTorClientConfig failed: %v", err)
 	}
+	geo4, geo6 := torGeoIPFilePaths()
 	for _, want := range []string{
 		"RunAsDaemon 0\n",
 		"ClientOnly 1\n",
 		"UseBridges 1\n",
+		"GeoIPFile " + geo4 + "\n",
+		"GeoIPv6File " + geo6 + "\n",
+		"ExcludeNodes {us},{??}\n",
+		"GeoIPExcludeUnknown 1\n",
+		"StrictNodes 1\n",
 		"DataDirectory " + cfg.TorDataDir + "\n",
 		"SocksPort 127.0.0.1:19050 IsolateSOCKSAuth\n",
 		"ClientTransportPlugin snowflake,webtunnel exec " + cfg.TorPTBinary + "\n",
