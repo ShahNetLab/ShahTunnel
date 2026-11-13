@@ -1,3 +1,11 @@
+## 4.0.4 safety and profile scheduling
+
+- Psiphon region policy now defaults to Germany and allows only the approved non-US region set: AE, TR, DE, RS, RO, BG, GR, GE, AM, AZ, NL, CH, AT, PL, CZ, SK, HU, FR, SE and FI. US and unrestricted/blank region configurations are rejected.
+- Before applying the dedicated Psiphon Xray egress, ShahTunnel verifies the live exit country through the Psiphon SOCKS proxy. If the country is US, outside the allowlist, or cannot be verified, the route is refused.
+- Cron scheduled restarts are now scoped to one selected tunnel profile. Each profile gets separate config, state, lock, checker and `/etc/cron.d` entry; configuring or removing one profile does not restart or alter another profile.
+- Important limitation: `EgressRegion` is a Psiphon region preference, not a guarantee of server availability. This release enforces the non-US safety boundary, but does not yet run parallel country trials or automatically switch to the highest measured-throughput country. Keep the currently healthy Germany route until a measured replacement is available.
+
+
 <div align="center">
 
 <img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel Galactic emblem" width="100%">
@@ -23,11 +31,6 @@
 </div>
 
 ---
-
-## ShahTunnel 4.0.4 changes
-
-- **Psiphon non-US egress enforcement:** blank/automatic and US regions are rejected; Germany is the safe bootstrap region. On a fresh Agent start, temporary ConsoleClient sessions benchmark real HTTPS download throughput through SOCKS5 for DE, NL, GB, FR, CH and SE. Each candidate must pass public egress-country verification; the fastest verified non-US region is cached per profile for eight hours. A live verified non-US connection is preserved. The public exit country is re-verified every 45 seconds; US or unverified egress stops ConsoleClient (fail-closed).
-- **Independent per-tunnel Cron:** option 6 asks which tunnel to configure. Each profile has its own interval, state, lock and cron entry, and the checker can restart only that profile's systemd service. Recognized legacy global schedules are migrated to separate per-profile schedules. Removing one schedule or deleting one profile leaves all other schedules intact.
 
 <a id="network-flow"></a>
 ## Network Flow
@@ -80,7 +83,7 @@ Choose a mode during tunnel creation. The Hub and Agent must use compatible sett
 | `6` | Automatic fallback | Tries TCP/TLS, then WebSocket/TLS. |
 | `7` | Full Adaptive Failover | Uses all four implemented transports; each lane remembers its last successful transport. |
 | `8` | External egress | On an Agent, select Cloudflare MASQUE, Psiphon/SOCKS5 or Tor Snowflake/WebTunnel. |
-| `9` | All-protocol adaptive | On an Agent, combines all four transports with active MASQUE, configured Psiphon and Direct egress failover. |
+| `9` | Auto-Quality Adaptive | Distributes Agent lanes across all four transports and every available egress (MASQUE, configured Psiphon, Direct); authenticated RTT/load measurements steer new streams to the healthiest lane. |
 
 ### Agent egress providers
 
@@ -92,6 +95,8 @@ Choose a mode during tunnel creation. The Hub and Agent must use compatible sett
 | `Tor / Snowflake` | Installs the official Tor Expert Bundle and Lyrebird with pinned SHA-256; exposes loopback SOCKS5 for Agent TCP lanes and the same profile’s isolated Xray user egress. |
 | `Tor / WebTunnel` | Uses the same Tor path with a user-supplied Tor WebTunnel bridge line. |
 | `Adaptive` | Uses an already-active MASQUE path, configured Psiphon, and Direct failover; unsupported WARP protocols are not selected. |
+
+Option `9` staggers the Agent's independent lanes across the full transport/egress matrix at startup. Every lane sends authenticated PING/PONG heartbeats (5-second sampling); the Hub ranks fresh RTT with a bounded active-stream load penalty and assigns each **new** TCP stream to the best current lane. If a path fails or its session ends, that lane walks the remaining path matrix and remembers its last successful pair for reconnect. Existing TCP sessions are not migrated mid-stream; they stay on their original lane until they close. With the default 12 lanes, up to 12 combinations can be measured in parallel (4 transports × up to 3 available egress paths).
 
 ### Tor transport underlay: Snowflake and WebTunnel
 
@@ -126,7 +131,7 @@ For an existing Agent profile whose earlier Psiphon bootstrap did not connect, r
 
 No TUN device, default route, SSH service, or X-UI service is changed. The first Psiphon setup downloads and builds the official client; it requires access to GitHub source hosting and the Go toolchain distribution. For a newly created Agent that selects Psiphon, both its outer TCP lanes to the Hub and its mapped end-user Xray TCP/DNS traffic use the profile's Psiphon SOCKS5 path; UDP is blocked on the user sidecar to prevent direct leakage.
 
-> The creation wizard's option `9` means **All-protocol adaptive**. There is no WARP egress action in the main manager menu anymore: WARP is applied automatically while creating an Agent profile when selected as its external egress.
+> The creation wizard's option `9` means **Auto-Quality Adaptive**. There is no WARP egress action in the main manager menu anymore: WARP is applied automatically while creating an Agent profile when selected as its external egress.
 
 ## Automatic per-tunnel WARP egress for Xray
 
