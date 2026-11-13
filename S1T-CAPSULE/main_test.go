@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -2844,10 +2845,10 @@ func TestSanitizeOpenVPNProviderProfileIsTCPIsolatedAndFailClosed(t *testing.T) 
 	}
 }
 
-func TestSanitizeOpenVPNRejectsUDPAndMissingTLSCrypt(t *testing.T) {
+func TestSanitizeOpenVPNRejectsUDPAndMissingCA(t *testing.T) {
 	dir := t.TempDir()
 	for name, content := range map[string]string{
-		"udp.ovpn":         "client\nproto udp\nremote vpn.example 1194\n<tls-crypt>\nsecret\n</tls-crypt>\n",
+		"udp.ovpn":         "client\nproto udp\nremote vpn.example 1194\n<ca>\nTEST-CA\n</ca>\n",
 		"notls.ovpn":       "client\nproto tcp-client\nremote vpn.example 443\n",
 		"wrongverify.ovpn": "client\nproto tcp-client\nremote vpn.example 443\nremote-cert-tls client\n<tls-crypt>\nsecret\n</tls-crypt>\n",
 	} {
@@ -2859,6 +2860,68 @@ func TestSanitizeOpenVPNRejectsUDPAndMissingTLSCrypt(t *testing.T) {
 		if err == nil {
 			t.Fatalf("unsafe/incompatible profile %s was accepted", name)
 		}
+	}
+}
+
+func TestVPNGateCSVParsesFreeTCPServersAndSkipsUDP(t *testing.T) {
+	tcpConfig := "client\nproto tcp-client\nremote example.invalid 443\nremote-cert-tls server\n<ca>\nTEST-CA\n</ca>\nauth-user-pass\n"
+	udpConfig := "client\nproto udp\nremote example.invalid 1194\n<ca>\nTEST-CA\n</ca>\nauth-user-pass\n"
+	csvText := "*vpn_servers\n#HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64\n" +
+		"server-jp,203.0.113.10,100,22,90000000,Japan,JP,4,1000,100,200,2weeks,Volunteer,hello," + base64.StdEncoding.EncodeToString([]byte(tcpConfig)) + "\n" +
+		"server-us,203.0.113.11,200,10,100000000,United States,US,2,1000,200,300,2weeks,Volunteer,hello," + base64.StdEncoding.EncodeToString([]byte(udpConfig)) + "\n*"
+	servers, err := parseVPNGateCSV([]byte(csvText))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 {
+		t.Fatalf("got %d usable servers; want only the TCP server", len(servers))
+	}
+	got := servers[0]
+	if got.CountryCode != "JP" || got.IP != "203.0.113.10" || got.Port != 443 {
+		t.Fatalf("unexpected parsed VPN Gate server: %#v", got)
+	}
+	if !strings.Contains(string(got.Config), "proto tcp-client") || !strings.Contains(string(got.Config), "remote 203.0.113.10 443") || !strings.Contains(string(got.Config), "auth-user-pass") {
+		t.Fatalf("VPN Gate config was not normalized safely:\n%s", got.Config)
+	}
+}
+
+func TestVPNGateNormalizerRejectsUDPAndPinsAPIAddress(t *testing.T) {
+	good := "client\nproto tcp\nremote relay.example 443\n"
+	got, port, ok := normalizeVPNGateTCPProfile(good, "198.51.100.8")
+	if !ok || port != 443 || !strings.Contains(got, "proto tcp-client") || !strings.Contains(got, "remote 198.51.100.8 443") {
+		t.Fatalf("valid TCP profile was not normalized: ok=%v port=%d config=%s", ok, port, got)
+	}
+	if _, _, ok := normalizeVPNGateTCPProfile("client\nproto udp\nremote relay.example 1194\n", "198.51.100.8"); ok {
+		t.Fatal("UDP VPN Gate profile was accepted by TCP-only egress")
+	}
+}
+
+func TestSanitizeVPNGateProfileWithoutTLSCryptButWithCA(t *testing.T) {
+	dir := t.TempDir()
+	profile := filepath.Join(dir, "vpngate.ovpn")
+	content := "client\nproto tcp-client\nremote 198.51.100.9 443\nauth-user-pass\n<ca>\nTEST-CA\n</ca>\n"
+	if err := os.WriteFile(profile, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	creds := filepath.Join(dir, "vpn-gate-auth.txt")
+	if err := os.WriteFile(creds, []byte("vpn\nvpn\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	managed := filepath.Join(dir, "managed", "client.ovpn")
+	route := openVPNRouteInfo{Table: 21001, Mark: 5500001, Priority: 11001, Device: "tuntest01"}
+	if _, err := sanitizeOpenVPNProfile(profile, managed, creds, "vpngate", openVPNRouteHelperPath, route); err != nil {
+		t.Fatalf("VPN Gate profile without tls-crypt but with CA should be accepted: %v", err)
+	}
+	data, err := os.ReadFile(managed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "remote-cert-tls server") || strings.Contains(string(data), "tls-crypt") {
+		t.Fatalf("unexpected sanitized VPN Gate profile:\n%s", data)
+	}
+	auth, err := os.ReadFile(filepath.Join(filepath.Dir(managed), "auth.txt"))
+	if err != nil || string(auth) != "vpn\nvpn\n" {
+		t.Fatalf("VPN Gate public credentials were not staged correctly: %q, %v", auth, err)
 	}
 }
 
@@ -2937,7 +3000,7 @@ func TestOpenVPNRouteHelperIsValidShellAndHasFailClosedRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(data)
-	for _, marker := range []string{"fwmark \"$MARK\"/0xffffffff blackhole", "fwmark \"$MARK\"/0xffffffff lookup \"$TABLE\"", "remove_lookup_rules", "blackhole_routes"} {
+	for _, marker := range []string{"fwmark \"$MARK\"/0xffffffff blackhole", "fwmark \"$MARK\"/0xffffffff lookup \"$TABLE\"", "remove_lookup_rules", "blackhole_routes", "DEV=\"${5:-${dev:-}}\""} {
 		if !strings.Contains(text, marker) {
 			t.Fatalf("OpenVPN route helper is missing fail-closed behavior %q", marker)
 		}

@@ -59,7 +59,7 @@ ACTION="${1:-}"
 TABLE="${2:-}"
 MARK="${3:-}"
 PRIORITY="${4:-}"
-DEV="${5:-}"
+DEV="${5:-${dev:-}}"
 BLACKHOLE_PRIORITY=$((PRIORITY + 10000))
 IP="/usr/sbin/ip"
 [ -x "$IP" ] || IP="$(command -v ip || true)"
@@ -215,7 +215,7 @@ func sanitizeOpenVPNProfile(src, dst, authPath, profile, helper string, route op
 	scanner := bufio.NewScanner(input)
 	scanner.Buffer(make([]byte, 4096), 2*1024*1024)
 	insideBlock := false
-	protoTCP, remoteSeen, tlsCryptSeen, authSeen := false, false, false, false
+	protoTCP, remoteSeen, caSeen, authSeen := false, false, false, false
 	var authSource string
 	blocked := map[string]bool{
 		"dev": true, "dev-type": true, "proto": true, "route": true, "route-ipv6": true, "redirect-gateway": true, "redirect-private": true,
@@ -233,8 +233,8 @@ func sanitizeOpenVPNProfile(src, dst, authPath, profile, helper string, route op
 			if !allowedBlock[strings.ToLower(trimmed)] {
 				return "", fmt.Errorf("unsupported OpenVPN inline block %q; connection/script blocks are not accepted", trimmed)
 			}
-			if strings.EqualFold(trimmed, "<tls-crypt>") || strings.EqualFold(trimmed, "<tls-crypt-v2>") {
-				tlsCryptSeen = true
+			if strings.EqualFold(trimmed, "<ca>") {
+				caSeen = true
 			}
 			insideBlock = true
 		}
@@ -268,8 +268,8 @@ func sanitizeOpenVPNProfile(src, dst, authPath, profile, helper string, route op
 				return "", errors.New("provider profile must verify the remote as a TLS server")
 			}
 		}
-		if key == "tls-crypt" || key == "tls-crypt-v2" {
-			tlsCryptSeen = true
+		if key == "ca" {
+			caSeen = true
 		}
 		if key == "auth-user-pass" {
 			authSeen = true
@@ -315,8 +315,8 @@ func sanitizeOpenVPNProfile(src, dst, authPath, profile, helper string, route op
 	if !remoteSeen {
 		return "", errors.New("the .ovpn profile has no remote server entry")
 	}
-	if !tlsCryptSeen {
-		return "", errors.New("this OpenVPN mode requires tls-crypt or tls-crypt-v2; download a provider profile that includes it")
+	if !caSeen {
+		return "", errors.New("OpenVPN profile must include a CA certificate so the remote TLS server can be authenticated")
 	}
 	if authSeen {
 		if authSource == "" {
@@ -375,13 +375,17 @@ func installOpenVPNRouteHelper() error {
 	return os.Chmod(openVPNRouteHelperPath, 0755)
 }
 
-func renderOpenVPNUnit(profile, configPath, workDir string, route openVPNRouteInfo) ([]byte, error) {
+func renderOpenVPNUnit(profile, configPath, workDir string, route openVPNRouteInfo, restartOnFailure bool) ([]byte, error) {
 	if configPath == "" || !filepath.IsAbs(configPath) || strings.ContainsAny(configPath+workDir, "\x00\r\n") {
 		return nil, errors.New("invalid OpenVPN service paths")
 	}
 	bin, err := exec.LookPath("openvpn")
 	if err != nil {
 		return nil, err
+	}
+	restartDirective := "Restart=no"
+	if restartOnFailure {
+		restartDirective = "Restart=always\nRestartSec=3"
 	}
 	unit := fmt.Sprintf(`[Unit]
 Description=ShahTunnel isolated OpenVPN TCP egress (%s)
@@ -397,8 +401,7 @@ WorkingDirectory=%s
 ExecStartPre=%s init %d %d %d
 ExecStart=%s --config %s
 ExecStopPost=%s down %d %d %d
-Restart=always
-RestartSec=3
+%s
 TimeoutStopSec=20
 LimitNOFILE=65536
 NoNewPrivileges=yes
@@ -419,7 +422,7 @@ ReadWritePaths=%s /run
 
 [Install]
 WantedBy=multi-user.target
-`, tunnelID(profile), systemdExecQuote(workDir), openVPNRouteHelperPath, route.Table, route.Mark, route.Priority, bin, systemdExecQuote(configPath), openVPNRouteHelperPath, route.Table, route.Mark, route.Priority, filepath.Dir(configPath))
+`, tunnelID(profile), systemdExecQuote(workDir), openVPNRouteHelperPath, route.Table, route.Mark, route.Priority, bin, systemdExecQuote(configPath), openVPNRouteHelperPath, route.Table, route.Mark, route.Priority, restartDirective, filepath.Dir(configPath))
 	return []byte(unit), nil
 }
 
@@ -438,59 +441,45 @@ func installOpenVPNAgentCapabilities(profile string) error {
 
 func prepareOpenVPNAgentProfile(c *Config) error {
 	if c == nil || c.Role != "agent" {
-		return errors.New("OpenVPN can only be configured for an Agent")
+		return errors.New("free OpenVPN egress can only be configured for an Agent")
 	}
 	if !isRoot() {
-		return errors.New("run the manager as root to prepare a private OpenVPN profile")
+		return errors.New("run the manager as root to prepare the private VPN Gate OpenVPN profile")
 	}
-	// Collect and validate user-supplied files before touching APT. This keeps
-	// the wizard responsive and avoids installing packages when no provider
-	// profile has been uploaded yet.
-	source := strings.TrimSpace(wizardAsk("Absolute path to the provider's OpenVPN TCP .ovpn file already uploaded to this VPS", ""))
-	if source == "" {
-		return errors.New("provider .ovpn file path is required; download a TCP profile for the desired country and upload it to this VPS first")
-	}
-	absSource, err := filepath.Abs(source)
+	uiInfo("Fetching the official VPN Gate free public relay list and filtering TCP servers…")
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	servers, err := fetchVPNGateServers(ctx)
+	cancel()
 	if err != nil {
-		return fmt.Errorf("invalid provider .ovpn path: %w", err)
+		return err
 	}
-	source = absSource
-	st, err := os.Stat(absSource)
+	countryCode, err := chooseVPNGateCountry(servers)
 	if err != nil {
-		return fmt.Errorf("provider .ovpn file is not accessible: %w", err)
+		return err
 	}
-	if !st.Mode().IsRegular() || st.Size() == 0 {
-		return errors.New("provider .ovpn path must point to a non-empty regular file")
+	filtered := make([]vpnGateServer, 0, len(servers))
+	for _, server := range servers {
+		if countryCode == "" || server.CountryCode == countryCode {
+			filtered = append(filtered, server)
+		}
 	}
-	probe, err := os.Open(absSource)
-	if err != nil {
-		return fmt.Errorf("provider .ovpn file is not readable: %w", err)
+	if len(filtered) == 0 {
+		return errors.New("VPN Gate has no TCP relay for the selected country; refresh the list or choose Automatic")
 	}
-	_ = probe.Close()
-	authHint := strings.TrimSpace(wizardAsk("Optional credentials file path (username on line 1, password on line 2); leave blank for certificate-only profiles", ""))
-	if authHint != "" {
-		absAuth, authErr := filepath.Abs(authHint)
-		if authErr != nil {
-			return fmt.Errorf("invalid OpenVPN credentials path: %w", authErr)
-		}
-		authInfo, authErr := os.Stat(absAuth)
-		if authErr != nil {
-			return fmt.Errorf("OpenVPN credentials file is not accessible: %w", authErr)
-		}
-		if !authInfo.Mode().IsRegular() || authInfo.Size() == 0 {
-			return errors.New("OpenVPN credentials path must point to a non-empty regular file")
-		}
-		probe, authErr := os.Open(absAuth)
-		if authErr != nil {
-			return fmt.Errorf("OpenVPN credentials file is not readable: %w", authErr)
-		}
-		_ = probe.Close()
-		authHint = absAuth
+	uiInfo(fmt.Sprintf("Testing TCP reachability for %d VPN Gate relays; ranking by reported ping, speed and load…", len(filtered)))
+	candidates := probeVPNGateServers(filtered, 5)
+	if len(candidates) == 0 {
+		return errors.New("no VPN Gate TCP server responded to the reachability check; choose another country or retry later")
+	}
+	uiInfo(fmt.Sprintf("Found %d reachable VPN Gate TCP candidates. ShahTunnel will try them automatically until one connects.", len(candidates)))
+
+	if err := ensureOpenVPNInstalled(); err != nil {
+		return err
 	}
 	profileDir := openVPNProfileDir(c.Name)
 	unitPath := filepath.Join("/etc/systemd/system", openVPNServiceName(c.Name))
 	if _, err := os.Stat(unitPath); err == nil {
-		return fmt.Errorf("managed OpenVPN service %s already exists; remove that Agent profile before reusing its name", filepath.Base(unitPath))
+		return fmt.Errorf("managed OpenVPN service %s already exists; remove or repair the existing Agent profile before reusing its name", filepath.Base(unitPath))
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -500,96 +489,157 @@ func prepareOpenVPNAgentProfile(c *Config) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	profileDirExisted := false
 	if _, err := os.Stat(profileDir); err == nil {
-		profileDirExisted = true
-	}
-	if profileDirExisted {
 		return fmt.Errorf("managed OpenVPN directory already exists for Agent %s; remove or repair the old profile first", c.Name)
-	}
-	if err := ensureOpenVPNInstalled(); err != nil {
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	if err := os.MkdirAll(profileDir, 0700); err != nil {
 		return err
 	}
 	_ = os.Chmod(profileDir, 0700)
+	rollbackDir := func() { _ = os.RemoveAll(profileDir) }
+
+	// VPN Gate publishes the shared public credentials in its official
+	// connection guide. They are written locally with owner-only permissions;
+	// no account, API key or user-supplied profile is required.
+	authPath := filepath.Join(profileDir, "vpngate-auth.txt")
+	if err := os.WriteFile(authPath, []byte("vpn\nvpn\n"), 0600); err != nil {
+		rollbackDir()
+		return err
+	}
 	route := openVPNRouteInfoForProfile(c.Name)
-	managedConfig := filepath.Join(profileDir, "client.ovpn")
-	workDir, err := sanitizeOpenVPNProfile(source, managedConfig, strings.TrimSpace(authHint), c.Name, openVPNRouteHelperPath, route)
-	if err != nil {
-		_ = os.RemoveAll(profileDir)
-		return err
-	}
 	if err := installOpenVPNRouteHelper(); err != nil {
-		_ = os.RemoveAll(profileDir)
+		rollbackDir()
 		return err
-	}
-	c.OpenVPNConfig = managedConfig
-	c.OpenVPNAuthFile = ""
-	c.OpenVPNService = openVPNServiceName(c.Name)
-	c.OpenVPNDevice = route.Device
-	c.OpenVPNTable = route.Table
-	c.OpenVPNMark = route.Mark
-	c.OpenVPNPriority = route.Priority
-	cleanupRoutePolicy := func() {
-		_ = exec.Command(openVPNRouteHelperPath, "remove", strconv.Itoa(route.Table), strconv.Itoa(route.Mark), strconv.Itoa(route.Priority)).Run()
 	}
 	if err := installOpenVPNAgentCapabilities(c.Name); err != nil {
 		_ = os.Remove(dropInPath)
 		_ = systemdReload()
-		_ = os.RemoveAll(profileDir)
+		rollbackDir()
 		return err
 	}
 	rollbackCapabilities := func() {
 		_ = os.Remove(dropInPath)
 		_ = systemdReload()
 	}
-	unit, err := renderOpenVPNUnit(c.Name, managedConfig, workDir, route)
-	if err != nil {
-		rollbackCapabilities()
-		_ = os.RemoveAll(profileDir)
-		return err
+	managedConfig := filepath.Join(profileDir, "client.ovpn")
+	c.OpenVPNConfig = managedConfig
+	c.OpenVPNAuthFile = filepath.Join(profileDir, "auth.txt")
+	c.OpenVPNService = openVPNServiceName(c.Name)
+	c.OpenVPNDevice = route.Device
+	c.OpenVPNTable = route.Table
+	c.OpenVPNMark = route.Mark
+	c.OpenVPNPriority = route.Priority
+	c.OpenVPNProvider = "VPN Gate (free public relay)"
+	c.OpenVPNCountry = ""
+	c.OpenVPNServer = ""
+	c.OpenVPNServerIP = ""
+	cleanupRoutePolicy := func() {
+		_ = exec.Command(openVPNRouteHelperPath, "remove", strconv.Itoa(route.Table), strconv.Itoa(route.Mark), strconv.Itoa(route.Priority)).Run()
 	}
-	if err := os.WriteFile(unitPath, unit, 0644); err != nil {
-		rollbackCapabilities()
-		_ = os.RemoveAll(profileDir)
-		return err
-	}
-	if err := systemdReload(); err != nil {
-		_ = os.Remove(unitPath)
-		rollbackCapabilities()
-		_ = os.RemoveAll(profileDir)
-		return err
-	}
-	out, err := exec.Command("systemctl", "enable", "--now", c.OpenVPNService).CombinedOutput()
-	if err != nil {
+	rollbackAll := func() {
 		_ = exec.Command("systemctl", "disable", "--now", c.OpenVPNService).Run()
 		cleanupRoutePolicy()
 		_ = os.Remove(unitPath)
 		rollbackCapabilities()
-		_ = os.RemoveAll(profileDir)
-		return fmt.Errorf("OpenVPN could not connect using this provider profile: %w: %s", err, tailText(string(out), 2500))
+		rollbackDir()
+		_ = systemdReload()
 	}
-	if err := waitOpenVPNRoute(c, 75*time.Second); err != nil {
-		_ = exec.Command("systemctl", "disable", "--now", c.OpenVPNService).Run()
-		cleanupRoutePolicy()
-		_ = os.Remove(unitPath)
-		rollbackCapabilities()
-		_ = os.RemoveAll(profileDir)
-		return err
+
+	// A first successful candidate is retained. For failed or stale public
+	// volunteers, the same isolated service is retried with the next candidate.
+	unitInstalled := false
+	for index, candidate := range candidates {
+		sourcePath := filepath.Join(profileDir, fmt.Sprintf("candidate-%02d.ovpn", index+1))
+		if err := os.WriteFile(sourcePath, candidate.Config, 0600); err != nil {
+			rollbackAll()
+			return fmt.Errorf("stage VPN Gate candidate %s: %w", candidate.IP, err)
+		}
+		if _, err := sanitizeOpenVPNProfile(sourcePath, managedConfig, authPath, c.Name, openVPNRouteHelperPath, route); err != nil {
+			_ = os.Remove(sourcePath)
+			uiWarn(fmt.Sprintf("Skipping incompatible VPN Gate relay %s: %v", candidate.IP, err))
+			continue
+		}
+		_ = os.Remove(sourcePath)
+		workDir := profileDir
+		unit, err := renderOpenVPNUnit(c.Name, managedConfig, workDir, route, false)
+		if err != nil {
+			rollbackAll()
+			return err
+		}
+		if !unitInstalled {
+			if err := os.WriteFile(unitPath, unit, 0644); err != nil {
+				rollbackAll()
+				return err
+			}
+			if err := systemdReload(); err != nil {
+				rollbackAll()
+				return err
+			}
+			if out, err := exec.Command("systemctl", "enable", c.OpenVPNService).CombinedOutput(); err != nil {
+				rollbackAll()
+				return fmt.Errorf("enable isolated OpenVPN service: %w: %s", err, tailText(string(out), 1500))
+			}
+			unitInstalled = true
+		}
+		uiInfo("Trying VPN Gate relay " + vpnGateServerLabel(candidate))
+		out, startErr := exec.Command("systemctl", "start", c.OpenVPNService).CombinedOutput()
+		if startErr == nil {
+			startErr = waitOpenVPNRoute(c, 35*time.Second)
+		}
+		var exitIP string
+		if startErr == nil {
+			exitIP, startErr = openVPNPublicEgressIP(c.OpenVPNMark, 10*time.Second)
+		}
+		if startErr == nil {
+			// During candidate discovery, Restart=no ensures one bad public relay
+			// cannot consume systemd's restart budget before we try the next one.
+			// Once a relay has passed both route and egress-IP checks, install the
+			// persistent restart policy and start it once under the final unit.
+			finalUnit, unitErr := renderOpenVPNUnit(c.Name, managedConfig, workDir, route, true)
+			if unitErr != nil {
+				rollbackAll()
+				return unitErr
+			}
+			if unitErr = exec.Command("systemctl", "stop", c.OpenVPNService).Run(); unitErr == nil {
+				unitErr = os.WriteFile(unitPath, finalUnit, 0644)
+			}
+			if unitErr == nil {
+				unitErr = systemdReload()
+			}
+			if unitErr == nil {
+				_ = exec.Command("systemctl", "reset-failed", c.OpenVPNService).Run()
+				unitErr = exec.Command("systemctl", "start", c.OpenVPNService).Run()
+			}
+			if unitErr == nil {
+				unitErr = waitOpenVPNRoute(c, 35*time.Second)
+			}
+			if unitErr == nil {
+				exitIP, unitErr = openVPNPublicEgressIP(c.OpenVPNMark, 10*time.Second)
+			}
+			if unitErr != nil {
+				rollbackAll()
+				return fmt.Errorf("VPN Gate relay passed initial validation but failed under its persistent service policy: %w", unitErr)
+			}
+			c.OpenVPNCountry = candidate.Country
+			c.OpenVPNServer = candidate.HostName
+			c.OpenVPNServerIP = candidate.IP
+			if c.OpenVPNServer == "" {
+				c.OpenVPNServer = candidate.IP
+			}
+			uiSuccess(fmt.Sprintf("Connected through free VPN Gate relay %s; verified public exit IP: %s", vpnGateServerLabel(candidate), exitIP))
+			uiWarn("VPN Gate relays are operated by volunteers; speed and availability may change, and this network is not suitable for sensitive traffic.")
+			return nil
+		}
+		journal, _ := exec.Command("journalctl", "-u", c.OpenVPNService, "-n", "12", "--no-pager", "-o", "cat").CombinedOutput()
+		uiWarn(fmt.Sprintf("VPN Gate relay %s failed; trying the next candidate: %v %s %s", candidate.IP, startErr, tailText(string(out), 600), tailText(string(journal), 1200)))
+		_ = exec.Command("systemctl", "stop", c.OpenVPNService).Run()
+		_ = exec.Command("systemctl", "reset-failed", c.OpenVPNService).Run()
+		_ = exec.Command(openVPNRouteHelperPath, "down", strconv.Itoa(route.Table), strconv.Itoa(route.Mark), strconv.Itoa(route.Priority)).Run()
 	}
-	if ip, err := openVPNPublicEgressIP(c.OpenVPNMark, 15*time.Second); err != nil {
-		_ = exec.Command("systemctl", "disable", "--now", c.OpenVPNService).Run()
-		cleanupRoutePolicy()
-		_ = os.Remove(unitPath)
-		rollbackCapabilities()
-		_ = os.RemoveAll(profileDir)
-		return fmt.Errorf("OpenVPN interface came up, but a marked HTTPS exit-IP check failed; refusing to save a possibly leaking profile: %w", err)
-	} else {
-		uiSuccess("Verified OpenVPN public exit IP through the isolated policy route: " + ip)
-	}
-	return nil
+	rollbackAll()
+	return errors.New("all tested VPN Gate TCP relays failed to establish a verified OpenVPN route; no Agent profile was saved and the dedicated policy route was rolled back")
 }
 
 func waitOpenVPNRoute(c *Config, timeout time.Duration) error {
@@ -621,9 +671,14 @@ func verifyOpenVPNRoute(c *Config) error {
 func openVPNPublicEgressIP(mark int, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", "api.ipify.org")
+	// Resolve the verification hostname through the marked VPN route as well;
+	// the host's ordinary resolver must not be used for this egress check.
+	resolver := &net.Resolver{PreferGo: true, Dial: func(dnsCtx context.Context, network, _ string) (net.Conn, error) {
+		return dialMarkedContext(dnsCtx, network, net.JoinHostPort("1.1.1.1", "53"), mark)
+	}}
+	ips, err := resolver.LookupIP(ctx, "ip4", "api.ipify.org")
 	if err != nil {
-		return "", fmt.Errorf("resolve IP check endpoint: %w", err)
+		return "", fmt.Errorf("resolve IP check endpoint through marked VPN egress: %w", err)
 	}
 	if len(ips) == 0 {
 		return "", errors.New("IP check endpoint returned no IPv4 address")

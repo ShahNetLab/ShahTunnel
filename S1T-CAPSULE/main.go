@@ -117,19 +117,23 @@ type Config struct {
 	Version         string `json:"version"`
 	Role            string `json:"role"`                        // hub on Iran, agent on outside
 	Transport       string `json:"transport,omitempty"`         // Existing inner transport policy: auto, adaptive, tcp_tls, websocket_tls, http2_connect, http1_connect, or http_connect_auto
-	Underlay        string `json:"underlay,omitempty"`          // Agent egress: direct, warp_masque, psiphon_socks5, or adaptive_external
+	Underlay        string `json:"underlay,omitempty"`          // Agent egress: direct, warp_masque, psiphon_socks5, openvpn_tcp_marked, or adaptive_external
 	PsiphonConfig   string `json:"psiphon_config,omitempty"`    // Official Psiphon ConsoleClient JSON config
 	PsiphonProxy    string `json:"psiphon_proxy,omitempty"`     // Loopback SOCKS5 endpoint exposed by Psiphon
 	PsiphonClient   string `json:"psiphon_client,omitempty"`    // ConsoleClient executable name or absolute path
 	PsiphonDataDir  string `json:"psiphon_data_dir,omitempty"`  // Per-profile Psiphon persistent data directory
 	PsiphonHubAddr  string `json:"psiphon_hub_addr,omitempty"`  // Hub public Mapping endpoint used only through Psiphon SOCKS5
-	OpenVPNConfig   string `json:"openvpn_config,omitempty"`    // ShahTunnel-managed, sanitized provider .ovpn profile
-	OpenVPNAuthFile string `json:"openvpn_auth_file,omitempty"` // Private username/password file, if required by provider
+	OpenVPNConfig   string `json:"openvpn_config,omitempty"`    // ShahTunnel-managed, sanitized VPN Gate .ovpn profile
+	OpenVPNAuthFile string `json:"openvpn_auth_file,omitempty"` // Private VPN Gate public credentials file
 	OpenVPNService  string `json:"openvpn_service,omitempty"`   // Dedicated profile-scoped OpenVPN systemd service
-	OpenVPNDevice   string `json:"openvpn_device,omitempty"`    // Dedicated TUN device
-	OpenVPNTable    int    `json:"openvpn_table,omitempty"`     // Per-profile policy-routing table
-	OpenVPNMark     int    `json:"openvpn_mark,omitempty"`      // SO_MARK used only by this profile
-	OpenVPNPriority int    `json:"openvpn_priority,omitempty"`  // Per-profile fwmark rule priority
+	OpenVPNProvider string `json:"openvpn_provider,omitempty"`
+	OpenVPNCountry  string `json:"openvpn_country,omitempty"`
+	OpenVPNServer   string `json:"openvpn_server,omitempty"`
+	OpenVPNServerIP string `json:"openvpn_server_ip,omitempty"`
+	OpenVPNDevice   string `json:"openvpn_device,omitempty"`   // Dedicated TUN device
+	OpenVPNTable    int    `json:"openvpn_table,omitempty"`    // Per-profile policy-routing table
+	OpenVPNMark     int    `json:"openvpn_mark,omitempty"`     // SO_MARK used only by this profile
+	OpenVPNPriority int    `json:"openvpn_priority,omitempty"` // Per-profile fwmark rule priority
 	ControlListen   string `json:"control_listen,omitempty"`
 	PublicListen    string `json:"public_listen,omitempty"`
 	HubAddr         string `json:"hub_addr,omitempty"`
@@ -4706,8 +4710,8 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 	fmt.Printf("  %s\n", paint(ansiGreen, "5) HTTP CONNECT fallback — HTTP/2, then HTTP/1.1"))
 	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
 	fmt.Printf("  %s\n", paint(ansiPinkGlow, "7) FULL ADAPTIVE FAILOVER — all 4 implemented transports"))
-	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "8) EXTERNAL EGRESS — Cloudflare MASQUE / Psiphon / OpenVPN TCP+tls-crypt"))
-	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) ALL-PROTOCOL ADAPTIVE — all 4 transports + Direct/WARP/Psiphon/OpenVPN failover"))
+	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "8) EXTERNAL EGRESS — Cloudflare MASQUE / Psiphon / Free VPN Gate OpenVPN"))
+	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) ALL-PROTOCOL ADAPTIVE — all 4 transports + Direct/WARP/Psiphon/VPN Gate failover"))
 	choice := wizardAsk(prompt+" (1-9)", "7")
 	switch choice {
 	case "1":
@@ -4732,7 +4736,7 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 		fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "EXTERNAL EGRESS PROVIDER"))
 		fmt.Println("  1) Cloudflare WARP over MASQUE (WarpProxy / Local Proxy required; already Connected)")
 		fmt.Println("  2) Psiphon ConsoleClient via local SOCKS5")
-		fmt.Println("  3) OpenVPN TCP + tls-crypt (provider .ovpn profile required)")
+		fmt.Println("  3) Free OpenVPN via VPN Gate (automatic server list and country selection)")
 		sub := wizardAsk("Select external egress (1-3)", "1")
 		switch sub {
 		case "1":
@@ -4752,10 +4756,10 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 		}
 	case "9":
 		if role != "agent" {
-			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent to enable Direct/WARP/Psiphon/OpenVPN egress failover.")
+			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent to enable Direct/WARP/Psiphon/VPN Gate egress failover.")
 			return transportAdaptive, underlayDirect, "", nil
 		}
-		// OpenVPN is offered as an additional isolated candidate later in the Agent wizard.
+		// VPN Gate OpenVPN is offered as an additional isolated candidate later in the Agent wizard.
 		return transportAdaptive, underlayAdaptive, "", nil
 	default:
 		return "", "", "", errors.New("invalid transport selection; enter a number from 1 to 9")
@@ -4955,12 +4959,30 @@ func setup() error {
 			return err
 		}
 		if c.Underlay == underlayOpenVPN || c.Underlay == underlayAdaptive {
-			configureOpenVPN := c.Underlay == underlayOpenVPN || wizardYesNo("Add OpenVPN TCP + tls-crypt as an additional Option 9 egress candidate? (y/N)", "n")
+			configureOpenVPN := c.Underlay == underlayOpenVPN || wizardYesNo("Add free VPN Gate OpenVPN as an additional Option 9 egress candidate? (Y/n)", "y")
 			if configureOpenVPN {
 				if err = prepareOpenVPNAgentProfile(&c); err != nil {
-					return fmt.Errorf("OpenVPN egress setup failed; Agent profile was not saved: %w", err)
+					if c.Underlay != underlayAdaptive {
+						return fmt.Errorf("OpenVPN egress setup failed; Agent profile was not saved: %w", err)
+					}
+					// VPN Gate is an optional candidate in adaptive mode. If its public
+					// directory is temporarily unavailable, preserve the rest of the
+					// adaptive wizard instead of failing MASQUE/Psiphon configuration.
+					uiWarn("VPN Gate could not be prepared; continuing Option 9 without this optional candidate: " + err.Error())
+					c.OpenVPNConfig = ""
+					c.OpenVPNAuthFile = ""
+					c.OpenVPNService = ""
+					c.OpenVPNProvider = ""
+					c.OpenVPNCountry = ""
+					c.OpenVPNServer = ""
+					c.OpenVPNServerIP = ""
+					c.OpenVPNDevice = ""
+					c.OpenVPNTable = 0
+					c.OpenVPNMark = 0
+					c.OpenVPNPriority = 0
+				} else {
+					uiSuccess("Free OpenVPN via VPN Gate profile and isolated policy-routing service prepared.")
 				}
-				uiSuccess("OpenVPN TCP + tls-crypt profile and isolated policy-routing service prepared.")
 			}
 		}
 		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
