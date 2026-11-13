@@ -1068,29 +1068,6 @@ func TestAgentTransportsActuallyDialHubThroughPsiphonSOCKS5(t *testing.T) {
 	}
 }
 
-func TestAdaptiveWarpProxyAddressIncludesConfiguredListenerBeforeItIsReady(t *testing.T) {
-	dir := t.TempDir()
-	cli := filepath.Join(dir, "warp-cli")
-	script := "#!/bin/sh\nif [ \"$1\" = settings ]; then\n  printf '%s\\n' '(user set) Mode: WarpProxy on port 40000' '(consumer overrides) WARP tunnel protocol: MASQUE'\nfi\n"
-	if err := os.WriteFile(cli, []byte(script), 0700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	got := adaptiveWarpProxyAddress()
-	if got != "127.0.0.1:40000" {
-		t.Fatalf("adaptive WarpProxy endpoint=%q; want configured loopback even when no listener is running", got)
-	}
-}
-
-func TestAdaptiveUnderlayCacheKeyIncludesCandidateSet(t *testing.T) {
-	cfg := Config{Name: "s", HubAddr: "hub.example:9443", PsiphonHubAddr: "hub.example:443", PsiphonProxy: "127.0.0.1:21083"}
-	withoutWarp := adaptiveUnderlayCacheKey(cfg, []string{underlayDirect, underlayPsiphon})
-	withWarp := adaptiveUnderlayCacheKey(cfg, []string{underlayMASQUE, underlayPsiphon, underlayDirect})
-	if withoutWarp == withWarp {
-		t.Fatal("adaptive route cache key did not change when WARP became available")
-	}
-}
-
 func TestOptionNineSwitchesFromFailedDirectPathToPsiphonSOCKS5(t *testing.T) {
 	certDir := t.TempDir()
 	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
@@ -1114,12 +1091,9 @@ func TestOptionNineSwitchesFromFailedDirectPathToPsiphonSOCKS5(t *testing.T) {
 	serverDone := make(chan struct{})
 	go func() {
 		defer close(serverDone)
-		for {
-			conn, acceptErr := listener.Accept()
-			if acceptErr != nil {
-				return
-			}
-			go h.serveAgent(conn, hubTLSConfig(cert))
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			h.serveAgent(conn, hubTLSConfig(cert))
 		}
 	}()
 
@@ -1132,7 +1106,7 @@ func TestOptionNineSwitchesFromFailedDirectPathToPsiphonSOCKS5(t *testing.T) {
 	unavailableAddress := unavailable.Addr().String()
 	_ = unavailable.Close()
 	proxyAddress := startTestSOCKS5Relay(t, listener.Addr().String())
-	channel := 109
+	channel := 8001 // (channel-1) modulo 8 = 0: Direct/TCP is the first candidate.
 	agentPreferredTransport.Delete(channel)
 	agentPreferredUnderlay.Delete(channel)
 	t.Cleanup(func() {
@@ -1589,10 +1563,25 @@ func TestPsiphonHubAddressDefaultsToPublicMappingPort(t *testing.T) {
 	if got := agentHubAddressForUnderlay(explicit, underlayDirect); got != explicit.HubAddr {
 		t.Fatalf("Direct endpoint = %q; want unchanged %q", got, explicit.HubAddr)
 	}
+	torDefault := Config{Role: "agent", Underlay: underlayTor, HubAddr: "37.32.12.244:9448"}
+	if got := agentHubAddressForUnderlay(torDefault, underlayTor); got != "37.32.12.244:443" {
+		t.Fatalf("default Tor Mapping endpoint = %q; want 37.32.12.244:443", got)
+	}
+	torCustom := torDefault
+	torCustom.TorHubAddr = "37.32.12.244:8443"
+	if got := agentHubAddressForUnderlay(torCustom, underlayTor); got != torCustom.TorHubAddr {
+		t.Fatalf("explicit Tor Mapping endpoint = %q; want %q", got, torCustom.TorHubAddr)
+	}
+	if got := agentHubAddressForTransport(torDefault, transportTCP); got != "37.32.12.244:443" {
+		t.Fatalf("Tor TCP lane endpoint = %q; want public Mapping on 443", got)
+	}
+	if got := agentHubAddressForTransport(torDefault, transportHTTP2); got != torDefault.HubAddr {
+		t.Fatalf("Tor HTTP/2 CONNECT endpoint = %q; want control port %q", got, torDefault.HubAddr)
+	}
 }
 
 func TestUnderlayModesAndLoopbackValidation(t *testing.T) {
-	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayAdaptive} {
+	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayTor, underlayAdaptive} {
 		if !validUnderlayMode(mode) {
 			t.Fatalf("valid underlay %q was rejected", mode)
 		}
@@ -1634,6 +1623,50 @@ func TestRemovedLegacyWARPUnderlayIsRejectedWithoutDirectDowngrade(t *testing.T)
 	}
 	if err := validateConfig(cfg); err == nil {
 		t.Fatal("removed legacy underlay was accepted; it must not silently downgrade to Direct")
+	}
+}
+
+func TestAdaptiveAgentPathCandidatesDistributeStartupLanes(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // Simulate no active WARP CLI.
+	cfg := Config{Transport: transportAdaptive, Underlay: underlayAdaptive, PsiphonConfig: "/tmp/psiphon-client.json"}
+	paths := adaptiveAgentPathCandidates(cfg, "", "", 1)
+	if len(paths) != 8 { // Four transports x two egresses when WARP is absent.
+		t.Fatalf("adaptive path matrix has %d entries, want 8: %#v", len(paths), paths)
+	}
+	seen := map[string]bool{}
+	for lane := 1; lane <= len(paths); lane++ {
+		lanePaths := adaptiveAgentPathCandidates(cfg, "", "", lane)
+		key := lanePaths[0].Transport + "/" + lanePaths[0].Underlay
+		if seen[key] {
+			t.Fatalf("startup lane %d repeats first path %s before all matrix pairs are tried", lane, key)
+		}
+		seen[key] = true
+	}
+	preferred := adaptiveAgentPathCandidates(cfg, transportHTTP2, underlayPsiphon, 9)
+	if len(preferred) == 0 || preferred[0] != (adaptiveAgentPath{Transport: transportHTTP2, Underlay: underlayPsiphon}) {
+		t.Fatalf("last successful path was not preferred on reconnect: %#v", preferred)
+	}
+
+	// With MASQUE connected, all four transports are spread across three egresses.
+	binDir := t.TempDir()
+	warpCLI := filepath.Join(binDir, "warp-cli")
+	warpScript := "#!/bin/sh\ncase \"$1\" in status) echo 'Status update: Connected' ;; settings) echo 'WARP tunnel protocol: MASQUE' ;; *) exit 2 ;; esac\n"
+	if err := os.WriteFile(warpCLI, []byte(warpScript), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+	allPaths := adaptiveAgentPathCandidates(cfg, "", "", 1)
+	if len(allPaths) != 12 {
+		t.Fatalf("MASQUE + Psiphon + Direct matrix has %d entries, want 12: %#v", len(allPaths), allPaths)
+	}
+	seen = map[string]bool{}
+	for lane := 1; lane <= 12; lane++ {
+		pathSet := adaptiveAgentPathCandidates(cfg, "", "", lane)
+		key := pathSet[0].Transport + "/" + pathSet[0].Underlay
+		if seen[key] {
+			t.Fatalf("12-lane startup matrix duplicated %s before covering all 12 combinations", key)
+		}
+		seen[key] = true
 	}
 }
 
@@ -1849,24 +1882,10 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
-func TestNormalizeConfigDefaultsAgentToTwelveLanes(t *testing.T) {
-	got := normalizeConfig(Config{Role: "agent"})
+func TestNormalizeConfigUpgradesAgentToTwelveLanes(t *testing.T) {
+	got := normalizeConfig(Config{Role: "agent", TunnelChannels: 4})
 	if got.TunnelChannels != 12 {
 		t.Fatalf("TunnelChannels = %d; want 12", got.TunnelChannels)
-	}
-}
-
-func TestNormalizeAdaptiveAgentCapsLanesAtFour(t *testing.T) {
-	got := normalizeConfig(Config{Role: "agent", Underlay: underlayAdaptive, TunnelChannels: 12})
-	if got.TunnelChannels != adaptiveTunnelChannels {
-		t.Fatalf("adaptive TunnelChannels = %d; want %d", got.TunnelChannels, adaptiveTunnelChannels)
-	}
-}
-
-func TestNormalizePsiphonAgentCapsLanesAtThree(t *testing.T) {
-	got := normalizeConfig(Config{Role: "agent", Underlay: underlayPsiphon, TunnelChannels: 12})
-	if got.TunnelChannels != psiphonTunnelChannels {
-		t.Fatalf("Psiphon TunnelChannels = %d; want %d", got.TunnelChannels, psiphonTunnelChannels)
 	}
 }
 
@@ -2519,127 +2538,21 @@ exit 1
 	}
 }
 
-func TestXrayConfigArgumentResolvesXUIRelativePath(t *testing.T) {
-	got, err := xrayConfigArgument([]string{"bin/xray-linux-amd64", "-c", "bin/config.json"}, "/usr/local/x-ui")
-	if err != nil {
-		t.Fatalf("resolve x-ui relative config argument: %v", err)
+func TestXrayListenerAndSystemdWorkingDirectoryFallback(t *testing.T) {
+	listener := "LISTEN 0 4096               *:2083        *:*\n"
+	if !xrayListenerOutputHasPort(listener, 2083) {
+		t.Fatal("listener parser did not recognize wildcard IPv4/IPv6 listener")
 	}
-	if got != "/usr/local/x-ui/bin/config.json" {
-		t.Fatalf("resolved config path = %q; want /usr/local/x-ui/bin/config.json", got)
+	if xrayListenerOutputHasPort(listener, 21083) {
+		t.Fatal("listener parser matched the wrong port")
 	}
-}
-
-func TestXrayListenerPIDsForPortParsesUnfilteredSSOutput(t *testing.T) {
-	output := `LISTEN 0 4096 *:2083 *:* users:(("xray-linux-amd6",pid=335141,fd=7))
-LISTEN 0 128 127.0.0.1:21083 0.0.0.0:* users:(("psiphon-console",pid=701936,fd=6))
-LISTEN 0 128 [::]:2083 [::]:* users:(("xray-linux-amd64",pid=335141,fd=8))
-ESTAB 0 0 127.0.0.1:2083 127.0.0.1:55210 users:(("not-a-listener",pid=999,fd=3))
-LISTEN 0 128 *:20831 *:* users:(("other",pid=444,fd=3))
-`
-	got := xrayListenerPIDsForPort(output, 2083)
-	if len(got) != 1 || got[0] != 335141 {
-		t.Fatalf("listener PIDs for 2083 = %v; want [335141]", got)
+	got := xraySystemdWorkingDirectories("", "{ path=/usr/local/x-ui/x-ui ; argv[]=/usr/local/x-ui/x-ui server ; ignore_errors=no }")
+	if len(got) != 1 || got[0] != "/usr/local/x-ui" {
+		t.Fatalf("systemd ExecStart fallback = %#v; want [/usr/local/x-ui]", got)
 	}
-	if got := xrayListenerPIDsForPort(output, 21083); len(got) != 1 || got[0] != 701936 {
-		t.Fatalf("listener PIDs for 21083 = %v; want [701936]", got)
-	}
-	if got := xrayListenerPIDsForPort(output, 2082); len(got) != 0 {
-		t.Fatalf("listener PIDs for 2082 = %v; want none", got)
-	}
-}
-
-func TestBuildXrayAdaptiveEgressUsesLeastPingAndFailsClosed(t *testing.T) {
-	original := []byte(`{
-      "log": {"loglevel":"warning"},
-      "inbounds": [{"tag":"xui-main","listen":"127.0.0.1","port":23456,"protocol":"socks","settings":{"auth":"noauth","udp":true}}],
-      "outbounds": [{"tag":"direct","protocol":"freedom"}],
-      "routing": {"rules": []}
-    }`)
-	generated, bindings, balancerTag, psiphonTag, err := buildXrayAdaptivePsiphonConfig(original, "s", "127.0.0.1:21083", "127.0.0.1:40000", []PortMapping{{ID: "main", Target: "127.0.0.1:23456"}})
-	if err != nil {
-		t.Fatalf("build adaptive Xray config: %v", err)
-	}
-	if len(bindings) != 1 {
-		t.Fatalf("bindings = %d; want 1", len(bindings))
-	}
-	var root map[string]any
-	if err := json.Unmarshal(generated, &root); err != nil {
-		t.Fatal(err)
-	}
-	outbounds := root["outbounds"].([]any)
-	hasWarp, hasBlock := false, false
-	for _, raw := range outbounds {
-		item := raw.(map[string]any)
-		switch item["tag"] {
-		case "s1t-adaptive-s-warp":
-			hasWarp = item["protocol"] == "socks"
-		case "s1t-adaptive-s-block":
-			hasBlock = item["protocol"] == "blackhole"
-		}
-	}
-	if !hasWarp || !hasBlock {
-		t.Fatalf("adaptive WARP/blackhole outbounds missing (warp=%v block=%v)", hasWarp, hasBlock)
-	}
-	obs := root["observatory"].(map[string]any)
-	if obs["probeInterval"] != "20s" || obs["probeUrl"] != "https://www.cloudflare.com/cdn-cgi/trace" {
-		t.Fatalf("unexpected observatory config: %#v", obs)
-	}
-	routing := root["routing"].(map[string]any)
-	balancers := routing["balancers"].([]any)
-	if len(balancers) != 1 {
-		t.Fatalf("balancers = %d; want 1", len(balancers))
-	}
-	balancer := balancers[0].(map[string]any)
-	if balancer["tag"] != balancerTag || balancer["fallbackTag"] != "s1t-adaptive-s-block" {
-		t.Fatalf("balancer/fallback tags are incorrect: %#v", balancer)
-	}
-	strategy := balancer["strategy"].(map[string]any)
-	if strategy["type"] != "leastPing" {
-		t.Fatalf("strategy = %#v; want leastPing", strategy)
-	}
-	rules := routing["rules"].([]any)
-	foundBalancerRule, foundUDPBlock := false, false
-	for _, raw := range rules {
-		rule := raw.(map[string]any)
-		if rule["balancerTag"] == balancerTag {
-			foundBalancerRule = true
-		}
-		if rule["outboundTag"] == "s1t-psiphon-s-udp-block" {
-			foundUDPBlock = true
-		}
-	}
-	if !foundBalancerRule || !foundUDPBlock {
-		t.Fatalf("adaptive TCP/UDP rules missing: %#v", rules)
-	}
-	if psiphonTag == balancerTag {
-		t.Fatal("Psiphon outbound tag must remain distinct from balancer tag")
-	}
-}
-
-func TestBuildXrayAdaptiveEgressWithoutWarpDoesNotAddDirectFallback(t *testing.T) {
-	original := []byte(`{"inbounds":[{"tag":"xui-main","listen":"127.0.0.1","port":23457,"protocol":"socks","settings":{}}],"outbounds":[{"tag":"direct","protocol":"freedom"}],"routing":{"rules":[]}}`)
-	generated, _, balancerTag, _, err := buildXrayAdaptivePsiphonConfig(original, "s2", "127.0.0.1:21084", "", []PortMapping{{ID: "main", Target: "127.0.0.1:23457"}})
-	if err != nil {
-		t.Fatalf("build adaptive Xray config without WARP: %v", err)
-	}
-	var root map[string]any
-	if err := json.Unmarshal(generated, &root); err != nil {
-		t.Fatal(err)
-	}
-	balancers := root["routing"].(map[string]any)["balancers"].([]any)
-	balancer := balancers[0].(map[string]any)
-	selector := balancer["selector"].([]any)
-	if len(selector) != 1 {
-		t.Fatalf("without WARP, selector = %#v; want Psiphon only", selector)
-	}
-	if balancer["tag"] != balancerTag || balancer["fallbackTag"] != "s1t-adaptive-s2-block" {
-		t.Fatalf("unexpected fail-closed balancer: %#v", balancer)
-	}
-	for _, raw := range root["outbounds"].([]any) {
-		item := raw.(map[string]any)
-		if item["tag"] == "s1t-adaptive-s2-direct" {
-			t.Fatal("direct public egress must not be added to option 9's user Xray sidecar")
-		}
+	got = xraySystemdWorkingDirectories("/opt/x-ui", "{ path=/usr/local/x-ui/x-ui ; argv[]=/usr/local/x-ui/x-ui server }")
+	if len(got) != 2 || got[0] != "/opt/x-ui" || got[1] != "/usr/local/x-ui" {
+		t.Fatalf("systemd working directory candidates = %#v", got)
 	}
 }
 
@@ -2925,7 +2838,9 @@ func TestHubBalancesMeasuredRTTAndLoad(t *testing.T) {
 	}
 	// The 14ms lane has some load but a lower weighted RTT than the idle 30ms lane.
 	fast := mkSession(1, 32, 14*time.Millisecond)
+	fast.transport = transportHTTP2
 	slower := mkSession(2, 0, 30*time.Millisecond)
+	slower.transport = transportTCP
 	h := &hubServer{sessions: map[*hubSession]struct{}{fast: {}, slower: {}}}
 	for i := 0; i < 20; i++ {
 		if got := h.current(); got != fast {

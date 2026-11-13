@@ -39,13 +39,11 @@ import (
 )
 
 const (
-	version                          = "4.0.2"
+	version                          = "4.0.3"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
 	defaultTunnelChannels            = 12
-	adaptiveTunnelChannels           = 4
-	psiphonTunnelChannels            = 3
 	maxPendingPublicConnections      = 2048
 	controlBurstLimit                = 8
 	streamAdmissionWait              = 5 * time.Second
@@ -72,6 +70,7 @@ const (
 	underlayDirect                   = "direct"
 	underlayMASQUE                   = "warp_masque"
 	underlayPsiphon                  = "psiphon_socks5"
+	underlayTor                      = "tor_socks5"
 	underlayAdaptive                 = "adaptive_external"
 	http2TokenHeader                 = "X-S1T-Token"
 	controlALPN                      = "shah-tunnel-control/1"
@@ -124,6 +123,14 @@ type Config struct {
 	PsiphonClient  string `json:"psiphon_client,omitempty"`   // ConsoleClient executable name or absolute path
 	PsiphonDataDir string `json:"psiphon_data_dir,omitempty"` // Per-profile Psiphon persistent data directory
 	PsiphonHubAddr string `json:"psiphon_hub_addr,omitempty"` // Hub public Mapping endpoint used only through Psiphon SOCKS5
+	TorMode        string `json:"tor_mode,omitempty"`         // snowflake or webtunnel
+	TorBridge      string `json:"tor_bridge,omitempty"`       // User-provided WebTunnel bridge line
+	TorProxy       string `json:"tor_proxy,omitempty"`        // Per-profile loopback SOCKS5 endpoint
+	TorHubAddr     string `json:"tor_hub_addr,omitempty"`     // Hub public Mapping endpoint reachable through Tor
+	TorDataDir     string `json:"tor_data_dir,omitempty"`     // Per-profile Tor persistent state
+	TorConfigPath  string `json:"tor_config_path,omitempty"`  // Per-profile Tor client configuration
+	TorBinary      string `json:"tor_binary,omitempty"`       // Tor daemon executable
+	TorPTBinary    string `json:"tor_pt_binary,omitempty"`    // Lyrebird pluggable transport executable
 	ControlListen  string `json:"control_listen,omitempty"`
 	PublicListen   string `json:"public_listen,omitempty"`
 	HubAddr        string `json:"hub_addr,omitempty"`
@@ -139,6 +146,7 @@ type Config struct {
 	Ports          []PortMapping           `json:"ports,omitempty"`
 	XrayWARP       *XrayWarpIntegration    `json:"xray_warp,omitempty"`
 	XrayPsiphon    *XrayPsiphonIntegration `json:"xray_psiphon,omitempty"`
+	XrayTor        *XrayTorIntegration     `json:"xray_tor,omitempty"`
 }
 
 type RuntimeSnapshot struct {
@@ -171,14 +179,7 @@ var agentMetricChannels int64
 // It is used only by adaptive mode; legacy auto mode keeps its deterministic TCP-then-WebSocket order.
 var agentPreferredTransport sync.Map // map[int]string
 var agentPreferredUnderlay sync.Map  // map[int]string
-var adaptiveUnderlayProbeMu sync.Mutex
-var adaptiveUnderlayProbeCache = map[string]adaptiveUnderlayProbeCacheEntry{}
 var nextHubSessionID atomic.Uint64
-
-type adaptiveUnderlayProbeCacheEntry struct {
-	order     []string
-	expiresAt time.Time
-}
 
 // logAuthFailure rate-limits unauthenticated peer logs to reduce journal flooding.
 func logAuthFailure(message string) {
@@ -664,7 +665,7 @@ func validTransportMode(mode string) bool {
 }
 
 func validUnderlayMode(mode string) bool {
-	return mode == underlayDirect || mode == underlayMASQUE || mode == underlayPsiphon || mode == underlayAdaptive
+	return mode == underlayDirect || mode == underlayMASQUE || mode == underlayPsiphon || mode == underlayTor || mode == underlayAdaptive
 }
 
 func isLoopbackProxyAddress(address string) bool {
@@ -1236,12 +1237,13 @@ func (s *hubStream) close() {
 }
 
 type hubSession struct {
-	id       uint64
-	wire     *wire
-	mu       sync.RWMutex
-	streams  map[uint32]*hubStream
-	next     atomic.Uint32
-	stopOnce sync.Once
+	id        uint64
+	transport string // observed authenticated Agent transport on the Hub listener
+	wire      *wire
+	mu        sync.RWMutex
+	streams   map[uint32]*hubStream
+	next      atomic.Uint32
+	stopOnce  sync.Once
 }
 
 func newHubSession(c net.Conn) *hubSession {
@@ -1739,13 +1741,14 @@ func (s *agentSession) run() {
 }
 
 type hubServer struct {
-	cfg              Config
-	controlTLSConfig *tls.Config
-	mu               sync.RWMutex
-	sessions         map[*hubSession]struct{}
-	pendingPublic    chan struct{}
-	controlSlots     chan struct{}
-	pickCursor       atomic.Uint64
+	cfg                 Config
+	controlTLSConfig    *tls.Config
+	mu                  sync.RWMutex
+	sessions            map[*hubSession]struct{}
+	pendingPublic       chan struct{}
+	controlSlots        chan struct{}
+	pickCursor          atomic.Uint64
+	lastSelectedSession atomic.Uint64
 }
 
 func (h *hubServer) controlSemaphore() chan struct{} {
@@ -1844,6 +1847,11 @@ func (h *hubServer) current() *hubSession {
 			}
 		}
 		// `ordered` is rotated each call, so equal scores remain fairly shared.
+		if h.cfg.Transport == transportAdaptive {
+			if previous := h.lastSelectedSession.Swap(best.session.id); previous != best.session.id {
+				log.Printf("adaptive quality selector chose Hub lane session=%d transport=%s rtt=%s active_streams=%d", best.session.id, best.session.transport, best.rtt, best.load)
+			}
+		}
 		return best.session
 	}
 
@@ -2241,7 +2249,7 @@ func runAgentOverStream(conn net.Conn, cfg Config, channel int, displayTransport
 	if cfg.Transport == transportAdaptive {
 		agentPreferredTransport.Store(channel, displayTransport)
 	}
-	if cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE {
+	if cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE || cfg.Underlay == underlayTor {
 		agentPreferredUnderlay.Store(channel, cfg.Underlay)
 	}
 	log.Printf("tunnel lane %d/%d connected via %s over %s; forwarding through %d configured port mapping(s)", channel, cfg.TunnelChannels, displayTransport, cfg.Underlay, len(normalizeConfig(cfg).Ports))
@@ -2434,6 +2442,7 @@ func (h *hubServer) serveAuthorizedAgent(c net.Conn, observed string) {
 	defer c.Close()
 	_ = c.SetDeadline(time.Time{})
 	s := newHubSession(c)
+	s.transport = observed
 	h.registerSession(s)
 	log.Printf("outside agent lane connected via %s; active lanes=%d", observed, h.sessionCount())
 	s.run()
@@ -2775,6 +2784,12 @@ func runAgent(cfg Config) error {
 			return err
 		}
 		cleanupUnderlay = cleanup
+	case underlayTor:
+		cleanup, err := startTorForAgent(cfg)
+		if err != nil {
+			return fmt.Errorf("start Tor %s egress: %w", cfg.TorMode, err)
+		}
+		cleanupUnderlay = cleanup
 	case underlayAdaptive:
 		cleanup, err := startPsiphonForAgent(cfg)
 		if err != nil {
@@ -2787,11 +2802,6 @@ func runAgent(cfg Config) error {
 		}
 	}
 	defer cleanupUnderlay()
-	if cfg.Underlay == underlayAdaptive && cfg.XrayPsiphon != nil {
-		if err := ensureAdaptiveXrayPsiphonEgress(cfg); err != nil {
-			log.Printf("WARNING: adaptive Xray egress upgrade was not applied; previous sidecar config was retained: %v", err)
-		}
-	}
 	if cfg.Underlay == underlayAdaptive {
 		if warpMode := detectActiveWarpUnderlay(); warpMode != "" {
 			log.Printf("WARP is already connected with %s; adaptive egress will verify it before use (no route changes made)", warpMode)
@@ -2886,6 +2896,46 @@ func adaptiveTransportCandidates(preferred string) []string {
 	return out
 }
 
+type adaptiveAgentPath struct {
+	Transport string
+	Underlay  string
+}
+
+// adaptiveAgentPathCandidates distributes independent Agent lanes across the
+// Cartesian product of the four authenticated transports and every currently
+// usable egress. The Hub measures authenticated PING/PONG RTT per lane and
+// selects the lowest-latency, least-loaded lane for each new client stream.
+// A lane remembers its last successful pair for reconnects; first startup
+// attempts are staggered so all lanes do not pile onto Direct/TCP.
+func adaptiveAgentPathCandidates(cfg Config, preferredTransport, preferredUnderlay string, channel int) []adaptiveAgentPath {
+	transports := adaptiveTransportCandidates(preferredTransport)
+	underlays := []string{cfg.Underlay}
+	if cfg.Underlay == "" {
+		underlays = []string{underlayDirect}
+	} else if cfg.Underlay == underlayAdaptive {
+		underlays = adaptiveUnderlayCandidates(cfg, preferredUnderlay)
+	}
+	paths := make([]adaptiveAgentPath, 0, len(transports)*len(underlays))
+	for _, underlay := range underlays {
+		for _, transport := range transports {
+			paths = append(paths, adaptiveAgentPath{Transport: transport, Underlay: underlay})
+		}
+	}
+	if len(paths) < 2 {
+		return paths
+	}
+	// Preserve the last successful combination on reconnect. On first boot,
+	// rotate the full matrix by lane number so different lanes test different
+	// transport+egress pairs concurrently.
+	if preferredTransport == "" && preferredUnderlay == "" {
+		offset := (channel - 1) % len(paths)
+		if offset > 0 {
+			paths = append(append([]adaptiveAgentPath(nil), paths[offset:]...), paths[:offset]...)
+		}
+	}
+	return paths
+}
+
 func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
 	// WARP is only a candidate when its client reports a connected MASQUE path.
 	// Other WARP protocols are never selected by adaptive routing.
@@ -2904,9 +2954,9 @@ func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
 		all = append(all, candidate)
 	}
 
-	// An active WARP route joins the candidate set with Psiphon and Direct.
-	// The subsequent probe ranks all currently available routes by TCP connect
-	// latency; the last successful route only breaks ties.
+	// An active WARP route is always checked first, then fails over to
+	// Psiphon and Direct. When WARP is down, retain the last successful
+	// non-WARP route; a lost WARP preference hands off to Psiphon first.
 	if warpMode != "" {
 		appendCandidate(warpMode)
 		appendCandidate(underlayPsiphon)
@@ -2922,110 +2972,6 @@ func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
 	appendCandidate(underlayPsiphon)
 	appendCandidate(underlayDirect)
 	return all
-}
-
-// adaptiveUnderlayCacheKey scopes route measurements to one Agent profile,
-// its actual Hub/Psiphon endpoints, and the currently available candidate set.
-// The cache is shared by all lanes so they do not launch duplicate probes.
-func adaptiveUnderlayCacheKey(cfg Config, candidates []string) string {
-	// Candidate membership is part of the key: WARP may become connected or
-	// disconnect while the Hub/Psiphon endpoints remain unchanged.
-	parts := []string{cfg.Name, cfg.HubAddr, cfg.PsiphonHubAddr, cfg.PsiphonProxy, strings.Join(candidates, ",")}
-	return strings.Join(parts, "|")
-}
-
-// probeAdaptiveUnderlay measures the TCP path used by the Agent control lane.
-// SOCKS5 CONNECT is part of the probe, so a Psiphon SSH "administratively
-// prohibited" rejection is counted as unavailable rather than as a healthy
-// local SOCKS listener.
-func probeAdaptiveUnderlay(cfg Config, candidate string) (time.Duration, error) {
-	routeCfg := cfg
-	routeCfg.Underlay = candidate
-	if candidate == underlayMASQUE {
-		if err := verifyWarpMasqueUnderlay(); err != nil {
-			return 0, err
-		}
-	}
-	target := agentHubAddressForTransport(routeCfg, transportTCP)
-	if strings.TrimSpace(target) == "" {
-		return 0, errors.New("Hub endpoint is empty")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-	defer cancel()
-	started := time.Now()
-	conn, err := dialAgentUnderlay(ctx, routeCfg, "tcp", target)
-	if err != nil {
-		return 0, err
-	}
-	_ = conn.Close()
-	return time.Since(started), nil
-}
-
-// rankAdaptiveUnderlayCandidates puts currently reachable Hub paths first,
-// ordered by measured SOCKS/TCP connect latency. Failed candidates remain at
-// the end so the normal authenticated transport attempts can still provide
-// the definitive check. Results are refreshed every 45 seconds.
-func rankAdaptiveUnderlayCandidates(cfg Config, candidates []string) []string {
-	if len(candidates) < 2 {
-		return append([]string(nil), candidates...)
-	}
-	key := adaptiveUnderlayCacheKey(cfg, candidates)
-	adaptiveUnderlayProbeMu.Lock()
-	defer adaptiveUnderlayProbeMu.Unlock()
-	if cached, ok := adaptiveUnderlayProbeCache[key]; ok && time.Now().Before(cached.expiresAt) {
-		return append([]string(nil), cached.order...)
-	}
-
-	type result struct {
-		route string
-		index int
-		rtt   time.Duration
-		err   error
-	}
-	results := make(chan result, len(candidates))
-	for i, candidate := range candidates {
-		i, candidate := i, candidate
-		go func() {
-			rtt, err := probeAdaptiveUnderlay(cfg, candidate)
-			results <- result{route: candidate, index: i, rtt: rtt, err: err}
-		}()
-	}
-	measured := make([]result, 0, len(candidates))
-	for range candidates {
-		measured = append(measured, <-results)
-	}
-	sort.SliceStable(measured, func(i, j int) bool {
-		if (measured[i].err == nil) != (measured[j].err == nil) {
-			return measured[i].err == nil
-		}
-		if measured[i].err == nil && measured[j].err == nil && measured[i].rtt != measured[j].rtt {
-			return measured[i].rtt < measured[j].rtt
-		}
-		return measured[i].index < measured[j].index
-	})
-	ordered := make([]string, 0, len(measured))
-	for _, item := range measured {
-		ordered = append(ordered, item.route)
-		if item.err == nil {
-			log.Printf("adaptive egress probe: %s reachable in %s", item.route, item.rtt.Round(time.Millisecond))
-		} else {
-			log.Printf("adaptive egress probe: %s unavailable: %v", item.route, item.err)
-		}
-	}
-	adaptiveUnderlayProbeCache[key] = adaptiveUnderlayProbeCacheEntry{order: append([]string(nil), ordered...), expiresAt: time.Now().Add(45 * time.Second)}
-	return ordered
-}
-
-func invalidateAdaptiveUnderlayProbeCache(cfg Config) {
-	adaptiveUnderlayProbeMu.Lock()
-	// All cached variants for this profile are invalid after an exhausted route.
-	prefix := adaptiveUnderlayCacheKey(cfg, nil)
-	for key := range adaptiveUnderlayProbeCache {
-		if strings.HasPrefix(key, prefix) {
-			delete(adaptiveUnderlayProbeCache, key)
-		}
-	}
-	adaptiveUnderlayProbeMu.Unlock()
 }
 
 func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
@@ -3047,64 +2993,62 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 		return connectAndRunAgentWithTransport(cfg, pin, channel, mode)
 	}
 
-	preferredTransport := transportTCP
+	preferredTransport := ""
 	if mode == transportAdaptive {
 		if v, ok := agentPreferredTransport.Load(channel); ok {
-			if saved, ok := v.(string); ok && isAdaptiveTransport(saved) {
-				preferredTransport = saved
-			}
+			preferredTransport, _ = v.(string)
+		}
+		if !isAdaptiveTransport(preferredTransport) {
+			preferredTransport = ""
 		}
 	}
-	transportCandidates := []string{transportTCP, transportWebSocket}
-	if mode == transportAdaptive {
-		transportCandidates = adaptiveTransportCandidates(preferredTransport)
+	preferredUnderlay := ""
+	if v, ok := agentPreferredUnderlay.Load(channel); ok {
+		preferredUnderlay, _ = v.(string)
 	}
-
 	underlay := cfg.Underlay
 	if underlay == "" {
 		underlay = underlayDirect
 	}
-	underlayCandidates := []string{underlay}
-	if underlay == underlayAdaptive {
-		preferred := ""
-		if v, ok := agentPreferredUnderlay.Load(channel); ok {
-			preferred, _ = v.(string)
-		}
-		underlayCandidates = adaptiveUnderlayCandidates(cfg, preferred)
-		underlayCandidates = rankAdaptiveUnderlayCandidates(cfg, underlayCandidates)
+
+	// Adaptive modes evaluate the complete transport/egress matrix. Lanes are
+	// staggered on first startup; Hub's RTT/load scheduler routes each new flow
+	// over the best currently healthy lane. A failed/ended path is followed by
+	// the next candidate, while reconnects prefer that lane's last good pair.
+	paths := make([]adaptiveAgentPath, 0, 4)
+	if mode == transportAdaptive {
+		paths = adaptiveAgentPathCandidates(cfg, preferredTransport, preferredUnderlay, channel)
+	} else {
+		// Legacy auto keeps deterministic TCP -> WebSocket fallback.
+		paths = append(paths,
+			adaptiveAgentPath{Transport: transportTCP, Underlay: underlay},
+			adaptiveAgentPath{Transport: transportWebSocket, Underlay: underlay},
+		)
 	}
 
-	// A lane exhausts every configured inner transport on one egress path before
-	// switching the egress path. The same authenticated Hub protocol is retained.
 	var lastErr error
-	for routeIndex, route := range underlayCandidates {
-		if cfg.Underlay == underlayAdaptive {
-			var warpErr error
-			switch route {
-			case underlayMASQUE:
-				warpErr = verifyWarpMasqueUnderlay()
-			}
-			if warpErr != nil {
+	for i, path := range paths {
+		route := path.Underlay
+		if route == "" {
+			route = underlayDirect
+		}
+		if cfg.Underlay == underlayAdaptive && route == underlayMASQUE {
+			if warpErr := verifyWarpMasqueUnderlay(); warpErr != nil {
 				lastErr = warpErr
-				log.Printf("tunnel lane %d: WARP egress %s is unavailable; skipping to the next egress: %v", channel, route, warpErr)
+				log.Printf("tunnel lane %d: WARP egress is unhealthy; skipping %s over %s: %v", channel, path.Transport, route, warpErr)
 				continue
 			}
 		}
 		routeCfg := cfg
 		routeCfg.Underlay = route
-		for i, candidate := range transportCandidates {
-			err := connectAndRunAgentWithTransport(routeCfg, pin, channel, candidate)
-			if err == nil {
-				return nil
-			}
-			lastErr = err
-			if i < len(transportCandidates)-1 {
-				log.Printf("tunnel lane %d: transport %s failed on %s; trying %s", channel, candidate, route, transportCandidates[i+1])
-			}
+		err := connectAndRunAgentWithTransport(routeCfg, pin, channel, path.Transport)
+		if err == nil {
+			return nil
 		}
-		if routeIndex+1 < len(underlayCandidates) {
-			log.Printf("tunnel lane %d: egress path %s exhausted; switching to %s", channel, route, underlayCandidates[routeIndex+1])
-			invalidateAdaptiveUnderlayProbeCache(cfg)
+		lastErr = err
+		if i+1 < len(paths) {
+			next := paths[i+1]
+			log.Printf("tunnel lane %d: path %s over %s failed/ended; trying %s over %s: %v", channel, path.Transport, route, next.Transport, next.Underlay, err)
 		}
 	}
 	if lastErr == nil {
@@ -3189,7 +3133,7 @@ func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode s
 	if cfg.Transport == transportAdaptive {
 		agentPreferredTransport.Store(channel, mode)
 	}
-	if cfg.Underlay == underlayAdaptive || cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE {
+	if cfg.Underlay == underlayAdaptive || cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE || cfg.Underlay == underlayTor {
 		agentPreferredUnderlay.Store(channel, cfg.Underlay)
 	}
 	log.Printf("tunnel lane %d/%d connected via %s over %s; forwarding through %d configured port mapping(s)", channel, cfg.TunnelChannels, mode, cfg.Underlay, len(normalizeConfig(cfg).Ports))
@@ -3206,6 +3150,8 @@ func dialAgentUnderlay(ctx context.Context, cfg Config, network, address string)
 	switch cfg.Underlay {
 	case underlayPsiphon:
 		return dialSOCKS5Context(ctx, cfg.PsiphonProxy, address)
+	case underlayTor:
+		return dialSOCKS5Context(ctx, cfg.TorProxy, address)
 	case underlayMASQUE:
 		proxyAddress, localProxyMode, err := warpProxyAddressFromCLI()
 		if err != nil {
@@ -3313,7 +3259,7 @@ func dialSOCKS5Context(ctx context.Context, proxyAddress, targetAddress string) 
 
 func probeSOCKS5(proxyAddress string, timeout time.Duration) error {
 	if !isLoopbackProxyAddress(proxyAddress) {
-		return errors.New("Psiphon SOCKS5 proxy must be loopback-only")
+		return errors.New("SOCKS5 proxy must be loopback-only")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -3755,6 +3701,13 @@ func defaultPsiphonHubAddress(hubAddr string) string {
 }
 
 func agentHubAddressForUnderlay(cfg Config, underlay string) string {
+	if underlay == underlayTor {
+		configured := strings.TrimSpace(cfg.TorHubAddr)
+		if configured == "" || configured == strings.TrimSpace(cfg.HubAddr) {
+			return defaultPsiphonHubAddress(cfg.HubAddr)
+		}
+		return configured
+	}
 	if underlay == underlayPsiphon {
 		configured := strings.TrimSpace(cfg.PsiphonHubAddr)
 		// Older wizard builds copied the custom control port into Step 06 when
@@ -3774,8 +3727,8 @@ func agentHubAddressForUnderlay(cfg Config, underlay string) string {
 // separate. The Mapping listener multiplexes the native ALPN (TCP/TLS and
 // WebSocket/TLS); CONNECT listeners remain adjacent to the control port.
 func agentHubAddressForTransport(cfg Config, transport string) string {
-	if cfg.Underlay == underlayPsiphon && (transport == transportTCP || transport == transportWebSocket || transport == transportAuto) {
-		return agentHubAddressForUnderlay(cfg, underlayPsiphon)
+	if (cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayTor) && (transport == transportTCP || transport == transportWebSocket || transport == transportAuto) {
+		return agentHubAddressForUnderlay(cfg, cfg.Underlay)
 	}
 	return cfg.HubAddr
 }
@@ -3788,6 +3741,24 @@ func normalizeConfig(c Config) Config {
 		}
 		if (c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive) && strings.TrimSpace(c.PsiphonHubAddr) == "" && strings.TrimSpace(c.HubAddr) != "" {
 			c.PsiphonHubAddr = defaultPsiphonHubAddress(c.HubAddr)
+		}
+		if c.Underlay == underlayTor {
+			c.TorMode = strings.ToLower(strings.TrimSpace(c.TorMode))
+			if c.TorMode == "" {
+				c.TorMode = torModeSnowflake
+			}
+			if c.TorProxy == "" {
+				c.TorProxy = "127.0.0.1:19050"
+			}
+			if c.TorDataDir == "" && c.Name != "" {
+				c.TorDataDir = filepath.Join(torDataRoot, tunnelID(c.Name))
+			}
+			if c.TorConfigPath == "" && c.Name != "" {
+				c.TorConfigPath = filepath.Join(torConfigDir, tunnelID(c.Name)+".torrc")
+			}
+			if strings.TrimSpace(c.TorHubAddr) == "" && strings.TrimSpace(c.HubAddr) != "" {
+				c.TorHubAddr = defaultPsiphonHubAddress(c.HubAddr)
+			}
 		}
 		if c.PsiphonProxy == "" {
 			c.PsiphonProxy = "127.0.0.1:1080"
@@ -3805,24 +3776,10 @@ func normalizeConfig(c Config) Config {
 			c.Transport = transportAuto
 		}
 	}
-	// Cap concurrency by egress type: Psiphon uses a small number of streams,
-	// option 9 uses four lanes to avoid hammering fragile relays, and ordinary
-	// Direct/WARP profiles retain the twelve-lane default. Explicit lower values
-	// are preserved; this only repairs missing/oversized legacy values.
-	if c.Role == "agent" {
-		defaultLanes, maxLanes := defaultTunnelChannels, maxTunnelChannels
-		switch c.Underlay {
-		case underlayAdaptive:
-			defaultLanes, maxLanes = adaptiveTunnelChannels, adaptiveTunnelChannels
-		case underlayPsiphon:
-			defaultLanes, maxLanes = psiphonTunnelChannels, psiphonTunnelChannels
-		}
-		if c.TunnelChannels < 1 {
-			c.TunnelChannels = defaultLanes
-		}
-		if c.TunnelChannels > maxLanes {
-			c.TunnelChannels = maxLanes
-		}
+	// Upgrade existing Agent profiles to the current independent-lane performance profile.
+	// Each lane reconnects independently; no Hub-side config change is required.
+	if c.Role == "agent" && c.TunnelChannels < defaultTunnelChannels {
+		c.TunnelChannels = defaultTunnelChannels
 	}
 	if len(c.Ports) == 0 {
 		if c.Role == "hub" && c.PublicListen != "" {
@@ -3893,6 +3850,30 @@ func validateConfig(c Config) error {
 			}
 			if strings.ContainsAny(c.PsiphonConfig, "\r\n\x00") {
 				return errors.New("invalid Psiphon config path")
+			}
+		}
+		if c.Underlay == underlayTor {
+			if _, err := torBridgeLine(c); err != nil {
+				return err
+			}
+			if !isLoopbackProxyAddress(c.TorProxy) {
+				return errors.New("Tor SOCKS5 proxy must bind to a loopback address")
+			}
+			for label, path := range map[string]string{"Tor data directory": c.TorDataDir, "Tor config path": c.TorConfigPath, "Tor binary": c.TorBinary, "Lyrebird binary": c.TorPTBinary} {
+				if !filepath.IsAbs(path) || strings.ContainsAny(path, "\r\n\x00") {
+					return fmt.Errorf("%s must be an absolute path", label)
+				}
+			}
+			if !strings.HasPrefix(filepath.Clean(c.TorDataDir)+string(os.PathSeparator), torDataRoot+string(os.PathSeparator)) {
+				return errors.New("Tor data directory must remain inside the ShahTunnel Tor data root")
+			}
+			if !strings.HasPrefix(filepath.Clean(c.TorConfigPath)+string(os.PathSeparator), torConfigDir+string(os.PathSeparator)) {
+				return errors.New("Tor config path must remain inside the ShahTunnel Tor config directory")
+			}
+			if c.TorHubAddr != "" {
+				if err := validateTCPAddress("Tor Hub Mapping address", c.TorHubAddr); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -3983,8 +3964,8 @@ func validateConfig(c Config) error {
 		if _, err := normalizeFingerprint(c.Fingerprint); err != nil {
 			return err
 		}
-		if c.XrayWARP != nil && c.XrayPsiphon != nil {
-			return errors.New("an Agent profile cannot have both isolated WARP and Psiphon Xray egress")
+		if (c.XrayWARP != nil && c.XrayPsiphon != nil) || (c.XrayWARP != nil && c.XrayTor != nil) || (c.XrayPsiphon != nil && c.XrayTor != nil) {
+			return errors.New("an Agent profile can have only one isolated Xray egress integration")
 		}
 		if c.XrayPsiphon != nil {
 			if c.Underlay != underlayPsiphon && c.Underlay != underlayAdaptive {
@@ -3992,6 +3973,14 @@ func validateConfig(c Config) error {
 			}
 			if !isLoopbackProxyAddress(c.XrayPsiphon.Proxy) {
 				return errors.New("isolated Xray Psiphon proxy must be loopback-only")
+			}
+		}
+		if c.XrayTor != nil {
+			if c.Underlay != underlayTor {
+				return errors.New("isolated Xray Tor egress requires the Tor underlay")
+			}
+			if !isLoopbackProxyAddress(c.XrayTor.Proxy) || c.XrayTor.Proxy != c.TorProxy {
+				return errors.New("isolated Xray Tor proxy must match the Agent's loopback-only Tor SOCKS5 endpoint")
 			}
 		}
 	} else {
@@ -4349,7 +4338,7 @@ LockPersonality=true
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
-ReadWritePaths=/etc/ravanreverse /var/lib/shah-tunnel/psiphon
+ReadWritePaths=/etc/ravanreverse /var/lib/shah-tunnel/psiphon /var/lib/shah-tunnel/tor
 [Install]
 WantedBy=multi-user.target
 `
@@ -4454,6 +4443,11 @@ func deleteOneTunnel() error {
 	if cfg.XrayPsiphon != nil {
 		if err := removeXrayPsiphonIntegration(&cfg); err != nil {
 			return fmt.Errorf("tunnel stopped, but its isolated Xray Psiphon route could not be removed; tunnel profile was kept: %w", err)
+		}
+	}
+	if cfg.XrayTor != nil {
+		if err := removeXrayTorIntegration(&cfg); err != nil {
+			return fmt.Errorf("tunnel stopped, but its isolated Xray Tor route could not be removed; tunnel profile was kept: %w", err)
 		}
 	}
 	if !selected.Legacy {
@@ -4755,8 +4749,8 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 	fmt.Printf("  %s\n", paint(ansiGreen, "5) HTTP CONNECT fallback — HTTP/2, then HTTP/1.1"))
 	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
 	fmt.Printf("  %s\n", paint(ansiPinkGlow, "7) FULL ADAPTIVE FAILOVER — all 4 implemented transports"))
-	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "8) EXTERNAL EGRESS — Cloudflare MASQUE / Psiphon"))
-	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) ALL-PROTOCOL ADAPTIVE — all 4 transports + fastest reachable egress (WARP/Psiphon/Direct)"))
+	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "8) EXTERNAL EGRESS — Cloudflare MASQUE / Psiphon / Tor"))
+	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) AUTO-QUALITY ADAPTIVE — test all 4 transports + available egress paths; route new streams by live RTT"))
 	choice := wizardAsk(prompt+" (1-9)", "7")
 	switch choice {
 	case "1":
@@ -4781,7 +4775,8 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 		fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "EXTERNAL EGRESS PROVIDER"))
 		fmt.Println("  1) Cloudflare WARP over MASQUE (WarpProxy / Local Proxy required; already Connected)")
 		fmt.Println("  2) Psiphon ConsoleClient via local SOCKS5")
-		sub := wizardAsk("Select external egress (1-2)", "1")
+		fmt.Println("  3) Tor via Snowflake or WebTunnel (local SOCKS5; TCP tunnel only)")
+		sub := wizardAsk("Select external egress (1-3)", "1")
 		switch sub {
 		case "1":
 			if _, err := verifyWarpPerTunnelPrerequisites(); err != nil {
@@ -4794,18 +4789,19 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 			// config, and a unique loopback SOCKS5 port are prepared automatically
 			// during Agent creation. No manual Psiphon files are requested.
 			return transportAdaptive, underlayPsiphon, "", nil
+		case "3":
+			// Tor and Lyrebird are provisioned on demand. The Agent wizard asks
+			// for either Snowflake's built-in bridge or a user-supplied WebTunnel bridge.
+			return transportAdaptive, underlayTor, "", nil
 		default:
-			return "", "", "", errors.New("invalid external egress selection; enter 1 or 2")
+			return "", "", "", errors.New("invalid external egress selection; enter 1, 2, or 3")
 		}
 	case "9":
 		if role != "agent" {
-			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent to enable Direct/Psiphon egress failover.")
+			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent to enable live RTT-based path selection and Direct/Psiphon/WARP egress failover.")
 			return transportAdaptive, underlayDirect, "", nil
 		}
-		// Option 9 includes Psiphon as a standby and can also use a per-app
-		// WARP Local Proxy. Control lanes probe candidate routes and prefer the
-		// lowest-latency reachable path; mapped Xray traffic uses leastPing and
-		// never silently falls back to the host's direct public IP.
+		// Option 9 includes Psiphon as an automatically prepared standby egress.
 		return transportAdaptive, underlayAdaptive, "", nil
 	default:
 		return "", "", "", errors.New("invalid transport selection; enter a number from 1 to 9")
@@ -5004,6 +5000,17 @@ func setup() error {
 		if err != nil {
 			return err
 		}
+		if c.Underlay == underlayTor {
+			c.TorMode = strings.ToLower(strings.TrimSpace(wizardAsk("Tor pluggable transport (snowflake/webtunnel)", torModeSnowflake)))
+			if c.TorMode == torModeWebTunnel {
+				c.TorBridge = wizardAsk("Paste one Tor WebTunnel bridge line from the Tor Bridges service", "")
+				if err = validateTorBridgeLine(c.TorBridge); err != nil {
+					return fmt.Errorf("invalid WebTunnel bridge: %w", err)
+				}
+			} else if c.TorMode != torModeSnowflake {
+				return errors.New("Tor transport must be snowflake or webtunnel")
+			}
+		}
 		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
 			defaultEndpoint := defaultPsiphonHubAddress(c.HubAddr)
 			c.PsiphonHubAddr = wizardAsk("Hub public Mapping address reachable through Psiphon SOCKS5 (IP:PORT)", defaultEndpoint)
@@ -5011,6 +5018,13 @@ func setup() error {
 				c.PsiphonHubAddr = defaultEndpoint
 			}
 			uiInfo("The dedicated ShahTunnel ALPN is multiplexed on this public Mapping port; ordinary HTTPS traffic remains unchanged.")
+		}
+		if c.Underlay == underlayTor {
+			defaultEndpoint := defaultPsiphonHubAddress(c.HubAddr)
+			c.TorHubAddr = wizardAsk("Hub public Mapping address reachable through Tor SOCKS5 (IP:PORT)", defaultEndpoint)
+			if strings.TrimSpace(c.TorHubAddr) == "" {
+				c.TorHubAddr = defaultEndpoint
+			}
 		}
 		if transportModeAllowsHTTP2(c.Transport) {
 			uiInfo("HTTP/2 CONNECT uses TCP port " + nextPortLabel(c.HubAddr) + ". Open it in the Hub firewall if selected.")
@@ -5047,16 +5061,29 @@ func setup() error {
 			}
 			uiSuccess("Psiphon ConsoleClient installed; per-profile config and loopback SOCKS5 endpoint are ready: " + c.PsiphonProxy)
 		}
+		if c.Underlay == underlayTor {
+			uiInfo("Preparing the official Tor Expert Bundle and per-profile Snowflake/WebTunnel SOCKS5 configuration...")
+			if err = prepareTorAgentProfile(&c); err != nil {
+				return fmt.Errorf("automatic Tor setup failed; Agent profile was not saved: %w", err)
+			}
+			uiSuccess("Tor and Lyrebird are installed; per-profile loopback SOCKS5 endpoint is ready: " + c.TorProxy)
+		}
 		c = normalizeConfig(c)
 		if err = saveConfig(c); err != nil {
 			return err
 		}
 		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s; egress=%s.", c.TunnelChannels, c.Transport, c.Underlay))
+		if c.Transport == transportAdaptive {
+			uiInfo("Adaptive quality selection is active: lanes test different transport/egress pairs; Hub uses fresh RTT and load to choose the best lane for new streams.")
+		}
 		if c.Underlay == underlayMASQUE {
 			uiInfo("This Agent's Xray mappings and DNS use its isolated WARP Local Proxy sidecar; system routes and SSH are untouched.")
 		}
 		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
 			uiInfo("Psiphon starts as a loopback-only child process. The Agent-to-Hub lanes and the isolated Xray user TCP/DNS egress use its SOCKS5 endpoint; UDP is blocked on the isolated user path to prevent direct-IP leaks. No TUN device or host route changes are made.")
+		}
+		if c.Underlay == underlayTor {
+			uiInfo("Tor starts as a per-profile child process. Agent-to-Hub TCP lanes and this Agent's isolated Xray user TCP/DNS mappings use its loopback SOCKS5 proxy. UDP, QUIC, and ICMP are blocked on the user path; no TUN device, default route, SSH, X-UI source config, or host firewall is changed.")
 		}
 		uiSuccess("Agent configuration saved. Reconnection is automatic if a lane drops.")
 	case "3", "relay", "front":
@@ -5099,6 +5126,14 @@ func setup() error {
 	if c.Role == "agent" && (c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive) {
 		if err := autoApplyXrayPsiphonForNewAgent(); err != nil {
 			return err
+		}
+	}
+	if c.Role == "agent" && c.Underlay == underlayTor {
+		if err := autoApplyXrayTorForNewAgent(); err != nil {
+			if rollbackErr := rollbackFailedTorAgentSetup(configPath, c); rollbackErr != nil {
+				return fmt.Errorf("automatic Tor Xray egress setup failed: %w; profile rollback also failed: %v", err, rollbackErr)
+			}
+			return fmt.Errorf("automatic Tor Xray egress setup failed; incomplete Agent profile and Tor state were rolled back: %w", err)
 		}
 	}
 	fmt.Printf("\n  %s %s\n", paint(ansiGreen+ansiBold, "✓"), "Configuration saved: "+configPath)
