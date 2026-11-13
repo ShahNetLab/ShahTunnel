@@ -40,7 +40,7 @@ import (
 )
 
 const (
-	version                          = "4.0.4"
+	version                          = "4.0.5"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -3311,7 +3311,7 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 		return nil, fmt.Errorf("tune Psiphon performance profile: %w", tuneErr)
 	} else if tuned {
 		profile := psiphonHostPerformanceProfile()
-		log.Printf("Psiphon: applied resource-aware throughput profile (MeekBufferLimit=%t, RelayBufferLimit=%t, CPUThreadLimit=%t, SSHChannelWindowSize=%d)", profile.LimitMeekBufferSizes, profile.LimitRelayBufferSizes, profile.LimitCPUThreads, profile.SSHChannelWindowSize)
+		log.Printf("Psiphon: applied concurrency-aware throughput profile (TunnelPoolSize=%d, MeekBufferLimit=%t, RelayBufferLimit=%t, CPUThreadLimit=%t, SSHChannelWindowSize=%d)", profile.TunnelPoolSize, profile.LimitMeekBufferSizes, profile.LimitRelayBufferSizes, profile.LimitCPUThreads, profile.SSHChannelWindowSize)
 	}
 	if err := validatePsiphonClientConfig(configPath, cfg.PsiphonProxy); err != nil {
 		return nil, fmt.Errorf("invalid Psiphon client configuration: %w", err)
@@ -3408,7 +3408,11 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 			log.Printf("Psiphon local SOCKS5 listener ready at %s; waiting for a real tunnel (ConsoleClient remains running)", cfg.PsiphonProxy)
 		}
 		if proxyReady && connectedTunnels > 0 {
-			log.Printf("Psiphon ConsoleClient connected (%d tunnel(s)); TCP egress uses SOCKS5 %s", connectedTunnels, cfg.PsiphonProxy)
+			desiredPool := psiphonHostPerformanceProfile().TunnelPoolSize
+			log.Printf("Psiphon ConsoleClient connected (%d/%d configured tunnel(s)); TCP egress uses SOCKS5 %s", connectedTunnels, desiredPool, cfg.PsiphonProxy)
+			if connectedTunnels < desiredPool {
+				log.Printf("Psiphon tunnel pool is under target at startup (%d/%d); the client may add tunnels as capacity becomes available", connectedTunnels, desiredPool)
+			}
 			return func() {
 				cancel()
 				select {
@@ -5074,6 +5078,9 @@ func setup() error {
 			return err
 		}
 		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s; egress=%s.", c.TunnelChannels, c.Transport, c.Underlay))
+		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
+			uiInfo(fmt.Sprintf("Psiphon egress pool: up to %d parallel tunnels based on detected RAM/CPU resources.", psiphonHostPerformanceProfile().TunnelPoolSize))
+		}
 		if c.Transport == transportAdaptive {
 			uiInfo("Adaptive quality selection is active: lanes test different transport/egress pairs; Hub uses fresh RTT and load to choose the best lane for new streams.")
 		}

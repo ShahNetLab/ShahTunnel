@@ -86,7 +86,11 @@ type psiphonClientConfig struct {
 	LimitRelayBufferSizes       bool   `json:"LimitRelayBufferSizes"`
 	SSHChannelWindowSize        *int   `json:"SSHChannelWindowSize,omitempty"`
 	ConnectionWorkerPoolMaxSize int    `json:"ConnectionWorkerPoolMaxSize,omitempty"`
-	EmitDiagnosticNotices       bool   `json:"EmitDiagnosticNotices,omitempty"`
+	// TunnelPoolSize controls independent Psiphon tunnels carrying multiplexed
+	// port-forward streams. Psiphon's upstream default is 1; ShahTunnel selects
+	// a resource-aware pool size for concurrent multi-user mappings.
+	TunnelPoolSize        int  `json:"TunnelPoolSize,omitempty"`
+	EmitDiagnosticNotices bool `json:"EmitDiagnosticNotices,omitempty"`
 }
 
 // psiphonConsoleClientArgs deliberately leaves ListenInterface unset so the
@@ -103,6 +107,7 @@ type psiphonPerformanceProfile struct {
 	LimitCPUThreads       bool
 	LimitRelayBufferSizes bool
 	SSHChannelWindowSize  int
+	TunnelPoolSize        int
 }
 
 const psiphonHighThroughputMinRAM = uint64(3 << 30) // 3 GiB
@@ -123,11 +128,30 @@ func psiphonPerformanceProfileForHost(totalRAMBytes uint64, cpuCount int) psipho
 		// window (512 KiB) improves throughput on high-RTT paths when RAM allows.
 		windowSize = 4
 	}
+	// Psiphon's upstream TunnelPoolSize defaults to one. That is a useful
+	// single-user default but becomes a shared bottleneck when many Xray users
+	// are multiplexed over one SOCKS endpoint. Scale the number of parallel
+	// Psiphon tunnels conservatively with available RAM and CPU; never exceed
+	// 16 in ShahTunnel even though upstream supports a larger maximum.
+	tunnelPoolSize := 2
+	if cpuCount >= 2 && totalRAMBytes >= 2<<30 {
+		tunnelPoolSize = 4
+	}
+	if cpuCount >= 2 && totalRAMBytes >= 4<<30 {
+		tunnelPoolSize = 8
+	}
+	if cpuCount >= 4 && totalRAMBytes >= 8<<30 {
+		tunnelPoolSize = 12
+	}
+	if cpuCount >= 8 && totalRAMBytes >= 16<<30 {
+		tunnelPoolSize = 16
+	}
 	return psiphonPerformanceProfile{
 		LimitMeekBufferSizes:  lowMemory,
 		LimitCPUThreads:       cpuCount < 2,
 		LimitRelayBufferSizes: lowMemory,
 		SSHChannelWindowSize:  windowSize,
+		TunnelPoolSize:        tunnelPoolSize,
 	}
 }
 
@@ -205,6 +229,7 @@ func newPsiphonClientConfig(port int) psiphonClientConfig {
 		LimitCPUThreads:         performance.LimitCPUThreads,
 		LimitRelayBufferSizes:   performance.LimitRelayBufferSizes,
 		SSHChannelWindowSize:    intPointer(performance.SSHChannelWindowSize),
+		TunnelPoolSize:          performance.TunnelPoolSize,
 		// Diagnostic notices are written only to the local systemd journal;
 		// they are needed to distinguish bootstrap-list failures from blocked
 		// Psiphon server connections when the first tunnel is delayed.
@@ -541,6 +566,7 @@ func tunePsiphonPerformanceConfigForProfile(configPath string, profile psiphonPe
 		"LimitCPUThreads":       profile.LimitCPUThreads,
 		"LimitRelayBufferSizes": profile.LimitRelayBufferSizes,
 		"SSHChannelWindowSize":  profile.SSHChannelWindowSize,
+		"TunnelPoolSize":        profile.TunnelPoolSize,
 	}
 	changed := false
 	for key, value := range settings {
@@ -627,6 +653,9 @@ func validatePsiphonClientConfig(configPath, proxyAddress string) error {
 	}
 	if cfg.SSHChannelWindowSize != nil && (*cfg.SSHChannelWindowSize < 1 || *cfg.SSHChannelWindowSize > 128) {
 		return fmt.Errorf("invalid Psiphon SSHChannelWindowSize %d (valid range is 1-128)", *cfg.SSHChannelWindowSize)
+	}
+	if cfg.TunnelPoolSize < 1 || cfg.TunnelPoolSize > 32 {
+		return fmt.Errorf("invalid Psiphon TunnelPoolSize %d (valid range is 1-32)", cfg.TunnelPoolSize)
 	}
 	decodeKey := func(name, value string, minBytes, exactBytes int) error {
 		decoded, err := base64.StdEncoding.DecodeString(value)
