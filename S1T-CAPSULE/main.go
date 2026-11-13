@@ -39,46 +39,48 @@ import (
 )
 
 const (
-	version                          = "4.0.0"
-	legacyConfigPath                 = "/etc/ravanreverse/config.json"
-	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
-	maxFrame                         = 64 * 1024
-	defaultTunnelChannels            = 12
-	maxPendingPublicConnections      = 2048
-	controlBurstLimit                = 8
-	streamAdmissionWait              = 5 * time.Second
-	maxTunnelChannels                = 16
-	msgOpen                     byte = 1
-	msgOpenOK                   byte = 2
-	msgOpenErr                  byte = 3
-	msgData                     byte = 4
-	msgClose                    byte = 5
-	msgPing                     byte = 6
-	msgPong                     byte = 7
-	maxStreams                       = 512
-	streamWindowFrames               = 256
-	maxQueuedPayloadBytes            = int64(64 << 20)
-	wireWriteTimeout                 = 30 * time.Second
-	reverseStreamOpenTimeout         = 18 * time.Second
-	transportAuto                    = "auto"
-	transportAdaptive                = "adaptive"
-	transportTCP                     = "tcp_tls"
-	transportWebSocket               = "websocket_tls"
-	transportHTTP2                   = "http2_connect"
-	transportHTTP1                   = "http1_connect"
-	transportHTTPConnectAuto         = "http_connect_auto"
-	underlayDirect                   = "direct"
-	underlayMASQUE                   = "warp_masque"
-	underlayPsiphon                  = "psiphon_socks5"
-	underlayAdaptive                 = "adaptive_external"
-	http2TokenHeader                 = "X-S1T-Token"
-	controlALPN                      = "shah-tunnel-control/1"
-	webSocketPath                    = "/s1t-tunnel"
-	webSocketGUID                    = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	maxWebSocketHeaders              = 16 * 1024
-	maxWebSocketFrame                = maxFrame + 9
-	msgHalfClose                byte = 8
-	msgDataAck                  byte = 9
+	version                             = "4.0.1"
+	legacyConfigPath                    = "/etc/ravanreverse/config.json"
+	tunnelConfigDir                     = "/etc/ravanreverse/tunnels"
+	maxFrame                            = 64 * 1024
+	defaultTunnelChannels               = 12
+	psiphonTunnelChannels               = 3
+	adaptiveExternalTunnelChannels      = 4
+	maxPendingPublicConnections         = 2048
+	controlBurstLimit                   = 8
+	streamAdmissionWait                 = 5 * time.Second
+	maxTunnelChannels                   = 16
+	msgOpen                        byte = 1
+	msgOpenOK                      byte = 2
+	msgOpenErr                     byte = 3
+	msgData                        byte = 4
+	msgClose                       byte = 5
+	msgPing                        byte = 6
+	msgPong                        byte = 7
+	maxStreams                          = 512
+	streamWindowFrames                  = 256
+	maxQueuedPayloadBytes               = int64(64 << 20)
+	wireWriteTimeout                    = 30 * time.Second
+	reverseStreamOpenTimeout            = 18 * time.Second
+	transportAuto                       = "auto"
+	transportAdaptive                   = "adaptive"
+	transportTCP                        = "tcp_tls"
+	transportWebSocket                  = "websocket_tls"
+	transportHTTP2                      = "http2_connect"
+	transportHTTP1                      = "http1_connect"
+	transportHTTPConnectAuto            = "http_connect_auto"
+	underlayDirect                      = "direct"
+	underlayMASQUE                      = "warp_masque"
+	underlayPsiphon                     = "psiphon_socks5"
+	underlayAdaptive                    = "adaptive_external"
+	http2TokenHeader                    = "X-S1T-Token"
+	controlALPN                         = "shah-tunnel-control/1"
+	webSocketPath                       = "/s1t-tunnel"
+	webSocketGUID                       = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	maxWebSocketHeaders                 = 16 * 1024
+	maxWebSocketFrame                   = maxFrame + 9
+	msgHalfClose                   byte = 8
+	msgDataAck                     byte = 9
 )
 
 var (
@@ -3244,7 +3246,7 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 		return nil, fmt.Errorf("tune Psiphon performance profile: %w", tuneErr)
 	} else if tuned {
 		profile := psiphonHostPerformanceProfile()
-		log.Printf("Psiphon: applied resource-aware throughput profile (MeekBufferLimit=%t, RelayBufferLimit=%t, CPUThreadLimit=%t, SSHChannelWindowSize=%d)", profile.LimitMeekBufferSizes, profile.LimitRelayBufferSizes, profile.LimitCPUThreads, profile.SSHChannelWindowSize)
+		log.Printf("Psiphon: applied resource-aware profile (MeekBufferLimit=%t, RelayBufferLimit=%t, CPUThreadLimit=%t, SSHChannelWindowSize=%d, TunnelPoolSize=%d)", profile.LimitMeekBufferSizes, profile.LimitRelayBufferSizes, profile.LimitCPUThreads, profile.SSHChannelWindowSize, profile.TunnelPoolSize)
 	}
 	if err := validatePsiphonClientConfig(configPath, cfg.PsiphonProxy); err != nil {
 		return nil, fmt.Errorf("invalid Psiphon client configuration: %w", err)
@@ -3685,10 +3687,26 @@ func normalizeConfig(c Config) Config {
 			c.Transport = transportAuto
 		}
 	}
-	// Upgrade existing Agent profiles to the current independent-lane performance profile.
-	// Each lane reconnects independently; no Hub-side config change is required.
-	if c.Role == "agent" && c.TunnelChannels < defaultTunnelChannels {
-		c.TunnelChannels = defaultTunnelChannels
+	// Keep direct/WARP paths highly parallel, but avoid flooding a single
+	// Psiphon SOCKS egress with many concurrent Hub lanes. Adaptive external
+	// profiles may use Psiphon for user egress, so they receive a moderate cap.
+	// Existing explicit lower values are preserved; old 12-lane Psiphon
+	// profiles are safely normalized at runtime without editing their JSON.
+	if c.Role == "agent" {
+		switch c.Underlay {
+		case underlayPsiphon:
+			if c.TunnelChannels < 1 || c.TunnelChannels > psiphonTunnelChannels {
+				c.TunnelChannels = psiphonTunnelChannels
+			}
+		case underlayAdaptive:
+			if c.TunnelChannels < 1 || c.TunnelChannels > adaptiveExternalTunnelChannels {
+				c.TunnelChannels = adaptiveExternalTunnelChannels
+			}
+		default:
+			if c.TunnelChannels < defaultTunnelChannels {
+				c.TunnelChannels = defaultTunnelChannels
+			}
+		}
 	}
 	if len(c.Ports) == 0 {
 		if c.Role == "hub" && c.PublicListen != "" {

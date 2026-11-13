@@ -1823,10 +1823,26 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
-func TestNormalizeConfigUpgradesAgentToTwelveLanes(t *testing.T) {
-	got := normalizeConfig(Config{Role: "agent", TunnelChannels: 4})
-	if got.TunnelChannels != 12 {
-		t.Fatalf("TunnelChannels = %d; want 12", got.TunnelChannels)
+func TestNormalizeConfigKeepsTwelveLanesForDirectAndCapsPsiphonPaths(t *testing.T) {
+	direct := normalizeConfig(Config{Role: "agent", Underlay: underlayDirect, TunnelChannels: 4})
+	if direct.TunnelChannels != 12 {
+		t.Fatalf("direct TunnelChannels = %d; want 12", direct.TunnelChannels)
+	}
+	psiphon := normalizeConfig(Config{Role: "agent", Underlay: underlayPsiphon, TunnelChannels: 12})
+	if psiphon.TunnelChannels != psiphonTunnelChannels {
+		t.Fatalf("Psiphon TunnelChannels = %d; want %d", psiphon.TunnelChannels, psiphonTunnelChannels)
+	}
+	psiphonSmall := normalizeConfig(Config{Role: "agent", Underlay: underlayPsiphon, TunnelChannels: 2})
+	if psiphonSmall.TunnelChannels != 2 {
+		t.Fatalf("explicit Psiphon TunnelChannels = %d; want 2", psiphonSmall.TunnelChannels)
+	}
+	adaptive := normalizeConfig(Config{Role: "agent", Underlay: underlayAdaptive, TunnelChannels: 12})
+	if adaptive.TunnelChannels != adaptiveExternalTunnelChannels {
+		t.Fatalf("adaptive TunnelChannels = %d; want %d", adaptive.TunnelChannels, adaptiveExternalTunnelChannels)
+	}
+	adaptiveSmall := normalizeConfig(Config{Role: "agent", Underlay: underlayAdaptive, TunnelChannels: 3})
+	if adaptiveSmall.TunnelChannels != 3 {
+		t.Fatalf("explicit adaptive TunnelChannels = %d; want 3", adaptiveSmall.TunnelChannels)
 	}
 }
 
