@@ -1644,6 +1644,25 @@ func TestAdaptiveUnderlayCandidatesPreferLastSuccessfulEgress(t *testing.T) {
 	}
 }
 
+func TestAdaptiveUnderlayAvoidsDoublePsiphonWhenFinalUserExitIsPsiphon(t *testing.T) {
+	cfg := Config{
+		Underlay:      underlayAdaptive,
+		PsiphonConfig: "/etc/shah-tunnel/psiphon-client.json",
+		XrayPsiphon:   &XrayPsiphonIntegration{Proxy: "127.0.0.1:21082"},
+	}
+	if got, want := adaptiveUnderlayCandidatesWithWarp(cfg, underlayPsiphon, ""), []string{underlayDirect, underlayPsiphon}; !equalStrings(got, want) {
+		t.Fatalf("outer candidates with Psiphon final user exit = %v; want Direct first and Psiphon only as last resort: %v", got, want)
+	}
+	if got, want := adaptiveUnderlayCandidatesWithWarp(cfg, underlayPsiphon, underlayMASQUE), []string{underlayMASQUE, underlayDirect, underlayPsiphon}; !equalStrings(got, want) {
+		t.Fatalf("outer candidates with active MASQUE and Psiphon final user exit = %v; want %v", got, want)
+	}
+	// The user-facing Xray sidecar remains configured to use the same Psiphon
+	// loopback proxy; only the Agent->Hub underlay preference changes.
+	if cfg.XrayPsiphon == nil || cfg.XrayPsiphon.Proxy != "127.0.0.1:21082" {
+		t.Fatal("test fixture lost the final Psiphon user-egress integration")
+	}
+}
+
 func TestAdaptiveUnderlayCandidatesDetectMASQUEAndFailOver(t *testing.T) {
 	binDir := t.TempDir()
 	warpCLI := filepath.Join(binDir, "warp-cli")

@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "4.0.7"
+	version                          = "4.0.8"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -2936,9 +2936,12 @@ func adaptiveTransportCandidates(preferred string) []string {
 }
 
 func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
+	return adaptiveUnderlayCandidatesWithWarp(cfg, preferred, detectActiveWarpUnderlay())
+}
+
+func adaptiveUnderlayCandidatesWithWarp(cfg Config, preferred, warpMode string) []string {
 	// WARP is only a candidate when its client reports a connected MASQUE path.
 	// Other WARP protocols are never selected by adaptive routing.
-	warpMode := detectActiveWarpUnderlay()
 	usesPsiphon := strings.TrimSpace(cfg.PsiphonConfig) != ""
 	all := make([]string, 0, 3)
 	appendCandidate := func(candidate string) {
@@ -2953,9 +2956,25 @@ func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
 		all = append(all, candidate)
 	}
 
-	// An active WARP route is always checked first, then fails over to
-	// Psiphon and Direct. When WARP is down, retain the last successful
-	// non-WARP route; a lost WARP preference hands off to Psiphon first.
+	// When the final user egress is already Psiphon (isolated Xray SOCKS
+	// sidecar), do NOT prefer Psiphon for the Agent->Hub transport as well.
+	// Doing so nests a second Psiphon hop in front of the user Psiphon hop,
+	// adding latency and TCP-over-TCP head-of-line blocking. The users' public
+	// exit remains Psiphon because their mapped Xray traffic is still routed
+	// through cfg.XrayPsiphon. Prefer active MASQUE, then Direct; keep Psiphon
+	// as a last-resort Hub-reachability fallback only.
+	if cfg.XrayPsiphon != nil && usesPsiphon {
+		if warpMode == underlayMASQUE {
+			appendCandidate(underlayMASQUE)
+		}
+		appendCandidate(underlayDirect)
+		appendCandidate(underlayPsiphon)
+		return all
+	}
+
+	// Without a separate Psiphon user-egress sidecar, preserve the existing
+	// adaptive behavior: an active WARP path is preferred, then Psiphon and
+	// Direct; otherwise the last successful path is tried first.
 	if warpMode != "" {
 		appendCandidate(warpMode)
 		appendCandidate(underlayPsiphon)
@@ -3134,6 +3153,9 @@ func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode s
 	}
 	if cfg.Underlay == underlayAdaptive || cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE || cfg.Underlay == underlayTor {
 		agentPreferredUnderlay.Store(channel, cfg.Underlay)
+	}
+	if cfg.Underlay == underlayPsiphon && cfg.XrayPsiphon != nil {
+		log.Printf("WARNING: lane %d uses Psiphon for Agent->Hub while mapped user egress also uses Psiphon; this is a double Psiphon hop and may increase latency. Direct/WARP is preferred for the outer lane when reachable.", channel)
 	}
 	log.Printf("tunnel lane %d/%d connected via %s over %s; forwarding through %d configured port mapping(s)", channel, cfg.TunnelChannels, mode, cfg.Underlay, len(normalizeConfig(cfg).Ports))
 	targets := make(map[string]string, len(cfg.Ports))
