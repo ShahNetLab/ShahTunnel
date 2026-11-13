@@ -53,9 +53,25 @@ printf '%s  %s\n' "$EXPECTED_SHA256" "$ARCHIVE_PATH" | sha256sum -c - \
 tar -tzf "$ARCHIVE_PATH" >/dev/null 2>&1 || fail "downloaded Tor Expert Bundle is not a valid tar.gz archive."
 tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR" || fail "could not extract Tor Expert Bundle."
 
-TOR_BIN="$(find "$EXTRACT_DIR" -type f -name tor -perm /111 -print -quit)"
-LYREBIRD_BIN="$(find "$EXTRACT_DIR" -type f -name lyrebird -perm /111 -print -quit)"
-[[ -n "$TOR_BIN" && -n "$LYREBIRD_BIN" ]] || fail "official bundle does not contain both tor and lyrebird executables."
+# Prefer the real Expert Bundle daemon. Some bundles also ship a file named
+# debug/tor; selecting the first filesystem match can pick an incompatible
+# helper and cause Linux exec format errors.
+TOR_BIN="${EXTRACT_DIR}/tor/tor"
+if [[ ! -x "$TOR_BIN" ]] || ! env LD_LIBRARY_PATH="$(dirname "$TOR_BIN")" "$TOR_BIN" --version >/dev/null 2>&1; then
+  TOR_BIN=""
+  while IFS= read -r candidate; do
+    [[ -x "$candidate" ]] || continue
+    if env LD_LIBRARY_PATH="$(dirname "$candidate")" "$candidate" --version >/dev/null 2>&1; then
+      TOR_BIN="$candidate"
+      break
+    fi
+  done < <(find "$EXTRACT_DIR" -type f -name tor -perm /111 -print | sort)
+fi
+LYREBIRD_BIN="${EXTRACT_DIR}/tor/pluggable_transports/lyrebird"
+if [[ ! -x "$LYREBIRD_BIN" ]]; then
+  LYREBIRD_BIN="$(find "$EXTRACT_DIR" -type f -name lyrebird -perm /111 -print -quit)"
+fi
+[[ -n "$TOR_BIN" && -x "$TOR_BIN" && -n "$LYREBIRD_BIN" && -x "$LYREBIRD_BIN" ]] || fail "official bundle does not contain runnable Tor and Lyrebird executables for this architecture."
 
 install -d -o root -g root -m 0755 "$STATE_DIR"
 NEW_DIR="${STATE_DIR}/tor-bundle.new.$$"
