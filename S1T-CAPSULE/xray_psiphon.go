@@ -297,7 +297,25 @@ func psiphonPublicEgressCountry(proxyAddress string, timeout time.Duration) (str
 			return code, nil
 		}
 	}
-	return "", errors.New("could not verify Psiphon exit country through either geolocation endpoint")
+	return "", errors.New("could not verify Psiphon exit country through SOCKS geolocation endpoints")
+}
+
+// psiphonCountryFromDirectIPLookup performs a second, independent lookup of the
+// exact public IP already observed through Psiphon's SOCKS proxy. It does not
+// look up the Agent's own address: the exit IP is embedded in every provider
+// request and the shared parser rejects any provider response that echoes a
+// different IP. Unknown or conflicting results remain fail-closed.
+func psiphonCountryFromDirectIPLookup(exitIP string) (string, error) {
+	parsed := net.ParseIP(strings.TrimSpace(exitIP))
+	if !isPublicGeoIP(parsed) {
+		return "", fmt.Errorf("expected a public Psiphon exit address, got %q", exitIP)
+	}
+	expected := parsed.String()
+	geo, ok := lookupCountryForPublicIP(expected)
+	if !ok || !geo.Valid || geo.IP != expected || !isAlphaCountryCode(geo.CountryCode) {
+		return "", fmt.Errorf("no independent provider returned a verified country for Psiphon exit IP %s", expected)
+	}
+	return strings.ToUpper(geo.CountryCode), nil
 }
 
 // applyXrayPsiphonEgress builds an independent Xray sidecar and switches only
@@ -336,9 +354,18 @@ func applyXrayPsiphonEgress(restartAgent, confirm bool) error {
 		if err != nil {
 			return err
 		}
-		country, err := psiphonPublicEgressCountry(proxy, 12*time.Second)
-		if err != nil {
-			return fmt.Errorf("refusing Psiphon egress because exit country could not be verified: %w", err)
+		country, proxyGeoErr := psiphonPublicEgressCountry(proxy, 12*time.Second)
+		if proxyGeoErr != nil {
+			// Some Psiphon exits block or rate-limit geolocation APIs. We already
+			// obtained the actual public exit IP through the SOCKS proxy above;
+			// look up that exact IP from the Agent's ordinary network as a fallback.
+			// lookupCountryForIPv4 validates any echoed IP against the supplied IP,
+			// so this cannot accidentally classify the Agent's own public address.
+			country, err = psiphonCountryFromDirectIPLookup(ip)
+			if err != nil {
+				return fmt.Errorf("refusing Psiphon egress because the exact exit IP country could not be verified (SOCKS lookup: %v; independent IP lookup: %w)", proxyGeoErr, err)
+			}
+			uiWarn(fmt.Sprintf("Psiphon geolocation APIs were unreachable through SOCKS; exact exit IP %s was verified using independent IP lookup (%s).", ip, country))
 		}
 		if country == "US" || !psiphonAllowedEgressRegions[country] {
 			return fmt.Errorf("refusing Psiphon exit %s (%s): US is prohibited and only approved non-US regions are allowed", ip, country)

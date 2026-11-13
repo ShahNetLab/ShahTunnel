@@ -2864,3 +2864,18 @@ func TestHubPrefersFreshRTTOverStaleLowRTT(t *testing.T) {
 		t.Fatalf("selected lane %d; want fresh lane %d despite stale lower RTT", got.id, freshHealthy.id)
 	}
 }
+
+func TestParseGeoResponseSupportsExactPublicIPv6ExitIP(t *testing.T) {
+	exitIP := "2001:4860:4860::8888"
+	body := []byte(`{"ip":"2001:4860:4860::8888","country":"US"}`)
+	geo, ok := parseGeoResponse(body, exitIP)
+	if !ok || !geo.Valid || geo.IP != exitIP || geo.CountryCode != "US" {
+		t.Fatalf("parseGeoResponse() = (%+v, %t), want exact public IPv6 + US country code", geo, ok)
+	}
+	if _, ok := parseGeoResponse([]byte(`{"ip":"2001:4860:4860::8844","country":"DE"}`), exitIP); ok {
+		t.Fatal("geo response for a different IPv6 address must be rejected")
+	}
+	if isPublicGeoIP(net.ParseIP("fd00::1")) || isPublicGeoIP(net.ParseIP("fe80::1")) || isPublicGeoIP(net.ParseIP("::1")) {
+		t.Fatal("private, link-local and loopback IPv6 addresses must not be treated as public exits")
+	}
+}

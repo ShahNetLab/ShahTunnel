@@ -40,7 +40,7 @@ import (
 )
 
 const (
-	version                          = "4.0.5"
+	version                          = "4.0.6"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -5798,6 +5798,20 @@ func isPublicIPv4(ip net.IP) bool {
 	return true
 }
 
+// isPublicGeoIP accepts globally routable IPv4 or IPv6 addresses for explicit
+// IP-geolocation lookups. IPv4 retains the stricter special-range filtering
+// above; IPv6 rejects local, private, multicast and non-global addresses.
+func isPublicGeoIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.To4() != nil {
+		return isPublicIPv4(ip)
+	}
+	return ip.To16() != nil && ip.IsGlobalUnicast() && !ip.IsPrivate() &&
+		!ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsUnspecified() && !ip.IsMulticast()
+}
+
 // detectAssignedPublicIPv4 finds an IPv4 assigned directly to the active route
 // first. It deliberately refuses private/interface-local addresses, which are
 // not the public identity the menu should advertise.
@@ -5927,19 +5941,19 @@ func parseGeoResponse(body []byte, expectedIP string) (ServerGeo, bool) {
 	}
 	if expectedIP != "" {
 		expected := net.ParseIP(expectedIP)
-		if expected == nil || expected.To4() == nil {
+		if !isPublicGeoIP(expected) {
 			return zero, false
 		}
 		if returnedIP != "" {
 			got := net.ParseIP(returnedIP)
-			if got == nil || got.To4() == nil || !got.To4().Equal(expected.To4()) {
+			if !isPublicGeoIP(got) || !got.Equal(expected) {
 				return zero, false
 			}
 		}
-		returnedIP = expected.To4().String()
+		returnedIP = expected.String()
 	}
 	parsedIP := net.ParseIP(returnedIP)
-	if !isPublicIPv4(parsedIP) {
+	if !isPublicGeoIP(parsedIP) {
 		return zero, false
 	}
 
@@ -5967,7 +5981,7 @@ func parseGeoResponse(body []byte, expectedIP string) (ServerGeo, bool) {
 	if strings.EqualFold(country, "Unknown") {
 		code = ""
 	}
-	return ServerGeo{IP: parsedIP.To4().String(), Country: country, CountryCode: code, UpdatedAt: time.Now(), Valid: true}, true
+	return ServerGeo{IP: parsedIP.String(), Country: country, CountryCode: code, UpdatedAt: time.Now(), Valid: true}, true
 }
 
 func isAlphaCountryCode(s string) bool {
@@ -6100,14 +6114,28 @@ func detectPublicIPv4FromAPIs() string {
 	return ""
 }
 
-func lookupCountryForIPv4(ip string) (ServerGeo, bool) {
-	urls := []string{
-		"https://ipapi.co/" + ip + "/json/",
-		"https://ipwho.is/" + ip,
-		"https://api.ip.sb/geoip/" + ip,
-		"https://ipinfo.io/" + ip + "/json",
+func lookupCountryForPublicIP(ip string) (ServerGeo, bool) {
+	parsed := net.ParseIP(strings.TrimSpace(ip))
+	if !isPublicGeoIP(parsed) {
+		return ServerGeo{}, false
 	}
-	return lookupGeoURLs(urls, ip, false)
+	urls := []string{
+		"https://ipapi.co/" + parsed.String() + "/json/",
+		"https://ipwho.is/" + parsed.String(),
+		"https://api.ip.sb/geoip/" + parsed.String(),
+		"https://ipinfo.io/" + parsed.String() + "/json",
+		"https://free.freeipapi.com/api/v1/json/" + parsed.String(),
+		"https://api.country.is/" + parsed.String(),
+	}
+	return lookupGeoURLs(urls, parsed.String(), false)
+}
+
+func lookupCountryForIPv4(ip string) (ServerGeo, bool) {
+	parsed := net.ParseIP(strings.TrimSpace(ip))
+	if parsed == nil || parsed.To4() == nil {
+		return ServerGeo{}, false
+	}
+	return lookupCountryForPublicIP(parsed.To4().String())
 }
 
 func lookupCombinedServerGeo() (ServerGeo, bool) {
