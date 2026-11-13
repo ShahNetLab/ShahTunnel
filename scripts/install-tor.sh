@@ -5,8 +5,8 @@ set -Eeuo pipefail
 # The archive checksum is pinned to Tor Project's signed build manifest.
 STATE_DIR="/usr/local/lib/shah-tunnel"
 BUNDLE_DIR="${STATE_DIR}/tor-bundle"
-TOR_VERSION="16.0"
-BASE_URL="https://archive.torproject.org/tor-package-archive/torbrowser/${TOR_VERSION}"
+TOR_VERSION="16.0.1"
+BASE_URL="https://dist.torproject.org/torbrowser/${TOR_VERSION}"
 
 fail() { echo "Tor installer: $*" >&2; exit 1; }
 [[ "${EUID:-$(id -u)}" -eq 0 ]] || fail "run as root (ShahTunnel invokes this automatically as root)."
@@ -25,11 +25,11 @@ fi
 case "$(uname -m)" in
   x86_64|amd64)
     ARCHIVE="tor-expert-bundle-linux-x86_64-${TOR_VERSION}.tar.gz"
-    EXPECTED_SHA256="cc950ebe9acb80188325c3a2cd8817def7dd7237d6fdcd861bb87b234a0cb2fd"
+    EXPECTED_SHA256="7039cb16060ab22e669852e55774d894b55f25ea8bd0ab7194d3478429a58725"
     ;;
   aarch64|arm64)
     ARCHIVE="tor-expert-bundle-linux-aarch64-${TOR_VERSION}.tar.gz"
-    EXPECTED_SHA256="bed98744e093a0dc3a22be0eecfdce7a33cb36866d3f15fcf011a35bf3513d0d"
+    EXPECTED_SHA256="67040520d44c87ccaaf5aa7df0dc1ff122eb938dbb600ae7722e8b6b75282a4b"
     ;;
   *) fail "unsupported CPU architecture: $(uname -m); supported: amd64 and arm64." ;;
 esac
