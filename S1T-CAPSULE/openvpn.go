@@ -129,11 +129,32 @@ esac
 `)
 }
 
-func ensureOpenVPNInstalled() error {
-	if _, err := exec.LookPath("openvpn"); err == nil {
-		if _, err := exec.LookPath("ip"); err == nil {
-			return nil
+func runOpenVPNPackageCommand(label string, timeout time.Duration, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "apt-get", args...)
+	cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+	// Stream apt output directly to the interactive terminal. The previous
+	// CombinedOutput implementation buffered everything, making a slow apt
+	// mirror look like the ShahTunnel wizard had frozen after option 3.
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	uiInfo(label)
+	if err := cmd.Run(); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("%s timed out after %s; check apt repository/network availability", strings.Join(args, " "), timeout)
 		}
+		return fmt.Errorf("%s failed: %w", strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+func ensureOpenVPNInstalled() error {
+	openVPNErr := func() error { _, err := exec.LookPath("openvpn"); return err }()
+	ipErr := func() error { _, err := exec.LookPath("ip"); return err }()
+	if openVPNErr == nil && ipErr == nil {
+		uiInfo("OpenVPN and iproute2 are already installed.")
+		return nil
 	}
 	if os.Geteuid() != 0 {
 		return errors.New("OpenVPN installation requires root")
@@ -141,16 +162,17 @@ func ensureOpenVPNInstalled() error {
 	if _, err := exec.LookPath("apt-get"); err != nil {
 		return errors.New("OpenVPN is not installed and this system has no apt-get package manager; install openvpn and iproute2 first")
 	}
-	cmd := exec.Command("apt-get", "update")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("apt-get update failed: %w: %s", err, tailText(string(out), 3000))
+	if err := runOpenVPNPackageCommand("Updating APT package indexes (progress is shown below)...", 8*time.Minute, "-o", "Dpkg::Use-Pty=0", "-o", "Acquire::Retries=2", "update"); err != nil {
+		return fmt.Errorf("APT package index update failed: %w", err)
 	}
-	cmd = exec.Command("apt-get", "install", "-y", "openvpn", "iproute2")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("install openvpn/iproute2 failed: %w: %s", err, tailText(string(out), 3000))
+	if err := runOpenVPNPackageCommand("Installing OpenVPN and iproute2 (progress is shown below)...", 8*time.Minute, "-o", "Dpkg::Use-Pty=0", "install", "-y", "openvpn", "iproute2"); err != nil {
+		return fmt.Errorf("OpenVPN dependency installation failed: %w", err)
 	}
 	if _, err := exec.LookPath("openvpn"); err != nil {
 		return fmt.Errorf("OpenVPN package installed but binary is not available: %w", err)
+	}
+	if _, err := exec.LookPath("ip"); err != nil {
+		return fmt.Errorf("iproute2 package installed but ip binary is not available: %w", err)
 	}
 	return nil
 }
@@ -421,12 +443,49 @@ func prepareOpenVPNAgentProfile(c *Config) error {
 	if !isRoot() {
 		return errors.New("run the manager as root to prepare a private OpenVPN profile")
 	}
-	if err := ensureOpenVPNInstalled(); err != nil {
-		return err
-	}
+	// Collect and validate user-supplied files before touching APT. This keeps
+	// the wizard responsive and avoids installing packages when no provider
+	// profile has been uploaded yet.
 	source := strings.TrimSpace(wizardAsk("Absolute path to the provider's OpenVPN TCP .ovpn file already uploaded to this VPS", ""))
 	if source == "" {
 		return errors.New("provider .ovpn file path is required; download a TCP profile for the desired country and upload it to this VPS first")
+	}
+	absSource, err := filepath.Abs(source)
+	if err != nil {
+		return fmt.Errorf("invalid provider .ovpn path: %w", err)
+	}
+	source = absSource
+	st, err := os.Stat(absSource)
+	if err != nil {
+		return fmt.Errorf("provider .ovpn file is not accessible: %w", err)
+	}
+	if !st.Mode().IsRegular() || st.Size() == 0 {
+		return errors.New("provider .ovpn path must point to a non-empty regular file")
+	}
+	probe, err := os.Open(absSource)
+	if err != nil {
+		return fmt.Errorf("provider .ovpn file is not readable: %w", err)
+	}
+	_ = probe.Close()
+	authHint := strings.TrimSpace(wizardAsk("Optional credentials file path (username on line 1, password on line 2); leave blank for certificate-only profiles", ""))
+	if authHint != "" {
+		absAuth, authErr := filepath.Abs(authHint)
+		if authErr != nil {
+			return fmt.Errorf("invalid OpenVPN credentials path: %w", authErr)
+		}
+		authInfo, authErr := os.Stat(absAuth)
+		if authErr != nil {
+			return fmt.Errorf("OpenVPN credentials file is not accessible: %w", authErr)
+		}
+		if !authInfo.Mode().IsRegular() || authInfo.Size() == 0 {
+			return errors.New("OpenVPN credentials path must point to a non-empty regular file")
+		}
+		probe, authErr := os.Open(absAuth)
+		if authErr != nil {
+			return fmt.Errorf("OpenVPN credentials file is not readable: %w", authErr)
+		}
+		_ = probe.Close()
+		authHint = absAuth
 	}
 	profileDir := openVPNProfileDir(c.Name)
 	unitPath := filepath.Join("/etc/systemd/system", openVPNServiceName(c.Name))
@@ -448,12 +507,14 @@ func prepareOpenVPNAgentProfile(c *Config) error {
 	if profileDirExisted {
 		return fmt.Errorf("managed OpenVPN directory already exists for Agent %s; remove or repair the old profile first", c.Name)
 	}
+	if err := ensureOpenVPNInstalled(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(profileDir, 0700); err != nil {
 		return err
 	}
 	_ = os.Chmod(profileDir, 0700)
 	route := openVPNRouteInfoForProfile(c.Name)
-	authHint := wizardAsk("Optional credentials file path (username on line 1, password on line 2); leave blank for certificate-only profiles", "")
 	managedConfig := filepath.Join(profileDir, "client.ovpn")
 	workDir, err := sanitizeOpenVPNProfile(source, managedConfig, strings.TrimSpace(authHint), c.Name, openVPNRouteHelperPath, route)
 	if err != nil {
