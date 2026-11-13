@@ -57,9 +57,6 @@ func TestNewPsiphonClientConfigUsesAuthenticatedBootstrap(t *testing.T) {
 	if !cfg.EmitDiagnosticNotices {
 		t.Fatal("Psiphon diagnostic notices must be enabled so bootstrap/tunnel failures are observable")
 	}
-	if cfg.TunnelPoolSize < 1 || cfg.TunnelPoolSize > 4 {
-		t.Fatalf("TunnelPoolSize=%d; want a bounded pool from 1 to 4", cfg.TunnelPoolSize)
-	}
 	if cfg.ConnectionWorkerPoolMaxSize != 0 {
 		t.Fatalf("ConnectionWorkerPoolMaxSize=%d; expected the Psiphon default (unset)", cfg.ConnectionWorkerPoolMaxSize)
 	}
@@ -344,15 +341,15 @@ func TestPsiphonConsoleClientArgsUseDefaultLoopbackBinding(t *testing.T) {
 
 func TestPsiphonPerformanceProfileIsMemoryAndCPUAware(t *testing.T) {
 	low := psiphonPerformanceProfileForHost(1<<30, 1)
-	if !low.LimitMeekBufferSizes || !low.LimitRelayBufferSizes || !low.LimitCPUThreads || low.SSHChannelWindowSize != 4 || low.TunnelPoolSize != 1 {
+	if !low.LimitMeekBufferSizes || !low.LimitRelayBufferSizes || !low.LimitCPUThreads || low.SSHChannelWindowSize != 4 {
 		t.Fatalf("low-resource profile should retain safety limits and the default SSH window: %+v", low)
 	}
 	highMemorySingleCore := psiphonPerformanceProfileForHost(4<<30, 1)
-	if highMemorySingleCore.LimitMeekBufferSizes || highMemorySingleCore.LimitRelayBufferSizes || !highMemorySingleCore.LimitCPUThreads || highMemorySingleCore.SSHChannelWindowSize != 16 || highMemorySingleCore.TunnelPoolSize != 2 {
+	if highMemorySingleCore.LimitMeekBufferSizes || highMemorySingleCore.LimitRelayBufferSizes || !highMemorySingleCore.LimitCPUThreads || highMemorySingleCore.SSHChannelWindowSize != 16 {
 		t.Fatalf("high-memory single-core profile should expand buffers/window but limit CPU threads: %+v", highMemorySingleCore)
 	}
 	high := psiphonPerformanceProfileForHost(4<<30, 4)
-	if high.LimitMeekBufferSizes || high.LimitRelayBufferSizes || high.LimitCPUThreads || high.SSHChannelWindowSize != 16 || high.TunnelPoolSize != 2 {
+	if high.LimitMeekBufferSizes || high.LimitRelayBufferSizes || high.LimitCPUThreads || high.SSHChannelWindowSize != 16 {
 		t.Fatalf("high-resource profile should lift conservative throughput limits and use a moderate larger SSH window: %+v", high)
 	}
 }
@@ -360,7 +357,7 @@ func TestPsiphonPerformanceProfileIsMemoryAndCPUAware(t *testing.T) {
 func TestTunePsiphonPerformanceConfigPreservesUnknownFields(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "profile.json")
-	original := []byte(`{"EgressRegion":"DE","LocalSocksProxyPort":21086,"UnknownFuturePsiphonOption":{"keep":"me"},"LimitMeekBufferSizes":true,"LimitCPUThreads":true,"LimitRelayBufferSizes":true,"SSHChannelWindowSize":4,"TunnelPoolSize":1}`)
+	original := []byte(`{"EgressRegion":"DE","LocalSocksProxyPort":21086,"UnknownFuturePsiphonOption":{"keep":"me"},"LimitMeekBufferSizes":true,"LimitCPUThreads":true,"LimitRelayBufferSizes":true,"SSHChannelWindowSize":4}`)
 	if err := os.WriteFile(path, original, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -384,9 +381,6 @@ func TestTunePsiphonPerformanceConfigPreservesUnknownFields(t *testing.T) {
 	}
 	if string(got["SSHChannelWindowSize"]) != "16" {
 		t.Fatalf("SSHChannelWindowSize=%s; want 16 for high-memory host", got["SSHChannelWindowSize"])
-	}
-	if string(got["TunnelPoolSize"]) != "2" {
-		t.Fatalf("TunnelPoolSize=%s; want 2 for high-memory host", got["TunnelPoolSize"])
 	}
 	var unknown map[string]string
 	if err := json.Unmarshal(got["UnknownFuturePsiphonOption"], &unknown); err != nil || unknown["keep"] != "me" {

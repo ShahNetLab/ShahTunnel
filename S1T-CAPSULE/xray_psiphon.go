@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -44,6 +47,215 @@ func buildXrayPsiphonConfig(original []byte, profileID, proxyAddress string, map
 		})
 	}
 	return generated, bindings, outTag, nil
+}
+
+// adaptiveWarpProxyAddress returns only a loopback WarpProxy/Local Proxy
+// endpoint. System Tunnel mode is intentionally excluded because it would
+// change the host-wide route instead of isolating this ShahTunnel profile.
+func adaptiveWarpProxyAddress() string {
+	warpCLI, err := exec.LookPath("warp-cli")
+	if err != nil {
+		return ""
+	}
+	settings, err := runWarpCLI(warpCLI, "settings")
+	if err != nil || !warpProtocolMatches(string(settings), "MASQUE") {
+		return ""
+	}
+	proxy, localProxy, err := warpProxyAddressFromSettings(string(settings))
+	if err != nil || !localProxy || !isLoopbackProxyAddress(proxy) {
+		return ""
+	}
+	// Do not require the listener to answer at Agent startup. Xray's
+	// Observatory probes it continuously and can promote it when WARP comes
+	// online later; an unavailable proxy is simply marked unhealthy meanwhile.
+	return proxy
+}
+
+// addXrayAdaptiveEgressBalancer turns an already isolated Psiphon sidecar into
+// a health-aware egress group. Psiphon and an available per-app WARP proxy are
+// tested independently; Xray selects the lowest-latency healthy path. If all
+// external egresses fail, traffic is blackholed rather than sent directly.
+func addXrayAdaptiveEgressBalancer(generated []byte, profileID, psiphonOutboundTag, warpProxy string) ([]byte, string, error) {
+	var root map[string]any
+	if err := json.Unmarshal(generated, &root); err != nil {
+		return nil, "", fmt.Errorf("parse isolated Xray Psiphon config: %w", err)
+	}
+	outbounds, ok := root["outbounds"].([]any)
+	if !ok {
+		return nil, "", errors.New("isolated Xray config has no outbounds array")
+	}
+	shortID := safeXrayTag(profileID)
+	warpTag := "s1t-adaptive-" + shortID + "-warp"
+	blockTag := "s1t-adaptive-" + shortID + "-block"
+	balancerTag := "s1t-adaptive-" + shortID + "-best"
+	hasPsiphon := false
+	usedTags := map[string]bool{}
+	for _, raw := range outbounds {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		tag, _ := item["tag"].(string)
+		if tag != "" {
+			usedTags[tag] = true
+		}
+		if tag == psiphonOutboundTag {
+			hasPsiphon = true
+		}
+	}
+	if !hasPsiphon {
+		return nil, "", fmt.Errorf("Psiphon outbound %q is missing", psiphonOutboundTag)
+	}
+	for _, tag := range []string{warpTag, blockTag} {
+		if usedTags[tag] {
+			return nil, "", fmt.Errorf("Xray tag %q already exists; refusing to overwrite it", tag)
+		}
+	}
+	selectors := []any{psiphonOutboundTag}
+	if strings.TrimSpace(warpProxy) != "" {
+		if _, _, err := net.SplitHostPort(warpProxy); err != nil || !isLoopbackProxyAddress(warpProxy) {
+			return nil, "", errors.New("adaptive WARP proxy must be a loopback IP:PORT endpoint")
+		}
+		outbounds = append(outbounds, map[string]any{
+			"tag": warpTag, "protocol": "socks",
+			"settings": map[string]any{"servers": []any{map[string]any{"address": "127.0.0.1", "port": mustPortNumber(warpProxy)}}},
+		})
+		selectors = append(selectors, warpTag)
+	}
+	outbounds = append(outbounds, map[string]any{
+		"tag": blockTag, "protocol": "blackhole", "settings": map[string]any{"response": map[string]any{"type": "none"}},
+	})
+	root["outbounds"] = outbounds
+
+	routing, ok := root["routing"].(map[string]any)
+	if !ok {
+		routing = map[string]any{}
+		root["routing"] = routing
+	}
+	rules, ok := routing["rules"].([]any)
+	if !ok {
+		return nil, "", errors.New("Xray routing.rules is not an array")
+	}
+	replaced := 0
+	for _, raw := range rules {
+		rule, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if target, _ := rule["outboundTag"].(string); target == psiphonOutboundTag {
+			delete(rule, "outboundTag")
+			rule["balancerTag"] = balancerTag
+			replaced++
+		}
+	}
+	if replaced < 2 {
+		return nil, "", fmt.Errorf("expected TCP and DNS rules for Psiphon, found only %d", replaced)
+	}
+	balancers, ok := routing["balancers"].([]any)
+	if !ok && routing["balancers"] != nil {
+		return nil, "", errors.New("Xray routing.balancers is not an array")
+	}
+	for _, raw := range balancers {
+		if item, ok := raw.(map[string]any); ok {
+			if tag, _ := item["tag"].(string); tag == balancerTag {
+				return nil, "", fmt.Errorf("Xray balancer tag %q already exists", balancerTag)
+			}
+		}
+	}
+	balancers = append(balancers, map[string]any{
+		"tag":         balancerTag,
+		"selector":    selectors,
+		"fallbackTag": blockTag,
+		"strategy":    map[string]any{"type": "leastPing"},
+	})
+	routing["balancers"] = balancers
+
+	observatory, ok := root["observatory"].(map[string]any)
+	if !ok {
+		if root["observatory"] != nil {
+			return nil, "", errors.New("Xray observatory section is not an object")
+		}
+		observatory = map[string]any{}
+		root["observatory"] = observatory
+	}
+	observatory["subjectSelector"] = selectors
+	observatory["probeUrl"] = "https://www.cloudflare.com/cdn-cgi/trace"
+	observatory["probeInterval"] = "20s"
+	observatory["enableConcurrency"] = true
+
+	result, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return nil, "", err
+	}
+	return append(result, '\n'), balancerTag, nil
+}
+
+func buildXrayAdaptivePsiphonConfig(original []byte, profileID, psiphonProxy, warpProxy string, mappings []PortMapping) ([]byte, []XrayPsiphonBinding, string, string, error) {
+	base, bindings, psiphonTag, err := buildXrayPsiphonConfig(original, profileID, psiphonProxy, mappings)
+	if err != nil {
+		return nil, nil, "", "", err
+	}
+	generated, balancerTag, err := addXrayAdaptiveEgressBalancer(base, profileID, psiphonTag, warpProxy)
+	if err != nil {
+		return nil, nil, "", "", err
+	}
+	return generated, bindings, balancerTag, psiphonTag, nil
+}
+
+// preserveXraySidecarPorts keeps already-published loopback target ports stable
+// while regenerating the isolated sidecar. No Hub mapping or client port changes.
+func preserveXraySidecarPorts(generated []byte, fresh, previous []XrayPsiphonBinding) ([]byte, []XrayPsiphonBinding, error) {
+	oldByID := make(map[string]string, len(previous))
+	for _, item := range previous {
+		oldByID[item.MappingID] = item.PsiphonTarget
+	}
+	var root map[string]any
+	if err := json.Unmarshal(generated, &root); err != nil {
+		return nil, nil, err
+	}
+	inbounds, ok := root["inbounds"].([]any)
+	if !ok {
+		return nil, nil, errors.New("adaptive Xray config has no inbounds array")
+	}
+	used := map[string]string{}
+	updated := append([]XrayPsiphonBinding(nil), fresh...)
+	for i := range updated {
+		oldTarget := oldByID[updated[i].MappingID]
+		host, portText, err := net.SplitHostPort(oldTarget)
+		if err != nil || !isLoopbackProxyAddress(oldTarget) {
+			return nil, nil, fmt.Errorf("existing sidecar target for %q is not loopback IP:PORT", updated[i].MappingID)
+		}
+		port, err := strconv.Atoi(portText)
+		if err != nil || port < 1 || port > 65535 {
+			return nil, nil, fmt.Errorf("existing sidecar target for %q has invalid port", updated[i].MappingID)
+		}
+		if other, exists := used[oldTarget]; exists && other != updated[i].InboundTag {
+			return nil, nil, fmt.Errorf("existing sidecar port %s is shared by different inbound tags", oldTarget)
+		}
+		used[oldTarget] = updated[i].InboundTag
+		found := false
+		for _, raw := range inbounds {
+			inbound, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if tag, _ := inbound["tag"].(string); tag == updated[i].InboundTag {
+				inbound["listen"] = host
+				inbound["port"] = port
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, nil, fmt.Errorf("generated Xray inbound %q is missing", updated[i].InboundTag)
+		}
+		updated[i].PsiphonTarget = oldTarget
+	}
+	result, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return nil, nil, err
+	}
+	return append(result, '\n'), updated, nil
 }
 
 func xrayPsiphonServiceName(profileID string) string {
@@ -337,7 +549,24 @@ func applyXrayPsiphonEgress(restartAgent, confirm bool) error {
 		return fmt.Errorf("read Xray source config %s: %w", runtime.ConfigPath, err)
 	}
 	profileID := strings.TrimSuffix(filepath.Base(configPath), filepath.Ext(configPath))
-	generated, bindings, outTag, err := buildXrayPsiphonConfig(originalXray, profileID, proxy, cfg.Ports)
+	var generated []byte
+	var bindings []XrayPsiphonBinding
+	var outTag string
+	if cfg.Underlay == underlayAdaptive {
+		warpProxy := adaptiveWarpProxyAddress()
+		var psiphonTag string
+		generated, bindings, outTag, psiphonTag, err = buildXrayAdaptivePsiphonConfig(originalXray, profileID, proxy, warpProxy, cfg.Ports)
+		if err == nil {
+			if warpProxy != "" {
+				uiInfo("Option 9 Xray egress candidates: Psiphon + WARP Local Proxy; Xray leastPing health checks are enabled.")
+			} else {
+				uiInfo("Option 9: no connected per-app WARP Local Proxy detected; Psiphon remains the only external Xray egress candidate until WARP Local Proxy is configured.")
+			}
+			_ = psiphonTag
+		}
+	} else {
+		generated, bindings, outTag, err = buildXrayPsiphonConfig(originalXray, profileID, proxy, cfg.Ports)
+	}
 	if err != nil {
 		return err
 	}
@@ -413,6 +642,120 @@ func applyXrayPsiphonEgress(restartAgent, confirm bool) error {
 	return nil
 }
 
+// ensureAdaptiveXrayPsiphonEgress upgrades an already-installed option-9
+// Psiphon-only sidecar in place. It never edits the X-UI source config, never
+// changes the published loopback target ports, and restores the previous
+// sidecar file if validation or restart fails.
+func ensureAdaptiveXrayPsiphonEgress(cfg Config) error {
+	if cfg.Role != "agent" || cfg.Underlay != underlayAdaptive || cfg.XrayPsiphon == nil {
+		return nil
+	}
+	meta := cfg.XrayPsiphon
+	if _, err := xrayPsiphonUnitPath(meta.Service); err != nil {
+		return err
+	}
+	if _, err := xrayPsiphonConfigDirectory(meta.ConfigPath); err != nil {
+		return err
+	}
+	originalMappings := make([]PortMapping, 0, len(meta.Bindings))
+	var runtime xrayRuntime
+	for i, binding := range meta.Bindings {
+		_, portText, err := net.SplitHostPort(binding.OriginalTarget)
+		if err != nil {
+			return fmt.Errorf("original Xray target for mapping %q is invalid: %w", binding.MappingID, err)
+		}
+		port, err := strconv.Atoi(portText)
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("original Xray target for mapping %q has invalid port", binding.MappingID)
+		}
+		rt, _, findErr := findXrayRuntimeForPort(port)
+		if findErr != nil {
+			return fmt.Errorf("find original Xray runtime for mapping %q: %w", binding.MappingID, findErr)
+		}
+		if i == 0 {
+			runtime = rt
+		} else if runtime.ConfigPath != rt.ConfigPath || runtime.Binary != rt.Binary || runtime.CWD != rt.CWD {
+			return errors.New("adaptive egress mappings belong to different Xray instances")
+		}
+		originalMappings = append(originalMappings, PortMapping{ID: binding.MappingID, Target: binding.OriginalTarget})
+	}
+	if len(originalMappings) == 0 {
+		return errors.New("adaptive Xray integration has no saved original mappings")
+	}
+	originalXray, err := os.ReadFile(runtime.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read original Xray config: %w", err)
+	}
+	warpProxy := adaptiveWarpProxyAddress()
+	generated, freshBindings, balancerTag, _, err := buildXrayAdaptivePsiphonConfig(originalXray, strings.TrimSuffix(filepath.Base(configPath), filepath.Ext(configPath)), cfg.PsiphonProxy, warpProxy, originalMappings)
+	if err != nil {
+		return err
+	}
+	generated, freshBindings, err = preserveXraySidecarPorts(generated, freshBindings, meta.Bindings)
+	if err != nil {
+		return err
+	}
+
+	stateDir := filepath.Dir(meta.ConfigPath)
+	testFile, err := os.CreateTemp(stateDir, ".adaptive-config-test-*.json")
+	if err != nil {
+		return err
+	}
+	testPath := testFile.Name()
+	if _, err = testFile.Write(generated); err != nil {
+		_ = testFile.Close()
+		_ = os.Remove(testPath)
+		return err
+	}
+	if err = testFile.Chmod(0600); err != nil {
+		_ = testFile.Close()
+		_ = os.Remove(testPath)
+		return err
+	}
+	if err = testFile.Close(); err != nil {
+		_ = os.Remove(testPath)
+		return err
+	}
+	defer os.Remove(testPath)
+	if err = validateXrayConfig(runtime, testPath); err != nil {
+		return fmt.Errorf("installed Xray rejected adaptive leastPing config; existing Psiphon sidecar was kept: %w", err)
+	}
+
+	previous, err := os.ReadFile(meta.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read current Xray sidecar config: %w", err)
+	}
+	if bytes.Equal(previous, generated) {
+		log.Printf("adaptive Xray egress already configured; candidates=%s", adaptiveXrayCandidateSummary(warpProxy))
+		return nil
+	}
+	if err := atomicReplaceFile(meta.ConfigPath, generated, 0600); err != nil {
+		return fmt.Errorf("write adaptive Xray sidecar config: %w", err)
+	}
+	restore := func() {
+		_ = atomicReplaceFile(meta.ConfigPath, previous, 0600)
+		_ = exec.Command("systemctl", "restart", meta.Service).Run()
+	}
+	out, restartErr := exec.Command("systemctl", "restart", meta.Service).CombinedOutput()
+	if restartErr != nil {
+		restore()
+		return fmt.Errorf("restart adaptive Xray sidecar %s: %w: %s; previous config restored", meta.Service, restartErr, strings.TrimSpace(string(out)))
+	}
+	if err := waitForXrayPsiphonInbounds(meta.Service, freshBindings); err != nil {
+		restore()
+		return fmt.Errorf("adaptive Xray sidecar health check failed; previous config restored: %w", err)
+	}
+	log.Printf("adaptive Xray egress active: %s; balancer=%s; probe interval=20s; fallback=blackhole", adaptiveXrayCandidateSummary(warpProxy), balancerTag)
+	return nil
+}
+
+func adaptiveXrayCandidateSummary(warpProxy string) string {
+	if strings.TrimSpace(warpProxy) != "" {
+		return "Psiphon + WARP Local Proxy (leastPing)"
+	}
+	return "Psiphon only (WARP Local Proxy unavailable; fail-closed)"
+}
+
 func removeXrayPsiphonIntegration(cfg *Config) error {
 	if cfg == nil || cfg.XrayPsiphon == nil {
 		return nil
@@ -440,7 +783,11 @@ func autoApplyXrayPsiphonForNewAgent() error {
 	if cfg.Role != "agent" || (cfg.Underlay != underlayPsiphon && cfg.Underlay != underlayAdaptive) || cfg.XrayPsiphon != nil {
 		return nil
 	}
-	uiInfo("Preparing isolated Xray user egress through the Agent's Psiphon SOCKS5 proxy...")
+	if cfg.Underlay == underlayAdaptive {
+		uiInfo("Preparing isolated Xray user egress with automatic Psiphon/WARP leastPing selection (fail-closed; no direct IP fallback)...")
+	} else {
+		uiInfo("Preparing isolated Xray user egress through the Agent's Psiphon SOCKS5 proxy...")
+	}
 	if err := applyXrayPsiphonEgress(false, false); err != nil {
 		return fmt.Errorf("Agent profile was saved, but automatic per-tunnel Psiphon user-egress setup failed: %w", err)
 	}

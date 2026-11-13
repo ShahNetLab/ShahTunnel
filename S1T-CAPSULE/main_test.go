@@ -1068,6 +1068,29 @@ func TestAgentTransportsActuallyDialHubThroughPsiphonSOCKS5(t *testing.T) {
 	}
 }
 
+func TestAdaptiveWarpProxyAddressIncludesConfiguredListenerBeforeItIsReady(t *testing.T) {
+	dir := t.TempDir()
+	cli := filepath.Join(dir, "warp-cli")
+	script := "#!/bin/sh\nif [ \"$1\" = settings ]; then\n  printf '%s\\n' '(user set) Mode: WarpProxy on port 40000' '(consumer overrides) WARP tunnel protocol: MASQUE'\nfi\n"
+	if err := os.WriteFile(cli, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	got := adaptiveWarpProxyAddress()
+	if got != "127.0.0.1:40000" {
+		t.Fatalf("adaptive WarpProxy endpoint=%q; want configured loopback even when no listener is running", got)
+	}
+}
+
+func TestAdaptiveUnderlayCacheKeyIncludesCandidateSet(t *testing.T) {
+	cfg := Config{Name: "s", HubAddr: "hub.example:9443", PsiphonHubAddr: "hub.example:443", PsiphonProxy: "127.0.0.1:21083"}
+	withoutWarp := adaptiveUnderlayCacheKey(cfg, []string{underlayDirect, underlayPsiphon})
+	withWarp := adaptiveUnderlayCacheKey(cfg, []string{underlayMASQUE, underlayPsiphon, underlayDirect})
+	if withoutWarp == withWarp {
+		t.Fatal("adaptive route cache key did not change when WARP became available")
+	}
+}
+
 func TestOptionNineSwitchesFromFailedDirectPathToPsiphonSOCKS5(t *testing.T) {
 	certDir := t.TempDir()
 	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
@@ -1091,9 +1114,12 @@ func TestOptionNineSwitchesFromFailedDirectPathToPsiphonSOCKS5(t *testing.T) {
 	serverDone := make(chan struct{})
 	go func() {
 		defer close(serverDone)
-		conn, acceptErr := listener.Accept()
-		if acceptErr == nil {
-			h.serveAgent(conn, hubTLSConfig(cert))
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go h.serveAgent(conn, hubTLSConfig(cert))
 		}
 	}()
 
@@ -1823,26 +1849,24 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
-func TestNormalizeConfigKeepsTwelveLanesForDirectAndCapsPsiphonPaths(t *testing.T) {
-	direct := normalizeConfig(Config{Role: "agent", Underlay: underlayDirect, TunnelChannels: 4})
-	if direct.TunnelChannels != 12 {
-		t.Fatalf("direct TunnelChannels = %d; want 12", direct.TunnelChannels)
+func TestNormalizeConfigDefaultsAgentToTwelveLanes(t *testing.T) {
+	got := normalizeConfig(Config{Role: "agent"})
+	if got.TunnelChannels != 12 {
+		t.Fatalf("TunnelChannels = %d; want 12", got.TunnelChannels)
 	}
-	psiphon := normalizeConfig(Config{Role: "agent", Underlay: underlayPsiphon, TunnelChannels: 12})
-	if psiphon.TunnelChannels != psiphonTunnelChannels {
-		t.Fatalf("Psiphon TunnelChannels = %d; want %d", psiphon.TunnelChannels, psiphonTunnelChannels)
+}
+
+func TestNormalizeAdaptiveAgentCapsLanesAtFour(t *testing.T) {
+	got := normalizeConfig(Config{Role: "agent", Underlay: underlayAdaptive, TunnelChannels: 12})
+	if got.TunnelChannels != adaptiveTunnelChannels {
+		t.Fatalf("adaptive TunnelChannels = %d; want %d", got.TunnelChannels, adaptiveTunnelChannels)
 	}
-	psiphonSmall := normalizeConfig(Config{Role: "agent", Underlay: underlayPsiphon, TunnelChannels: 2})
-	if psiphonSmall.TunnelChannels != 2 {
-		t.Fatalf("explicit Psiphon TunnelChannels = %d; want 2", psiphonSmall.TunnelChannels)
-	}
-	adaptive := normalizeConfig(Config{Role: "agent", Underlay: underlayAdaptive, TunnelChannels: 12})
-	if adaptive.TunnelChannels != adaptiveExternalTunnelChannels {
-		t.Fatalf("adaptive TunnelChannels = %d; want %d", adaptive.TunnelChannels, adaptiveExternalTunnelChannels)
-	}
-	adaptiveSmall := normalizeConfig(Config{Role: "agent", Underlay: underlayAdaptive, TunnelChannels: 3})
-	if adaptiveSmall.TunnelChannels != 3 {
-		t.Fatalf("explicit adaptive TunnelChannels = %d; want 3", adaptiveSmall.TunnelChannels)
+}
+
+func TestNormalizePsiphonAgentCapsLanesAtThree(t *testing.T) {
+	got := normalizeConfig(Config{Role: "agent", Underlay: underlayPsiphon, TunnelChannels: 12})
+	if got.TunnelChannels != psiphonTunnelChannels {
+		t.Fatalf("Psiphon TunnelChannels = %d; want %d", got.TunnelChannels, psiphonTunnelChannels)
 	}
 }
 
@@ -2492,6 +2516,101 @@ exit 1
 	}
 	if !warpProtocolMatches(string(settings), "MASQUE") {
 		t.Fatalf("expected MASQUE settings after the remembered ToS flag, got %q", settings)
+	}
+}
+
+func TestBuildXrayAdaptiveEgressUsesLeastPingAndFailsClosed(t *testing.T) {
+	original := []byte(`{
+      "log": {"loglevel":"warning"},
+      "inbounds": [{"tag":"xui-main","listen":"127.0.0.1","port":23456,"protocol":"socks","settings":{"auth":"noauth","udp":true}}],
+      "outbounds": [{"tag":"direct","protocol":"freedom"}],
+      "routing": {"rules": []}
+    }`)
+	generated, bindings, balancerTag, psiphonTag, err := buildXrayAdaptivePsiphonConfig(original, "s", "127.0.0.1:21083", "127.0.0.1:40000", []PortMapping{{ID: "main", Target: "127.0.0.1:23456"}})
+	if err != nil {
+		t.Fatalf("build adaptive Xray config: %v", err)
+	}
+	if len(bindings) != 1 {
+		t.Fatalf("bindings = %d; want 1", len(bindings))
+	}
+	var root map[string]any
+	if err := json.Unmarshal(generated, &root); err != nil {
+		t.Fatal(err)
+	}
+	outbounds := root["outbounds"].([]any)
+	hasWarp, hasBlock := false, false
+	for _, raw := range outbounds {
+		item := raw.(map[string]any)
+		switch item["tag"] {
+		case "s1t-adaptive-s-warp":
+			hasWarp = item["protocol"] == "socks"
+		case "s1t-adaptive-s-block":
+			hasBlock = item["protocol"] == "blackhole"
+		}
+	}
+	if !hasWarp || !hasBlock {
+		t.Fatalf("adaptive WARP/blackhole outbounds missing (warp=%v block=%v)", hasWarp, hasBlock)
+	}
+	obs := root["observatory"].(map[string]any)
+	if obs["probeInterval"] != "20s" || obs["probeUrl"] != "https://www.cloudflare.com/cdn-cgi/trace" {
+		t.Fatalf("unexpected observatory config: %#v", obs)
+	}
+	routing := root["routing"].(map[string]any)
+	balancers := routing["balancers"].([]any)
+	if len(balancers) != 1 {
+		t.Fatalf("balancers = %d; want 1", len(balancers))
+	}
+	balancer := balancers[0].(map[string]any)
+	if balancer["tag"] != balancerTag || balancer["fallbackTag"] != "s1t-adaptive-s-block" {
+		t.Fatalf("balancer/fallback tags are incorrect: %#v", balancer)
+	}
+	strategy := balancer["strategy"].(map[string]any)
+	if strategy["type"] != "leastPing" {
+		t.Fatalf("strategy = %#v; want leastPing", strategy)
+	}
+	rules := routing["rules"].([]any)
+	foundBalancerRule, foundUDPBlock := false, false
+	for _, raw := range rules {
+		rule := raw.(map[string]any)
+		if rule["balancerTag"] == balancerTag {
+			foundBalancerRule = true
+		}
+		if rule["outboundTag"] == "s1t-psiphon-s-udp-block" {
+			foundUDPBlock = true
+		}
+	}
+	if !foundBalancerRule || !foundUDPBlock {
+		t.Fatalf("adaptive TCP/UDP rules missing: %#v", rules)
+	}
+	if psiphonTag == balancerTag {
+		t.Fatal("Psiphon outbound tag must remain distinct from balancer tag")
+	}
+}
+
+func TestBuildXrayAdaptiveEgressWithoutWarpDoesNotAddDirectFallback(t *testing.T) {
+	original := []byte(`{"inbounds":[{"tag":"xui-main","listen":"127.0.0.1","port":23457,"protocol":"socks","settings":{}}],"outbounds":[{"tag":"direct","protocol":"freedom"}],"routing":{"rules":[]}}`)
+	generated, _, balancerTag, _, err := buildXrayAdaptivePsiphonConfig(original, "s2", "127.0.0.1:21084", "", []PortMapping{{ID: "main", Target: "127.0.0.1:23457"}})
+	if err != nil {
+		t.Fatalf("build adaptive Xray config without WARP: %v", err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(generated, &root); err != nil {
+		t.Fatal(err)
+	}
+	balancers := root["routing"].(map[string]any)["balancers"].([]any)
+	balancer := balancers[0].(map[string]any)
+	selector := balancer["selector"].([]any)
+	if len(selector) != 1 {
+		t.Fatalf("without WARP, selector = %#v; want Psiphon only", selector)
+	}
+	if balancer["tag"] != balancerTag || balancer["fallbackTag"] != "s1t-adaptive-s2-block" {
+		t.Fatalf("unexpected fail-closed balancer: %#v", balancer)
+	}
+	for _, raw := range root["outbounds"].([]any) {
+		item := raw.(map[string]any)
+		if item["tag"] == "s1t-adaptive-s2-direct" {
+			t.Fatal("direct public egress must not be added to option 9's user Xray sidecar")
+		}
 	}
 }
 

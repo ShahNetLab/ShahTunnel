@@ -39,48 +39,48 @@ import (
 )
 
 const (
-	version                             = "4.0.1"
-	legacyConfigPath                    = "/etc/ravanreverse/config.json"
-	tunnelConfigDir                     = "/etc/ravanreverse/tunnels"
-	maxFrame                            = 64 * 1024
-	defaultTunnelChannels               = 12
-	psiphonTunnelChannels               = 3
-	adaptiveExternalTunnelChannels      = 4
-	maxPendingPublicConnections         = 2048
-	controlBurstLimit                   = 8
-	streamAdmissionWait                 = 5 * time.Second
-	maxTunnelChannels                   = 16
-	msgOpen                        byte = 1
-	msgOpenOK                      byte = 2
-	msgOpenErr                     byte = 3
-	msgData                        byte = 4
-	msgClose                       byte = 5
-	msgPing                        byte = 6
-	msgPong                        byte = 7
-	maxStreams                          = 512
-	streamWindowFrames                  = 256
-	maxQueuedPayloadBytes               = int64(64 << 20)
-	wireWriteTimeout                    = 30 * time.Second
-	reverseStreamOpenTimeout            = 18 * time.Second
-	transportAuto                       = "auto"
-	transportAdaptive                   = "adaptive"
-	transportTCP                        = "tcp_tls"
-	transportWebSocket                  = "websocket_tls"
-	transportHTTP2                      = "http2_connect"
-	transportHTTP1                      = "http1_connect"
-	transportHTTPConnectAuto            = "http_connect_auto"
-	underlayDirect                      = "direct"
-	underlayMASQUE                      = "warp_masque"
-	underlayPsiphon                     = "psiphon_socks5"
-	underlayAdaptive                    = "adaptive_external"
-	http2TokenHeader                    = "X-S1T-Token"
-	controlALPN                         = "shah-tunnel-control/1"
-	webSocketPath                       = "/s1t-tunnel"
-	webSocketGUID                       = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	maxWebSocketHeaders                 = 16 * 1024
-	maxWebSocketFrame                   = maxFrame + 9
-	msgHalfClose                   byte = 8
-	msgDataAck                     byte = 9
+	version                          = "4.0.1"
+	legacyConfigPath                 = "/etc/ravanreverse/config.json"
+	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
+	maxFrame                         = 64 * 1024
+	defaultTunnelChannels            = 12
+	adaptiveTunnelChannels           = 4
+	psiphonTunnelChannels            = 3
+	maxPendingPublicConnections      = 2048
+	controlBurstLimit                = 8
+	streamAdmissionWait              = 5 * time.Second
+	maxTunnelChannels                = 16
+	msgOpen                     byte = 1
+	msgOpenOK                   byte = 2
+	msgOpenErr                  byte = 3
+	msgData                     byte = 4
+	msgClose                    byte = 5
+	msgPing                     byte = 6
+	msgPong                     byte = 7
+	maxStreams                       = 512
+	streamWindowFrames               = 256
+	maxQueuedPayloadBytes            = int64(64 << 20)
+	wireWriteTimeout                 = 30 * time.Second
+	reverseStreamOpenTimeout         = 18 * time.Second
+	transportAuto                    = "auto"
+	transportAdaptive                = "adaptive"
+	transportTCP                     = "tcp_tls"
+	transportWebSocket               = "websocket_tls"
+	transportHTTP2                   = "http2_connect"
+	transportHTTP1                   = "http1_connect"
+	transportHTTPConnectAuto         = "http_connect_auto"
+	underlayDirect                   = "direct"
+	underlayMASQUE                   = "warp_masque"
+	underlayPsiphon                  = "psiphon_socks5"
+	underlayAdaptive                 = "adaptive_external"
+	http2TokenHeader                 = "X-S1T-Token"
+	controlALPN                      = "shah-tunnel-control/1"
+	webSocketPath                    = "/s1t-tunnel"
+	webSocketGUID                    = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	maxWebSocketHeaders              = 16 * 1024
+	maxWebSocketFrame                = maxFrame + 9
+	msgHalfClose                byte = 8
+	msgDataAck                  byte = 9
 )
 
 var (
@@ -171,7 +171,14 @@ var agentMetricChannels int64
 // It is used only by adaptive mode; legacy auto mode keeps its deterministic TCP-then-WebSocket order.
 var agentPreferredTransport sync.Map // map[int]string
 var agentPreferredUnderlay sync.Map  // map[int]string
+var adaptiveUnderlayProbeMu sync.Mutex
+var adaptiveUnderlayProbeCache = map[string]adaptiveUnderlayProbeCacheEntry{}
 var nextHubSessionID atomic.Uint64
+
+type adaptiveUnderlayProbeCacheEntry struct {
+	order     []string
+	expiresAt time.Time
+}
 
 // logAuthFailure rate-limits unauthenticated peer logs to reduce journal flooding.
 func logAuthFailure(message string) {
@@ -2780,6 +2787,11 @@ func runAgent(cfg Config) error {
 		}
 	}
 	defer cleanupUnderlay()
+	if cfg.Underlay == underlayAdaptive && cfg.XrayPsiphon != nil {
+		if err := ensureAdaptiveXrayPsiphonEgress(cfg); err != nil {
+			log.Printf("WARNING: adaptive Xray egress upgrade was not applied; previous sidecar config was retained: %v", err)
+		}
+	}
 	if cfg.Underlay == underlayAdaptive {
 		if warpMode := detectActiveWarpUnderlay(); warpMode != "" {
 			log.Printf("WARP is already connected with %s; adaptive egress will verify it before use (no route changes made)", warpMode)
@@ -2892,9 +2904,9 @@ func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
 		all = append(all, candidate)
 	}
 
-	// An active WARP route is always checked first, then fails over to
-	// Psiphon and Direct. When WARP is down, retain the last successful
-	// non-WARP route; a lost WARP preference hands off to Psiphon first.
+	// An active WARP route joins the candidate set with Psiphon and Direct.
+	// The subsequent probe ranks all currently available routes by TCP connect
+	// latency; the last successful route only breaks ties.
 	if warpMode != "" {
 		appendCandidate(warpMode)
 		appendCandidate(underlayPsiphon)
@@ -2910,6 +2922,110 @@ func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
 	appendCandidate(underlayPsiphon)
 	appendCandidate(underlayDirect)
 	return all
+}
+
+// adaptiveUnderlayCacheKey scopes route measurements to one Agent profile,
+// its actual Hub/Psiphon endpoints, and the currently available candidate set.
+// The cache is shared by all lanes so they do not launch duplicate probes.
+func adaptiveUnderlayCacheKey(cfg Config, candidates []string) string {
+	// Candidate membership is part of the key: WARP may become connected or
+	// disconnect while the Hub/Psiphon endpoints remain unchanged.
+	parts := []string{cfg.Name, cfg.HubAddr, cfg.PsiphonHubAddr, cfg.PsiphonProxy, strings.Join(candidates, ",")}
+	return strings.Join(parts, "|")
+}
+
+// probeAdaptiveUnderlay measures the TCP path used by the Agent control lane.
+// SOCKS5 CONNECT is part of the probe, so a Psiphon SSH "administratively
+// prohibited" rejection is counted as unavailable rather than as a healthy
+// local SOCKS listener.
+func probeAdaptiveUnderlay(cfg Config, candidate string) (time.Duration, error) {
+	routeCfg := cfg
+	routeCfg.Underlay = candidate
+	if candidate == underlayMASQUE {
+		if err := verifyWarpMasqueUnderlay(); err != nil {
+			return 0, err
+		}
+	}
+	target := agentHubAddressForTransport(routeCfg, transportTCP)
+	if strings.TrimSpace(target) == "" {
+		return 0, errors.New("Hub endpoint is empty")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	started := time.Now()
+	conn, err := dialAgentUnderlay(ctx, routeCfg, "tcp", target)
+	if err != nil {
+		return 0, err
+	}
+	_ = conn.Close()
+	return time.Since(started), nil
+}
+
+// rankAdaptiveUnderlayCandidates puts currently reachable Hub paths first,
+// ordered by measured SOCKS/TCP connect latency. Failed candidates remain at
+// the end so the normal authenticated transport attempts can still provide
+// the definitive check. Results are refreshed every 45 seconds.
+func rankAdaptiveUnderlayCandidates(cfg Config, candidates []string) []string {
+	if len(candidates) < 2 {
+		return append([]string(nil), candidates...)
+	}
+	key := adaptiveUnderlayCacheKey(cfg, candidates)
+	adaptiveUnderlayProbeMu.Lock()
+	defer adaptiveUnderlayProbeMu.Unlock()
+	if cached, ok := adaptiveUnderlayProbeCache[key]; ok && time.Now().Before(cached.expiresAt) {
+		return append([]string(nil), cached.order...)
+	}
+
+	type result struct {
+		route string
+		index int
+		rtt   time.Duration
+		err   error
+	}
+	results := make(chan result, len(candidates))
+	for i, candidate := range candidates {
+		i, candidate := i, candidate
+		go func() {
+			rtt, err := probeAdaptiveUnderlay(cfg, candidate)
+			results <- result{route: candidate, index: i, rtt: rtt, err: err}
+		}()
+	}
+	measured := make([]result, 0, len(candidates))
+	for range candidates {
+		measured = append(measured, <-results)
+	}
+	sort.SliceStable(measured, func(i, j int) bool {
+		if (measured[i].err == nil) != (measured[j].err == nil) {
+			return measured[i].err == nil
+		}
+		if measured[i].err == nil && measured[j].err == nil && measured[i].rtt != measured[j].rtt {
+			return measured[i].rtt < measured[j].rtt
+		}
+		return measured[i].index < measured[j].index
+	})
+	ordered := make([]string, 0, len(measured))
+	for _, item := range measured {
+		ordered = append(ordered, item.route)
+		if item.err == nil {
+			log.Printf("adaptive egress probe: %s reachable in %s", item.route, item.rtt.Round(time.Millisecond))
+		} else {
+			log.Printf("adaptive egress probe: %s unavailable: %v", item.route, item.err)
+		}
+	}
+	adaptiveUnderlayProbeCache[key] = adaptiveUnderlayProbeCacheEntry{order: append([]string(nil), ordered...), expiresAt: time.Now().Add(45 * time.Second)}
+	return ordered
+}
+
+func invalidateAdaptiveUnderlayProbeCache(cfg Config) {
+	adaptiveUnderlayProbeMu.Lock()
+	// All cached variants for this profile are invalid after an exhausted route.
+	prefix := adaptiveUnderlayCacheKey(cfg, nil)
+	for key := range adaptiveUnderlayProbeCache {
+		if strings.HasPrefix(key, prefix) {
+			delete(adaptiveUnderlayProbeCache, key)
+		}
+	}
+	adaptiveUnderlayProbeMu.Unlock()
 }
 
 func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
@@ -2955,6 +3071,7 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 			preferred, _ = v.(string)
 		}
 		underlayCandidates = adaptiveUnderlayCandidates(cfg, preferred)
+		underlayCandidates = rankAdaptiveUnderlayCandidates(cfg, underlayCandidates)
 	}
 
 	// A lane exhausts every configured inner transport on one egress path before
@@ -2987,6 +3104,7 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 		}
 		if routeIndex+1 < len(underlayCandidates) {
 			log.Printf("tunnel lane %d: egress path %s exhausted; switching to %s", channel, route, underlayCandidates[routeIndex+1])
+			invalidateAdaptiveUnderlayProbeCache(cfg)
 		}
 	}
 	if lastErr == nil {
@@ -3246,7 +3364,7 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 		return nil, fmt.Errorf("tune Psiphon performance profile: %w", tuneErr)
 	} else if tuned {
 		profile := psiphonHostPerformanceProfile()
-		log.Printf("Psiphon: applied resource-aware profile (MeekBufferLimit=%t, RelayBufferLimit=%t, CPUThreadLimit=%t, SSHChannelWindowSize=%d, TunnelPoolSize=%d)", profile.LimitMeekBufferSizes, profile.LimitRelayBufferSizes, profile.LimitCPUThreads, profile.SSHChannelWindowSize, profile.TunnelPoolSize)
+		log.Printf("Psiphon: applied resource-aware throughput profile (MeekBufferLimit=%t, RelayBufferLimit=%t, CPUThreadLimit=%t, SSHChannelWindowSize=%d)", profile.LimitMeekBufferSizes, profile.LimitRelayBufferSizes, profile.LimitCPUThreads, profile.SSHChannelWindowSize)
 	}
 	if err := validatePsiphonClientConfig(configPath, cfg.PsiphonProxy); err != nil {
 		return nil, fmt.Errorf("invalid Psiphon client configuration: %w", err)
@@ -3687,25 +3805,23 @@ func normalizeConfig(c Config) Config {
 			c.Transport = transportAuto
 		}
 	}
-	// Keep direct/WARP paths highly parallel, but avoid flooding a single
-	// Psiphon SOCKS egress with many concurrent Hub lanes. Adaptive external
-	// profiles may use Psiphon for user egress, so they receive a moderate cap.
-	// Existing explicit lower values are preserved; old 12-lane Psiphon
-	// profiles are safely normalized at runtime without editing their JSON.
+	// Cap concurrency by egress type: Psiphon uses a small number of streams,
+	// option 9 uses four lanes to avoid hammering fragile relays, and ordinary
+	// Direct/WARP profiles retain the twelve-lane default. Explicit lower values
+	// are preserved; this only repairs missing/oversized legacy values.
 	if c.Role == "agent" {
+		defaultLanes, maxLanes := defaultTunnelChannels, maxTunnelChannels
 		switch c.Underlay {
-		case underlayPsiphon:
-			if c.TunnelChannels < 1 || c.TunnelChannels > psiphonTunnelChannels {
-				c.TunnelChannels = psiphonTunnelChannels
-			}
 		case underlayAdaptive:
-			if c.TunnelChannels < 1 || c.TunnelChannels > adaptiveExternalTunnelChannels {
-				c.TunnelChannels = adaptiveExternalTunnelChannels
-			}
-		default:
-			if c.TunnelChannels < defaultTunnelChannels {
-				c.TunnelChannels = defaultTunnelChannels
-			}
+			defaultLanes, maxLanes = adaptiveTunnelChannels, adaptiveTunnelChannels
+		case underlayPsiphon:
+			defaultLanes, maxLanes = psiphonTunnelChannels, psiphonTunnelChannels
+		}
+		if c.TunnelChannels < 1 {
+			c.TunnelChannels = defaultLanes
+		}
+		if c.TunnelChannels > maxLanes {
+			c.TunnelChannels = maxLanes
 		}
 	}
 	if len(c.Ports) == 0 {
@@ -4640,7 +4756,7 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
 	fmt.Printf("  %s\n", paint(ansiPinkGlow, "7) FULL ADAPTIVE FAILOVER — all 4 implemented transports"))
 	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "8) EXTERNAL EGRESS — Cloudflare MASQUE / Psiphon"))
-	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) ALL-PROTOCOL ADAPTIVE — all 4 transports + Direct/Psiphon egress failover"))
+	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) ALL-PROTOCOL ADAPTIVE — all 4 transports + fastest reachable egress (WARP/Psiphon/Direct)"))
 	choice := wizardAsk(prompt+" (1-9)", "7")
 	switch choice {
 	case "1":
@@ -4686,7 +4802,10 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent to enable Direct/Psiphon egress failover.")
 			return transportAdaptive, underlayDirect, "", nil
 		}
-		// Option 9 includes Psiphon as an automatically prepared standby egress.
+		// Option 9 includes Psiphon as a standby and can also use a per-app
+		// WARP Local Proxy. Control lanes probe candidate routes and prefer the
+		// lowest-latency reachable path; mapped Xray traffic uses leastPing and
+		// never silently falls back to the host's direct public IP.
 		return transportAdaptive, underlayAdaptive, "", nil
 	default:
 		return "", "", "", errors.New("invalid transport selection; enter a number from 1 to 9")
