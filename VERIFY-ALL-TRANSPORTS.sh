@@ -68,6 +68,8 @@ grep -Fq 'tor-expert-bundle-linux-x86_64-16.0.1.tar.gz' scripts/install-tor.sh |
 grep -Fq '7039cb16060ab22e669852e55774d894b55f25ea8bd0ab7194d3478429a58725' scripts/install-tor.sh || fail "Official Tor x86_64 checksum pin is missing."
 grep -Fq '67040520d44c87ccaaf5aa7df0dc1ff122eb938dbb600ae7722e8b6b75282a4b' scripts/install-tor.sh || fail "Official Tor arm64 checksum pin is missing."
 grep -Fq 'func startTorForAgent(cfg Config)' S1T-CAPSULE/tor.go || fail "Tor per-profile runtime is missing."
+grep -Fq 'func compatibleLinuxELF(path string) bool' S1T-CAPSULE/tor.go || fail "Tor CPU/ELF compatibility validation is missing."
+grep -Fq 'Prefer the real Expert Bundle daemon' scripts/install-tor.sh || fail "Tor installer does not avoid debug/tor artifacts."
 grep -Fq 'func validateTorBridgeLine' S1T-CAPSULE/tor.go || fail "Tor WebTunnel bridge validation is missing."
 grep -Fq 'func emergencyTorMenu() error' S1T-CAPSULE/main.go || fail "Standalone emergency Tor menu is missing."
 grep -Fq 'Tor Snowflake' S1T-CAPSULE/main.go || fail "Emergency Snowflake choice is missing."
