@@ -69,7 +69,7 @@ grep -Fq '7039cb16060ab22e669852e55774d894b55f25ea8bd0ab7194d3478429a58725' scri
 grep -Fq '67040520d44c87ccaaf5aa7df0dc1ff122eb938dbb600ae7722e8b6b75282a4b' scripts/install-tor.sh || fail "Official Tor arm64 checksum pin is missing."
 grep -Fq 'func startTorForAgent(cfg Config)' S1T-CAPSULE/tor.go || fail "Tor per-profile runtime is missing."
 grep -Fq 'func compatibleLinuxELF(path string) bool' S1T-CAPSULE/tor.go || fail "Tor CPU/ELF compatibility validation is missing."
-grep -Fq 'ExcludeNodes {us},{??}' S1T-CAPSULE/tor.go || fail "Tor US/unknown relay exclusion is missing."
+grep -Fq 'ExcludeExitNodes {us},{??}' S1T-CAPSULE/tor.go || fail "Tor US/unknown exit exclusion is missing."
 grep -Fq 'StrictNodes 1' S1T-CAPSULE/tor.go || fail "Tor strict non-US circuit policy is missing."
 grep -Fq 'GeoIPv6File ' S1T-CAPSULE/tor.go || fail "Tor IPv6 GeoIP enforcement is missing."
 grep -Fq 'verifyTorPublicEgress' S1T-CAPSULE/xray_tor.go || fail "Tor public egress country verification is missing."
