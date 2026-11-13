@@ -384,30 +384,49 @@ func psiphonPublicEgressCountry(proxyAddress, exitIP string, timeout time.Durati
 		}()
 	}
 	go func() { wg.Wait(); close(results) }()
-	verified := ""
+	var countries []string
 	for {
 		select {
 		case got, ok := <-results:
 			if !ok {
-				if verified != "" {
-					return verified, nil
-				}
-				return "", errors.New("no geolocation provider verified the exact proxy exit IP through SOCKS5")
+				return resolveTorGeoVotes(countries)
 			}
-			if !got.ok {
-				continue
+			if got.ok {
+				countries = append(countries, strings.ToUpper(strings.TrimSpace(got.country)))
 			}
-			if verified != "" && verified != got.country {
-				return "", fmt.Errorf("Psiphon geolocation providers disagree for exit IP %s (%s vs %s)", exitIP, verified, got.country)
-			}
-			verified = got.country
 		case <-ctx.Done():
-			if verified != "" {
-				return verified, nil
-			}
-			return "", fmt.Errorf("Psiphon SOCKS geolocation timed out: %w", ctx.Err())
+			return "", fmt.Errorf("geolocation verification timed out before all providers completed: %w", ctx.Err())
 		}
 	}
+}
+
+// resolveTorGeoVotes enforces the actual policy: any provider reporting US
+// blocks the exit; otherwise at least two independent providers must identify
+// this exact SOCKS-observed IP as non-US. Different non-US country databases
+// (for example NL vs SC) do not imply a US exit and are accepted as NON-US.
+func resolveTorGeoVotes(countries []string) (string, error) {
+	unique := make(map[string]struct{})
+	validVotes := 0
+	for _, country := range countries {
+		country = strings.ToUpper(strings.TrimSpace(country))
+		if !isAlphaCountryCode(country) {
+			continue
+		}
+		validVotes++
+		if country == "US" {
+			return "US", nil
+		}
+		unique[country] = struct{}{}
+	}
+	if validVotes < 2 || len(unique) == 0 {
+		return "", errors.New("fewer than two independent geolocation providers verified a non-US country for the exact SOCKS exit IP")
+	}
+	if len(unique) == 1 {
+		for country := range unique {
+			return country, nil
+		}
+	}
+	return "NON-US", nil
 }
 
 // psiphonCountryFromDirectIPLookup performs an independent lookup of the exact

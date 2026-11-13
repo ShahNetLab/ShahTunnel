@@ -161,3 +161,18 @@ func TestRollbackFailedTorAgentSetupRefusesForeignPaths(t *testing.T) {
 		t.Fatalf("foreign config file was changed: data=%q err=%v", data, readErr)
 	}
 }
+
+func TestResolveTorGeoVotesBlocksAnyUSAndAllowsNonUSDatabaseDisagreement(t *testing.T) {
+	if country, err := resolveTorGeoVotes([]string{"NL", "SC"}); err != nil || country != "NON-US" {
+		t.Fatalf("non-US provider disagreement should be accepted as non-US: country=%q err=%v", country, err)
+	}
+	if country, err := resolveTorGeoVotes([]string{"NL", "US"}); err != nil || country != "US" {
+		t.Fatalf("any US report must dominate: country=%q err=%v", country, err)
+	}
+	if _, err := resolveTorGeoVotes([]string{"NL"}); err == nil {
+		t.Fatal("one provider is not enough to verify a non-US exit")
+	}
+	if _, err := resolveTorGeoVotes([]string{"", "??"}); err == nil {
+		t.Fatal("unknown countries must fail closed")
+	}
+}
