@@ -1,6 +1,10 @@
 package main
 
 import (
+	"encoding/binary"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -121,5 +125,49 @@ func TestTorRuntimeEnvironmentAddsOnlyBundleLibraryPaths(t *testing.T) {
 	env = strings.Join(torRuntimeEnvironment(cfg), "\n")
 	if strings.Contains(env, "LD_LIBRARY_PATH=/usr/bin") {
 		t.Fatalf("system-installed binaries should not modify library lookup paths: %s", env)
+	}
+}
+
+func TestFindCompatibleTorPrefersRuntimeOverDebugArtifact(t *testing.T) {
+	root := t.TempDir()
+	debugDir := filepath.Join(root, "debug")
+	runtimeDir := filepath.Join(root, "tor")
+	if err := os.MkdirAll(debugDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// The debug artifact is deliberately non-ELF, matching the failure mode
+	// seen when a first-match filesystem walk selected debug/tor.
+	debugPath := filepath.Join(debugDir, "tor")
+	if err := os.WriteFile(debugPath, []byte("not an ELF executable"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	machine := uint16(62)
+	if runtime.GOARCH == "arm64" {
+		machine = 183
+	}
+	header := make([]byte, 20)
+	copy(header[:4], []byte{0x7f, 'E', 'L', 'F'})
+	header[4], header[5] = 2, 1
+	binary.LittleEndian.PutUint16(header[18:20], machine)
+	runtimePath := filepath.Join(runtimeDir, "tor")
+	if err := os.WriteFile(runtimePath, header, 0755); err != nil {
+		t.Fatal(err)
+	}
+	got := findCompatibleExecutable(root, "tor")
+	if got != runtimePath {
+		t.Fatalf("selected %q, want official runtime %q", got, runtimePath)
+	}
+}
+
+func TestCompatibleLinuxELFRejectsWrongFormat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tor")
+	if err := os.WriteFile(path, []byte("not ELF"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if compatibleLinuxELF(path) {
+		t.Fatal("non-ELF executable was accepted")
 	}
 }

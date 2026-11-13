@@ -15,6 +15,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -195,34 +197,76 @@ func executableFile(path string) bool {
 	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0
 }
 
-func findExecutableInTree(root, name string) string {
-	var found string
+// compatibleLinuxELF rejects non-Linux, non-ELF and wrong-CPU executables.
+// The Tor Expert Bundle contains more than one file named "tor" on some
+// releases; blindly taking the first match can select a debug/helper artifact
+// which the kernel cannot execute (exec format error).
+func compatibleLinuxELF(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var header [20]byte
+	if _, err := io.ReadFull(f, header[:]); err != nil {
+		return false
+	}
+	if string(header[:4]) != "\x7fELF" || header[5] != 1 {
+		return false
+	} // ELF, little endian
+	machine := binary.LittleEndian.Uint16(header[18:20])
+	switch runtime.GOARCH {
+	case "amd64":
+		return header[4] == 2 && machine == 62
+	case "arm64":
+		return header[4] == 2 && machine == 183
+	default:
+		return false
+	}
+}
+
+func findCompatibleExecutable(root, name string) string {
+	if root == "" {
+		return ""
+	}
+	var candidates []string
 	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil || found != "" {
+		if err != nil || entry.IsDir() || entry.Name() != name {
 			return nil
 		}
-		if entry.IsDir() || entry.Name() != name {
-			return nil
-		}
-		if executableFile(path) {
-			found = path
-			return filepath.SkipAll
+		if executableFile(path) && compatibleLinuxELF(path) {
+			candidates = append(candidates, path)
 		}
 		return nil
 	})
-	return found
+	// Prefer the official Expert Bundle runtime location over debug artifacts.
+	preferred := filepath.Join(root, "tor", "tor")
+	for _, candidate := range candidates {
+		if candidate == preferred {
+			return candidate
+		}
+	}
+	if len(candidates) > 0 {
+		sort.Strings(candidates)
+		return candidates[0]
+	}
+	return ""
 }
 
 func locateTorBinaries() (string, string) {
-	torBinary := findExecutableInTree(torBundleRoot, "tor")
-	ptBinary := findExecutableInTree(torBundleRoot, "lyrebird")
+	torBinary := findCompatibleExecutable(torBundleRoot, "tor")
+	ptBinary := findCompatibleExecutable(torBundleRoot, "lyrebird")
 	if torBinary == "" {
-		torBinary, _ = exec.LookPath("tor")
+		if candidate, err := exec.LookPath("tor"); err == nil && compatibleLinuxELF(candidate) {
+			torBinary = candidate
+		}
 	}
 	if ptBinary == "" {
-		ptBinary, _ = exec.LookPath("lyrebird")
+		if candidate, err := exec.LookPath("lyrebird"); err == nil && compatibleLinuxELF(candidate) {
+			ptBinary = candidate
+		}
 	}
-	if !executableFile(torBinary) || !executableFile(ptBinary) {
+	if torBinary == "" || ptBinary == "" {
 		return "", ""
 	}
 	return torBinary, ptBinary
@@ -392,8 +436,19 @@ func startTorForAgent(cfg Config) (func(), error) {
 	if cfg.Underlay != underlayTor {
 		return func() {}, nil
 	}
-	if !executableFile(cfg.TorBinary) || !executableFile(cfg.TorPTBinary) {
-		return nil, errors.New("Tor/lyrebird binaries are missing; recreate the Tor Agent profile with the updated installer")
+	// Repair stale paths saved by earlier 5.0.0 builds. In particular, older
+	// installers could select tor-bundle/debug/tor merely because it appeared
+	// first in a filesystem walk. Resolve a CPU-compatible official runtime on
+	// every start and use it for this process without modifying other profiles.
+	if !compatibleLinuxELF(cfg.TorBinary) || !compatibleLinuxELF(cfg.TorPTBinary) {
+		torBinary, ptBinary, err := ensureTorBinaries()
+		if err != nil {
+			return nil, err
+		}
+		cfg.TorBinary, cfg.TorPTBinary = torBinary, ptBinary
+	}
+	if !executableFile(cfg.TorBinary) || !executableFile(cfg.TorPTBinary) || !compatibleLinuxELF(cfg.TorBinary) || !compatibleLinuxELF(cfg.TorPTBinary) {
+		return nil, errors.New("compatible Linux Tor/lyrebird executables are missing; rerun the updated ShahTunnel installer")
 	}
 	if !isLoopbackProxyAddress(cfg.TorProxy) {
 		return nil, errors.New("Tor SOCKS5 proxy must be loopback-only")
