@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 4.0.2 installer.
+# Shah Tunnel 4.0.3 installer.
 # Downloads the pinned Go 1.26.1 toolchain, verifies its SHA-256, fetches the source,
 # and builds the Linux binary on the target server. No prebuilt release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="4.0.2"
+VERSION="4.0.3"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -502,8 +502,9 @@ build_from_official_go_toolchain() {
     if ! cp -a "$script_dir/go.mod" "$source_dir/" ||
        ! cp -a "$script_dir/S1T-CAPSULE" "$source_dir/" ||
        ! cp -a "$script_dir/install-psiphon.sh" "$source_dir/" ||
+       ! cp -a "$script_dir/install-tor.sh" "$source_dir/" ||
        ! cp -a "$script_dir/repair-psiphon-profile.sh" "$source_dir/"; then
-      echo "Could not copy the local ShahTunnel source tree or Psiphon auto-installer." >&2
+      echo "Could not copy the local ShahTunnel source tree or egress auto-installers." >&2
       return 1
     fi
     if [[ -f "$script_dir/go.sum" ]]; then
@@ -530,6 +531,11 @@ build_from_official_go_toolchain() {
   [[ -s "$source_dir/install-psiphon.sh" ]] || { echo "Pinned Psiphon auto-installer is missing from the ShahTunnel source." >&2; return 1; }
   if ! bash -n "$source_dir/install-psiphon.sh"; then
     echo "Psiphon auto-installer has invalid shell syntax; refusing to continue." >&2
+    return 1
+  fi
+  [[ -s "$source_dir/install-tor.sh" ]] || { echo "Pinned Tor auto-installer is missing from the ShahTunnel source." >&2; return 1; }
+  if ! bash -n "$source_dir/install-tor.sh"; then
+    echo "Tor auto-installer has invalid shell syntax; refusing to continue." >&2
     return 1
   fi
   local source_fingerprint build_cache_dir cached_binary
@@ -577,6 +583,9 @@ install -d -o root -g root -m 0755 "$STATE_DIR"
 # built on-demand only when an Agent selects Psiphon; no TUN/routes are created.
 install -o root -g root -m 0750 "$TMP/source/install-psiphon.sh" "$STATE_DIR/install-psiphon.sh.new"
 mv -f "$STATE_DIR/install-psiphon.sh.new" "$STATE_DIR/install-psiphon.sh"
+install -o root -g root -m 0750 "$TMP/source/install-tor.sh" "$STATE_DIR/install-tor.sh.new"
+mv -f "$STATE_DIR/install-tor.sh.new" "$STATE_DIR/install-tor.sh"
+install -d -o root -g root -m 0700 /var/lib/shah-tunnel/tor
 [[ -s "$TMP/source/repair-psiphon-profile.sh" ]] || { echo "Psiphon profile repair helper is missing from the source archive." >&2; exit 1; }
 install -o root -g root -m 0750 "$TMP/source/repair-psiphon-profile.sh" "$STATE_DIR/repair-psiphon-profile.sh.new"
 mv -f "$STATE_DIR/repair-psiphon-profile.sh.new" "$STATE_DIR/repair-psiphon-profile.sh"
@@ -625,7 +634,7 @@ LockPersonality=true
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
-ReadWritePaths=/etc/ravanreverse
+ReadWritePaths=/etc/ravanreverse /var/lib/shah-tunnel/tor
 [Install]
 WantedBy=multi-user.target
 UNIT
@@ -666,7 +675,7 @@ LockPersonality=true
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
-ReadWritePaths=/etc/ravanreverse
+ReadWritePaths=/etc/ravanreverse /var/lib/shah-tunnel/tor
 [Install]
 WantedBy=multi-user.target
 UNIT
@@ -682,6 +691,11 @@ for unit in ravanreverse.service ravanreverse@.service; do
 ReadWritePaths=/var/lib/shah-tunnel/psiphon
 DROPIN
   install -o root -g root -m 0644 "$TMP/psiphon-${unit}.conf" "$dropin_dir/psiphon.conf"
+  cat > "$TMP/tor-${unit}.conf" <<'TOR_DROPIN'
+[Service]
+ReadWritePaths=/var/lib/shah-tunnel/tor
+TOR_DROPIN
+  install -o root -g root -m 0644 "$TMP/tor-${unit}.conf" "$dropin_dir/tor.conf"
 
   # Keep this as the same standalone override that fixed the live Agent
   # manually. It is deliberately installed under the template drop-in so
