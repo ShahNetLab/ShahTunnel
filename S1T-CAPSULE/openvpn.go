@@ -376,7 +376,7 @@ func installOpenVPNRouteHelper() error {
 }
 
 func renderOpenVPNUnit(profile, configPath, workDir string, route openVPNRouteInfo, restartOnFailure bool) ([]byte, error) {
-	if configPath == "" || !filepath.IsAbs(configPath) || strings.ContainsAny(configPath+workDir, "\x00\r\n") {
+	if configPath == "" || workDir == "" || !filepath.IsAbs(configPath) || !filepath.IsAbs(workDir) || strings.ContainsAny(configPath+workDir, "\x00\r\n") {
 		return nil, errors.New("invalid OpenVPN service paths")
 	}
 	bin, err := exec.LookPath("openvpn")
@@ -422,7 +422,7 @@ ReadWritePaths=%s /run
 
 [Install]
 WantedBy=multi-user.target
-`, tunnelID(profile), systemdExecQuote(workDir), openVPNRouteHelperPath, route.Table, route.Mark, route.Priority, bin, systemdExecQuote(configPath), openVPNRouteHelperPath, route.Table, route.Mark, route.Priority, restartDirective, filepath.Dir(configPath))
+`, tunnelID(profile), workDir, openVPNRouteHelperPath, route.Table, route.Mark, route.Priority, bin, systemdExecQuote(configPath), openVPNRouteHelperPath, route.Table, route.Mark, route.Priority, restartDirective, filepath.Dir(configPath))
 	return []byte(unit), nil
 }
 

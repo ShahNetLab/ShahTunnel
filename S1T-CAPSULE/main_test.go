@@ -2987,6 +2987,34 @@ func TestAdaptiveUnderlayCandidatesIncludeConfiguredOpenVPN(t *testing.T) {
 	}
 }
 
+func TestRenderOpenVPNUnitUsesAbsoluteUnquotedWorkingDirectory(t *testing.T) {
+	binDir := t.TempDir()
+	openvpn := filepath.Join(binDir, "openvpn")
+	if err := os.WriteFile(openvpn, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+
+	workDir := "/etc/ravanreverse/openvpn/agent-s"
+	configPath := filepath.Join(workDir, "client.ovpn")
+	route := openVPNRouteInfo{Table: 21001, Mark: 5500001, Priority: 11001, Device: "tuntest01"}
+	unit, err := renderOpenVPNUnit("agent-s", configPath, workDir, route, false)
+	if err != nil {
+		t.Fatalf("render OpenVPN unit: %v", err)
+	}
+	text := string(unit)
+	want := "WorkingDirectory=" + workDir + "\n"
+	if !strings.Contains(text, want) {
+		t.Fatalf("OpenVPN unit must use the raw absolute WorkingDirectory %q:\n%s", want, text)
+	}
+	if strings.Contains(text, "WorkingDirectory=\"") {
+		t.Fatalf("OpenVPN WorkingDirectory must not be wrapped in ExecStart-style quotes:\n%s", text)
+	}
+	if _, err := renderOpenVPNUnit("agent-s", configPath, "relative/openvpn", route, false); err == nil {
+		t.Fatal("OpenVPN unit accepted a relative WorkingDirectory")
+	}
+}
+
 func TestOpenVPNRouteHelperIsValidShellAndHasFailClosedRules(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "openvpn-route.sh")
 	if err := os.WriteFile(path, openVPNRouteHelperScript(), 0700); err != nil {
