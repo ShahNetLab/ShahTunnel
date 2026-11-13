@@ -1106,7 +1106,7 @@ func TestOptionNineSwitchesFromFailedDirectPathToPsiphonSOCKS5(t *testing.T) {
 	unavailableAddress := unavailable.Addr().String()
 	_ = unavailable.Close()
 	proxyAddress := startTestSOCKS5Relay(t, listener.Addr().String())
-	channel := 8001 // (channel-1) modulo 8 = 0: Direct/TCP is the first candidate.
+	channel := 109
 	agentPreferredTransport.Delete(channel)
 	agentPreferredUnderlay.Delete(channel)
 	t.Cleanup(func() {
@@ -1626,50 +1626,6 @@ func TestRemovedLegacyWARPUnderlayIsRejectedWithoutDirectDowngrade(t *testing.T)
 	}
 }
 
-func TestAdaptiveAgentPathCandidatesDistributeStartupLanes(t *testing.T) {
-	t.Setenv("PATH", t.TempDir()) // Simulate no active WARP CLI.
-	cfg := Config{Transport: transportAdaptive, Underlay: underlayAdaptive, PsiphonConfig: "/tmp/psiphon-client.json"}
-	paths := adaptiveAgentPathCandidates(cfg, "", "", 1)
-	if len(paths) != 8 { // Four transports x two egresses when WARP is absent.
-		t.Fatalf("adaptive path matrix has %d entries, want 8: %#v", len(paths), paths)
-	}
-	seen := map[string]bool{}
-	for lane := 1; lane <= len(paths); lane++ {
-		lanePaths := adaptiveAgentPathCandidates(cfg, "", "", lane)
-		key := lanePaths[0].Transport + "/" + lanePaths[0].Underlay
-		if seen[key] {
-			t.Fatalf("startup lane %d repeats first path %s before all matrix pairs are tried", lane, key)
-		}
-		seen[key] = true
-	}
-	preferred := adaptiveAgentPathCandidates(cfg, transportHTTP2, underlayPsiphon, 9)
-	if len(preferred) == 0 || preferred[0] != (adaptiveAgentPath{Transport: transportHTTP2, Underlay: underlayPsiphon}) {
-		t.Fatalf("last successful path was not preferred on reconnect: %#v", preferred)
-	}
-
-	// With MASQUE connected, all four transports are spread across three egresses.
-	binDir := t.TempDir()
-	warpCLI := filepath.Join(binDir, "warp-cli")
-	warpScript := "#!/bin/sh\ncase \"$1\" in status) echo 'Status update: Connected' ;; settings) echo 'WARP tunnel protocol: MASQUE' ;; *) exit 2 ;; esac\n"
-	if err := os.WriteFile(warpCLI, []byte(warpScript), 0700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", binDir)
-	allPaths := adaptiveAgentPathCandidates(cfg, "", "", 1)
-	if len(allPaths) != 12 {
-		t.Fatalf("MASQUE + Psiphon + Direct matrix has %d entries, want 12: %#v", len(allPaths), allPaths)
-	}
-	seen = map[string]bool{}
-	for lane := 1; lane <= 12; lane++ {
-		pathSet := adaptiveAgentPathCandidates(cfg, "", "", lane)
-		key := pathSet[0].Transport + "/" + pathSet[0].Underlay
-		if seen[key] {
-			t.Fatalf("12-lane startup matrix duplicated %s before covering all 12 combinations", key)
-		}
-		seen[key] = true
-	}
-}
-
 func TestAdaptiveUnderlayCandidatesPreferLastSuccessfulEgress(t *testing.T) {
 	t.Setenv("PATH", t.TempDir()) // Keep this test independent of a host WARP installation.
 	cfg := Config{Underlay: underlayAdaptive, PsiphonConfig: "/tmp/psiphon-client.json"}
@@ -1911,6 +1867,71 @@ func TestHubSelectsLeastLoadedLaneAndRotatesTies(t *testing.T) {
 	second := h.current()
 	if first == second {
 		t.Fatalf("equal-load lanes were not rotated; both selections chose lane %d", first.id)
+	}
+}
+
+func TestHubSpreadsOneHundredNewStreamsAcrossHealthyLanes(t *testing.T) {
+	const lanes = 12
+	sessions := make([]*hubSession, lanes)
+	set := make(map[*hubSession]struct{}, lanes)
+	for i := 0; i < lanes; i++ {
+		sessions[i] = &hubSession{id: uint64(i + 1), streams: make(map[uint32]*hubStream), wire: &wire{done: make(chan struct{})}}
+		set[sessions[i]] = struct{}{}
+	}
+	h := &hubServer{sessions: set}
+	for streamID := 1; streamID <= 100; streamID++ {
+		selected := h.current()
+		if selected == nil {
+			t.Fatalf("no lane selected for stream %d", streamID)
+		}
+		selected.mu.Lock()
+		selected.streams[uint32(streamID)] = &hubStream{}
+		selected.mu.Unlock()
+	}
+	minLoad, maxLoad := 101, 0
+	for _, session := range sessions {
+		load := session.activeStreams()
+		if load < minLoad {
+			minLoad = load
+		}
+		if load > maxLoad {
+			maxLoad = load
+		}
+	}
+	if maxLoad-minLoad > 1 {
+		t.Fatalf("100 streams were not evenly distributed over %d lanes: min=%d max=%d", lanes, minLoad, maxLoad)
+	}
+}
+
+func TestHubAvoidsLaneWithHeavyPendingDataQueue(t *testing.T) {
+	mkSession := func(id uint64, rtt time.Duration, pending int64) *hubSession {
+		w := &wire{done: make(chan struct{})}
+		w.rttNanos.Store(int64(rtt))
+		w.lastPongAt.Store(time.Now().UnixNano())
+		w.dataPendingBytes.Store(pending)
+		return &hubSession{id: id, streams: make(map[uint32]*hubStream), wire: w}
+	}
+	lowIdleRTTButQueued := mkSession(1, 12*time.Millisecond, 4<<20)
+	lessCongested := mkSession(2, 28*time.Millisecond, 0)
+	h := &hubServer{sessions: map[*hubSession]struct{}{lowIdleRTTButQueued: {}, lessCongested: {}}}
+	if got := h.current(); got != lessCongested {
+		t.Fatalf("selected queued lane %d; want less-congested lane %d", got.id, lessCongested.id)
+	}
+}
+
+func TestHubAccountsForRecentDataWriteWait(t *testing.T) {
+	mkSession := func(id uint64, rtt, writeWait time.Duration) *hubSession {
+		w := &wire{done: make(chan struct{})}
+		w.rttNanos.Store(int64(rtt))
+		w.lastPongAt.Store(time.Now().UnixNano())
+		w.dataWriteWaitNanos.Store(int64(writeWait))
+		return &hubSession{id: id, streams: make(map[uint32]*hubStream), wire: w}
+	}
+	lowRTTSlowWriter := mkSession(1, 10*time.Millisecond, 450*time.Millisecond)
+	healthyWriter := mkSession(2, 24*time.Millisecond, 5*time.Millisecond)
+	h := &hubServer{sessions: map[*hubSession]struct{}{lowRTTSlowWriter: {}, healthyWriter: {}}}
+	if got := h.current(); got != healthyWriter {
+		t.Fatalf("selected blocked writer lane %d; want healthy writer lane %d", got.id, healthyWriter.id)
 	}
 }
 
@@ -2538,24 +2559,6 @@ exit 1
 	}
 }
 
-func TestXrayListenerAndSystemdWorkingDirectoryFallback(t *testing.T) {
-	listener := "LISTEN 0 4096               *:2083        *:*\n"
-	if !xrayListenerOutputHasPort(listener, 2083) {
-		t.Fatal("listener parser did not recognize wildcard IPv4/IPv6 listener")
-	}
-	if xrayListenerOutputHasPort(listener, 21083) {
-		t.Fatal("listener parser matched the wrong port")
-	}
-	got := xraySystemdWorkingDirectories("", "{ path=/usr/local/x-ui/x-ui ; argv[]=/usr/local/x-ui/x-ui server ; ignore_errors=no }")
-	if len(got) != 1 || got[0] != "/usr/local/x-ui" {
-		t.Fatalf("systemd ExecStart fallback = %#v; want [/usr/local/x-ui]", got)
-	}
-	got = xraySystemdWorkingDirectories("/opt/x-ui", "{ path=/usr/local/x-ui/x-ui ; argv[]=/usr/local/x-ui/x-ui server }")
-	if len(got) != 2 || got[0] != "/opt/x-ui" || got[1] != "/usr/local/x-ui" {
-		t.Fatalf("systemd working directory candidates = %#v", got)
-	}
-}
-
 func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 	original := []byte(`{
   "api":{"tag":"api","services":["HandlerService"]},
@@ -2711,6 +2714,19 @@ func TestBuildXrayWarpConfigRejectsNonLoopbackAndAmbiguousInbound(t *testing.T) 
 	}
 }
 
+func TestParsePsiphonEgressGeoRequiresExactExitIP(t *testing.T) {
+	got, ok := parsePsiphonEgressGeo([]byte(`{"ip":"1.1.1.1","country_code":"DE"}`), "1.1.1.1")
+	if !ok || got != "DE" {
+		t.Fatalf("valid exact-IP geolocation = %q, %v; want DE", got, ok)
+	}
+	if _, ok := parsePsiphonEgressGeo([]byte(`{"ip":"8.8.8.8","country_code":"US"}`), "1.1.1.1"); ok {
+		t.Fatal("geolocation for a different IP was accepted")
+	}
+	if _, ok := parsePsiphonEgressGeo([]byte(`{"ip":"1.1.1.1","country_code":"US"}`), "1.1.1.1"); !ok {
+		t.Fatal("US response should parse successfully so the caller can reject it explicitly")
+	}
+}
+
 func TestBuildXrayPsiphonConfigIsolatesTCPAndBlocksUDP(t *testing.T) {
 	original := []byte(`{
   "inbounds": [
@@ -2838,9 +2854,7 @@ func TestHubBalancesMeasuredRTTAndLoad(t *testing.T) {
 	}
 	// The 14ms lane has some load but a lower weighted RTT than the idle 30ms lane.
 	fast := mkSession(1, 32, 14*time.Millisecond)
-	fast.transport = transportHTTP2
 	slower := mkSession(2, 0, 30*time.Millisecond)
-	slower.transport = transportTCP
 	h := &hubServer{sessions: map[*hubSession]struct{}{fast: {}, slower: {}}}
 	for i := 0; i < 20; i++ {
 		if got := h.current(); got != fast {
@@ -2862,20 +2876,5 @@ func TestHubPrefersFreshRTTOverStaleLowRTT(t *testing.T) {
 	h := &hubServer{sessions: map[*hubSession]struct{}{staleFormerlyFast: {}, freshHealthy: {}}}
 	if got := h.current(); got != freshHealthy {
 		t.Fatalf("selected lane %d; want fresh lane %d despite stale lower RTT", got.id, freshHealthy.id)
-	}
-}
-
-func TestParseGeoResponseSupportsExactPublicIPv6ExitIP(t *testing.T) {
-	exitIP := "2001:4860:4860::8888"
-	body := []byte(`{"ip":"2001:4860:4860::8888","country":"US"}`)
-	geo, ok := parseGeoResponse(body, exitIP)
-	if !ok || !geo.Valid || geo.IP != exitIP || geo.CountryCode != "US" {
-		t.Fatalf("parseGeoResponse() = (%+v, %t), want exact public IPv6 + US country code", geo, ok)
-	}
-	if _, ok := parseGeoResponse([]byte(`{"ip":"2001:4860:4860::8844","country":"DE"}`), exitIP); ok {
-		t.Fatal("geo response for a different IPv6 address must be rejected")
-	}
-	if isPublicGeoIP(net.ParseIP("fd00::1")) || isPublicGeoIP(net.ParseIP("fe80::1")) || isPublicGeoIP(net.ParseIP("::1")) {
-		t.Fatal("private, link-local and loopback IPv6 addresses must not be treated as public exits")
 	}
 }

@@ -28,7 +28,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -40,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "4.0.6"
+	version                          = "4.0.7"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -706,6 +705,10 @@ type wire struct {
 	once       sync.Once
 	rttNanos   atomic.Int64 // EWMA of authenticated PING/PONG round-trip time; zero until measured.
 	lastPongAt atomic.Int64 // Unix nanoseconds of the latest valid PONG, for diagnostics/future health checks.
+	// Queue-pressure telemetry lets the Hub avoid sending new streams into a
+	// lane that has a low idle RTT but is already blocked writing user payload.
+	dataPendingBytes   atomic.Int64
+	dataWriteWaitNanos atomic.Int64 // EWMA from data enqueue to completed socket write.
 }
 
 func newWire(c net.Conn) *wire {
@@ -792,9 +795,15 @@ func (w *wire) send(typ byte, id uint32, data []byte) error {
 		return net.ErrClosed
 	default:
 	}
+	isData := typ == msgData
+	started := time.Now()
+	if isData {
+		w.dataPendingBytes.Add(int64(len(data)))
+		defer w.dataPendingBytes.Add(-int64(len(data)))
+	}
 	req := &wireRequest{typ: typ, id: id, data: data, done: make(chan error, 1)}
 	queue := w.controlQ
-	if typ == msgData {
+	if isData {
 		queue = w.dataQ
 	}
 	// send stays synchronous: callers may safely reuse their frame buffer only
@@ -806,10 +815,54 @@ func (w *wire) send(typ byte, id uint32, data []byte) error {
 	}
 	select {
 	case err := <-req.done:
+		if isData {
+			w.observeDataWriteWait(time.Since(started))
+		}
 		return err
 	case <-w.done:
 		return net.ErrClosed
 	}
+}
+
+// observeDataWriteWait records the time a payload spends waiting for the lane's
+// single writer and socket. The EWMA is deliberately separate from RTT so the
+// Hub can detect congestion before heartbeat RTT catches up.
+func (w *wire) observeDataWriteWait(wait time.Duration) {
+	n := int64(wait)
+	if n <= 0 {
+		return
+	}
+	for {
+		old := w.dataWriteWaitNanos.Load()
+		next := n
+		if old > 0 {
+			next = old - old/4 + n/4
+		}
+		if w.dataWriteWaitNanos.CompareAndSwap(old, next) {
+			return
+		}
+	}
+}
+
+// queuePressurePenalty is a bounded latency estimate, not a throughput claim.
+// It combines bytes waiting on this lane with its recent data-write wait time.
+func (w *wire) queuePressurePenalty() time.Duration {
+	if w == nil {
+		return 0
+	}
+	pending := w.dataPendingBytes.Load()
+	if pending < 0 {
+		pending = 0
+	}
+	queuePenalty := time.Duration(pending/(128<<10)) * 3 * time.Millisecond
+	if queuePenalty > 750*time.Millisecond {
+		queuePenalty = 750 * time.Millisecond
+	}
+	writeWait := time.Duration(w.dataWriteWaitNanos.Load())
+	if writeWait > 500*time.Millisecond {
+		writeWait = 500 * time.Millisecond
+	}
+	return queuePenalty + writeWait/2
 }
 
 func (w *wire) writeRequest(req *wireRequest) error {
@@ -1238,13 +1291,12 @@ func (s *hubStream) close() {
 }
 
 type hubSession struct {
-	id        uint64
-	transport string // observed authenticated Agent transport on the Hub listener
-	wire      *wire
-	mu        sync.RWMutex
-	streams   map[uint32]*hubStream
-	next      atomic.Uint32
-	stopOnce  sync.Once
+	id       uint64
+	wire     *wire
+	mu       sync.RWMutex
+	streams  map[uint32]*hubStream
+	next     atomic.Uint32
+	stopOnce sync.Once
 }
 
 func newHubSession(c net.Conn) *hubSession {
@@ -1742,14 +1794,13 @@ func (s *agentSession) run() {
 }
 
 type hubServer struct {
-	cfg                 Config
-	controlTLSConfig    *tls.Config
-	mu                  sync.RWMutex
-	sessions            map[*hubSession]struct{}
-	pendingPublic       chan struct{}
-	controlSlots        chan struct{}
-	pickCursor          atomic.Uint64
-	lastSelectedSession atomic.Uint64
+	cfg              Config
+	controlTLSConfig *tls.Config
+	mu               sync.RWMutex
+	sessions         map[*hubSession]struct{}
+	pendingPublic    chan struct{}
+	controlSlots     chan struct{}
+	pickCursor       atomic.Uint64
 }
 
 func (h *hubServer) controlSemaphore() chan struct{} {
@@ -1809,13 +1860,14 @@ func (h *hubServer) current() *hubSession {
 		ordered = append(ordered, candidates[(start+i)%len(candidates)])
 	}
 
-	// A stream on a lane with a very high active count can experience queueing.
-	// The penalty rises linearly to +100% at maxStreams; measured RTT remains
-	// the primary signal and all arithmetic is bounded to positive durations.
+	// Rank by fresh authenticated RTT, active streams, and live queue pressure.
+	// A lane with a low idle RTT but a blocked writer must not attract every new
+	// flow; queue telemetry helps redistribute before heartbeat RTT rises.
 	type laneMetric struct {
-		session *hubSession
-		load    int
-		rtt     time.Duration
+		session  *hubSession
+		load     int
+		rtt      time.Duration
+		pressure time.Duration
 	}
 	metrics := make([]laneMetric, 0, len(ordered))
 	freshMetrics := make([]laneMetric, 0, len(ordered))
@@ -1825,7 +1877,7 @@ func (h *hubServer) current() *hubSession {
 		if load >= maxStreams {
 			continue
 		}
-		metric := laneMetric{session: candidate, load: load}
+		metric := laneMetric{session: candidate, load: load, pressure: candidate.wire.queuePressurePenalty()}
 		metric.rtt = candidate.wire.freshRoundTripTime(now)
 		metrics = append(metrics, metric)
 		if metric.rtt > 0 {
@@ -1835,43 +1887,30 @@ func (h *hubServer) current() *hubSession {
 	if len(metrics) == 0 {
 		return nil
 	}
-	// As soon as one lane has a fresh sample, rank only fresh lanes. A stale
-	// measurement (even a formerly excellent one) is not evidence of current
-	// path quality. New lanes join ranking as soon as their first PONG arrives.
 	if len(freshMetrics) > 0 {
 		best := freshMetrics[0]
-		bestScore := best.rtt + best.rtt*time.Duration(best.load)/time.Duration(maxStreams)
+		bestScore := best.rtt + best.rtt*time.Duration(best.load)/time.Duration(maxStreams) + best.pressure
 		for _, metric := range freshMetrics[1:] {
-			score := metric.rtt + metric.rtt*time.Duration(metric.load)/time.Duration(maxStreams)
+			score := metric.rtt + metric.rtt*time.Duration(metric.load)/time.Duration(maxStreams) + metric.pressure
 			if score < bestScore {
 				best, bestScore = metric, score
 			}
 		}
-		// `ordered` is rotated each call, so equal scores remain fairly shared.
-		if h.cfg.Transport == transportAdaptive {
-			if previous := h.lastSelectedSession.Swap(best.session.id); previous != best.session.id {
-				log.Printf("adaptive quality selector chose Hub lane session=%d transport=%s rtt=%s active_streams=%d", best.session.id, best.session.transport, best.rtt, best.load)
-			}
-		}
+		// `ordered` rotates each call, so equal scores remain fairly shared.
 		return best.session
 	}
 
-	// Before a fresh RTT sample exists, retain least-loaded selection.
-	bestLoad := maxStreams + 1
-	var leastLoaded []*hubSession
+	// Before the first fresh RTT sample, use a combined least-load/queue score.
+	// This also avoids piling startup flows onto the first lane to reconnect.
+	bestScore := time.Duration(1<<62 - 1)
+	var best *hubSession
 	for _, metric := range metrics {
-		if metric.load < bestLoad {
-			bestLoad = metric.load
-			leastLoaded = leastLoaded[:0]
-		}
-		if metric.load == bestLoad {
-			leastLoaded = append(leastLoaded, metric.session)
+		score := time.Duration(metric.load)*2*time.Millisecond + metric.pressure
+		if score < bestScore {
+			best, bestScore = metric.session, score
 		}
 	}
-	if len(leastLoaded) == 0 {
-		return nil
-	}
-	return leastLoaded[0]
+	return best
 }
 
 func (h *hubServer) acceptPublic(ln net.Listener, portID string) {
@@ -2443,7 +2482,6 @@ func (h *hubServer) serveAuthorizedAgent(c net.Conn, observed string) {
 	defer c.Close()
 	_ = c.SetDeadline(time.Time{})
 	s := newHubSession(c)
-	s.transport = observed
 	h.registerSession(s)
 	log.Printf("outside agent lane connected via %s; active lanes=%d", observed, h.sessionCount())
 	s.run()
@@ -2897,46 +2935,6 @@ func adaptiveTransportCandidates(preferred string) []string {
 	return out
 }
 
-type adaptiveAgentPath struct {
-	Transport string
-	Underlay  string
-}
-
-// adaptiveAgentPathCandidates distributes independent Agent lanes across the
-// Cartesian product of the four authenticated transports and every currently
-// usable egress. The Hub measures authenticated PING/PONG RTT per lane and
-// selects the lowest-latency, least-loaded lane for each new client stream.
-// A lane remembers its last successful pair for reconnects; first startup
-// attempts are staggered so all lanes do not pile onto Direct/TCP.
-func adaptiveAgentPathCandidates(cfg Config, preferredTransport, preferredUnderlay string, channel int) []adaptiveAgentPath {
-	transports := adaptiveTransportCandidates(preferredTransport)
-	underlays := []string{cfg.Underlay}
-	if cfg.Underlay == "" {
-		underlays = []string{underlayDirect}
-	} else if cfg.Underlay == underlayAdaptive {
-		underlays = adaptiveUnderlayCandidates(cfg, preferredUnderlay)
-	}
-	paths := make([]adaptiveAgentPath, 0, len(transports)*len(underlays))
-	for _, underlay := range underlays {
-		for _, transport := range transports {
-			paths = append(paths, adaptiveAgentPath{Transport: transport, Underlay: underlay})
-		}
-	}
-	if len(paths) < 2 {
-		return paths
-	}
-	// Preserve the last successful combination on reconnect. On first boot,
-	// rotate the full matrix by lane number so different lanes test different
-	// transport+egress pairs concurrently.
-	if preferredTransport == "" && preferredUnderlay == "" {
-		offset := (channel - 1) % len(paths)
-		if offset > 0 {
-			paths = append(append([]adaptiveAgentPath(nil), paths[offset:]...), paths[:offset]...)
-		}
-	}
-	return paths
-}
-
 func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
 	// WARP is only a candidate when its client reports a connected MASQUE path.
 	// Other WARP protocols are never selected by adaptive routing.
@@ -2994,62 +2992,62 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 		return connectAndRunAgentWithTransport(cfg, pin, channel, mode)
 	}
 
-	preferredTransport := ""
+	preferredTransport := transportTCP
 	if mode == transportAdaptive {
 		if v, ok := agentPreferredTransport.Load(channel); ok {
-			preferredTransport, _ = v.(string)
-		}
-		if !isAdaptiveTransport(preferredTransport) {
-			preferredTransport = ""
+			if saved, ok := v.(string); ok && isAdaptiveTransport(saved) {
+				preferredTransport = saved
+			}
 		}
 	}
-	preferredUnderlay := ""
-	if v, ok := agentPreferredUnderlay.Load(channel); ok {
-		preferredUnderlay, _ = v.(string)
+	transportCandidates := []string{transportTCP, transportWebSocket}
+	if mode == transportAdaptive {
+		transportCandidates = adaptiveTransportCandidates(preferredTransport)
 	}
+
 	underlay := cfg.Underlay
 	if underlay == "" {
 		underlay = underlayDirect
 	}
-
-	// Adaptive modes evaluate the complete transport/egress matrix. Lanes are
-	// staggered on first startup; Hub's RTT/load scheduler routes each new flow
-	// over the best currently healthy lane. A failed/ended path is followed by
-	// the next candidate, while reconnects prefer that lane's last good pair.
-	paths := make([]adaptiveAgentPath, 0, 4)
-	if mode == transportAdaptive {
-		paths = adaptiveAgentPathCandidates(cfg, preferredTransport, preferredUnderlay, channel)
-	} else {
-		// Legacy auto keeps deterministic TCP -> WebSocket fallback.
-		paths = append(paths,
-			adaptiveAgentPath{Transport: transportTCP, Underlay: underlay},
-			adaptiveAgentPath{Transport: transportWebSocket, Underlay: underlay},
-		)
+	underlayCandidates := []string{underlay}
+	if underlay == underlayAdaptive {
+		preferred := ""
+		if v, ok := agentPreferredUnderlay.Load(channel); ok {
+			preferred, _ = v.(string)
+		}
+		underlayCandidates = adaptiveUnderlayCandidates(cfg, preferred)
 	}
 
+	// A lane exhausts every configured inner transport on one egress path before
+	// switching the egress path. The same authenticated Hub protocol is retained.
 	var lastErr error
-	for i, path := range paths {
-		route := path.Underlay
-		if route == "" {
-			route = underlayDirect
-		}
-		if cfg.Underlay == underlayAdaptive && route == underlayMASQUE {
-			if warpErr := verifyWarpMasqueUnderlay(); warpErr != nil {
+	for routeIndex, route := range underlayCandidates {
+		if cfg.Underlay == underlayAdaptive {
+			var warpErr error
+			switch route {
+			case underlayMASQUE:
+				warpErr = verifyWarpMasqueUnderlay()
+			}
+			if warpErr != nil {
 				lastErr = warpErr
-				log.Printf("tunnel lane %d: WARP egress is unhealthy; skipping %s over %s: %v", channel, path.Transport, route, warpErr)
+				log.Printf("tunnel lane %d: WARP egress %s is unavailable; skipping to the next egress: %v", channel, route, warpErr)
 				continue
 			}
 		}
 		routeCfg := cfg
 		routeCfg.Underlay = route
-		err := connectAndRunAgentWithTransport(routeCfg, pin, channel, path.Transport)
-		if err == nil {
-			return nil
+		for i, candidate := range transportCandidates {
+			err := connectAndRunAgentWithTransport(routeCfg, pin, channel, candidate)
+			if err == nil {
+				return nil
+			}
+			lastErr = err
+			if i < len(transportCandidates)-1 {
+				log.Printf("tunnel lane %d: transport %s failed on %s; trying %s", channel, candidate, route, transportCandidates[i+1])
+			}
 		}
-		lastErr = err
-		if i+1 < len(paths) {
-			next := paths[i+1]
-			log.Printf("tunnel lane %d: path %s over %s failed/ended; trying %s over %s: %v", channel, path.Transport, route, next.Transport, next.Underlay, err)
+		if routeIndex+1 < len(underlayCandidates) {
+			log.Printf("tunnel lane %d: egress path %s exhausted; switching to %s", channel, route, underlayCandidates[routeIndex+1])
 		}
 	}
 	if lastErr == nil {
@@ -3311,7 +3309,7 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 		return nil, fmt.Errorf("tune Psiphon performance profile: %w", tuneErr)
 	} else if tuned {
 		profile := psiphonHostPerformanceProfile()
-		log.Printf("Psiphon: applied concurrency-aware throughput profile (TunnelPoolSize=%d, MeekBufferLimit=%t, RelayBufferLimit=%t, CPUThreadLimit=%t, SSHChannelWindowSize=%d)", profile.TunnelPoolSize, profile.LimitMeekBufferSizes, profile.LimitRelayBufferSizes, profile.LimitCPUThreads, profile.SSHChannelWindowSize)
+		log.Printf("Psiphon: applied resource-aware throughput profile (MeekBufferLimit=%t, RelayBufferLimit=%t, CPUThreadLimit=%t, SSHChannelWindowSize=%d)", profile.LimitMeekBufferSizes, profile.LimitRelayBufferSizes, profile.LimitCPUThreads, profile.SSHChannelWindowSize)
 	}
 	if err := validatePsiphonClientConfig(configPath, cfg.PsiphonProxy); err != nil {
 		return nil, fmt.Errorf("invalid Psiphon client configuration: %w", err)
@@ -3408,11 +3406,7 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 			log.Printf("Psiphon local SOCKS5 listener ready at %s; waiting for a real tunnel (ConsoleClient remains running)", cfg.PsiphonProxy)
 		}
 		if proxyReady && connectedTunnels > 0 {
-			desiredPool := psiphonHostPerformanceProfile().TunnelPoolSize
-			log.Printf("Psiphon ConsoleClient connected (%d/%d configured tunnel(s)); TCP egress uses SOCKS5 %s", connectedTunnels, desiredPool, cfg.PsiphonProxy)
-			if connectedTunnels < desiredPool {
-				log.Printf("Psiphon tunnel pool is under target at startup (%d/%d); the client may add tunnels as capacity becomes available", connectedTunnels, desiredPool)
-			}
+			log.Printf("Psiphon ConsoleClient connected (%d tunnel(s)); TCP egress uses SOCKS5 %s", connectedTunnels, cfg.PsiphonProxy)
 			return func() {
 				cancel()
 				select {
@@ -4755,7 +4749,7 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
 	fmt.Printf("  %s\n", paint(ansiPinkGlow, "7) FULL ADAPTIVE FAILOVER — all 4 implemented transports"))
 	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "8) EXTERNAL EGRESS — Cloudflare MASQUE / Psiphon / Tor"))
-	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) AUTO-QUALITY ADAPTIVE — test all 4 transports + available egress paths; route new streams by live RTT"))
+	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) ALL-PROTOCOL ADAPTIVE — all 4 transports + Direct/Psiphon egress failover"))
 	choice := wizardAsk(prompt+" (1-9)", "7")
 	switch choice {
 	case "1":
@@ -4803,7 +4797,7 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 		}
 	case "9":
 		if role != "agent" {
-			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent to enable live RTT-based path selection and Direct/Psiphon/WARP egress failover.")
+			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent to enable Direct/Psiphon egress failover.")
 			return transportAdaptive, underlayDirect, "", nil
 		}
 		// Option 9 includes Psiphon as an automatically prepared standby egress.
@@ -5064,7 +5058,7 @@ func setup() error {
 			if err = preparePsiphonAgentProfile(&c); err != nil {
 				return fmt.Errorf("automatic Psiphon setup failed; Agent profile was not saved: %w", err)
 			}
-			uiSuccess("Psiphon ConsoleClient installed; per-profile config and loopback SOCKS5 endpoint are configured (the listener starts with the Agent service): " + c.PsiphonProxy)
+			uiSuccess("Psiphon ConsoleClient installed; per-profile config and loopback SOCKS5 endpoint are ready: " + c.PsiphonProxy)
 		}
 		if c.Underlay == underlayTor {
 			uiInfo("Preparing the official Tor Expert Bundle and per-profile Snowflake/WebTunnel SOCKS5 configuration...")
@@ -5078,12 +5072,6 @@ func setup() error {
 			return err
 		}
 		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s; egress=%s.", c.TunnelChannels, c.Transport, c.Underlay))
-		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
-			uiInfo(fmt.Sprintf("Psiphon egress pool: up to %d parallel tunnels based on detected RAM/CPU resources.", psiphonHostPerformanceProfile().TunnelPoolSize))
-		}
-		if c.Transport == transportAdaptive {
-			uiInfo("Adaptive quality selection is active: lanes test different transport/egress pairs; Hub uses fresh RTT and load to choose the best lane for new streams.")
-		}
 		if c.Underlay == underlayMASQUE {
 			uiInfo("This Agent's Xray mappings and DNS use its isolated WARP Local Proxy sidecar; system routes and SSH are untouched.")
 		}
@@ -5131,6 +5119,11 @@ func setup() error {
 			return err
 		}
 	}
+	if c.Role == "agent" && (c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive) {
+		if err := autoApplyXrayPsiphonForNewAgent(); err != nil {
+			return err
+		}
+	}
 	if c.Role == "agent" && c.Underlay == underlayTor {
 		if err := autoApplyXrayTorForNewAgent(); err != nil {
 			if rollbackErr := rollbackFailedTorAgentSetup(configPath, c); rollbackErr != nil {
@@ -5141,12 +5134,12 @@ func setup() error {
 	}
 	fmt.Printf("\n  %s %s\n", paint(ansiGreen+ansiBold, "✓"), "Configuration saved: "+configPath)
 	uiInfo("Enabling the independent service and automatic startup after VPS reboot…")
-	connected, startErr := ensureSelectedTunnelRunningWithPsiphon(true)
+	connected, startErr := ensureTunnelRunning(true)
 	if startErr != nil {
-		return fmt.Errorf("configuration was saved, but automatic startup/egress setup failed: %w", startErr)
+		return fmt.Errorf("configuration was saved, but automatic startup failed: %w", startErr)
 	}
-	if (c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive) && !connected {
-		uiInfo("Psiphon egress is established and the per-tunnel Xray route is configured. The Agent-to-Hub lane is not yet confirmed; check Status & Logs while it reconnects.")
+	if c.Underlay == underlayPsiphon && !connected {
+		uiInfo("Agent service and local Psiphon SOCKS5 are running. Psiphon egress and/or the Agent-to-Hub lane may still be connecting; end-to-end connectivity is not yet confirmed.")
 	} else {
 		uiSuccess("Tunnel '" + name + "' is active. Existing tunnels were not changed.")
 	}
@@ -5229,53 +5222,20 @@ func ensureTunnelRunning(restartActive bool) (bool, error) {
 	// continue its own retries rather than reporting a false install failure.
 	if data, readErr := os.ReadFile(configPath); readErr == nil {
 		var selected Config
-		if json.Unmarshal(data, &selected) == nil && selected.Role == "agent" && (selected.Underlay == underlayPsiphon || (selected.Underlay == underlayAdaptive && strings.TrimSpace(selected.PsiphonConfig) != "")) && serviceWasStarted {
-			ready, waitErr := waitForPsiphonAgentReady(service, serviceStartTime, 110*time.Second)
+		if json.Unmarshal(data, &selected) == nil && selected.Role == "agent" && selected.Underlay == underlayPsiphon && serviceWasStarted {
+			ready, waitErr := waitForPsiphonAgentReady(service, serviceStartTime, 100*time.Second)
 			if waitErr != nil {
 				showRecentLogs(55)
 				return false, fmt.Errorf("Psiphon Agent startup failed: %w", waitErr)
 			}
 			psiphonTunnelReady = ready
 			if !ready {
-				fmt.Println("Psiphon egress is established, but an Agent-to-Hub lane is not yet confirmed. The service remains running and will keep reconnecting.")
+				fmt.Println("Psiphon SOCKS5 is running locally; its first external tunnel is still connecting. ConsoleClient remains running and will retry. This is NOT yet a connected Agent lane.")
 			}
 		}
 	}
 	fmt.Printf("Tunnel service %s is active; automatic startup at boot is enabled.\n", service)
 	return psiphonTunnelReady, nil
-}
-
-// ensureSelectedTunnelRunningWithPsiphon fixes the startup order for Psiphon egress:
-// the Agent service owns the Psiphon ConsoleClient child process, so that service
-// must be started and its real Psiphon tunnel verified before Xray can use SOCKS5.
-// It also repairs profiles saved by older builds that exited before this step.
-func ensureSelectedTunnelRunningWithPsiphon(restartActive bool) (bool, error) {
-	cfg, err := loadConfig()
-	if err != nil {
-		return false, err
-	}
-	needsPsiphonXray := cfg.Role == "agent" &&
-		(cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayAdaptive) &&
-		strings.TrimSpace(cfg.PsiphonConfig) != "" && cfg.XrayPsiphon == nil
-	// When an older setup left the integration unfinished, deliberately restart
-	// this profile once so the ConsoleClient child starts and readiness is verified.
-	connected, err := ensureTunnelRunning(restartActive || needsPsiphonXray)
-	if err != nil {
-		return false, err
-	}
-	if !needsPsiphonXray {
-		return connected, nil
-	}
-	if err := autoApplyXrayPsiphonForNewAgent(); err != nil {
-		return false, fmt.Errorf("Agent/Psiphon service is running, but automatic per-tunnel Psiphon user-egress setup failed: %w", err)
-	}
-	// The profile's mapping targets have changed to the private Xray sidecar.
-	// Restart only this Agent profile so its listeners reload the new targets.
-	connected, err = ensureTunnelRunning(true)
-	if err != nil {
-		return false, fmt.Errorf("Psiphon Xray egress was prepared, but the Agent did not restart cleanly: %w", err)
-	}
-	return connected, nil
 }
 
 func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.Duration) (bool, error) {
@@ -5289,25 +5249,22 @@ func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.
 		logText := string(logs)
 		psiphonReady := strings.Contains(logText, "Psiphon ConsoleClient connected")
 		agentLaneReady := false
-		psiphonAgentLaneReady := false
+		proxyReady := strings.Contains(logText, "Psiphon local SOCKS5 listener ready")
 		for _, line := range strings.Split(logText, "\n") {
-			if strings.Contains(line, "tunnel lane ") && strings.Contains(line, " connected via ") {
+			if strings.Contains(line, "tunnel lane ") && strings.Contains(line, " connected via ") && strings.Contains(line, " over psiphon_socks5") {
 				agentLaneReady = true
-				if strings.Contains(line, " over psiphon_socks5") {
-					psiphonAgentLaneReady = true
-				}
+				break
 			}
 		}
-		selected, _ := loadConfig()
-		psiphonAgentLaneReady = selected.Underlay == underlayAdaptive && agentLaneReady || selected.Underlay != underlayAdaptive && psiphonAgentLaneReady
-		if psiphonReady && exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
-			// A live Psiphon tunnel is enough to configure the isolated Xray route.
-			// The boolean separately reports whether an Agent-to-Hub lane is already up.
-			return psiphonAgentLaneReady, nil
+		if psiphonReady && agentLaneReady && exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
+			return true, nil
+		}
+		if proxyReady && exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
+			return false, nil
 		}
 		time.Sleep(time.Second)
 	}
-	return false, fmt.Errorf("service %s did not establish Psiphon egress and a connected Agent lane within %s", service, timeout)
+	return false, fmt.Errorf("service %s did not start its local Psiphon SOCKS5 listener within %s", service, timeout)
 }
 
 func showRecentLogs(n int) {
@@ -5343,9 +5300,11 @@ func showStatusAndLogs() error {
 }
 
 const (
-	restartScheduleDir    = "/etc/shah-tunnel/restart-profiles"
-	restartScheduleScript = "/usr/local/sbin/shah-tunnel-restart-check-"
-	restartScheduleCron   = "/etc/cron.d/shah-tunnel-restart-"
+	restartScheduleDir    = "/etc/shah-tunnel"
+	restartScheduleConfig = "/etc/shah-tunnel/restart.conf"
+	restartScheduleState  = "/var/lib/shah-tunnel/last-restart"
+	restartCronFile       = "/etc/cron.d/shah-tunnel-restart"
+	restartCronScript     = "/usr/local/sbin/shah-tunnel-restart-check"
 )
 
 type restartInterval struct {
@@ -5361,42 +5320,12 @@ var restartIntervals = []restartInterval{
 	{label: "10 hours", seconds: int64(10 * time.Hour / time.Second)},
 }
 
-type profileRestartPaths struct {
-	id, service, config, state, cron, script, lock string
-}
-
-func restartPathsForService(service string) (profileRestartPaths, error) {
-	service = strings.TrimSpace(service)
-	id := "legacy"
-	if service == "ravanreverse" || service == "ravanreverse.service" {
-		service = "ravanreverse"
-	} else if strings.HasPrefix(service, "ravanreverse@") {
-		id = strings.TrimSuffix(strings.TrimPrefix(service, "ravanreverse@"), ".service")
-		if id == "" || !regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`).MatchString(id) {
-			return profileRestartPaths{}, errors.New("invalid ShahTunnel profile service name")
-		}
-		service = "ravanreverse@" + id + ".service"
-	} else {
-		return profileRestartPaths{}, errors.New("refusing to schedule a non-ShahTunnel service")
-	}
-	return profileRestartPaths{
-		id: id, service: service,
-		config: filepath.Join(restartScheduleDir, id+".conf"),
-		state:  filepath.Join(restartScheduleDir, id+".state"),
-		cron:   restartScheduleCron + id,
-		script: restartScheduleScript + id,
-		lock:   "/run/lock/shah-tunnel-restart-" + id + ".lock",
-	}, nil
-}
-
-func restartCronScriptForProfile(p profileRestartPaths) string {
-	return fmt.Sprintf(`#!/usr/bin/env bash
+const restartCronScriptBody = `#!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-CONFIG=%q
-STATE=%q
-LOCK=%q
-SERVICE=%q
+CONFIG="/etc/shah-tunnel/restart.conf"
+STATE="/var/lib/shah-tunnel/last-restart"
+LOCK="/run/lock/shah-tunnel-restart.lock"
 [[ -r "$CONFIG" ]] || exit 0
 IFS= read -r INTERVAL < "$CONFIG" || exit 0
 [[ "$INTERVAL" =~ ^[0-9]+$ ]] || exit 0
@@ -5404,32 +5333,37 @@ IFS= read -r INTERVAL < "$CONFIG" || exit 0
 command -v flock >/dev/null 2>&1 || exit 0
 exec 9>"$LOCK"
 flock -n 9 || exit 0
-NOW="$(date +%%s)"
+NOW="$(date +%s)"
 LAST=""
-if [[ -r "$STATE" ]]; then IFS= read -r LAST < "$STATE" || LAST=""; fi
+if [[ -r "$STATE" ]]; then
+  IFS= read -r LAST < "$STATE" || LAST=""
+fi
 if [[ ! "$LAST" =~ ^[0-9]+$ ]] || (( NOW < LAST )); then
-  printf '%%s\n' "$NOW" > "${STATE}.tmp"
+  LAST="$NOW"
+  printf '%s\n' "$LAST" > "${STATE}.tmp"
   mv -f "${STATE}.tmp" "$STATE"
   exit 0
 fi
 (( NOW - LAST >= INTERVAL )) || exit 0
-if systemctl is-active --quiet "$SERVICE"; then
-  if systemctl restart "$SERVICE"; then
-    printf '%%s\n' "$NOW" > "${STATE}.tmp"
-    mv -f "${STATE}.tmp" "$STATE"
-    logger -t shah-tunnel-restart "Restarted only $SERVICE at configured interval (${INTERVAL}s)." 2>/dev/null || true
-  else
-    logger -t shah-tunnel-restart "Scheduled restart failed for $SERVICE; retrying next minute." 2>/dev/null || true
-    exit 1
-  fi
-else
-  # Do not start stopped profiles as a side effect of a restart schedule.
-  printf '%%s\n' "$NOW" > "${STATE}.tmp"
-  mv -f "${STATE}.tmp" "$STATE"
+RESTART_FAILED=0
+if systemctl is-active --quiet ravanreverse; then
+  systemctl restart ravanreverse || RESTART_FAILED=1
 fi
-`, p.config, p.state, p.lock, p.service)
-}
+while read -r UNIT; do
+  [[ -n "$UNIT" ]] || continue
+  systemctl restart "$UNIT" || RESTART_FAILED=1
+done < <(systemctl list-units --type=service --state=active --no-legend --no-pager 'ravanreverse@*.service' 2>/dev/null | awk '{print $1}')
+if (( RESTART_FAILED == 0 )); then
+  printf '%s\n' "$NOW" > "${STATE}.tmp"
+  mv -f "${STATE}.tmp" "$STATE"
+  logger -t shah-tunnel-restart "Shah Tunnel restarted by its configured interval (${INTERVAL}s)." 2>/dev/null || true
+else
+  logger -t shah-tunnel-restart "Scheduled Shah Tunnel restart failed; it will be retried next minute." 2>/dev/null || true
+  exit 1
+fi
+`
 
+// atomicWriteFile writes a root-owned schedule file by replacing it atomically.
 func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
@@ -5449,72 +5383,56 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
-func removeProfileRestartSchedule(p profileRestartPaths) error {
-	for _, path := range []string{p.cron, p.script, p.config, p.state, p.config + ".tmp", p.state + ".tmp", p.cron + ".tmp", p.script + ".tmp"} {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	_ = os.Remove(restartScheduleDir)
-	return nil
-}
-
 func removeRestartScheduleFiles() error {
-	// Remove only files owned by ShahTunnel's scheduler. Never edit user crontabs
-	// or unrelated /etc/cron.d entries.
-	for _, path := range []string{"/etc/cron.d/shah-tunnel-restart", "/usr/local/sbin/shah-tunnel-restart-check", "/etc/shah-tunnel/restart.conf", "/var/lib/shah-tunnel/last-restart"} {
+	for _, path := range []string{restartCronFile, restartCronScript, restartScheduleConfig, restartScheduleState, restartScheduleConfig + ".tmp", restartScheduleState + ".tmp", restartCronFile + ".tmp", restartCronScript + ".tmp"} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
-	for _, prefixDir := range []struct{ dir, prefix string }{
-		{"/etc/cron.d", "shah-tunnel-restart-"},
-		{"/usr/local/sbin", "shah-tunnel-restart-check-"},
-		{restartScheduleDir, ""},
-	} {
-		entries, err := os.ReadDir(prefixDir.dir)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
+	for _, dir := range []string{restartScheduleDir, "/var/lib/shah-tunnel"} {
+		if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) {
 			return err
 		}
-		for _, entry := range entries {
-			if prefixDir.prefix == "" || strings.HasPrefix(entry.Name(), prefixDir.prefix) {
-				if err := os.Remove(filepath.Join(prefixDir.dir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
-					return err
-				}
-			}
-		}
 	}
-	_ = os.Remove(restartScheduleDir)
 	return nil
 }
 
-func restartScheduleStatusForProfile(p profileRestartPaths) string {
-	data, err := os.ReadFile(p.config)
+func restartScheduleStatus() string {
+	data, err := os.ReadFile(restartScheduleConfig)
 	if err != nil {
-		return "No scheduled restart for this profile"
+		return "No scheduled restart"
 	}
-	cronEntry, err := os.ReadFile(p.cron)
-	if err != nil || !strings.Contains(string(cronEntry), p.script) {
-		return "Incomplete: this profile's cron entry is missing"
+	cronEntry, err := os.ReadFile(restartCronFile)
+	if err != nil || !strings.Contains(string(cronEntry), restartCronScript) {
+		return "Incomplete: cron entry is missing or invalid"
 	}
-	checker, err := os.ReadFile(p.script)
-	if err != nil || !strings.Contains(string(checker), p.service) {
-		return "Incomplete: this profile's checker is invalid"
+	checker, err := os.ReadFile(restartCronScript)
+	if err != nil || !strings.Contains(string(checker), "ravanreverse@*.service") {
+		return "Incomplete: restart checker is missing or invalid"
 	}
-	if _, err := os.ReadFile(p.state); err != nil {
-		return "Incomplete: this profile's timer state is missing"
+	state, err := os.ReadFile(restartScheduleState)
+	if err != nil {
+		return "Incomplete: timer state is missing"
+	}
+	if _, err := strconv.ParseInt(strings.TrimSpace(string(state)), 10, 64); err != nil {
+		return "Incomplete: timer state is invalid"
+	}
+	if _, err := exec.LookPath("flock"); err != nil {
+		return "Configured, but flock is missing"
+	}
+	cronActive := false
+	for _, candidate := range []string{"cron.service", "crond.service"} {
+		if exec.Command("systemctl", "is-active", "--quiet", candidate).Run() == nil {
+			cronActive = true
+			break
+		}
+	}
+	if !cronActive {
+		return "Files configured, but cron daemon is inactive"
 	}
 	seconds, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
 	if err != nil || seconds <= 0 {
 		return "Schedule file is invalid"
-	}
-	cronActive := exec.Command("systemctl", "is-active", "--quiet", "cron.service").Run() == nil ||
-		exec.Command("systemctl", "is-active", "--quiet", "crond.service").Run() == nil
-	if !cronActive {
-		return fmt.Sprintf("Every %s (cron daemon inactive)", time.Duration(seconds)*time.Second)
 	}
 	for _, interval := range restartIntervals {
 		if seconds == interval.seconds {
@@ -5524,9 +5442,12 @@ func restartScheduleStatusForProfile(p profileRestartPaths) string {
 	return fmt.Sprintf("Every %s (cron active)", time.Duration(seconds)*time.Second)
 }
 
-func setRestartScheduleForProfile(p profileRestartPaths, interval restartInterval) error {
+func setRestartSchedule(interval restartInterval) error {
 	if !isRoot() {
 		return errors.New("run as root")
+	}
+	if _, err := os.Stat("/etc/systemd/system/ravanreverse.service"); err != nil {
+		return errors.New("Shah Tunnel is not installed; install it before setting a restart schedule")
 	}
 	if _, err := os.Stat("/etc/cron.d"); err != nil {
 		return errors.New("/etc/cron.d is unavailable; this scheduler supports Debian/Ubuntu-style cron")
@@ -5554,21 +5475,21 @@ func setRestartScheduleForProfile(p profileRestartPaths, interval restartInterva
 			return fmt.Errorf("could not start cron daemon: %w: %s", err, strings.TrimSpace(string(out)))
 		}
 	}
-	if err := atomicWriteFile(p.state, []byte(strconv.FormatInt(time.Now().Unix(), 10)+"\n"), 0600); err != nil {
-		return fmt.Errorf("initialize profile timer: %w", err)
+	if err := atomicWriteFile(restartScheduleState, []byte(strconv.FormatInt(time.Now().Unix(), 10)+"\n"), 0600); err != nil {
+		return fmt.Errorf("initialize schedule timer: %w", err)
 	}
-	if err := atomicWriteFile(p.config, []byte(strconv.FormatInt(interval.seconds, 10)+"\n"), 0600); err != nil {
-		return fmt.Errorf("write profile schedule: %w", err)
+	if err := atomicWriteFile(restartScheduleConfig, []byte(strconv.FormatInt(interval.seconds, 10)+"\n"), 0600); err != nil {
+		return fmt.Errorf("write schedule configuration: %w", err)
 	}
-	if err := atomicWriteFile(p.script, []byte(restartCronScriptForProfile(p)), 0750); err != nil {
-		return fmt.Errorf("write profile restart checker: %w", err)
+	if err := atomicWriteFile(restartCronScript, []byte(restartCronScriptBody), 0750); err != nil {
+		return fmt.Errorf("write restart checker: %w", err)
 	}
-	cron := "SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n* * * * * root " + p.script + " >/dev/null 2>&1\n"
-	if err := atomicWriteFile(p.cron, []byte(cron), 0644); err != nil {
-		return fmt.Errorf("write profile cron entry: %w", err)
+	cron := "SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n* * * * * root " + restartCronScript + " >/dev/null 2>&1\n"
+	if err := atomicWriteFile(restartCronFile, []byte(cron), 0644); err != nil {
+		return fmt.Errorf("write cron entry: %w", err)
 	}
-	fmt.Printf("\n  ✓ Scheduled restart enabled for %s only: every %s.\n", p.service, interval.label)
-	fmt.Println("  Warning: scheduled restarts interrupt this profile's active connections; other profiles are untouched.")
+	fmt.Printf("\n  ✓ Scheduled restart enabled: every %s. The first restart is after the selected interval.\n", interval.label)
+	fmt.Println("  Warning: each scheduled restart interrupts active tunnel connections; cron timing is accurate to about one minute.")
 	return nil
 }
 
@@ -5576,34 +5497,26 @@ func manageRestartSchedule() error {
 	if !ensureRoot() {
 		return errors.New("root permissions are required")
 	}
-	if !chooseTunnel("Select the tunnel/profile whose Cron Job you want to configure") {
-		return nil
-	}
-	p, err := restartPathsForService(currentServiceName())
-	if err != nil {
-		return err
-	}
 	for {
 		uiRule()
-		fmt.Println(paint(ansiCyan+ansiBold, "  PER-PROFILE CRON JOB / SCHEDULED RESTART"))
-		fmt.Printf("  PROFILE: %s\n", paint(ansiYellow, p.service))
-		fmt.Printf("  %s %s\n", paint(ansiDim, "CURRENT"), paint(ansiYellow, restartScheduleStatusForProfile(p)))
-		fmt.Println("  [1]  Restart this profile every 15 minutes")
-		fmt.Println("  [2]  Restart this profile every 30 minutes")
-		fmt.Println("  [3]  Restart this profile every 50 minutes")
-		fmt.Println("  [4]  Restart this profile every 2 hours")
-		fmt.Println("  [5]  Restart this profile every 10 hours")
-		fmt.Println("  [6]  Remove this profile's scheduled restart only")
+		fmt.Println(paint(ansiCyan+ansiBold, "  CRON JOB / SCHEDULED RESTART"))
+		fmt.Printf("  %s %s\n", paint(ansiDim, "CURRENT"), paint(ansiYellow, restartScheduleStatus()))
+		fmt.Println("  [1]  Restart every 15 minutes")
+		fmt.Println("  [2]  Restart every 30 minutes")
+		fmt.Println("  [3]  Restart every 50 minutes")
+		fmt.Println("  [4]  Restart every 2 hours")
+		fmt.Println("  [5]  Restart every 10 hours")
+		fmt.Println("  [6]  Remove scheduled restart")
 		fmt.Println("  [0]  Back to main menu")
 		choice := ask("Select a schedule", "0")
 		if choice == "0" {
 			return nil
 		}
 		if choice == "6" {
-			if err := removeProfileRestartSchedule(p); err != nil {
-				return fmt.Errorf("remove profile schedule: %w", err)
+			if err := removeRestartScheduleFiles(); err != nil {
+				return fmt.Errorf("remove schedule: %w", err)
 			}
-			fmt.Printf("Scheduled restart removed for %s only. Other profiles and cron jobs were not changed.\n", p.service)
+			fmt.Println("Scheduled restart removed. Shah Tunnel will no longer be restarted by this cron job.")
 			continue
 		}
 		idx, err := strconv.Atoi(choice)
@@ -5611,7 +5524,7 @@ func manageRestartSchedule() error {
 			fmt.Println("Invalid selection.")
 			continue
 		}
-		if err := setRestartScheduleForProfile(p, restartIntervals[idx-1]); err != nil {
+		if err := setRestartSchedule(restartIntervals[idx-1]); err != nil {
 			return err
 		}
 	}
@@ -5727,7 +5640,7 @@ const serverGeoCachePath = "/etc/ravanreverse/server-info-v2.json"
 const (
 	geoFailureRetryInterval = 45 * time.Second
 	geoCacheTTL             = 6 * time.Hour
-	geoRequestTimeout       = 2200 * time.Millisecond
+	geoRequestTimeout       = 5 * time.Second
 )
 
 func normalizeServerGeo(g ServerGeo) ServerGeo {
@@ -5796,20 +5709,6 @@ func isPublicIPv4(ip net.IP) bool {
 		return false
 	}
 	return true
-}
-
-// isPublicGeoIP accepts globally routable IPv4 or IPv6 addresses for explicit
-// IP-geolocation lookups. IPv4 retains the stricter special-range filtering
-// above; IPv6 rejects local, private, multicast and non-global addresses.
-func isPublicGeoIP(ip net.IP) bool {
-	if ip == nil {
-		return false
-	}
-	if ip.To4() != nil {
-		return isPublicIPv4(ip)
-	}
-	return ip.To16() != nil && ip.IsGlobalUnicast() && !ip.IsPrivate() &&
-		!ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsUnspecified() && !ip.IsMulticast()
 }
 
 // detectAssignedPublicIPv4 finds an IPv4 assigned directly to the active route
@@ -5941,19 +5840,19 @@ func parseGeoResponse(body []byte, expectedIP string) (ServerGeo, bool) {
 	}
 	if expectedIP != "" {
 		expected := net.ParseIP(expectedIP)
-		if !isPublicGeoIP(expected) {
+		if expected == nil || expected.To4() == nil {
 			return zero, false
 		}
 		if returnedIP != "" {
 			got := net.ParseIP(returnedIP)
-			if !isPublicGeoIP(got) || !got.Equal(expected) {
+			if got == nil || got.To4() == nil || !got.To4().Equal(expected.To4()) {
 				return zero, false
 			}
 		}
-		returnedIP = expected.String()
+		returnedIP = expected.To4().String()
 	}
 	parsedIP := net.ParseIP(returnedIP)
-	if !isPublicGeoIP(parsedIP) {
+	if !isPublicIPv4(parsedIP) {
 		return zero, false
 	}
 
@@ -5981,7 +5880,7 @@ func parseGeoResponse(body []byte, expectedIP string) (ServerGeo, bool) {
 	if strings.EqualFold(country, "Unknown") {
 		code = ""
 	}
-	return ServerGeo{IP: parsedIP.String(), Country: country, CountryCode: code, UpdatedAt: time.Now(), Valid: true}, true
+	return ServerGeo{IP: parsedIP.To4().String(), Country: country, CountryCode: code, UpdatedAt: time.Now(), Valid: true}, true
 }
 
 func isAlphaCountryCode(s string) bool {
@@ -6019,7 +5918,7 @@ func lookupGeoURLs(urls []string, expectedIP string, returnIPOnly bool) (ServerG
 	var zero ServerGeo
 	client := geoHTTPClient(geoRequestTimeout)
 	defer client.CloseIdleConnections()
-	ctx, cancel := context.WithTimeout(context.Background(), 2600*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 	defer cancel()
 	type answer struct {
 		geo ServerGeo
@@ -6072,7 +5971,7 @@ func detectPublicIPv4FromAPIs() string {
 	}
 	client := geoHTTPClient(geoRequestTimeout)
 	defer client.CloseIdleConnections()
-	ctx, cancel := context.WithTimeout(context.Background(), 2600*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 	defer cancel()
 	type answer struct{ ip string }
 	results := make(chan answer, len(urls))
@@ -6114,28 +6013,14 @@ func detectPublicIPv4FromAPIs() string {
 	return ""
 }
 
-func lookupCountryForPublicIP(ip string) (ServerGeo, bool) {
-	parsed := net.ParseIP(strings.TrimSpace(ip))
-	if !isPublicGeoIP(parsed) {
-		return ServerGeo{}, false
-	}
-	urls := []string{
-		"https://ipapi.co/" + parsed.String() + "/json/",
-		"https://ipwho.is/" + parsed.String(),
-		"https://api.ip.sb/geoip/" + parsed.String(),
-		"https://ipinfo.io/" + parsed.String() + "/json",
-		"https://free.freeipapi.com/api/v1/json/" + parsed.String(),
-		"https://api.country.is/" + parsed.String(),
-	}
-	return lookupGeoURLs(urls, parsed.String(), false)
-}
-
 func lookupCountryForIPv4(ip string) (ServerGeo, bool) {
-	parsed := net.ParseIP(strings.TrimSpace(ip))
-	if parsed == nil || parsed.To4() == nil {
-		return ServerGeo{}, false
+	urls := []string{
+		"https://ipapi.co/" + ip + "/json/",
+		"https://ipwho.is/" + ip,
+		"https://api.ip.sb/geoip/" + ip,
+		"https://ipinfo.io/" + ip + "/json",
 	}
-	return lookupCountryForPublicIP(parsed.To4().String())
+	return lookupGeoURLs(urls, ip, false)
 }
 
 func lookupCombinedServerGeo() (ServerGeo, bool) {
@@ -6291,7 +6176,7 @@ func menu() {
 			err = setup()
 		case "2":
 			if chooseTunnel("Select the tunnel to start (number or name)") {
-				_, err = ensureSelectedTunnelRunningWithPsiphon(false)
+				_, err = ensureTunnelRunning(false)
 			}
 		case "3":
 			if chooseTunnel("Select the tunnel to stop (number or name)") {
@@ -6303,7 +6188,7 @@ func menu() {
 			}
 		case "4":
 			if chooseTunnel("Select the tunnel to restart (number or name)") {
-				_, err = ensureSelectedTunnelRunningWithPsiphon(true)
+				_, err = ensureTunnelRunning(true)
 			}
 		case "5":
 			if chooseTunnel("Select the tunnel to inspect (number or name)") {

@@ -86,9 +86,8 @@ type psiphonClientConfig struct {
 	LimitRelayBufferSizes       bool   `json:"LimitRelayBufferSizes"`
 	SSHChannelWindowSize        *int   `json:"SSHChannelWindowSize,omitempty"`
 	ConnectionWorkerPoolMaxSize int    `json:"ConnectionWorkerPoolMaxSize,omitempty"`
-	// TunnelPoolSize controls independent Psiphon tunnels carrying multiplexed
-	// port-forward streams. Psiphon's upstream default is 1; ShahTunnel selects
-	// a resource-aware pool size for concurrent multi-user mappings.
+	// TunnelPoolSize is the number of independent Psiphon tunnels carrying
+	// multiplexed port-forward streams. Upstream defaults to one.
 	TunnelPoolSize        int  `json:"TunnelPoolSize,omitempty"`
 	EmitDiagnosticNotices bool `json:"EmitDiagnosticNotices,omitempty"`
 }
@@ -128,11 +127,10 @@ func psiphonPerformanceProfileForHost(totalRAMBytes uint64, cpuCount int) psipho
 		// window (512 KiB) improves throughput on high-RTT paths when RAM allows.
 		windowSize = 4
 	}
-	// Psiphon's upstream TunnelPoolSize defaults to one. That is a useful
-	// single-user default but becomes a shared bottleneck when many Xray users
-	// are multiplexed over one SOCKS endpoint. Scale the number of parallel
-	// Psiphon tunnels conservatively with available RAM and CPU; never exceed
-	// 16 in ShahTunnel even though upstream supports a larger maximum.
+	// Psiphon's upstream TunnelPoolSize defaults to one. Scale conservatively
+	// with RAM and CPU so a single SOCKS endpoint is not forced through one
+	// long-lived Psiphon tunnel. This does not manufacture bandwidth; it exposes
+	// independent relays when the Psiphon network and VPS have capacity.
 	tunnelPoolSize := 2
 	if cpuCount >= 2 && totalRAMBytes >= 2<<30 {
 		tunnelPoolSize = 4
@@ -178,19 +176,14 @@ func psiphonHostPerformanceProfile() psiphonPerformanceProfile {
 	return psiphonPerformanceProfileForHost(totalRAM, runtime.NumCPU())
 }
 
-// Psiphon region policy: US is intentionally absent and rejected at every
-// config-validation boundary. Psiphon may not have capacity in every region;
-// EgressRegion is a preference, so live egress country is verified separately.
+// Psiphon region preferences intentionally exclude the United States.
+// A requested region is only a preference; the live exit country is verified
+// independently before Xray user egress is enabled.
 var psiphonAllowedEgressRegions = map[string]bool{
 	"AE": true, "TR": true, "DE": true, "RS": true, "RO": true,
 	"BG": true, "GR": true, "GE": true, "AM": true, "AZ": true,
 	"NL": true, "CH": true, "AT": true, "PL": true, "CZ": true,
 	"SK": true, "HU": true, "FR": true, "SE": true, "FI": true,
-}
-
-var psiphonPreferredEgressRegions = []string{
-	"AE", "TR", "DE", "RS", "RO", "BG", "GR", "GE", "AM", "AZ",
-	"NL", "CH", "AT", "PL", "CZ", "SK", "HU", "FR", "SE", "FI",
 }
 
 func normalizePsiphonEgressRegion(region string) (string, error) {
@@ -437,16 +430,16 @@ func psiphonBootstrapNeedsMigration(cfg psiphonClientConfig) bool {
 	if !isUsablePsiphonClientID(cfg.PropagationChannelID) || !isUsablePsiphonClientID(cfg.SponsorID) {
 		return true
 	}
-	if strings.TrimSpace(cfg.EgressRegion) == "" {
-		return true
-	}
-	if _, err := normalizePsiphonEgressRegion(cfg.EgressRegion); err != nil {
-		return true
-	}
 	if _, err := strconv.Atoi(strings.TrimSpace(cfg.ClientVersion)); err != nil {
 		return true
 	}
 	if cfg.DisableLocalSocksProxy || cfg.UseUnixDomainSockets || !cfg.EmitDiagnosticNotices || cfg.ConnectionWorkerPoolMaxSize != 0 {
+		return true
+	}
+	if cfg.TunnelPoolSize < 1 || cfg.TunnelPoolSize > 16 {
+		return true
+	}
+	if _, err := normalizePsiphonEgressRegion(cfg.EgressRegion); err != nil {
 		return true
 	}
 	keysIncomplete := strings.TrimSpace(cfg.RemoteServerListSignaturePublicKey) == "" ||
@@ -460,7 +453,7 @@ func psiphonBootstrapNeedsMigration(cfg psiphonClientConfig) bool {
 
 // repairLegacyPsiphonClientConfig upgrades incomplete legacy bootstraps from
 // older ShahTunnel builds. It also recognizes the deprecated scalar URL
-// layout. Valid custom identities and approved non-US region preferences are preserved; blank, US, and unsupported regions are replaced with Germany.
+// layout. Valid custom identities and region preferences are preserved.
 func repairLegacyPsiphonClientConfig(configPath, proxyAddress string) (bool, error) {
 	if !isLoopbackProxyAddress(proxyAddress) {
 		return false, errors.New("Psiphon SOCKS5 proxy must be loopback-only")
@@ -487,8 +480,6 @@ func repairLegacyPsiphonClientConfig(configPath, proxyAddress string) (bool, err
 	upgraded := newPsiphonClientConfig(port)
 	if region, regionErr := normalizePsiphonEgressRegion(current.EgressRegion); regionErr == nil {
 		upgraded.EgressRegion = region
-	} else {
-		upgraded.EgressRegion = "DE"
 	}
 	upgraded.TargetServerEntry = current.TargetServerEntry
 	if isUsablePsiphonClientID(current.PropagationChannelID) {
@@ -629,13 +620,6 @@ func validatePsiphonClientConfig(configPath, proxyAddress string) error {
 	}
 	_, portText, _ := net.SplitHostPort(proxyAddress)
 	port, _ := strconv.Atoi(portText)
-	normalizedRegion, regionErr := normalizePsiphonEgressRegion(cfg.EgressRegion)
-	if regionErr != nil {
-		return regionErr
-	}
-	if cfg.EgressRegion != normalizedRegion {
-		return errors.New("Psiphon config must contain an explicit approved non-US EgressRegion; refusing an unrestricted region")
-	}
 	if cfg.LocalSocksProxyPort != port {
 		return fmt.Errorf("Psiphon config SOCKS5 port %d does not match proxy %s", cfg.LocalSocksProxyPort, proxyAddress)
 	}
@@ -645,6 +629,12 @@ func validatePsiphonClientConfig(configPath, proxyAddress string) error {
 	if cfg.UseUnixDomainSockets {
 		return errors.New("Psiphon config must use a loopback TCP SOCKS5 listener")
 	}
+	if _, err := normalizePsiphonEgressRegion(cfg.EgressRegion); err != nil {
+		return err
+	}
+	if cfg.TunnelPoolSize < 1 || cfg.TunnelPoolSize > 16 {
+		return fmt.Errorf("invalid Psiphon TunnelPoolSize %d (valid range is 1-16)", cfg.TunnelPoolSize)
+	}
 	if !isUsablePsiphonClientID(cfg.PropagationChannelID) || !isUsablePsiphonClientID(cfg.SponsorID) || cfg.ClientVersion == "" {
 		return errors.New("Psiphon client identity/bootstrap configuration is incomplete or contains placeholder IDs")
 	}
@@ -653,9 +643,6 @@ func validatePsiphonClientConfig(configPath, proxyAddress string) error {
 	}
 	if cfg.SSHChannelWindowSize != nil && (*cfg.SSHChannelWindowSize < 1 || *cfg.SSHChannelWindowSize > 128) {
 		return fmt.Errorf("invalid Psiphon SSHChannelWindowSize %d (valid range is 1-128)", *cfg.SSHChannelWindowSize)
-	}
-	if cfg.TunnelPoolSize < 1 || cfg.TunnelPoolSize > 32 {
-		return fmt.Errorf("invalid Psiphon TunnelPoolSize %d (valid range is 1-32)", cfg.TunnelPoolSize)
 	}
 	decodeKey := func(name, value string, minBytes, exactBytes int) error {
 		decoded, err := base64.StdEncoding.DecodeString(value)
