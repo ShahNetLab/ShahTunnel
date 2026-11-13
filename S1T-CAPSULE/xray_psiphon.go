@@ -329,8 +329,8 @@ func applyXrayPsiphonEgress(restartAgent, confirm bool) error {
 		return errors.New("Agent config does not contain a valid loopback Psiphon SOCKS5 endpoint")
 	}
 	{
-		if err := probeSOCKS5(proxy, 2*time.Second); err != nil {
-			return fmt.Errorf("Psiphon SOCKS5 is not ready at %s: %w; start the Agent/Psiphon service first", proxy, err)
+		if err := waitForPsiphonProxy(proxy, 30*time.Second); err != nil {
+			return fmt.Errorf("Psiphon SOCKS5 did not become ready at %s: %w; the selected Agent service must be active", proxy, err)
 		}
 		ip, err := psiphonPublicEgressIP(proxy, 12*time.Second)
 		if err != nil {

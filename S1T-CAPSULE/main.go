@@ -5060,7 +5060,7 @@ func setup() error {
 			if err = preparePsiphonAgentProfile(&c); err != nil {
 				return fmt.Errorf("automatic Psiphon setup failed; Agent profile was not saved: %w", err)
 			}
-			uiSuccess("Psiphon ConsoleClient installed; per-profile config and loopback SOCKS5 endpoint are ready: " + c.PsiphonProxy)
+			uiSuccess("Psiphon ConsoleClient installed; per-profile config and loopback SOCKS5 endpoint are configured (the listener starts with the Agent service): " + c.PsiphonProxy)
 		}
 		if c.Underlay == underlayTor {
 			uiInfo("Preparing the official Tor Expert Bundle and per-profile Snowflake/WebTunnel SOCKS5 configuration...")
@@ -5124,11 +5124,6 @@ func setup() error {
 			return err
 		}
 	}
-	if c.Role == "agent" && (c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive) {
-		if err := autoApplyXrayPsiphonForNewAgent(); err != nil {
-			return err
-		}
-	}
 	if c.Role == "agent" && c.Underlay == underlayTor {
 		if err := autoApplyXrayTorForNewAgent(); err != nil {
 			if rollbackErr := rollbackFailedTorAgentSetup(configPath, c); rollbackErr != nil {
@@ -5139,12 +5134,12 @@ func setup() error {
 	}
 	fmt.Printf("\n  %s %s\n", paint(ansiGreen+ansiBold, "✓"), "Configuration saved: "+configPath)
 	uiInfo("Enabling the independent service and automatic startup after VPS reboot…")
-	connected, startErr := ensureTunnelRunning(true)
+	connected, startErr := ensureSelectedTunnelRunningWithPsiphon(true)
 	if startErr != nil {
-		return fmt.Errorf("configuration was saved, but automatic startup failed: %w", startErr)
+		return fmt.Errorf("configuration was saved, but automatic startup/egress setup failed: %w", startErr)
 	}
-	if c.Underlay == underlayPsiphon && !connected {
-		uiInfo("Agent service and local Psiphon SOCKS5 are running. Psiphon egress and/or the Agent-to-Hub lane may still be connecting; end-to-end connectivity is not yet confirmed.")
+	if (c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive) && !connected {
+		uiInfo("Psiphon egress is established and the per-tunnel Xray route is configured. The Agent-to-Hub lane is not yet confirmed; check Status & Logs while it reconnects.")
 	} else {
 		uiSuccess("Tunnel '" + name + "' is active. Existing tunnels were not changed.")
 	}
@@ -5227,20 +5222,53 @@ func ensureTunnelRunning(restartActive bool) (bool, error) {
 	// continue its own retries rather than reporting a false install failure.
 	if data, readErr := os.ReadFile(configPath); readErr == nil {
 		var selected Config
-		if json.Unmarshal(data, &selected) == nil && selected.Role == "agent" && selected.Underlay == underlayPsiphon && serviceWasStarted {
-			ready, waitErr := waitForPsiphonAgentReady(service, serviceStartTime, 100*time.Second)
+		if json.Unmarshal(data, &selected) == nil && selected.Role == "agent" && (selected.Underlay == underlayPsiphon || (selected.Underlay == underlayAdaptive && strings.TrimSpace(selected.PsiphonConfig) != "")) && serviceWasStarted {
+			ready, waitErr := waitForPsiphonAgentReady(service, serviceStartTime, 110*time.Second)
 			if waitErr != nil {
 				showRecentLogs(55)
 				return false, fmt.Errorf("Psiphon Agent startup failed: %w", waitErr)
 			}
 			psiphonTunnelReady = ready
 			if !ready {
-				fmt.Println("Psiphon SOCKS5 is running locally; its first external tunnel is still connecting. ConsoleClient remains running and will retry. This is NOT yet a connected Agent lane.")
+				fmt.Println("Psiphon egress is established, but an Agent-to-Hub lane is not yet confirmed. The service remains running and will keep reconnecting.")
 			}
 		}
 	}
 	fmt.Printf("Tunnel service %s is active; automatic startup at boot is enabled.\n", service)
 	return psiphonTunnelReady, nil
+}
+
+// ensureSelectedTunnelRunningWithPsiphon fixes the startup order for Psiphon egress:
+// the Agent service owns the Psiphon ConsoleClient child process, so that service
+// must be started and its real Psiphon tunnel verified before Xray can use SOCKS5.
+// It also repairs profiles saved by older builds that exited before this step.
+func ensureSelectedTunnelRunningWithPsiphon(restartActive bool) (bool, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return false, err
+	}
+	needsPsiphonXray := cfg.Role == "agent" &&
+		(cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayAdaptive) &&
+		strings.TrimSpace(cfg.PsiphonConfig) != "" && cfg.XrayPsiphon == nil
+	// When an older setup left the integration unfinished, deliberately restart
+	// this profile once so the ConsoleClient child starts and readiness is verified.
+	connected, err := ensureTunnelRunning(restartActive || needsPsiphonXray)
+	if err != nil {
+		return false, err
+	}
+	if !needsPsiphonXray {
+		return connected, nil
+	}
+	if err := autoApplyXrayPsiphonForNewAgent(); err != nil {
+		return false, fmt.Errorf("Agent/Psiphon service is running, but automatic per-tunnel Psiphon user-egress setup failed: %w", err)
+	}
+	// The profile's mapping targets have changed to the private Xray sidecar.
+	// Restart only this Agent profile so its listeners reload the new targets.
+	connected, err = ensureTunnelRunning(true)
+	if err != nil {
+		return false, fmt.Errorf("Psiphon Xray egress was prepared, but the Agent did not restart cleanly: %w", err)
+	}
+	return connected, nil
 }
 
 func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.Duration) (bool, error) {
@@ -5254,22 +5282,25 @@ func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.
 		logText := string(logs)
 		psiphonReady := strings.Contains(logText, "Psiphon ConsoleClient connected")
 		agentLaneReady := false
-		proxyReady := strings.Contains(logText, "Psiphon local SOCKS5 listener ready")
+		psiphonAgentLaneReady := false
 		for _, line := range strings.Split(logText, "\n") {
-			if strings.Contains(line, "tunnel lane ") && strings.Contains(line, " connected via ") && strings.Contains(line, " over psiphon_socks5") {
+			if strings.Contains(line, "tunnel lane ") && strings.Contains(line, " connected via ") {
 				agentLaneReady = true
-				break
+				if strings.Contains(line, " over psiphon_socks5") {
+					psiphonAgentLaneReady = true
+				}
 			}
 		}
-		if psiphonReady && agentLaneReady && exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
-			return true, nil
-		}
-		if proxyReady && exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
-			return false, nil
+		selected, _ := loadConfig()
+		psiphonAgentLaneReady = selected.Underlay == underlayAdaptive && agentLaneReady || selected.Underlay != underlayAdaptive && psiphonAgentLaneReady
+		if psiphonReady && exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
+			// A live Psiphon tunnel is enough to configure the isolated Xray route.
+			// The boolean separately reports whether an Agent-to-Hub lane is already up.
+			return psiphonAgentLaneReady, nil
 		}
 		time.Sleep(time.Second)
 	}
-	return false, fmt.Errorf("service %s did not start its local Psiphon SOCKS5 listener within %s", service, timeout)
+	return false, fmt.Errorf("service %s did not establish Psiphon egress and a connected Agent lane within %s", service, timeout)
 }
 
 func showRecentLogs(n int) {
@@ -6225,7 +6256,7 @@ func menu() {
 			err = setup()
 		case "2":
 			if chooseTunnel("Select the tunnel to start (number or name)") {
-				_, err = ensureTunnelRunning(false)
+				_, err = ensureSelectedTunnelRunningWithPsiphon(false)
 			}
 		case "3":
 			if chooseTunnel("Select the tunnel to stop (number or name)") {
@@ -6237,7 +6268,7 @@ func menu() {
 			}
 		case "4":
 			if chooseTunnel("Select the tunnel to restart (number or name)") {
-				_, err = ensureTunnelRunning(true)
+				_, err = ensureSelectedTunnelRunningWithPsiphon(true)
 			}
 		case "5":
 			if chooseTunnel("Select the tunnel to inspect (number or name)") {
