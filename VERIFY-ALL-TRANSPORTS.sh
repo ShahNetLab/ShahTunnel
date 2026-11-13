@@ -119,6 +119,11 @@ grep -Fq 'TestPsiphonPerformanceProfileIsMemoryAndCPUAware' S1T-CAPSULE/psiphon_
 grep -Fq 'TunnelPoolSize' S1T-CAPSULE/psiphon.go || fail "Psiphon multi-tunnel pool configuration is missing."
 grep -Fq 'TestPsiphonTunnelPoolScalesWithHostResources' S1T-CAPSULE/psiphon_test.go || fail "Psiphon concurrency scaling coverage is missing."
 grep -Fq 'TestTunePsiphonPerformanceConfigPreservesUnknownFields' S1T-CAPSULE/psiphon_test.go || fail "Psiphon profile tuning compatibility coverage is missing."
+grep -Fq 'psiphonCountryFromDirectIPLookup(ip)' S1T-CAPSULE/xray_psiphon.go || fail "Psiphon exact-exit-IP country fallback is missing."
+grep -Fq 'func lookupCountryForPublicIP(ip string)' S1T-CAPSULE/main.go || fail "Generic IPv4/IPv6 exact-IP geolocation lookup is missing."
+grep -Fq 'TestParseGeoResponseSupportsExactPublicIPv6ExitIP' S1T-CAPSULE/main_test.go || fail "IPv6 Psiphon egress country verification coverage is missing."
+grep -Fq 'https://free.freeipapi.com/api/v1/json/' S1T-CAPSULE/main.go || fail "FreeIPAPI country lookup fallback is missing."
+grep -Fq 'https://api.country.is/' S1T-CAPSULE/main.go || fail "Country.is lookup fallback is missing."
 grep -Fq 'lanePingInterval = 5 * time.Second' S1T-CAPSULE/main.go || fail "Five-second lane RTT sampling is missing."
 grep -Fq 'dnsConfig["disableCache"] = false' S1T-CAPSULE/xray_warp.go || fail "Xray DNS cache is not explicitly enabled."
 pass "Shell syntax, docs layout, Psiphon bootstrap/runtime, public-Mapping ALPN multiplex, MASQUE Local Proxy, and failover coverage"
@@ -141,7 +146,7 @@ pass "go vet"
 
 printf '\n== 7/7: Linux build validation (temporary files only) ==\n'
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-amd64" ./S1T-CAPSULE
-[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 4.0.5 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 4.0.6 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-arm64" ./S1T-CAPSULE
 sha256sum "$BUILD_TMP/shah-tunnel-linux-amd64" "$BUILD_TMP/shah-tunnel-linux-arm64" > "$BUILD_TMP/SHA256SUMS"
 pass "Linux amd64 and arm64 binaries built and checksum-checked in a temporary directory (nothing added to the repository)"
