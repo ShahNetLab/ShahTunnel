@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -25,8 +24,8 @@ type xrayRuntime struct {
 	Service    string
 }
 
+var xrayPIDPattern = regexp.MustCompile(`pid=([0-9]+)`)
 var xrayServicePattern = regexp.MustCompile(`(?:^|/)([^/]+\.service)(?:/|$)`)
-var xrayExecStartPathPattern = regexp.MustCompile(`(?:^|[ ;])path=([^ ;]+)`)
 
 func xrayPortValue(v any) (int, bool) {
 	switch x := v.(type) {
@@ -107,200 +106,75 @@ func xrayConfigArgument(args []string, cwd string) (string, error) {
 	return "", errors.New("Xray command line does not expose a config file and no config.json exists in its working directory")
 }
 
-func xrayListenerOutputHasPort(output string, port int) bool {
-	for _, line := range strings.Split(output, "\n") {
-		fields := strings.Fields(line)
-		// `ss -H -lnt` columns: State Recv-Q Send-Q Local Peer.
-		if len(fields) < 5 || !strings.EqualFold(fields[0], "LISTEN") {
-			continue
-		}
-		local := fields[3]
-		colon := strings.LastIndexByte(local, ':')
-		if colon < 0 {
-			continue
-		}
-		localPort, err := strconv.Atoi(strings.Trim(local[colon+1:], "[]"))
-		if err == nil && localPort == port {
-			return true
-		}
-	}
-	return false
-}
-
-func xrayArgsFromCmdline(cmdline []byte) []string {
-	var args []string
-	for _, part := range bytes.Split(cmdline, []byte{0}) {
-		if len(part) > 0 {
-			args = append(args, string(part))
-		}
-	}
-	return args
-}
-
-// xraySystemdWorkingDirectories extracts safe working-directory candidates
-// from systemd unit properties. It is a fallback for hardened services where
-// ProtectProc/invisible and capability bounding block /proc/PID/cwd and exe,
-// even though /proc/PID/cmdline remains readable.
-func xraySystemdWorkingDirectories(workingDirectory, execStart string) []string {
-	var dirs []string
-	add := func(value string) {
-		value = strings.TrimSpace(value)
-		if value == "" || value == "-" || !filepath.IsAbs(value) {
-			return
-		}
-		clean := filepath.Clean(value)
-		for _, current := range dirs {
-			if current == clean {
-				return
-			}
-		}
-		dirs = append(dirs, clean)
-	}
-	add(workingDirectory)
-	if match := xrayExecStartPathPattern.FindStringSubmatch(execStart); len(match) == 2 {
-		add(filepath.Dir(match[1]))
-	}
-	return dirs
-}
-
-func xraySystemdWorkingDirectoriesForService(service string) []string {
-	if service == "" || filepath.Base(service) != service || !strings.HasSuffix(service, ".service") {
-		return nil
-	}
-	workingOut, workingErr := exec.Command("systemctl", "show", service, "-p", "WorkingDirectory", "--value").CombinedOutput()
-	execOut, execErr := exec.Command("systemctl", "show", service, "-p", "ExecStart", "--value").CombinedOutput()
-	if workingErr != nil && execErr != nil {
-		return nil
-	}
-	return xraySystemdWorkingDirectories(string(workingOut), string(execOut))
-}
-
-func xrayWorkingDirectoriesForPID(pid int, service string) []string {
-	var dirs []string
-	add := func(value string) {
-		value = strings.TrimSpace(value)
-		if value == "" || !filepath.IsAbs(value) {
-			return
-		}
-		clean := filepath.Clean(value)
-		for _, current := range dirs {
-			if current == clean {
-				return
-			}
-		}
-		dirs = append(dirs, clean)
-	}
-	if cwd, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "cwd")); err == nil {
-		add(cwd)
-	}
-	for _, dir := range xraySystemdWorkingDirectoriesForService(service) {
-		add(dir)
-	}
-	return dirs
-}
-
-func xrayProcessPIDs() ([]int, error) {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return nil, fmt.Errorf("list visible Linux processes: %w", err)
-	}
-	pids := make([]int, 0, 16)
-	for _, entry := range entries {
-		pid, convErr := strconv.Atoi(entry.Name())
-		if convErr != nil || pid <= 0 {
-			continue
-		}
-		cmdline, readErr := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
-		if readErr != nil {
-			continue
-		}
-		args := xrayArgsFromCmdline(cmdline)
-		if len(args) == 0 || !strings.Contains(strings.ToLower(filepath.Base(args[0])), "xray") {
-			continue
-		}
-		pids = append(pids, pid)
-	}
-	sort.Ints(pids)
-	return pids, nil
-}
-
 func findXrayRuntimeForPort(port int) (xrayRuntime, map[string]any, error) {
 	if port < 1 || port > 65535 {
 		return xrayRuntime{}, nil, fmt.Errorf("invalid local Xray target port %d", port)
 	}
-	// Do not use `ss -p`: this service intentionally drops capabilities and
-	// runs with ProtectProc=invisible, so the kernel omits listener PIDs. Check
-	// the socket without process metadata, then independently match visible
-	// Xray command lines and their JSON inbound configuration.
-	out, err := exec.Command("ss", "-H", "-lnt").CombinedOutput()
+	out, err := exec.Command("ss", "-H", "-lntp", fmt.Sprintf("sport = :%d", port)).CombinedOutput()
 	if err != nil {
-		return xrayRuntime{}, nil, fmt.Errorf("cannot inspect TCP listeners with ss: %w: %s", err, strings.TrimSpace(string(out)))
+		return xrayRuntime{}, nil, fmt.Errorf("cannot inspect listener on port %d with ss: %w: %s", port, err, strings.TrimSpace(string(out)))
 	}
-	if !xrayListenerOutputHasPort(string(out), port) {
-		return xrayRuntime{}, nil, fmt.Errorf("no TCP listener found on local target port %d", port)
+	matches := xrayPIDPattern.FindAllStringSubmatch(string(out), -1)
+	if len(matches) == 0 {
+		return xrayRuntime{}, nil, fmt.Errorf("no process PID found listening on local target port %d", port)
 	}
-	pids, err := xrayProcessPIDs()
-	if err != nil {
-		return xrayRuntime{}, nil, err
-	}
-	type candidate struct {
-		runtime xrayRuntime
-		root    map[string]any
-	}
-	var matches []candidate
-	for _, pid := range pids {
+	seen := map[int]bool{}
+	for _, match := range matches {
+		pid, _ := strconv.Atoi(match[1])
+		if pid <= 0 || seen[pid] {
+			continue
+		}
+		seen[pid] = true
 		base := filepath.Join("/proc", strconv.Itoa(pid))
 		cmdline, readErr := os.ReadFile(filepath.Join(base, "cmdline"))
 		if readErr != nil {
 			continue
 		}
-		args := xrayArgsFromCmdline(cmdline)
-		if len(args) == 0 {
+		var args []string
+		for _, part := range bytes.Split(cmdline, []byte{0}) {
+			if len(part) > 0 {
+				args = append(args, string(part))
+			}
+		}
+		if len(args) == 0 || !strings.Contains(strings.ToLower(filepath.Base(args[0])), "xray") {
 			continue
 		}
-		service, serviceErr := xrayServiceForPID(pid)
-		if serviceErr != nil || strings.Contains(strings.ToLower(service), "ssh") {
+		cwd, cwdErr := os.Readlink(filepath.Join(base, "cwd"))
+		if cwdErr != nil {
 			continue
 		}
-		for _, cwd := range xrayWorkingDirectoriesForPID(pid, service) {
-			configPath, cfgErr := xrayConfigArgument(args, cwd)
-			if cfgErr != nil {
-				continue
-			}
-			configData, cfgReadErr := os.ReadFile(configPath)
-			if cfgReadErr != nil {
-				continue
-			}
-			var root map[string]any
-			if json.Unmarshal(configData, &root) != nil || xrayConfigHasPort(root, port) == 0 {
-				continue
-			}
-			binary := args[0]
+		configPath, cfgErr := xrayConfigArgument(args, cwd)
+		if cfgErr != nil {
+			continue
+		}
+		configData, cfgReadErr := os.ReadFile(configPath)
+		if cfgReadErr != nil {
+			continue
+		}
+		var root map[string]any
+		if json.Unmarshal(configData, &root) != nil || xrayConfigHasPort(root, port) == 0 {
+			continue
+		}
+		binary, binErr := os.Readlink(filepath.Join(base, "exe"))
+		if binErr != nil || binary == "" {
+			binary = args[0]
 			if !filepath.IsAbs(binary) {
 				binary = filepath.Join(cwd, binary)
 			}
-			binary = filepath.Clean(binary)
-			if _, statErr := os.Stat(binary); statErr != nil {
-				continue
-			}
-			matches = append(matches, candidate{
-				runtime: xrayRuntime{PID: pid, Binary: binary, CWD: cwd, ConfigPath: configPath, Service: service},
-				root:    root,
-			})
-			break
 		}
-	}
-	if len(matches) == 0 {
-		return xrayRuntime{}, nil, fmt.Errorf("listener on %d exists, but no visible Xray process has a readable systemd working directory and matching JSON inbound; no Xray config was changed", port)
-	}
-	if len(matches) > 1 {
-		ids := make([]string, 0, len(matches))
-		for _, match := range matches {
-			ids = append(ids, fmt.Sprintf("pid=%d service=%s config=%s", match.runtime.PID, match.runtime.Service, match.runtime.ConfigPath))
+		service, serviceErr := xrayServiceForPID(pid)
+		if serviceErr != nil {
+			return xrayRuntime{}, nil, serviceErr
 		}
-		return xrayRuntime{}, nil, fmt.Errorf("multiple Xray processes match listener port %d; refusing ambiguous selection: %s", port, strings.Join(ids, "; "))
+		if strings.Contains(strings.ToLower(service), "ssh") {
+			return xrayRuntime{}, nil, fmt.Errorf("detected Xray cgroup %q looks SSH-related; refusing to restart it", service)
+		}
+		if _, statErr := os.Stat(binary); statErr != nil {
+			return xrayRuntime{}, nil, fmt.Errorf("cannot access running Xray executable %q: %w", binary, statErr)
+		}
+		return xrayRuntime{PID: pid, Binary: binary, CWD: cwd, ConfigPath: configPath, Service: service}, root, nil
 	}
-	return matches[0].runtime, matches[0].root, nil
+	return xrayRuntime{}, nil, fmt.Errorf("listener on %d is not a discoverable Xray inbound; no Xray config was changed", port)
 }
 
 func safeXrayTag(s string) string {

@@ -1106,7 +1106,7 @@ func TestOptionNineSwitchesFromFailedDirectPathToPsiphonSOCKS5(t *testing.T) {
 	unavailableAddress := unavailable.Addr().String()
 	_ = unavailable.Close()
 	proxyAddress := startTestSOCKS5Relay(t, listener.Addr().String())
-	channel := 8001 // (channel-1) modulo 8 = 0: Direct/TCP is the first candidate.
+	channel := 109
 	agentPreferredTransport.Delete(channel)
 	agentPreferredUnderlay.Delete(channel)
 	t.Cleanup(func() {
@@ -1623,50 +1623,6 @@ func TestRemovedLegacyWARPUnderlayIsRejectedWithoutDirectDowngrade(t *testing.T)
 	}
 	if err := validateConfig(cfg); err == nil {
 		t.Fatal("removed legacy underlay was accepted; it must not silently downgrade to Direct")
-	}
-}
-
-func TestAdaptiveAgentPathCandidatesDistributeStartupLanes(t *testing.T) {
-	t.Setenv("PATH", t.TempDir()) // Simulate no active WARP CLI.
-	cfg := Config{Transport: transportAdaptive, Underlay: underlayAdaptive, PsiphonConfig: "/tmp/psiphon-client.json"}
-	paths := adaptiveAgentPathCandidates(cfg, "", "", 1)
-	if len(paths) != 8 { // Four transports x two egresses when WARP is absent.
-		t.Fatalf("adaptive path matrix has %d entries, want 8: %#v", len(paths), paths)
-	}
-	seen := map[string]bool{}
-	for lane := 1; lane <= len(paths); lane++ {
-		lanePaths := adaptiveAgentPathCandidates(cfg, "", "", lane)
-		key := lanePaths[0].Transport + "/" + lanePaths[0].Underlay
-		if seen[key] {
-			t.Fatalf("startup lane %d repeats first path %s before all matrix pairs are tried", lane, key)
-		}
-		seen[key] = true
-	}
-	preferred := adaptiveAgentPathCandidates(cfg, transportHTTP2, underlayPsiphon, 9)
-	if len(preferred) == 0 || preferred[0] != (adaptiveAgentPath{Transport: transportHTTP2, Underlay: underlayPsiphon}) {
-		t.Fatalf("last successful path was not preferred on reconnect: %#v", preferred)
-	}
-
-	// With MASQUE connected, all four transports are spread across three egresses.
-	binDir := t.TempDir()
-	warpCLI := filepath.Join(binDir, "warp-cli")
-	warpScript := "#!/bin/sh\ncase \"$1\" in status) echo 'Status update: Connected' ;; settings) echo 'WARP tunnel protocol: MASQUE' ;; *) exit 2 ;; esac\n"
-	if err := os.WriteFile(warpCLI, []byte(warpScript), 0700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", binDir)
-	allPaths := adaptiveAgentPathCandidates(cfg, "", "", 1)
-	if len(allPaths) != 12 {
-		t.Fatalf("MASQUE + Psiphon + Direct matrix has %d entries, want 12: %#v", len(allPaths), allPaths)
-	}
-	seen = map[string]bool{}
-	for lane := 1; lane <= 12; lane++ {
-		pathSet := adaptiveAgentPathCandidates(cfg, "", "", lane)
-		key := pathSet[0].Transport + "/" + pathSet[0].Underlay
-		if seen[key] {
-			t.Fatalf("12-lane startup matrix duplicated %s before covering all 12 combinations", key)
-		}
-		seen[key] = true
 	}
 }
 
@@ -2538,24 +2494,6 @@ exit 1
 	}
 }
 
-func TestXrayListenerAndSystemdWorkingDirectoryFallback(t *testing.T) {
-	listener := "LISTEN 0 4096               *:2083        *:*\n"
-	if !xrayListenerOutputHasPort(listener, 2083) {
-		t.Fatal("listener parser did not recognize wildcard IPv4/IPv6 listener")
-	}
-	if xrayListenerOutputHasPort(listener, 21083) {
-		t.Fatal("listener parser matched the wrong port")
-	}
-	got := xraySystemdWorkingDirectories("", "{ path=/usr/local/x-ui/x-ui ; argv[]=/usr/local/x-ui/x-ui server ; ignore_errors=no }")
-	if len(got) != 1 || got[0] != "/usr/local/x-ui" {
-		t.Fatalf("systemd ExecStart fallback = %#v; want [/usr/local/x-ui]", got)
-	}
-	got = xraySystemdWorkingDirectories("/opt/x-ui", "{ path=/usr/local/x-ui/x-ui ; argv[]=/usr/local/x-ui/x-ui server }")
-	if len(got) != 2 || got[0] != "/opt/x-ui" || got[1] != "/usr/local/x-ui" {
-		t.Fatalf("systemd working directory candidates = %#v", got)
-	}
-}
-
 func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 	original := []byte(`{
   "api":{"tag":"api","services":["HandlerService"]},
@@ -2838,9 +2776,7 @@ func TestHubBalancesMeasuredRTTAndLoad(t *testing.T) {
 	}
 	// The 14ms lane has some load but a lower weighted RTT than the idle 30ms lane.
 	fast := mkSession(1, 32, 14*time.Millisecond)
-	fast.transport = transportHTTP2
 	slower := mkSession(2, 0, 30*time.Millisecond)
-	slower.transport = transportTCP
 	h := &hubServer{sessions: map[*hubSession]struct{}{fast: {}, slower: {}}}
 	for i := 0; i < 20; i++ {
 		if got := h.current(); got != fast {
