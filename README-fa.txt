@@ -11,13 +11,20 @@ ShahTunnel 5.0.0 — بهینه‌سازی مسیر چندکاربره و اصل
 - گزینهٔ اختصاصی Psiphon / SOCKS5 نیز همچنان برای خروجی کاربران و Laneهای Agent از Psiphon استفاده می‌کند.
 - زمان‌بندی Laneها همچنان از RTT معتبر، تعداد جریان‌های فعال، فشار صف و زمان انتظار نوشتن استفاده می‌کند.
 - سرویس Psiphon مستقل از Restart سرویس Agent اجرا می‌شود؛ بنابراین Restart معمولی Agent تونل‌های گرم Psiphon را از بین نمی‌برد.
-- هنگام ساخت Agent، Sidecar Xray و خروجی HTTPS واقعی Psiphon پیش از شروع Agent آماده و بررسی می‌شوند؛ کشور خروجی به‌ترتیب اتریش، استرالیا، برزیل، سوئد، سوئیس، جمهوری چک، آلمان، دانمارک، اسپانیا، بریتانیا، ایرلند، هند، ایتالیا، لیتوانی، هلند، نروژ، لهستان، رومانی و صربستان بررسی می‌شود.
+- هنگام ساخت Agent، Sidecar Xray و خروجی HTTPS واقعی Psiphon پیش از شروع Agent آماده و بررسی می‌شوند؛ کشور خروجی به‌ترتیب اتریش، برزیل، سوئیس، جمهوری چک، آلمان، دانمارک، اسپانیا، بریتانیا، ایرلند، هند، ایتالیا، لیتوانی، هلند، نروژ، لهستان، رومانی و صربستان بررسی می‌شود.
 - IP خروجی SOCKS5 با IP مستقیم VPS مقایسه می‌شود؛ اگر یکسان باشند یا Mapping به Sidecar اختصاصی اشاره نکند، مسیر کاربر fail-closed باقی می‌ماند.
 - عملیات Stop سرویس Agent، Sidecar اختصاصی Xray و Psiphon همان پروفایل را متوقف می‌کند؛ Start بعدی آن‌ها را دوباره راه‌اندازی می‌کند.
 - نسخهٔ برنامه، نصب‌کننده، بنر ترمینال و مستندات به 5.0.0 ارتقا یافته‌اند.
 
 نصب از مخزن:
-bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
+روش جایگزین نصب (بدون raw.githubusercontent.com):
+set -o pipefail
+curl -fsSL --connect-timeout 10 --max-time 30 \
+  -H 'Accept: application/vnd.github+json' \
+  -H 'User-Agent: ShahTunnel-bootstrap' \
+  'https://api.github.com/repos/ShahNetLab/ShahTunnel/contents/S1T-START.sh?ref=main' \
+| python3 -c 'import sys,json,base64; d=json.load(sys.stdin); sys.stdout.buffer.write(base64.b64decode(d["content"]))' \
+| bash
 
 اعمال اصلاح روی Agent قدیمی با گزینهٔ ۹:
 1. نسخهٔ 5.0.0 اصلاح‌شده را روی Agent نصب/جایگزین کنید.

@@ -51,7 +51,7 @@ Selected Xray inbound → loopback-only Xray sidecar → WARP / Psiphon / Tor SO
 
 ### Psiphon exit-country policy
 
-The allowed exit-country list is AT, AU, BR, SE, CH, CZ, DE, DK, ES, GB, IE, IN, IT, LT, NL, NO, PL, RO, and RS. New profiles start with Austria (`AT`) and ShahTunnel advances through the exact ordered list only when a country-specific Psiphon exit cannot be verified. Each candidate must return the requested country and a public IP different from the VPS's independently detected direct IP. Psiphon accepts one `EgressRegion` value per ConsoleClient; it does not itself rotate through a list. If no requested country can be verified or the SOCKS exit equals the VPS IP, user egress fails closed. After user egress is enabled, a profile-scoped systemd timer rotates the requested country once per hour, advancing through the allowlist and verifying the actual exit IP and country each time. If all alternate regions fail, ShahTunnel attempts to restore the previously verified region. Country availability depends on Psiphon's active relays and is not guaranteed.
+The allowed exit-country list is AT, BR, CH, CZ, DE, DK, ES, GB, IE, IN, IT, LT, NL, NO, PL, RO, and RS. New profiles start with Austria (`AT`) and ShahTunnel advances through the exact ordered list only when a country-specific Psiphon exit cannot be verified. Each candidate must return the requested country and a public IP different from the VPS's independently detected direct IP. Psiphon accepts one `EgressRegion` value per ConsoleClient; it does not itself rotate through a list. If no requested country can be verified or the SOCKS exit equals the VPS IP, user egress fails closed. After user egress is enabled, a profile-scoped systemd timer rotates the requested country once per hour, advancing through the allowlist and verifying the actual exit IP and country each time. If all alternate regions fail, ShahTunnel attempts to restore the previously verified region. Country availability depends on Psiphon's active relays and is not guaranteed.
 
 ### Automatic Psiphon egress for user traffic
 
@@ -179,8 +179,16 @@ ShahTunnel uses a **Hub / Agent** layout. Install it on the Hub and on every Age
 
 **1. Run the installer** on each server:
 
+If `raw.githubusercontent.com` is unreachable on your VPS, bootstrap the installer through the GitHub API instead:
+
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
+set -o pipefail
+curl -fsSL --connect-timeout 10 --max-time 30 \
+  -H 'Accept: application/vnd.github+json' \
+  -H 'User-Agent: ShahTunnel-bootstrap' \
+  'https://api.github.com/repos/ShahNetLab/ShahTunnel/contents/S1T-START.sh?ref=main' \
+| python3 -c 'import sys,json,base64; d=json.load(sys.stdin); sys.stdout.buffer.write(base64.b64decode(d["content"]))' \
+| bash
 ```
 
 The manager opens after installation. You can reopen it with:
