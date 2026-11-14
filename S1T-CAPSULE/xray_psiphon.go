@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -102,6 +103,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=full
+ReadWritePaths=/etc/ravanreverse/psiphon /run/lock
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
@@ -566,6 +568,230 @@ func validatePsiphonMappingTargets(cfg Config) error {
 	return nil
 }
 
+// nextPsiphonRotationCandidates starts immediately after the currently verified
+// region and wraps once. It never selects the current region as the first choice.
+func nextPsiphonRotationCandidates(current string) []string {
+	current = strings.ToUpper(strings.TrimSpace(current))
+	start := 0
+	for i, region := range psiphonEgressRegionPriority {
+		if region == current {
+			start = (i + 1) % len(psiphonEgressRegionPriority)
+			break
+		}
+	}
+	result := make([]string, 0, len(psiphonEgressRegionPriority)-1)
+	for offset := 0; offset < len(psiphonEgressRegionPriority); offset++ {
+		region := psiphonEgressRegionPriority[(start+offset)%len(psiphonEgressRegionPriority)]
+		if region != current {
+			result = append(result, region)
+		}
+	}
+	return result
+}
+
+func psiphonRotationUnitNames(profileID string) (string, string) {
+	id := tunnelID(profileID)
+	base := "shah-tunnel-psiphon-rotate-" + id
+	return base + ".service", base + ".timer"
+}
+
+func renderPsiphonRotationUnits(profileID, binary, absConfig string) ([]byte, []byte, error) {
+	if strings.TrimSpace(profileID) == "" || !filepath.IsAbs(binary) || !filepath.IsAbs(absConfig) {
+		return nil, nil, errors.New("invalid Psiphon rotation unit parameters")
+	}
+	for _, value := range []string{binary, absConfig} {
+		if strings.ContainsAny(value, "\x00\n\r") {
+			return nil, nil, errors.New("country rotation unit contains invalid control characters")
+		}
+	}
+	service, _ := psiphonRotationUnitNames(profileID)
+	serviceUnit := fmt.Sprintf(`[Unit]
+Description=ShahTunnel hourly Psiphon country rotation (%s)
+After=network-online.target %s
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=%s rotate-psiphon-country --config %s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+ReadWritePaths=/etc/ravanreverse/psiphon /run/lock
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+`, tunnelID(profileID), psiphonServiceName(profileID), systemdExecQuote(binary), systemdExecQuote(absConfig))
+	timerUnit := fmt.Sprintf(`[Unit]
+Description=Hourly Psiphon country rotation for ShahTunnel profile %s
+
+[Timer]
+OnBootSec=1h
+OnUnitActiveSec=1h
+AccuracySec=1min
+Persistent=true
+Unit=%s
+
+[Install]
+WantedBy=timers.target
+`, tunnelID(profileID), service)
+	return []byte(serviceUnit), []byte(timerUnit), nil
+}
+
+func ensurePsiphonRotationTimer(cfg Config) error {
+	if cfg.Role != "agent" || cfg.XrayPsiphon == nil {
+		return nil
+	}
+	if !isLoopbackProxyAddress(cfg.PsiphonProxy) || cfg.PsiphonConfig == "" {
+		return errors.New("cannot schedule Psiphon country rotation without a profile-local SOCKS proxy and config")
+	}
+	service, timer := psiphonRotationUnitNames(cfg.Name)
+	servicePath := filepath.Join("/etc/systemd/system", service)
+	timerPath := filepath.Join("/etc/systemd/system", timer)
+	binary, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve ShahTunnel executable for country rotation: %w", err)
+	}
+	absConfig, err := filepath.Abs(configPath)
+	if err != nil || absConfig == "." {
+		return errors.New("invalid Agent profile config path for country rotation")
+	}
+	serviceUnit, timerUnit, err := renderPsiphonRotationUnits(cfg.Name, binary, absConfig)
+	if err != nil {
+		return err
+	}
+	if err := atomicReplaceFile(servicePath, serviceUnit, 0644); err != nil {
+		return fmt.Errorf("write Psiphon country rotation service: %w", err)
+	}
+	if err := atomicReplaceFile(timerPath, timerUnit, 0644); err != nil {
+		return fmt.Errorf("write Psiphon country rotation timer: %w", err)
+	}
+	if err := systemdReload(); err != nil {
+		return err
+	}
+	if err := runSystemctl("enable", "--now", timer); err != nil {
+		return fmt.Errorf("enable hourly Psiphon country rotation: %w", err)
+	}
+	return nil
+}
+
+func removePsiphonRotationTimer(profileID string) error {
+	service, timer := psiphonRotationUnitNames(profileID)
+	profile := tunnelID(profileID)
+	for _, item := range []struct{ unit, marker string }{
+		{timer, "Description=Hourly Psiphon country rotation for ShahTunnel profile " + profile},
+		{service, "Description=ShahTunnel hourly Psiphon country rotation (" + profile + ")"},
+	} {
+		path := filepath.Join("/etc/systemd/system", item.unit)
+		if st, err := os.Lstat(path); err == nil {
+			if !st.Mode().IsRegular() || st.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("refusing to remove non-regular rotation unit %s", path)
+			}
+			body, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return readErr
+			}
+			if !strings.Contains(string(body), item.marker) {
+				return fmt.Errorf("rotation unit %s is not owned by this ShahTunnel profile; refusing removal", path)
+			}
+			_, _ = exec.Command("systemctl", "disable", "--now", item.unit).CombinedOutput()
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return systemdReload()
+}
+
+// rotatePsiphonCountry changes only the selected profile's Psiphon country.
+// The Xray sidecar remains SOCKS-only, so a failed rotation cannot fall back to
+// the VPS's direct route. If every alternate region fails, it restores and
+// verifies the previously working region before returning an error.
+func rotatePsiphonCountry(cfg Config) error {
+	if !isRoot() {
+		return errors.New("hourly Psiphon country rotation requires root")
+	}
+	if cfg.Role != "agent" || cfg.XrayPsiphon == nil {
+		return errors.New("hourly rotation requires an Agent with isolated Xray Psiphon egress")
+	}
+	if err := validatePsiphonMappingTargets(cfg); err != nil {
+		return err
+	}
+	proxy := strings.TrimSpace(cfg.PsiphonProxy)
+	if !isLoopbackProxyAddress(proxy) || proxy != strings.TrimSpace(cfg.XrayPsiphon.Proxy) {
+		return errors.New("country rotation refused: Xray is not bound to this profile's private Psiphon SOCKS endpoint")
+	}
+	lockPath := filepath.Join("/run/lock", "shah-tunnel-psiphon-rotate-"+tunnelID(cfg.Name)+".lock")
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("open Psiphon rotation lock: %w", err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			log.Printf("Psiphon hourly rotation skipped: another rotation is already running")
+			return nil
+		}
+		return fmt.Errorf("lock Psiphon rotation: %w", err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
+	directIP := detectPublicIPv4FromAPIs()
+	if directIP == "" {
+		if cached := readServerGeoCache(); cached.Valid {
+			directIP = cached.IP
+		}
+	}
+	if directIP == "" {
+		return errors.New("country rotation refused: cannot establish direct VPS IP baseline for leak protection")
+	}
+	oldRegion := readPsiphonPreferredRegion(cfg.PsiphonConfig)
+	if oldRegion == "" {
+		return errors.New("country rotation refused: current Psiphon country is not explicitly configured")
+	}
+	oldIP, oldCountry, oldErr := verifyPsiphonExit(proxy, oldRegion, directIP)
+	if oldErr != nil {
+		log.Printf("Psiphon rotation: current exit %s is not presently verifiable; trying the next allowlisted country for recovery: %v", oldRegion, oldErr)
+	}
+	service := psiphonServiceName(cfg.Name)
+	candidates := nextPsiphonRotationCandidates(oldRegion)
+	var failures []string
+	for _, region := range candidates {
+		log.Printf("Psiphon hourly country rotation: %s -> %s", oldRegion, region)
+		if _, err := setPsiphonEgressRegionPreference(cfg.PsiphonConfig, region); err != nil {
+			failures = append(failures, region+": config update: "+err.Error())
+			continue
+		}
+		if err := runSystemctl("restart", service); err != nil {
+			failures = append(failures, region+": Psiphon restart: "+err.Error())
+			continue
+		}
+		if ip, country, verifyErr := verifyPsiphonExit(proxy, region, directIP); verifyErr == nil {
+			log.Printf("Psiphon hourly country rotation succeeded: country=%s ip=%s previous_country=%s previous_ip=%s", country, ip, oldCountry, oldIP)
+			return nil
+		} else {
+			failures = append(failures, region+": "+verifyErr.Error())
+		}
+	}
+
+	// Do not leave the profile stranded on a region that failed verification.
+	if _, err := setPsiphonEgressRegionPreference(cfg.PsiphonConfig, oldRegion); err == nil {
+		if restartErr := runSystemctl("restart", service); restartErr == nil {
+			if ip, country, verifyErr := verifyPsiphonExit(proxy, oldRegion, directIP); verifyErr == nil {
+				log.Printf("Psiphon country rotation kept previous verified exit: country=%s ip=%s", country, ip)
+				return fmt.Errorf("no alternate country could be verified; retained previous country %s (%s): %s", country, ip, strings.Join(failures, " | "))
+			}
+		}
+	}
+	return fmt.Errorf("Psiphon country rotation failed for all alternate regions; user traffic remains fail-closed: %s", strings.Join(failures, " | "))
+}
+
 func ensurePsiphonUserEgressReady(cfg Config) error {
 	if cfg.XrayPsiphon == nil {
 		return nil
@@ -582,6 +808,9 @@ func ensurePsiphonUserEgressReady(cfg Config) error {
 		return fmt.Errorf("Psiphon user egress is not ready; Xray remains gated: %w", err)
 	}
 	log.Printf("Psiphon user egress verified: %s (%s); Agent direct IP is excluded", ip, country)
+	if err := ensurePsiphonRotationTimer(cfg); err != nil {
+		return fmt.Errorf("enable hourly Psiphon country rotation: %w", err)
+	}
 	return nil
 }
 
@@ -964,6 +1193,9 @@ func applyXrayPsiphonEgress(restartAgent, confirm bool) error {
 			return fmt.Errorf("Psiphon user-egress verification failed after Agent restart; previous profile was restored: %w", err)
 		}
 	}
+	if err = ensurePsiphonRotationTimer(cfg); err != nil {
+		return fmt.Errorf("Psiphon user egress is configured but hourly country rotation could not be enabled: %w", err)
+	}
 	if restartAgent {
 		uiSuccess("Per-tunnel Psiphon TCP egress is active. DNS is also routed through Psiphon; UDP is fail-closed.")
 	} else {
@@ -980,6 +1212,9 @@ func removeXrayPsiphonIntegration(cfg *Config) error {
 		return nil
 	}
 	meta := cfg.XrayPsiphon
+	if err := removePsiphonRotationTimer(cfg.Name); err != nil {
+		return fmt.Errorf("remove hourly Psiphon country rotation: %w", err)
+	}
 	if err := removeXrayPsiphonSidecar(meta); err != nil {
 		return fmt.Errorf("remove dedicated Psiphon Xray service: %w", err)
 	}

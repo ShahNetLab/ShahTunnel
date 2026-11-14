@@ -88,3 +88,50 @@ func TestPsiphonMappingsMustPointToIsolatedSidecar(t *testing.T) {
 		t.Fatal("original Xray target must be rejected as possible direct egress")
 	}
 }
+
+func TestNextPsiphonRotationCandidatesAdvanceAndWrap(t *testing.T) {
+	want := []string{"AU", "BE", "BR", "CA", "SE", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IN", "IT", "LT", "NL", "NO", "PL", "RO", "RS"}
+	got := nextPsiphonRotationCandidates("AT")
+	if len(got) != len(want) {
+		t.Fatalf("rotation candidate count=%d, want %d: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("rotation candidate %d=%s, want %s", i, got[i], want[i])
+		}
+	}
+	if got := nextPsiphonRotationCandidates("RS"); got[0] != "AT" {
+		t.Fatalf("rotation should wrap from RS to AT, got first=%s", got[0])
+	}
+	for _, region := range got {
+		if region == "AT" {
+			t.Fatal("rotation list must not retry the currently active country")
+		}
+	}
+}
+
+func TestRenderPsiphonRotationUnitsAreProfileScopedAndHourly(t *testing.T) {
+	service, timer, err := renderPsiphonRotationUnits("s", "/usr/local/bin/ravanreverse", "/etc/ravanreverse/tunnels/s.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceText, timerText := string(service), string(timer)
+	for _, want := range []string{
+		"Description=ShahTunnel hourly Psiphon country rotation (s)",
+		`"/usr/local/bin/ravanreverse" rotate-psiphon-country --config "/etc/ravanreverse/tunnels/s.json"`,
+		"ProtectSystem=full",
+		"ReadWritePaths=/etc/ravanreverse/psiphon /run/lock",
+	} {
+		if !strings.Contains(serviceText, want) {
+			t.Fatalf("rotation service missing %q:\n%s", want, serviceText)
+		}
+	}
+	for _, want := range []string{"OnBootSec=1h", "OnUnitActiveSec=1h", "AccuracySec=1min", "Unit=shah-tunnel-psiphon-rotate-s.service"} {
+		if !strings.Contains(timerText, want) {
+			t.Fatalf("rotation timer missing %q:\n%s", want, timerText)
+		}
+	}
+	if _, _, err := renderPsiphonRotationUnits("s", "relative/binary", "/etc/ravanreverse/tunnels/s.json"); err == nil {
+		t.Fatal("relative executable path must be rejected")
+	}
+}

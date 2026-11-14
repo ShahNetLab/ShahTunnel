@@ -6380,6 +6380,25 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+	case "rotate-psiphon-country":
+		if !ensureRoot() {
+			os.Exit(1)
+		}
+		for i := 2; i < len(os.Args); i++ {
+			if os.Args[i] == "--config" && i+1 < len(os.Args) {
+				configPath = filepath.Clean(os.Args[i+1])
+				i++
+			} else {
+				log.Fatalf("unknown rotate-psiphon-country argument %q", os.Args[i])
+			}
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := rotatePsiphonCountry(cfg); err != nil {
+			log.Fatal(err)
+		}
 	case "uninstall":
 		if !ensureRoot() {
 			os.Exit(1)
@@ -6390,7 +6409,7 @@ func main() {
 	case "version", "--version", "-v":
 		fmt.Printf("Shah Tunnel %s (%s)\n", version, runtimeArch())
 	default:
-		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|run [--config PATH]|uninstall|version]\n", version)
+		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|run [--config PATH]|rotate-psiphon-country --config PATH|uninstall|version]\n", version)
 	}
 }
 

@@ -464,6 +464,13 @@ func stopPsiphonSystemdService(cfg Config) error {
 	if cfg.Role != "agent" || cfg.PsiphonConfig == "" {
 		return nil
 	}
+	// A stopped Agent must not be restarted by its hourly country-rotation timer.
+	// The next verified Agent start recreates and enables the profile-local timer.
+	if cfg.XrayPsiphon != nil {
+		if err := removePsiphonRotationTimer(cfg.Name); err != nil {
+			return fmt.Errorf("disable hourly Psiphon rotation before stopping profile: %w", err)
+		}
+	}
 	service := psiphonServiceName(cfg.Name)
 	unitPath, err := psiphonServiceUnitPath(service)
 	if err != nil {
