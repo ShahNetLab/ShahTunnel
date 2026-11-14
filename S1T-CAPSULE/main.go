@@ -2832,9 +2832,12 @@ func runAgent(cfg Config) error {
 	case underlayAdaptive:
 		cleanup, err := startPsiphonForAgent(cfg)
 		if err != nil {
-			// Option 9 must retain the direct path even when Psiphon cannot
-			// start at boot. Its SOCKS candidate will fail fast and the lane
-			// remains able to use the other configured egress path.
+			// A profile with an isolated Psiphon Xray sidecar is explicitly
+			// fail-closed: do not start Agent lanes on a direct underlay.
+			if cfg.XrayPsiphon != nil {
+				return fmt.Errorf("Psiphon is required by this profile's user-egress policy; refusing direct fallback: %w", err)
+			}
+			// Generic adaptive mode retains its documented Direct fallback.
 			log.Printf("Psiphon is not ready at startup; direct egress remains enabled: %v", err)
 		} else {
 			cleanupUnderlay = cleanup
@@ -2936,6 +2939,12 @@ func adaptiveTransportCandidates(preferred string) []string {
 }
 
 func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
+	// Once this profile has an isolated Psiphon Xray user-egress integration,
+	// keep its Agent lanes on Psiphon too. A direct fallback would violate the
+	// profile's fail-closed egress policy during relay interruptions.
+	if cfg.XrayPsiphon != nil && strings.TrimSpace(cfg.PsiphonConfig) != "" {
+		return []string{underlayPsiphon}
+	}
 	// WARP is only a candidate when its client reports a connected MASQUE path.
 	// Other WARP protocols are never selected by adaptive routing.
 	warpMode := detectActiveWarpUnderlay()

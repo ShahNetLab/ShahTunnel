@@ -1638,6 +1638,14 @@ func TestAdaptiveUnderlayCandidatesPreferLastSuccessfulEgress(t *testing.T) {
 	if !equalStrings(got, []string{underlayPsiphon, underlayDirect}) {
 		t.Fatalf("preferred Psiphon candidates = %v", got)
 	}
+	strict := cfg
+	strict.XrayPsiphon = &XrayPsiphonIntegration{Proxy: "127.0.0.1:21082"}
+	for _, preferred := range []string{"", underlayDirect, underlayPsiphon, underlayMASQUE} {
+		got = adaptiveUnderlayCandidates(strict, preferred)
+		if !equalStrings(got, []string{underlayPsiphon}) {
+			t.Fatalf("Psiphon-integrated profile must fail closed; preferred=%q candidates=%v", preferred, got)
+		}
+	}
 	got = adaptiveUnderlayCandidates(Config{Underlay: underlayAdaptive}, underlayPsiphon)
 	if !equalStrings(got, []string{underlayDirect}) {
 		t.Fatalf("without Psiphon config, candidates = %v; want direct only", got)
