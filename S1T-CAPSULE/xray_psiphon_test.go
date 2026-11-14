@@ -90,7 +90,7 @@ func TestPsiphonMappingsMustPointToIsolatedSidecar(t *testing.T) {
 }
 
 func TestNextPsiphonRotationCandidatesAdvanceAndWrap(t *testing.T) {
-	want := []string{"AU", "BR", "SE", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IN", "IT", "LT", "NL", "NO", "PL", "RO", "RS"}
+	want := []string{"BR", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IN", "IT", "LT", "NL", "NO", "PL", "RO", "RS"}
 	got := nextPsiphonRotationCandidates("AT")
 	if len(got) != len(want) {
 		t.Fatalf("rotation candidate count=%d, want %d: %v", len(got), len(want), got)
