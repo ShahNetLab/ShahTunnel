@@ -3,8 +3,8 @@ set -Eeuo pipefail
 
 # One-shot repair for ShahTunnel 5.0.0 emergency Tor:
 # - restores automatic Snowflake (no user-supplied bridge line)
-# - permits unknown bridge metadata while excluding US-classified Tor relays
-# - removes redundant emergency profile name / mapping prompts by using saved defaults
+# - keeps Snowflake bridge metadata usable and blocks US Tor EXIT relays only
+# - automatically selects the running Agent, profile name, and saved Hub Mapping
 # - rebuilds and installs through the project's verified official installer
 
 OWNER="ShahNetLab"
@@ -50,27 +50,27 @@ main = main_path.read_text(encoding="utf-8")
 tor = tor_path.read_text(encoding="utf-8")
 tests = test_path.read_text(encoding="utf-8")
 
-# Tor: exclude US-classified Tor relays at every circuit position, but do not
-# exclude unknown GeoIP metadata. The Snowflake bridge uses a placeholder IP;
-# applying {??} / GeoIPExcludeUnknown prevents Tor from starting any bridge.
+# Tor: exclude US-classified EXIT relays only. ExcludeNodes also applies to bridges/guards
+# and caused the built-in Snowflake bridge to be rejected. The SOCKS egress verifier
+# independently rejects US or country-unverified public exit addresses.
 pattern = re.compile(
     r'\t// Strict emergency policy:.*?\n'
     r'\tb\.WriteString\("StrictNodes 1\\n"\)',
     re.S,
 )
 replacement = (
-    '\t// Exclude Tor relays classified by Tor GeoIP as US at every circuit position.\n'
-    '\t// Do not exclude unknown bridge metadata: Snowflake uses a placeholder address.\n'
-    '\t// The live exit verifier still rejects US or unverified exit IPs.\n'
-    '\tb.WriteString("ExcludeNodes {us}\\n")\n'
+    '\t// Exclude US-classified Tor EXIT relays only; ExcludeNodes would block bridges too.\n'
+    '\t// Keep Snowflake bridge metadata usable; StrictNodes enforces the exit filter.\n'
+    '\t// The live SOCKS egress verifier independently rejects US or unverified exits.\n'
+    '\tb.WriteString("ExcludeExitNodes {us}\\n")\n'
     '\tb.WriteString("StrictNodes 1\\n")'
 )
 tor_new, n = pattern.subn(lambda _match: replacement, tor, count=1)
 if n != 1:
     raise SystemExit("Could not find the expected strict Tor policy block; no source was changed.")
-if 'ExcludeNodes {us},{??}' in tor_new or 'GeoIPExcludeUnknown 1' in tor_new:
-    raise SystemExit("Unsafe unknown-node exclusion remained in tor.go.")
-if 'b.WriteString("ExcludeNodes {us}\\n")' not in tor_new:
+if 'ExcludeNodes {us}' in tor_new or 'GeoIPExcludeUnknown 1' in tor_new:
+    raise SystemExit("Unsafe bridge-wide exclusion remained in tor.go.")
+if 'b.WriteString("ExcludeExitNodes {us}\\n")' not in tor_new:
     raise SystemExit("The US relay exclusion was not installed in tor.go.")
 
 # Restore both choices. Snowflake uses ShahTunnel's built-in bridge and never
@@ -210,10 +210,10 @@ if old_endpoint not in main_new:
     raise SystemExit("Could not locate the emergency Hub Mapping prompt in main.go.")
 main_new = main_new.replace(old_endpoint, new_endpoint, 1)
 
-# Update tests to assert the correct Snowflake-compatible no-US policy.
+# Update tests to assert the Snowflake-compatible strict US-exit policy.
 if '"ExcludeNodes {us},{??}\\n",' not in tests:
     raise SystemExit("Could not locate old ExcludeNodes test expectation in tor_test.go.")
-tests = tests.replace('"ExcludeNodes {us},{??}\\n",', '"ExcludeNodes {us}\\n",', 1)
+tests = tests.replace('"ExcludeNodes {us},{??}\\n",', '"ExcludeExitNodes {us}\\n",', 1)
 if '"GeoIPExcludeUnknown 1\\n",' not in tests:
     raise SystemExit("Could not locate old GeoIPExcludeUnknown test expectation in tor_test.go.")
 tests = tests.replace('\t\t"GeoIPExcludeUnknown 1\\n",\n', '', 1)
@@ -221,21 +221,20 @@ old_assert = '''\tif !strings.Contains(got, "ExcludeNodes {us},{??}\\n") || stri
 \t\tt.Fatal("strict Tor policy must exclude US and unknown-country nodes at every circuit position")
 \t}
 '''
-new_assert = '''\tif !strings.Contains(got, "ExcludeNodes {us}\\n") || strings.Contains(got, "ExcludeNodes {us},{??}") || strings.Contains(got, "GeoIPExcludeUnknown") || strings.Contains(got, "ExcludeExitNodes") {
-\t\tt.Fatal("Tor policy must exclude US-classified relays without blocking unknown Snowflake bridge metadata")
+new_assert = '''\tif !strings.Contains(got, "ExcludeExitNodes {us}\\n") || strings.Contains(got, "ExcludeNodes") || strings.Contains(got, "GeoIPExcludeUnknown") {
+\t\tt.Fatal("Tor policy must block US exits while allowing the built-in Snowflake bridge")
 \t}
 '''
 if old_assert not in tests:
     raise SystemExit("Could not locate old strict Tor test assertion.")
 tests = tests.replace(old_assert, new_assert, 1)
-
 # Confirm the resulting source has exactly the intended behavior.
 if 'return torModeSnowflake, nil' not in main_new or '1) Tor Snowflake (automatic; no bridge input required)' not in main_new:
     raise SystemExit("Snowflake menu restoration verification failed.")
 if 'Paste one Tor WebTunnel bridge line' not in main_new:
     raise SystemExit("WebTunnel-only manual prompt disappeared unexpectedly.")
-if 'ExcludeNodes {us},{??}' in tor_new or 'GeoIPExcludeUnknown 1' in tor_new:
-    raise SystemExit("Unsafe strict bridge filtering remains.")
+if 'ExcludeNodes {us}' in tor_new or 'GeoIPExcludeUnknown 1' in tor_new or 'ExcludeExitNodes {us}' not in tor_new:
+    raise SystemExit("Tor US-exit policy verification failed.")
 
 main_path.write_text(main_new, encoding="utf-8")
 tor_path.write_text(tor_new, encoding="utf-8")
@@ -247,8 +246,8 @@ for helper in "$SRC/S1T-START.sh" "$SRC/scripts/install-tor.sh" "$SRC/scripts/in
   [[ -s "$helper" ]] || die "Required installer helper is missing: $helper"
   bash -n "$helper" || die "Shell syntax check failed: $helper"
 done
-grep -Fq 'ExcludeNodes {us}' "$SRC/S1T-CAPSULE/tor.go"
-! grep -Fq 'ExcludeNodes {us},{??}' "$SRC/S1T-CAPSULE/tor.go"
+grep -Fq 'ExcludeExitNodes {us}' "$SRC/S1T-CAPSULE/tor.go"
+! grep -Fq 'ExcludeNodes {us}' "$SRC/S1T-CAPSULE/tor.go"
 grep -Fq 'Tor Snowflake (automatic; no bridge input required)' "$SRC/S1T-CAPSULE/main.go"
 
 ARCH="$(uname -m)"
