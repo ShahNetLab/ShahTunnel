@@ -1,9 +1,9 @@
 <div align="center">
-# ShahTunnel 4.0.9
+# ShahTunnel 5.0.0
 
 <p align="center"><img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel logo" width="72%"></p>
 
-[![Version](https://img.shields.io/badge/version-4.0.9-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-5.0.0-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -26,7 +26,7 @@
 <a id="network-flow"></a>
 ## Network Flow
 
-<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v4.png" alt="ShahTunnel network flow diagram" width="100%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Network-Flow-v5.png" alt="ShahTunnel network flow diagram" width="100%"></p>
 
 The Hub-to-Agent forwarding path and optional per-profile Internet egress are separate: the tunnel forwards mapped TCP services to Agent-side targets, while the optional Xray sidecar sends only the selected inbound through that Agent profile’s WARP, Psiphon or Tor SOCKS5 egress.
 
@@ -51,7 +51,7 @@ Selected Xray inbound → loopback-only Xray sidecar → WARP / Psiphon / Tor SO
 
 ### Automatic Psiphon egress for user traffic
 
-When a new Agent profile is created with Psiphon egress, ShahTunnel first installs and starts a dedicated per-profile `shah-tunnel-psiphon-*.service` with `Restart=always`; the Agent unit has a `Requires`/`After` dependency on it. ShahTunnel waits for the SOCKS5 listener before starting the Agent, then verifies a real public Psiphon exit and country, prepares the dedicated loopback-only Xray sidecar, updates the mapping, and restarts only that Agent. The Agent restart also restarts its bound Psiphon unit; the setup waits for SOCKS5 and re-verifies a real approved, non-US exit before reporting success. TCP and DNS traffic use that profile's Psiphon SOCKS5 proxy. Psiphon's local port-forward SOCKS proxy carries TCP streams, not UDP; UDP and unknown network types are routed to a Blackhole outbound so they cannot silently fall back to the Agent's direct Internet connection. Consequently UDP/QUIC apps and ICMP ping are not supported on this Psiphon-only user path. No separate Psiphon action is added to the manager menu. Existing profiles are not modified in the background; when an operator explicitly starts or restarts a selected Psiphon/adaptive Agent, the manager repairs a missing per-profile Xray Psiphon sidecar before reporting success. The X-UI source config, unrelated inbounds, other profiles, SSH and host routes are left unchanged.
+When a new Agent profile is created with Psiphon egress, ShahTunnel first installs and starts a dedicated per-profile `shah-tunnel-psiphon-*.service` with `Restart=always`; the Agent unit has a `Requires`/`After` dependency on it. ShahTunnel waits for the SOCKS5 listener before starting the Agent, then verifies a real public Psiphon exit and country, prepares the dedicated loopback-only Xray sidecar, updates the mapping, and restarts only that Agent. The Agent restart also restarts its bound Psiphon unit; the setup waits for SOCKS5 and re-verifies a real approved, non-US exit before reporting success. TCP and DNS traffic use that profile's Psiphon SOCKS5 proxy. Psiphon's local port-forward SOCKS proxy carries TCP streams, not UDP; UDP and unknown network types are routed to a Blackhole outbound so they cannot silently fall back to the Agent's direct Internet connection. Consequently UDP/QUIC apps and ICMP ping are not supported on this Psiphon-only user path. No separate Psiphon action is added to the manager menu. The all-protocol adaptive option 9 is deliberately different: Psiphon is only a standby underlay for Agent-to-Hub lanes, and the Agent's existing Xray user-egress target is left untouched. On startup, 5.0.0 also migrates legacy option-9 profiles back to their saved original Xray targets and removes their managed Psiphon user-egress sidecar. Explicit Psiphon-only profiles continue to use their dedicated Xray sidecar. The X-UI source config, unrelated inbounds, other profiles, SSH and host routes are left unchanged.
 
 ### Automatic Tor egress for Xray users
 
@@ -102,11 +102,11 @@ The Agent's `EXTERNAL EGRESS` menu can use Tor. On profile creation, ShahTunnel 
 
 When Psiphon cannot reach the Hub control port (for example, a custom `9448`), the Agent uses the Hub public Mapping endpoint on `443` for Psiphon egress only; the Direct path continues to use the configured control port. The Step 06 default is independent of the control port and points to TCP/443. The Hub distinguishes ShahTunnel control traffic from ordinary TLS with the dedicated `shah-tunnel-control/1` ALPN and forwards normal ClientHello bytes unchanged. This does not take over the public port, move a Mapping, or modify X-UI.
 
-For the complete ShahTunnel 4.0.9 feature set, run **4.0.9 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
+For the complete ShahTunnel 5.0.0 feature set, run **5.0.0 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
 
 ### Automatic Psiphon setup
 
-When an Agent selects `Psiphon / SOCKS5` (or the adaptive egress option), ShahTunnel automatically:
+When an Agent selects the dedicated `Psiphon / SOCKS5` egress option, ShahTunnel automatically:
 
 - builds the official Psiphon ConsoleClient from a pinned upstream source revision for the host architecture (`amd64` or `arm64`);
 - verifies the resulting executable architecture and version before installation;
@@ -117,9 +117,9 @@ When an Agent selects `Psiphon / SOCKS5` (or the adaptive egress option), ShahTu
 
 For an existing Agent profile whose earlier Psiphon bootstrap did not connect, run `sudo bash scripts/repair-psiphon-profile.sh PROFILE` from the extracted project directory at `scripts/repair-psiphon-profile.sh`. The helper backs up and repairs only that profile's Psiphon JSON and restarts only its matching `ravanreverse@PROFILE.service` unit.
 
-No TUN device, default route, SSH service, or X-UI service is changed. The first Psiphon setup downloads and builds the official client; it requires access to GitHub source hosting and the Go toolchain distribution. For a newly created Agent that selects Psiphon, both its outer TCP lanes to the Hub and its mapped end-user Xray TCP/DNS traffic use the profile's Psiphon SOCKS5 path; UDP is blocked on the user sidecar to prevent direct leakage.
+No TUN device, default route, SSH service, or X-UI service is changed. The first Psiphon setup downloads and builds the official client; it requires access to GitHub source hosting and the Go toolchain distribution. For a newly created Agent that selects the dedicated Psiphon-only egress option, its outer TCP lanes to the Hub and mapped end-user Xray TCP/DNS traffic use the profile's Psiphon SOCKS5 path; UDP is blocked on the user sidecar to prevent direct leakage. Option 9 does not apply that user-sidecar route.
 
-> The creation wizard's option `9` means **All-protocol adaptive**. There is no WARP egress action in the main manager menu anymore: WARP is applied automatically while creating an Agent profile when selected as its external egress.
+> The creation wizard's option `9` means **All-protocol adaptive**. It tries the available outer tunnel transports and uses Direct/Psiphon egress failover for the Agent-to-Hub lanes. It does not redirect subscriber traffic through Psiphon; the mapped Xray target and its normal outbound remain unchanged. Choose the dedicated Psiphon-only egress option when Psiphon is intentionally required for subscriber TCP/DNS traffic. There is no WARP egress action in the main manager menu: WARP is applied automatically while creating an Agent profile when selected as its external egress.
 
 ## Automatic per-tunnel WARP egress for Xray
 
@@ -221,11 +221,11 @@ sudo shah-tunnel menu
 - Psiphon buffer limits remain enabled on hosts with less than 3 GiB RAM. On hosts with at least 3 GiB RAM, the Meek and relay buffer caps are removed and the SSH channel window is set to 16 (512 KiB); low-memory hosts retain the documented default window of 4 (128 KiB). CPU thread limiting remains enabled on single-core hosts. The Psiphon tunnel-pool default is retained.
 - These settings target TCP throughput and more responsive lane selection. They cannot remove the physical latency of the client's route to the Hub, the Psiphon relay, or the selected destination. A client-reported value such as 635 ms must be measured end-to-end before and after deployment; no fixed reduction is guaranteed.
 
-Full-feature deployments should keep Hub and Agent on the same ShahTunnel 4.0.9 release. Historical version numbers are retained only in migration/repair code where they are needed to recognize existing installations; they are not separate current releases.
+Full-feature deployments should keep Hub and Agent on the same ShahTunnel 5.0.0 release. Historical version numbers are retained only in migration/repair code where they are needed to recognize existing installations; they are not separate current releases.
 
 
-## Multi-user performance notes (4.0.9)
+## Multi-user performance notes (5.0.0)
 
-The Hub lane scheduler now considers authenticated RTT, active stream count, pending payload bytes, and recent data-write wait. The existing process-wide 64 MiB queued-payload ceiling is retained; queue-pressure and write-wait telemetry steer new flows away from congested lanes. Psiphon `TunnelPoolSize` is selected conservatively from RAM/CPU (2–16) and the US region is rejected; live egress-country verification remains mandatory. WARP per-tunnel proxy integration currently supports Cloudflare MASQUE Local Proxy only; WireGuard is not advertised as a compatible Xray Local Proxy underlay. Tor/Snowflake/WebTunnel remain fallback transports, not a high-throughput primary for large user populations.
+The Hub lane scheduler considers authenticated RTT, active stream count, pending payload bytes, and recent data-write wait. The process-wide 64 MiB queued-payload ceiling is retained; queue-pressure and write-wait telemetry steer new flows away from congested lanes. Psiphon `TunnelPoolSize` is selected from RAM/CPU (2–16) and the US region is rejected; live egress-country verification remains mandatory. In 5.0.0, option 9 no longer wraps all subscriber Xray traffic in the same Psiphon SOCKS5 sidecar: Psiphon remains a standby for the Agent-to-Hub tunnel only, avoiding an unintended shared Psiphon bottleneck for the user population. WARP per-tunnel proxy integration currently supports Cloudflare MASQUE Local Proxy only; WireGuard is not advertised as a compatible Xray Local Proxy underlay. Tor/Snowflake/WebTunnel remain fallback transports, not a high-throughput primary for large user populations.
 
 These changes improve scheduling and queue discipline but cannot guarantee 100 simultaneous users on every VPS. Actual capacity depends on CPU, RAM, NIC throughput, the Hub's bandwidth, and the available WARP/Psiphon relay capacity. Validate with a staged load test before serving production users.
