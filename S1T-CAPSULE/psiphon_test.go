@@ -12,6 +12,9 @@ import (
 
 func TestNewPsiphonClientConfigUsesAuthenticatedBootstrap(t *testing.T) {
 	cfg := newPsiphonClientConfig(23456)
+	if cfg.EgressRegion != "" {
+		t.Fatalf("new profiles must use Psiphon automatic best-performing region selection, got %q", cfg.EgressRegion)
+	}
 	if cfg.LocalSocksProxyPort != 23456 {
 		t.Fatalf("SOCKS port = %d, want 23456", cfg.LocalSocksProxyPort)
 	}
@@ -362,16 +365,16 @@ func TestPsiphonPerformanceProfileIsMemoryAndCPUAware(t *testing.T) {
 	}
 }
 
-func TestPsiphonEgressRegionPolicyBlocksUSAndDefaultsToGermany(t *testing.T) {
-	if got, err := normalizePsiphonEgressRegion(""); err != nil || got != "DE" {
-		t.Fatalf("empty region = %q, %v; want DE", got, err)
+func TestPsiphonEgressRegionPolicyBlocksUSAndDefaultsToAutomatic(t *testing.T) {
+	if got, err := normalizePsiphonEgressRegion(""); err != nil || got != "" {
+		t.Fatalf("empty region = %q, %v; want automatic selection", got, err)
 	}
-	for _, region := range []string{"US", "us", "GB", "XX"} {
+	for _, region := range []string{"US", "us", "XX"} {
 		if got, err := normalizePsiphonEgressRegion(region); err == nil {
 			t.Fatalf("region %q unexpectedly accepted as %q", region, got)
 		}
 	}
-	for _, region := range []string{"AE", "TR", "DE", "RS", "RO", "FR"} {
+	for _, region := range []string{"AT", "AU", "BE", "BR", "CA", "SE", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IN", "IT", "LT", "NL", "NO", "PL", "RO", "RS"} {
 		if got, err := normalizePsiphonEgressRegion(region); err != nil || got != region {
 			t.Fatalf("approved region %q rejected: got=%q err=%v", region, got, err)
 		}
@@ -400,7 +403,7 @@ func TestTunePsiphonPerformanceConfigPreservesUnknownFields(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatal(err)
 	}
-	if string(got["EgressRegion"]) != `"DE"` || string(got["LocalSocksProxyPort"]) != "21086" {
+	if string(got["EgressRegion"]) != `""` || string(got["LocalSocksProxyPort"]) != "21086" {
 		t.Fatalf("known profile fields were not preserved: region=%s port=%s", got["EgressRegion"], got["LocalSocksProxyPort"])
 	}
 	if string(got["SSHChannelWindowSize"]) != "16" {
@@ -427,7 +430,7 @@ func TestTunePsiphonPerformanceConfigPreservesUnknownFields(t *testing.T) {
 }
 
 func TestPsiphonEgressRegionPriorityAndUSBlock(t *testing.T) {
-	want := []string{"DE", "TR", "AE", "RS", "RO", "BG", "GR", "GE", "AM", "AZ", "NL", "CH", "AT", "PL", "CZ", "SK", "HU", "FR", "SE", "FI"}
+	want := []string{"AT", "AU", "BE", "BR", "CA", "SE", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IN", "IT", "LT", "NL", "NO", "PL", "RO", "RS"}
 	if !reflect.DeepEqual(psiphonEgressRegionPriority, want) {
 		t.Fatalf("Psiphon region priority = %v; want %v", psiphonEgressRegionPriority, want)
 	}

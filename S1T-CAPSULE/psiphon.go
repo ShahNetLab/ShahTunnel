@@ -177,18 +177,13 @@ func psiphonHostPerformanceProfile() psiphonPerformanceProfile {
 	return psiphonPerformanceProfileForHost(totalRAM, runtime.NumCPU())
 }
 
-// Psiphon region preferences intentionally exclude the United States.
-// A requested region is only a preference; the live exit country is verified
-// independently before Xray user egress is enabled.
-// The ordered region list is the approved candidate order. Psiphon accepts
-// one EgressRegion per ConsoleClient instance; DE is the initial preference,
-// while the complete list is used to validate permitted exit countries. The
-// actual country is always verified because availability is network-dependent.
+// Psiphon accepts one EgressRegion per ConsoleClient. An empty value lets
+// Psiphon select its best-performing server; the live exit is independently
+// verified against this explicit allowlist before user traffic is enabled.
+// These are exactly the countries requested for ShahTunnel 5.0.0.
 var psiphonEgressRegionPriority = []string{
-	// Priority 1: nearer alternatives to Iran.
-	"DE", "TR", "AE", "RS", "RO", "BG", "GR", "GE", "AM", "AZ",
-	// Priority 2: secondary alternatives.
-	"NL", "CH", "AT", "PL", "CZ", "SK", "HU", "FR", "SE", "FI",
+	"AT", "AU", "BE", "BR", "CA", "SE", "CH", "CZ", "DE", "DK",
+	"ES", "GB", "IE", "IN", "IT", "LT", "NL", "NO", "PL", "RO", "RS",
 }
 
 var psiphonAllowedEgressRegions = func() map[string]bool {
@@ -202,7 +197,7 @@ var psiphonAllowedEgressRegions = func() map[string]bool {
 func normalizePsiphonEgressRegion(region string) (string, error) {
 	region = strings.ToUpper(strings.TrimSpace(region))
 	if region == "" {
-		return "DE", nil
+		return "", nil // Psiphon auto-selects its best-performing country.
 	}
 	if region == "US" || !psiphonAllowedEgressRegions[region] {
 		return "", fmt.Errorf("Psiphon egress region %q is blocked or not in the approved non-US region list", region)
@@ -217,7 +212,7 @@ func newPsiphonClientConfig(port int) psiphonClientConfig {
 		ClientPlatform:                     "Linux",
 		PropagationChannelID:               psiphonPropagationChannelID,
 		SponsorID:                          psiphonSponsorID,
-		EgressRegion:                       "DE",
+		EgressRegion:                       "",
 		LocalSocksProxyPort:                port,
 		DisableLocalHTTPProxy:              true,
 		UseUnixDomainSockets:               false,
@@ -913,6 +908,11 @@ func tunePsiphonPerformanceConfigForProfile(configPath string, profile psiphonPe
 		"LimitRelayBufferSizes": profile.LimitRelayBufferSizes,
 		"SSHChannelWindowSize":  profile.SSHChannelWindowSize,
 		"TunnelPoolSize":        profile.TunnelPoolSize,
+	}
+	// DE was the old hard-coded default, not a user-selectable preference.
+	// Migrate it to Psiphon's automatic best-performing region selection.
+	if existing, ok := raw["EgressRegion"]; ok && string(existing) == `"DE"` {
+		settings["EgressRegion"] = ""
 	}
 	changed := false
 	for key, value := range settings {
