@@ -12,8 +12,8 @@ import (
 
 func TestNewPsiphonClientConfigUsesAuthenticatedBootstrap(t *testing.T) {
 	cfg := newPsiphonClientConfig(23456)
-	if cfg.EgressRegion != "" {
-		t.Fatalf("new profiles must use Psiphon automatic best-performing region selection, got %q", cfg.EgressRegion)
+	if cfg.EgressRegion != "AT" {
+		t.Fatalf("new profiles must prefer Austria first, got %q", cfg.EgressRegion)
 	}
 	if cfg.LocalSocksProxyPort != 23456 {
 		t.Fatalf("SOCKS port = %d, want 23456", cfg.LocalSocksProxyPort)
@@ -403,7 +403,7 @@ func TestTunePsiphonPerformanceConfigPreservesUnknownFields(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatal(err)
 	}
-	if string(got["EgressRegion"]) != `""` || string(got["LocalSocksProxyPort"]) != "21086" {
+	if string(got["EgressRegion"]) != `"AT"` || string(got["LocalSocksProxyPort"]) != "21086" {
 		t.Fatalf("known profile fields were not preserved: region=%s port=%s", got["EgressRegion"], got["LocalSocksProxyPort"])
 	}
 	if string(got["SSHChannelWindowSize"]) != "16" {
@@ -479,5 +479,39 @@ func TestRenderPsiphonSystemdServiceStaysWarmAcrossAgentRestarts(t *testing.T) {
 	}
 	if strings.Contains(text, "0.0.0.0") || strings.Contains(text, "CAP_NET_ADMIN") {
 		t.Fatalf("Psiphon unit must not expose a public proxy or grant network-admin capability:\n%s", text)
+	}
+}
+
+func TestPsiphonCountrySelectionStartsAtAustriaAndKeepsOrderedFallback(t *testing.T) {
+	want := []string{"AT", "AU", "BE", "BR", "CA", "SE", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IN", "IT", "LT", "NL", "NO", "PL", "RO", "RS"}
+	if got := psiphonRegionCandidates("DE"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("legacy DE profile candidates=%v; want %v", got, want)
+	}
+	if got := psiphonRegionCandidates("NL"); got[0] != "NL" || len(got) != len(want) {
+		t.Fatalf("persisted working region should be reused first, got %v", got)
+	}
+	dir := t.TempDir()
+	path, err := writePsiphonProfileConfig("country-order", 24680, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := setPsiphonEgressRegionPreference(path, "AU")
+	if err != nil || !changed {
+		t.Fatalf("set Psiphon region: changed=%v err=%v", changed, err)
+	}
+	if got := readPsiphonPreferredRegion(path); got != "AU" {
+		t.Fatalf("saved region=%q; want AU", got)
+	}
+}
+
+func TestPsiphonExitDirectIPIsRejected(t *testing.T) {
+	if !psiphonExitMatchesVPSDirectIP("203.0.113.10", "203.0.113.10") {
+		t.Fatal("same IP must be treated as direct VPS egress")
+	}
+	if psiphonExitMatchesVPSDirectIP("203.0.113.10", "198.51.100.20") {
+		t.Fatal("different IPs must not be treated as identical")
+	}
+	if psiphonExitMatchesVPSDirectIP("not-an-ip", "198.51.100.20") {
+		t.Fatal("invalid IP must not compare as a direct exit")
 	}
 }

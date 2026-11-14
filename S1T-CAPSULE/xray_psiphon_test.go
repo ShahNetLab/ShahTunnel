@@ -72,3 +72,19 @@ func TestXrayPsiphonLifecycleOwnershipRequiresExactProfileMetadata(t *testing.T)
 		t.Fatal("Xray Psiphon unit was accepted for a different managed config")
 	}
 }
+
+func TestPsiphonMappingsMustPointToIsolatedSidecar(t *testing.T) {
+	cfg := Config{
+		Ports: []PortMapping{{ID: "main", Target: "127.0.0.1:31083"}},
+		XrayPsiphon: &XrayPsiphonIntegration{
+			Bindings: []XrayPsiphonBinding{{MappingID: "main", OriginalTarget: "127.0.0.1:2083", PsiphonTarget: "127.0.0.1:31083"}},
+		},
+	}
+	if err := validatePsiphonMappingTargets(cfg); err != nil {
+		t.Fatalf("valid isolated mapping rejected: %v", err)
+	}
+	cfg.Ports[0].Target = "127.0.0.1:2083"
+	if err := validatePsiphonMappingTargets(cfg); err == nil {
+		t.Fatal("original Xray target must be rejected as possible direct egress")
+	}
+}

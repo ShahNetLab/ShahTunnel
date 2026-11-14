@@ -207,12 +207,16 @@ func normalizePsiphonEgressRegion(region string) (string, error) {
 
 func newPsiphonClientConfig(port int) psiphonClientConfig {
 	performance := psiphonHostPerformanceProfile()
+	preferredRegion := "AT"
+	if len(psiphonEgressRegionPriority) > 0 {
+		preferredRegion = psiphonEgressRegionPriority[0]
+	}
 	return psiphonClientConfig{
 		ClientVersion:                      "1",
 		ClientPlatform:                     "Linux",
 		PropagationChannelID:               psiphonPropagationChannelID,
 		SponsorID:                          psiphonSponsorID,
-		EgressRegion:                       "",
+		EgressRegion:                       preferredRegion,
 		LocalSocksProxyPort:                port,
 		DisableLocalHTTPProxy:              true,
 		UseUnixDomainSockets:               false,
@@ -884,6 +888,45 @@ func repairLegacyPsiphonClientConfig(configPath, proxyAddress string) (bool, err
 	return true, nil
 }
 
+// setPsiphonEgressRegionPreference updates only the EgressRegion field in a
+// profile-local Psiphon config. Psiphon supports exactly one requested country
+// per ConsoleClient process; ShahTunnel changes this value and restarts only
+// this profile's service when advancing through the user's ordered list.
+func setPsiphonEgressRegionPreference(configPath, region string) (bool, error) {
+	region, err := normalizePsiphonEgressRegion(region)
+	if err != nil || region == "" {
+		if err == nil {
+			err = errors.New("an explicit Psiphon region is required")
+		}
+		return false, err
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return false, err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil || raw == nil {
+		if err == nil {
+			err = errors.New("Psiphon config must be a JSON object")
+		}
+		return false, fmt.Errorf("read Psiphon region preference: %w", err)
+	}
+	encoded, _ := json.Marshal(region)
+	if old, ok := raw["EgressRegion"]; ok && string(old) == string(encoded) {
+		return false, nil
+	}
+	raw["EgressRegion"] = encoded
+	updated, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	updated = append(updated, '\n')
+	if err := atomicReplaceFile(configPath, updated, 0600); err != nil {
+		return false, fmt.Errorf("write Psiphon region preference %s: %w", region, err)
+	}
+	return true, nil
+}
+
 // tunePsiphonPerformanceConfig updates only the performance settings owned by
 // ShahTunnel, preserving every other field and unknown Psiphon option.
 func tunePsiphonPerformanceConfig(configPath string) (bool, error) {
@@ -909,10 +952,13 @@ func tunePsiphonPerformanceConfigForProfile(configPath string, profile psiphonPe
 		"SSHChannelWindowSize":  profile.SSHChannelWindowSize,
 		"TunnelPoolSize":        profile.TunnelPoolSize,
 	}
-	// DE was the old hard-coded default, not a user-selectable preference.
-	// Migrate it to Psiphon's automatic best-performing region selection.
-	if existing, ok := raw["EgressRegion"]; ok && string(existing) == `"DE"` {
-		settings["EgressRegion"] = ""
+	// The previous release used either a hard-coded DE value or an empty
+	// value (Psiphon's unrestricted automatic selection). Both caused Germany
+	// to be selected repeatedly. New and legacy profiles now start with the
+	// user's first requested priority (Austria), then the selector explicitly
+	// advances through the remaining allowlisted regions only when needed.
+	if existing, ok := raw["EgressRegion"]; !ok || string(existing) == `"DE"` || string(existing) == `""` {
+		settings["EgressRegion"] = psiphonEgressRegionPriority[0]
 	}
 	changed := false
 	for key, value := range settings {
