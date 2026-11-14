@@ -2948,80 +2948,46 @@ func TestStartSelectedTunnelRepairsMissingPsiphonSidecar(t *testing.T) {
 	}
 }
 
-func TestOptionNineRestoresOriginalXrayTargets(t *testing.T) {
-	cfg := Config{
-		Version:  version,
-		Role:     "agent",
-		Underlay: underlayAdaptive,
-		Ports: []PortMapping{
-			{ID: "main", Target: "127.0.0.1:31001"},
-			{ID: "secondary", Target: "127.0.0.1:443"},
-		},
-		XrayPsiphon: &XrayPsiphonIntegration{
-			Bindings: []XrayPsiphonBinding{{
-				MappingID: "main", OriginalTarget: "127.0.0.1:2083", PsiphonTarget: "127.0.0.1:31001",
-			}},
-		},
-	}
-	got, changed, err := restoreAdaptivePsiphonMappings(cfg)
-	if err != nil {
-		t.Fatalf("restoreAdaptivePsiphonMappings: %v", err)
-	}
-	if !changed {
-		t.Fatal("expected legacy option-9 Psiphon user egress to be migrated")
-	}
-	if got.XrayPsiphon != nil {
-		t.Fatal("legacy Xray Psiphon sidecar metadata was not removed")
-	}
-	if got.Ports[0].Target != "127.0.0.1:2083" {
-		t.Fatalf("main target = %q; want original 127.0.0.1:2083", got.Ports[0].Target)
-	}
-	if got.Ports[1].Target != "127.0.0.1:443" {
-		t.Fatalf("unrelated mapping target changed: %q", got.Ports[1].Target)
-	}
-	if got.Version != "5.0.0" {
-		t.Fatalf("migrated config version = %q; want 5.0.0", got.Version)
-	}
-}
-
-func TestOptionNineDoesNotAutomaticallyRouteUsersThroughPsiphon(t *testing.T) {
+func TestOptionNineAutomaticallyRoutesXrayUsersThroughPsiphon(t *testing.T) {
 	adaptive := Config{Role: "agent", Underlay: underlayAdaptive}
-	if requiresAutomaticPsiphonUserEgress(adaptive) {
-		t.Fatal("option 9 must not automatically create a Psiphon Xray user-egress sidecar")
+	if !supportsPsiphonUserEgress(adaptive) {
+		t.Fatal("option 9 must support the isolated Psiphon Xray user-egress route")
+	}
+	if !requiresAutomaticPsiphonUserEgress(adaptive) {
+		t.Fatal("option 9 must automatically prepare the Psiphon Xray sidecar")
 	}
 	dedicated := Config{Role: "agent", Underlay: underlayPsiphon}
 	if !requiresAutomaticPsiphonUserEgress(dedicated) {
 		t.Fatal("the dedicated Psiphon option must retain automatic Psiphon user egress")
 	}
-	if requiresAutomaticPsiphonUserEgress(Config{Role: "hub", Underlay: underlayPsiphon}) {
+	if supportsPsiphonUserEgress(Config{Role: "hub", Underlay: underlayAdaptive}) {
 		t.Fatal("Hub profiles must not create an Xray Psiphon user-egress sidecar")
 	}
-}
-
-func TestOptionNineMigrationRejectsUnknownMapping(t *testing.T) {
-	cfg := Config{
-		Role:     "agent",
-		Underlay: underlayAdaptive,
-		Ports:    []PortMapping{{ID: "main", Target: "127.0.0.1:31001"}},
-		XrayPsiphon: &XrayPsiphonIntegration{
-			Bindings: []XrayPsiphonBinding{{MappingID: "missing", OriginalTarget: "127.0.0.1:443"}},
-		},
-	}
-	if _, changed, err := restoreAdaptivePsiphonMappings(cfg); err == nil || changed {
-		t.Fatalf("unknown legacy mapping was not rejected safely: changed=%v err=%v", changed, err)
+	if supportsPsiphonUserEgress(Config{Role: "agent", Underlay: underlayDirect}) {
+		t.Fatal("Direct-only Agent profiles must not use the Psiphon Xray sidecar")
 	}
 }
 
-func TestOptionNineMigrationRejectsInvalidOriginalTarget(t *testing.T) {
-	cfg := Config{
-		Role:     "agent",
-		Underlay: underlayAdaptive,
-		Ports:    []PortMapping{{ID: "main", Target: "127.0.0.1:31001"}},
-		XrayPsiphon: &XrayPsiphonIntegration{
-			Bindings: []XrayPsiphonBinding{{MappingID: "main", OriginalTarget: "not-an-address"}},
-		},
+func TestRunAgentDoesNotDiscardOptionNinePsiphonMappings(t *testing.T) {
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate test source")
 	}
-	if _, changed, err := restoreAdaptivePsiphonMappings(cfg); err == nil || changed {
-		t.Fatalf("invalid original target was not rejected safely: changed=%v err=%v", changed, err)
+	source, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(source)
+	start := strings.Index(body, "func runAgent(cfg Config) error {")
+	if start < 0 {
+		t.Fatal("runAgent function was not found")
+	}
+	end := strings.Index(body[start:], "func runAgentWorker(")
+	if end < 0 {
+		t.Fatal("runAgentWorker function was not found")
+	}
+	body = body[start : start+end]
+	if strings.Contains(body, "migrateAdaptivePsiphonUserEgress") || strings.Contains(body, "restoreAdaptivePsiphonMappings") {
+		t.Fatal("Agent startup must preserve option-9 Psiphon Xray mappings instead of restoring direct targets")
 	}
 }

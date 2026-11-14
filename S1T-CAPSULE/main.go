@@ -2814,11 +2814,6 @@ func validAuth(line, token string) bool { return authProtocol(line, token) != ""
 
 func runAgent(cfg Config) error {
 	cfg = normalizeConfig(cfg)
-	if migrated, err := migrateAdaptivePsiphonUserEgress(&cfg); err != nil {
-		return fmt.Errorf("migrate legacy option-9 Psiphon user egress: %w", err)
-	} else if migrated {
-		log.Printf("option 9 migration complete: restored the original Xray targets; Psiphon remains available only as an Agent-to-Hub fallback")
-	}
 	var cleanupUnderlay func()
 	cleanupUnderlay = func() {}
 	switch cfg.Underlay {
@@ -3024,7 +3019,8 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 	}
 
 	// A lane exhausts every configured inner transport on one egress path before
-	// switching the egress path. The same authenticated Hub protocol is retained.
+	// switching the egress path. This affects Agent-to-Hub control/data lanes;
+	// mapped Xray user traffic has its own isolated Psiphon SOCKS5 sidecar.
 	var lastErr error
 	for routeIndex, route := range underlayCandidates {
 		if cfg.Underlay == underlayAdaptive {
@@ -4763,7 +4759,7 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
 	fmt.Printf("  %s\n", paint(ansiPinkGlow, "7) FULL ADAPTIVE FAILOVER — all 4 implemented transports"))
 	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "8) EXTERNAL EGRESS — Cloudflare MASQUE / Psiphon / Tor"))
-	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) ALL-PROTOCOL ADAPTIVE — all 4 transports + Direct/Psiphon egress failover"))
+	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) ALL-PROTOCOL ADAPTIVE — 4 transports + Psiphon user egress + lane failover"))
 	choice := wizardAsk(prompt+" (1-9)", "7")
 	switch choice {
 	case "1":
@@ -4811,10 +4807,11 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 		}
 	case "9":
 		if role != "agent" {
-			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent to enable Direct/Psiphon egress failover.")
+			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent for Psiphon user TCP/DNS egress and adaptive Agent-to-Hub lane failover.")
 			return transportAdaptive, underlayDirect, "", nil
 		}
-		// Option 9 includes Psiphon as an automatically prepared standby egress.
+		// Option 9 provisions Psiphon for mapped user TCP/DNS and also retains
+		// independent Direct/Psiphon/active-MASQUE failover for Agent-to-Hub lanes.
 		return transportAdaptive, underlayAdaptive, "", nil
 	default:
 		return "", "", "", errors.New("invalid transport selection; enter a number from 1 to 9")
@@ -5090,7 +5087,7 @@ func setup() error {
 			uiInfo("This Agent's Xray mappings and DNS use its isolated WARP Local Proxy sidecar; system routes and SSH are untouched.")
 		}
 		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
-			uiInfo("Psiphon starts as a loopback-only child process. The Agent-to-Hub lanes and the isolated Xray user TCP/DNS egress use its SOCKS5 endpoint; UDP is blocked on the isolated user path to prevent direct-IP leaks. No TUN device or host route changes are made.")
+			uiInfo("A per-profile Psiphon service provides loopback SOCKS5. Agent-to-Hub lanes use adaptive Direct/Psiphon failover, while this Agent's isolated Xray user TCP/DNS egress uses Psiphon; UDP is blocked to prevent direct-IP leaks. No TUN device or host route changes are made.")
 		}
 		if c.Underlay == underlayTor {
 			uiInfo("Tor starts as a per-profile child process. Agent-to-Hub TCP lanes and this Agent's isolated Xray user TCP/DNS mappings use its loopback SOCKS5 proxy. UDP, QUIC, and ICMP are blocked on the user path; no TUN device, default route, SSH, X-UI source config, or host firewall is changed.")
