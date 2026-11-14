@@ -100,6 +100,9 @@ grep -Fq 'func autoApplyXrayPsiphonForNewAgent() error' S1T-CAPSULE/xray_psiphon
 grep -Fq 'autoApplyXrayPsiphonForNewAgent()' S1T-CAPSULE/main.go || fail "New-Agent setup does not invoke automatic Psiphon user egress."
 if grep -Fq 'menuItem("10", "🛡️ Psiphon user egress"' S1T-CAPSULE/main.go; then fail "Redundant Psiphon menu option must not be present."; fi
 grep -Fq 'TestBuildXrayPsiphonConfigIsolatesTCPAndBlocksUDP' S1T-CAPSULE/main_test.go || fail "Psiphon TCP/DNS isolation and UDP fail-closed coverage is missing."
+grep -Fq 'TestOptionNineAutomaticallyRoutesXrayUsersThroughPsiphon' S1T-CAPSULE/main_test.go || fail "Option 9 Psiphon user-egress coverage is missing."
+grep -Fq 'func supportsPsiphonUserEgress(cfg Config) bool' S1T-CAPSULE/xray_psiphon.go || fail "Option 9 is not accepted by the Psiphon Xray egress integration."
+if grep -Fq 'migrateAdaptivePsiphonUserEgress' S1T-CAPSULE/main.go; then fail "Agent startup must not undo option-9 Psiphon user egress."; fi
 grep -Fq 'TestXrayPsiphonManagedPathsAndUnitAreRestricted' S1T-CAPSULE/main_test.go || fail "Psiphon sidecar service/path safety coverage is missing."
 grep -Fq 'TestHubBalancesMeasuredRTTAndLoad' S1T-CAPSULE/main_test.go || fail "RTT/load lane selection coverage is missing."
 grep -Fq 'TestHubPrefersFreshRTTOverStaleLowRTT' S1T-CAPSULE/main_test.go || fail "Fresh RTT lane selection regression coverage is missing."
