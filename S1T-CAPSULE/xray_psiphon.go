@@ -83,6 +83,7 @@ func renderXrayPsiphonUnit(runtime xrayRuntime, configPath, service string) ([]b
 		}
 	}
 	unit := fmt.Sprintf(`[Unit]
+# Managed-By: ShahTunnel 5.0.0
 Description=ShahTunnel isolated Psiphon Xray (%s)
 After=network-online.target
 Wants=network-online.target
@@ -141,6 +142,64 @@ func waitForXrayPsiphonInbounds(service string, bindings []XrayPsiphonBinding) e
 	return fmt.Errorf("isolated Xray service %s is active but its Psiphon-only loopback inbounds did not start; journal: %s", service, xrayPsiphonJournal(service))
 }
 
+// xrayPsiphonUnitBelongsToProfile recognizes only the exact service/config pair
+// ShahTunnel creates for this profile. This permits safe repair after an
+// interrupted first setup without taking over a similarly named third-party
+// unit or another profile's configuration.
+func xrayPsiphonUnitBelongsToProfile(unit []byte, runtime xrayRuntime, configPath, service string) bool {
+	if len(unit) == 0 || runtime.Binary == "" || runtime.CWD == "" || filepath.Base(service) != service ||
+		!strings.HasPrefix(service, "shah-tunnel-xray-psiphon-") || !strings.HasSuffix(service, ".service") {
+		return false
+	}
+	text := string(unit)
+	if !strings.Contains(text, "Description=ShahTunnel isolated Psiphon Xray (") {
+		return false
+	}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		// The Xray binary may have moved during an upgrade. Ownership is tied
+		// to the ShahTunnel unit description and its exact profile config path;
+		// the replacement unit will use the currently detected binary.
+		if strings.HasPrefix(line, "ExecStart=") && strings.HasSuffix(line, " run -config "+systemdExecQuote(configPath)) {
+			return true
+		}
+	}
+	return false
+}
+
+func restoreXrayPsiphonSidecar(service, unitPath, configPath string, oldUnit, oldConfig []byte, hadConfig, wasActive, wasEnabled bool) error {
+	_ = exec.Command("systemctl", "stop", service).Run()
+	var restoreErr error
+	if err := atomicReplaceFile(unitPath, oldUnit, 0644); err != nil {
+		restoreErr = errors.Join(restoreErr, fmt.Errorf("restore prior unit: %w", err))
+	}
+	if hadConfig {
+		if err := atomicReplaceFile(configPath, oldConfig, 0600); err != nil {
+			restoreErr = errors.Join(restoreErr, fmt.Errorf("restore prior Xray config: %w", err))
+		}
+	} else if err := os.Remove(configPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		restoreErr = errors.Join(restoreErr, fmt.Errorf("remove replacement Xray config: %w", err))
+	}
+	if err := systemdReload(); err != nil {
+		restoreErr = errors.Join(restoreErr, err)
+	}
+	if wasEnabled {
+		if out, err := exec.Command("systemctl", "enable", service).CombinedOutput(); err != nil {
+			restoreErr = errors.Join(restoreErr, fmt.Errorf("restore enabled state: %w: %s", err, strings.TrimSpace(string(out))))
+		}
+	} else {
+		if out, err := exec.Command("systemctl", "disable", service).CombinedOutput(); err != nil {
+			restoreErr = errors.Join(restoreErr, fmt.Errorf("restore disabled state: %w: %s", err, strings.TrimSpace(string(out))))
+		}
+	}
+	if wasActive {
+		if out, err := exec.Command("systemctl", "start", service).CombinedOutput(); err != nil {
+			restoreErr = errors.Join(restoreErr, fmt.Errorf("restore active state: %w: %s", err, strings.TrimSpace(string(out))))
+		}
+	}
+	return restoreErr
+}
+
 func installXrayPsiphonSidecar(runtime xrayRuntime, profileID string, generated []byte, bindings []XrayPsiphonBinding) (string, string, error) {
 	service := xrayPsiphonServiceName(profileID)
 	unitPath, err := xrayPsiphonUnitPath(service)
@@ -149,14 +208,91 @@ func installXrayPsiphonSidecar(runtime xrayRuntime, profileID string, generated 
 	}
 	configDir := xrayPsiphonDirectory(profileID)
 	configPath := filepath.Join(configDir, "config.json")
-	if _, err := os.Stat(unitPath); err == nil {
-		return "", "", fmt.Errorf("managed Psiphon Xray unit %s already exists; inspect or remove the previous profile integration first", service)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", "", err
-	}
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		return "", "", err
 	}
+	if err := os.Chmod(configDir, 0700); err != nil {
+		return "", "", err
+	}
+	dirInfo, err := os.Lstat(configDir)
+	if err != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
+		if err != nil {
+			return "", "", fmt.Errorf("inspect profile-local Psiphon Xray directory: %w", err)
+		}
+		return "", "", fmt.Errorf("profile-local Psiphon Xray path %s is not a real directory", configDir)
+	}
+	if configInfo, configStatErr := os.Lstat(configPath); configStatErr == nil {
+		if !configInfo.Mode().IsRegular() {
+			return "", "", fmt.Errorf("profile-local Psiphon Xray config %s is not a regular file; refusing to replace it", configPath)
+		}
+	} else if !errors.Is(configStatErr, os.ErrNotExist) {
+		return "", "", fmt.Errorf("inspect profile-local Psiphon Xray config: %w", configStatErr)
+	}
+	unit, err := renderXrayPsiphonUnit(runtime, configPath, service)
+	if err != nil {
+		return "", "", err
+	}
+
+	// First-time setup may have been interrupted after systemd installed the
+	// sidecar unit but before the profile metadata was committed. Adopt and
+	// update only the exact ShahTunnel unit for this profile; never overwrite an
+	// unknown unit, symlink, or unit pointing outside this profile directory.
+	st, statErr := os.Lstat(unitPath)
+	if statErr == nil {
+		if !st.Mode().IsRegular() {
+			return "", "", fmt.Errorf("managed Psiphon Xray unit path %s is not a regular file; refusing to replace it", unitPath)
+		}
+		oldUnit, readErr := os.ReadFile(unitPath)
+		if readErr != nil {
+			return "", "", fmt.Errorf("read existing Psiphon Xray unit %s: %w", service, readErr)
+		}
+		if !xrayPsiphonUnitBelongsToProfile(oldUnit, runtime, configPath, service) {
+			return "", "", fmt.Errorf("unit %s already exists but is not the ShahTunnel sidecar for this profile; refusing to overwrite it", service)
+		}
+		if err := systemdReload(); err != nil {
+			return "", "", fmt.Errorf("reload existing managed Psiphon Xray unit before repair: %w", err)
+		}
+		oldConfig, configErr := os.ReadFile(configPath)
+		hadConfig := configErr == nil
+		if configErr != nil && !errors.Is(configErr, os.ErrNotExist) {
+			return "", "", fmt.Errorf("read existing Psiphon Xray config: %w", configErr)
+		}
+		wasActive := exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil
+		wasEnabled := exec.Command("systemctl", "is-enabled", "--quiet", service).Run() == nil
+		if out, stopErr := exec.Command("systemctl", "stop", service).CombinedOutput(); stopErr != nil {
+			return "", "", fmt.Errorf("stop previous managed sidecar %s before repair: %w: %s", service, stopErr, strings.TrimSpace(string(out)))
+		}
+		rollback := func(cause error) (string, string, error) {
+			restoreErr := restoreXrayPsiphonSidecar(service, unitPath, configPath, oldUnit, oldConfig, hadConfig, wasActive, wasEnabled)
+			if restoreErr != nil {
+				return "", "", fmt.Errorf("%w; previous sidecar restoration also failed: %v", cause, restoreErr)
+			}
+			return "", "", cause
+		}
+		if err := atomicReplaceFile(configPath, generated, 0600); err != nil {
+			return rollback(fmt.Errorf("replace isolated Psiphon Xray config: %w", err))
+		}
+		if err := atomicReplaceFile(unitPath, unit, 0644); err != nil {
+			return rollback(fmt.Errorf("replace isolated Psiphon Xray unit: %w", err))
+		}
+		if err := systemdReload(); err != nil {
+			return rollback(err)
+		}
+		out, startErr := exec.Command("systemctl", "enable", "--now", service).CombinedOutput()
+		if startErr != nil {
+			journal := xrayPsiphonJournal(service)
+			return rollback(fmt.Errorf("start repaired isolated Xray service %s: %w: %s; journal: %s", service, startErr, strings.TrimSpace(string(out)), journal))
+		}
+		if err := waitForXrayPsiphonInbounds(service, bindings); err != nil {
+			journal := xrayPsiphonJournal(service)
+			return rollback(fmt.Errorf("repaired sidecar did not expose all loopback inbounds: %w; journal: %s", err, journal))
+		}
+		return configPath, service, nil
+	}
+	if !errors.Is(statErr, os.ErrNotExist) {
+		return "", "", fmt.Errorf("inspect Psiphon Xray unit path: %w", statErr)
+	}
+
 	cleanup := func() {
 		_ = exec.Command("systemctl", "disable", "--now", service).Run()
 		_ = os.Remove(unitPath)
@@ -167,12 +303,7 @@ func installXrayPsiphonSidecar(runtime xrayRuntime, profileID string, generated 
 		cleanup()
 		return "", "", fmt.Errorf("write isolated Psiphon Xray config: %w", err)
 	}
-	unit, err := renderXrayPsiphonUnit(runtime, configPath, service)
-	if err != nil {
-		cleanup()
-		return "", "", err
-	}
-	if err := os.WriteFile(unitPath, unit, 0644); err != nil {
+	if err := atomicReplaceFile(unitPath, unit, 0644); err != nil {
 		cleanup()
 		return "", "", fmt.Errorf("write isolated Psiphon Xray systemd unit: %w", err)
 	}
