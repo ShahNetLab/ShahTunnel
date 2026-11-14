@@ -4178,6 +4178,13 @@ func currentServiceName() string {
 	return "ravanreverse@" + id
 }
 
+func currentServiceNameForProfile(profile TunnelProfile) string {
+	if profile.Legacy {
+		return "ravanreverse"
+	}
+	return "ravanreverse@" + profile.ID
+}
+
 func parseTunnelProfileConfig(data []byte) (Config, bool) {
 	var c Config
 	if err := json.Unmarshal(data, &c); err != nil {
@@ -4453,6 +4460,9 @@ func deleteOneTunnel() error {
 		if err := removeXrayPsiphonIntegration(&cfg); err != nil {
 			return fmt.Errorf("tunnel stopped, but its isolated Xray Psiphon route could not be removed; tunnel profile was kept: %w", err)
 		}
+	}
+	if err := removePsiphonSystemdService(cfg, currentServiceNameForProfile(*selected)); err != nil {
+		return fmt.Errorf("tunnel stopped, but its profile-local Psiphon service could not be removed; tunnel profile was kept: %w", err)
 	}
 	if cfg.XrayTor != nil {
 		if err := removeXrayTorIntegration(&cfg); err != nil {
@@ -5139,19 +5149,19 @@ func setup() error {
 		}
 	}
 	fmt.Printf("\n  %s %s\n", paint(ansiGreen+ansiBold, "✓"), "Configuration saved: "+configPath)
+	// Prepare the Psiphon user-egress sidecar BEFORE the Agent starts. This
+	// avoids starting the Agent on original/direct targets and then restarting
+	// it (and cold-starting Psiphon) a second time after setup.
+	if c.Role == "agent" && (c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive) {
+		if err := autoApplyXrayPsiphonForNewAgent(); err != nil {
+			_ = stopPsiphonSystemdService(c)
+			return fmt.Errorf("Psiphon user-egress preparation failed before Agent startup: %w", err)
+		}
+	}
 	uiInfo("Enabling the independent service and automatic startup after VPS reboot…")
 	connected, startErr := ensureTunnelRunning(true)
 	if startErr != nil {
 		return fmt.Errorf("configuration was saved, but automatic startup failed: %w", startErr)
-	}
-	// The profile-bound Psiphon systemd unit is prepared before Agent startup.
-	// Configure isolated Xray user egress only after Agent and SOCKS readiness
-	// have both been confirmed, then verify Psiphon again after the restart.
-	if c.Role == "agent" && (c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive) {
-		if err := autoApplyXrayPsiphonForNewAgent(); err != nil {
-			_ = runSystemctl("stop", currentServiceName()) // fail closed: do not leave the new mapping on its original target
-			return fmt.Errorf("Agent service started, but Psiphon user-egress setup failed; Agent was stopped fail-closed: %w", err)
-		}
 	}
 	if c.Underlay == underlayPsiphon && !connected {
 		uiInfo("Agent service and local Psiphon SOCKS5 are running. Psiphon egress and/or the Agent-to-Hub lane may still be connecting; end-to-end connectivity is not yet confirmed.")
@@ -5266,16 +5276,45 @@ func ensureTunnelRunning(restartActive bool) (bool, error) {
 	return psiphonTunnelReady, nil
 }
 
-// startSelectedTunnel ensures profile-local dependencies are ready, starts the
-// Agent, and repairs the automatic Psiphon Xray sidecar if an earlier setup
-// attempt saved the profile but failed before the sidecar was committed.
+// startSelectedTunnel prepares and verifies all profile-local Psiphon
+// dependencies BEFORE the Agent is exposed. A warm Psiphon daemon is preserved
+// across Agent restarts; a cold daemon must establish a real approved exit
+// before the selected profile is started.
 func startSelectedTunnel(restartActive bool) error {
-	if _, err := ensureTunnelRunning(restartActive); err != nil {
+	cfg, err := loadConfig()
+	if err != nil {
 		return err
 	}
-	if err := autoApplyXrayPsiphonForNewAgent(); err != nil {
-		_ = runSystemctl("stop", currentServiceName())
-		return fmt.Errorf("selected Agent started but automatic Psiphon Xray repair failed; Agent stopped fail-closed: %w", err)
+	if supportsPsiphonUserEgress(cfg) {
+		wasAgentActive := tunnelIsActive()
+		if err := ensurePsiphonSystemdService(cfg); err != nil {
+			return fmt.Errorf("prepare profile-local Psiphon before Agent start: %w", err)
+		}
+		if cfg.XrayPsiphon == nil {
+			if err := autoApplyXrayPsiphonForNewAgent(); err != nil {
+				_ = stopPsiphonSystemdService(cfg)
+				return fmt.Errorf("automatic Psiphon Xray preparation failed; Agent was not started: %w", err)
+			}
+			// The Agent may already be running on the original targets. Restart
+			// it once, now that the saved mappings point at the Psiphon sidecar.
+			if wasAgentActive {
+				restartActive = true
+			}
+			cfg, err = loadConfig()
+			if err != nil {
+				return err
+			}
+		} else {
+			if err := ensurePsiphonUserEgressReady(cfg); err != nil {
+				return err
+			}
+			if err := ensureXrayPsiphonSidecar(cfg); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := ensureTunnelRunning(restartActive); err != nil {
+		return err
 	}
 	return nil
 }
@@ -5587,6 +5626,13 @@ func uninstall() error {
 	profiles, _ := listTunnelProfiles()
 	for _, profile := range profiles {
 		services[profile.Service] = true
+		services[psiphonServiceName(profile.Name)] = true
+		if data, readErr := os.ReadFile(profile.Path); readErr == nil {
+			var profileConfig Config
+			if json.Unmarshal(data, &profileConfig) == nil && profileConfig.XrayPsiphon != nil {
+				services[profileConfig.XrayPsiphon.Service] = true
+			}
+		}
 	}
 	if out, err := exec.Command("systemctl", "list-units", "--all", "--plain", "--no-legend", "--no-pager", "ravanreverse@*.service").Output(); err == nil {
 		for _, line := range strings.Split(string(out), "\n") {
@@ -5622,9 +5668,19 @@ func uninstall() error {
 			continue
 		}
 		var profileConfig Config
-		if json.Unmarshal(data, &profileConfig) == nil && profileConfig.XrayWARP != nil {
-			if cleanupErr := removeXrayWarpIntegration(&profileConfig); cleanupErr != nil {
-				return fmt.Errorf("could not remove Xray WARP integration for profile %s; ShahTunnel files were kept: %w", profile.Name, cleanupErr)
+		if json.Unmarshal(data, &profileConfig) == nil {
+			if profileConfig.XrayWARP != nil {
+				if cleanupErr := removeXrayWarpIntegration(&profileConfig); cleanupErr != nil {
+					return fmt.Errorf("could not remove Xray WARP integration for profile %s; ShahTunnel files were kept: %w", profile.Name, cleanupErr)
+				}
+			}
+			if profileConfig.XrayPsiphon != nil {
+				if cleanupErr := removeXrayPsiphonIntegration(&profileConfig); cleanupErr != nil {
+					return fmt.Errorf("could not remove Xray Psiphon integration for profile %s; ShahTunnel files were kept: %w", profile.Name, cleanupErr)
+				}
+			}
+			if cleanupErr := removePsiphonSystemdService(profileConfig, profile.Service); cleanupErr != nil {
+				return fmt.Errorf("could not remove Psiphon service for profile %s; ShahTunnel files were kept: %w", profile.Name, cleanupErr)
 			}
 		}
 	}
@@ -6226,6 +6282,17 @@ func menu() {
 				err = runSystemctl("stop", service)
 				if err == nil && tunnelIsActive() {
 					err = fmt.Errorf("service %s is still active after stop", service)
+				}
+				if err == nil {
+					if cfg, loadErr := loadConfig(); loadErr == nil {
+						if sidecarErr := stopXrayPsiphonSidecar(cfg); sidecarErr != nil {
+							err = sidecarErr
+						} else if psiphonErr := stopPsiphonSystemdService(cfg); psiphonErr != nil {
+							err = psiphonErr
+						}
+					} else {
+						err = loadErr
+					}
 				}
 			}
 		case "4":

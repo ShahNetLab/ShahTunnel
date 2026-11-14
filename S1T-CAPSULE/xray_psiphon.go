@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -325,6 +326,147 @@ func installXrayPsiphonSidecar(runtime xrayRuntime, profileID string, generated 
 	return configPath, service, nil
 }
 
+// xrayPsiphonUnitBelongsToConfig validates a sidecar using only the saved
+// profile metadata. It is used for lifecycle operations where Xray itself may
+// not yet be running, so runtime discovery is intentionally unnecessary.
+func xrayPsiphonUnitBelongsToConfig(unit []byte, cfg Config) bool {
+	if cfg.XrayPsiphon == nil || cfg.Name == "" || len(cfg.XrayPsiphon.Bindings) == 0 {
+		return false
+	}
+	meta := cfg.XrayPsiphon
+	expectedService := xrayPsiphonServiceName(cfg.Name)
+	expectedConfig := filepath.Join(xrayPsiphonDirectory(cfg.Name), "config.json")
+	if meta.Service != expectedService || filepath.Clean(meta.ConfigPath) != filepath.Clean(expectedConfig) ||
+		!isLoopbackProxyAddress(meta.Proxy) || strings.TrimSpace(meta.Proxy) != strings.TrimSpace(cfg.PsiphonProxy) {
+		return false
+	}
+	text := string(unit)
+	if !strings.Contains(text, "Description=ShahTunnel isolated Psiphon Xray (") {
+		return false
+	}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "ExecStart=") && strings.HasSuffix(line, " run -config "+systemdExecQuote(expectedConfig)) {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureXrayPsiphonSidecar starts a previously-created profile-local Xray
+// sidecar before Agent startup. It never adopts a unit that does not point to
+// this exact profile config.
+func ensureXrayPsiphonSidecar(cfg Config) error {
+	if cfg.XrayPsiphon == nil {
+		return nil
+	}
+	meta := cfg.XrayPsiphon
+	unitPath, err := xrayPsiphonUnitPath(meta.Service)
+	if err != nil {
+		return err
+	}
+	st, err := os.Lstat(unitPath)
+	if err != nil {
+		return fmt.Errorf("inspect profile Psiphon Xray unit: %w", err)
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("profile Psiphon Xray unit %s is not a regular file", meta.Service)
+	}
+	unit, err := os.ReadFile(unitPath)
+	if err != nil {
+		return err
+	}
+	if !xrayPsiphonUnitBelongsToConfig(unit, cfg) {
+		return fmt.Errorf("profile Psiphon Xray unit %s does not match saved profile metadata", meta.Service)
+	}
+	if err := systemdReload(); err != nil {
+		return err
+	}
+	out, err := exec.Command("systemctl", "enable", "--now", meta.Service).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("start profile Psiphon Xray sidecar %s: %w: %s; journal: %s", meta.Service, err, strings.TrimSpace(string(out)), xrayPsiphonJournal(meta.Service))
+	}
+	if err := waitForXrayPsiphonInbounds(meta.Service, meta.Bindings); err != nil {
+		return err
+	}
+	return nil
+}
+
+// stopXrayPsiphonSidecar stops, but does not disable, the selected profile's
+// sidecar. A later Agent Start re-enables/starts it before the Agent service.
+func stopXrayPsiphonSidecar(cfg Config) error {
+	if cfg.XrayPsiphon == nil {
+		return nil
+	}
+	meta := cfg.XrayPsiphon
+	unitPath, err := xrayPsiphonUnitPath(meta.Service)
+	if err != nil {
+		return err
+	}
+	st, err := os.Lstat(unitPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("profile Psiphon Xray unit %s is not a regular file; refusing to stop it", meta.Service)
+	}
+	unit, err := os.ReadFile(unitPath)
+	if err != nil {
+		return err
+	}
+	if !xrayPsiphonUnitBelongsToConfig(unit, cfg) {
+		return fmt.Errorf("profile Psiphon Xray unit %s does not match saved profile metadata; refusing to stop it", meta.Service)
+	}
+	out, err := exec.Command("systemctl", "stop", meta.Service).CombinedOutput()
+	if err != nil {
+		state, _ := exec.Command("systemctl", "show", meta.Service, "-p", "LoadState", "--value").Output()
+		if strings.TrimSpace(string(state)) == "not-found" {
+			return nil
+		}
+		return fmt.Errorf("stop profile Psiphon Xray sidecar %s: %w: %s", meta.Service, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// ensurePsiphonUserEgressReady proves that the SOCKS listener has a real,
+// approved Psiphon exit before mapped user traffic is exposed. On a warm
+// ConsoleClient this is one fast probe; after a cold start it waits for the
+// first usable tunnel and verifies the actual exit country.
+func ensurePsiphonUserEgressReady(cfg Config) error {
+	if cfg.XrayPsiphon == nil {
+		return nil
+	}
+	proxy := strings.TrimSpace(cfg.XrayPsiphon.Proxy)
+	if !isLoopbackProxyAddress(proxy) || proxy != strings.TrimSpace(cfg.PsiphonProxy) {
+		return errors.New("saved Xray Psiphon route does not match the profile's loopback SOCKS5 endpoint")
+	}
+	if err := waitForPsiphonProxy(proxy, 10*time.Second); err != nil {
+		return fmt.Errorf("Psiphon SOCKS5 is not ready: %w", err)
+	}
+	ip, err := psiphonPublicEgressIP(proxy, 5*time.Second)
+	if err != nil {
+		ip, err = waitForPsiphonPublicEgressIP(proxy, 75*time.Second)
+	}
+	if err != nil {
+		return fmt.Errorf("Psiphon user egress is not ready; Xray remains gated until a real exit is available: %w", err)
+	}
+	country, geoErr := psiphonPublicEgressCountry(proxy, ip, 8*time.Second)
+	if geoErr != nil {
+		country, geoErr = psiphonCountryFromDirectIPLookup(ip)
+	}
+	if geoErr != nil {
+		return fmt.Errorf("cannot verify the actual Psiphon exit %s before enabling user traffic: %w", ip, geoErr)
+	}
+	if country == "US" || !psiphonAllowedEgressRegions[country] {
+		return fmt.Errorf("refusing to expose user traffic through unapproved Psiphon exit %s (%s)", ip, country)
+	}
+	log.Printf("Psiphon user egress is warm and verified: %s (%s)", ip, country)
+	return nil
+}
+
 func removeXrayPsiphonSidecar(meta *XrayPsiphonIntegration) error {
 	if meta == nil {
 		return nil
@@ -585,7 +727,7 @@ func applyXrayPsiphonEgress(restartAgent, confirm bool) error {
 		return errors.New("Agent config does not contain a valid loopback Psiphon SOCKS5 endpoint")
 	}
 	// Always prove readiness and verify the real exit before creating user
-	// egress, including automatic first-time setup after the Agent service starts.
+	// egress. Automatic setup runs this before the Agent service is started.
 	if err := waitForPsiphonProxy(proxy, 120*time.Second); err != nil {
 		return fmt.Errorf("Psiphon SOCKS5 did not become ready at %s: %w; ConsoleClient may still be bootstrapping, so keep the Agent service running and retry", proxy, err)
 	}
@@ -719,9 +861,8 @@ func applyXrayPsiphonEgress(restartAgent, confirm bool) error {
 			rollbackSidecar()
 			return fmt.Errorf("restart ShahTunnel profile %s failed; previous Agent config was restored: %w", service, err)
 		}
-		// The Agent restart also restarts its PartOf Psiphon unit. Do not report
-		// success merely because systemd accepted the restart: wait for the SOCKS
-		// listener and a real, newly verified public exit before exposing Xray.
+		// The Psiphon ConsoleClient is independently supervised and remains warm
+		// across Agent restarts. Verify the user-egress path before returning.
 		if err = waitForPsiphonProxy(proxy, 120*time.Second); err == nil {
 			var refreshedIP string
 			refreshedIP, err = waitForPsiphonPublicEgressIP(proxy, 90*time.Second)
@@ -794,7 +935,10 @@ func autoApplyXrayPsiphonForNewAgent() error {
 		return nil
 	}
 	uiInfo("Preparing isolated Xray user egress through the verified per-profile Psiphon SOCKS5 proxy...")
-	if err := applyXrayPsiphonEgress(true, false); err != nil {
+	if err := ensurePsiphonSystemdService(cfg); err != nil {
+		return fmt.Errorf("prepare the profile-local Psiphon service before Xray setup: %w", err)
+	}
+	if err := applyXrayPsiphonEgress(false, false); err != nil {
 		return fmt.Errorf("Agent profile was saved, but automatic per-tunnel Psiphon user-egress setup failed: %w", err)
 	}
 	return nil

@@ -443,7 +443,7 @@ func TestPsiphonEgressRegionPriorityAndUSBlock(t *testing.T) {
 	}
 }
 
-func TestRenderPsiphonSystemdServiceIsRestartedAndTiedToAgent(t *testing.T) {
+func TestRenderPsiphonSystemdServiceStaysWarmAcrossAgentRestarts(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{
 		Name:           "profile-s",
@@ -458,9 +458,8 @@ func TestRenderPsiphonSystemdServiceIsRestartedAndTiedToAgent(t *testing.T) {
 	}
 	text := string(unit)
 	for _, want := range []string{
-		"PartOf=ravanreverse@s.service",
 		"Restart=always",
-		"RestartSec=5",
+		"RestartSec=2",
 		`ExecStart="/usr/local/bin/psiphon-console-client" "-config"`,
 		"-dataRootDirectory",
 		"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
@@ -468,6 +467,9 @@ func TestRenderPsiphonSystemdServiceIsRestartedAndTiedToAgent(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("Psiphon unit missing %q:\n%s", want, text)
 		}
+	}
+	if strings.Contains(text, "PartOf=ravanreverse@s.service") {
+		t.Fatalf("Psiphon must not be coupled to Agent restart jobs; its tunnels should remain warm:\n%s", text)
 	}
 	if strings.Contains(text, "[Install]") || strings.Contains(text, "WantedBy=multi-user.target") {
 		t.Fatalf("per-profile Psiphon service must be started through its Agent dependency, not enabled globally:\n%s", text)

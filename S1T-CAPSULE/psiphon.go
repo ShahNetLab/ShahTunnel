@@ -313,7 +313,9 @@ func renderPsiphonServiceUnit(cfg Config, service, agentService string) ([]byte,
 Description=ShahTunnel per-profile Psiphon ConsoleClient (%s)
 After=network-online.target
 Wants=network-online.target
-PartOf=%s.service
+# Deliberately not PartOf=Agent: an Agent restart must not cold-restart Psiphon.
+# Agent Requires/After ordering starts Psiphon when needed; the manager stops it
+# explicitly when the profile is stopped or deleted.
 
 [Service]
 Type=simple
@@ -321,7 +323,7 @@ User=root
 WorkingDirectory=%s
 ExecStart=%s
 Restart=always
-RestartSec=5
+RestartSec=2
 StartLimitIntervalSec=0
 LimitNOFILE=1048576
 KillSignal=SIGINT
@@ -338,7 +340,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
-`, strings.TrimSuffix(service, ".service"), agentService, dataDir, execStart)
+`, strings.TrimSuffix(service, ".service"), dataDir, execStart)
 	return []byte(unit), nil
 }
 
@@ -359,13 +361,17 @@ func ensurePsiphonSystemdService(cfg Config) error {
 	if err != nil {
 		return err
 	}
+	configChanged := false
 	if migrated, migrateErr := repairLegacyPsiphonClientConfig(configPath, cfg.PsiphonProxy); migrateErr != nil {
 		return fmt.Errorf("repair Psiphon bootstrap before service start: %w", migrateErr)
 	} else if migrated {
+		configChanged = true
 		log.Printf("Psiphon: migrated legacy bootstrap before systemd service start")
 	}
-	if _, tuneErr := tunePsiphonPerformanceConfig(configPath); tuneErr != nil {
+	if tuned, tuneErr := tunePsiphonPerformanceConfig(configPath); tuneErr != nil {
 		return fmt.Errorf("tune Psiphon performance before service start: %w", tuneErr)
+	} else if tuned {
+		configChanged = true
 	}
 	if err := validatePsiphonClientConfig(configPath, cfg.PsiphonProxy); err != nil {
 		return fmt.Errorf("validate Psiphon service config: %w", err)
@@ -417,18 +423,13 @@ func ensurePsiphonSystemdService(cfg Config) error {
 	if err := atomicReplaceFile(filepath.Join(dropInDir, "shah-tunnel-psiphon.conf"), dropIn, 0644); err != nil {
 		return fmt.Errorf("write Agent Psiphon dependency drop-in: %w", err)
 	}
-	if unitChanged {
-		if err := systemdReload(); err != nil {
-			return err
-		}
-	} else {
-		// The drop-in may have been added after the Psiphon unit was installed.
-		if err := systemdReload(); err != nil {
-			return err
-		}
+	// Reload systemd after the dependency drop-in is installed. The Psiphon
+	// daemon remains independent of Agent restart jobs once this unit is active.
+	if err := systemdReload(); err != nil {
+		return err
 	}
 	if exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
-		if unitChanged {
+		if unitChanged || configChanged {
 			if err := runSystemctl("restart", service); err != nil {
 				return fmt.Errorf("restart updated Psiphon service: %w", err)
 			}
@@ -441,6 +442,158 @@ func ensurePsiphonSystemdService(cfg Config) error {
 		return fmt.Errorf("per-profile Psiphon service %s is enabled but SOCKS5 %s is not ready: %w; journal: %s", service, cfg.PsiphonProxy, err, strings.TrimSpace(string(journal)))
 	}
 	log.Printf("Psiphon SOCKS5 is supervised by %s and is ready at %s", service, cfg.PsiphonProxy)
+	return nil
+}
+
+func psiphonServiceUnitBelongsToProfile(unit []byte, cfg Config) bool {
+	if len(unit) == 0 || cfg.Name == "" || cfg.PsiphonConfig == "" {
+		return false
+	}
+	configPath, err := filepath.Abs(cfg.PsiphonConfig)
+	if err != nil || configPath == "." {
+		return false
+	}
+	text := string(unit)
+	return strings.Contains(text, "Description=ShahTunnel per-profile Psiphon ConsoleClient (") &&
+		strings.Contains(text, `"-config" `+systemdExecQuote(configPath))
+}
+
+// stopPsiphonSystemdService stops only the current profile's verified daemon.
+// It is used by the explicit Stop action; Agent restarts intentionally leave
+// the daemon running so established Psiphon tunnels stay warm.
+func stopPsiphonSystemdService(cfg Config) error {
+	if cfg.Role != "agent" || cfg.PsiphonConfig == "" {
+		return nil
+	}
+	service := psiphonServiceName(cfg.Name)
+	unitPath, err := psiphonServiceUnitPath(service)
+	if err != nil {
+		return err
+	}
+	st, err := os.Lstat(unitPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect Psiphon unit %s: %w", service, err)
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("Psiphon unit %s is not a regular file; refusing to stop an unknown service", service)
+	}
+	unit, err := os.ReadFile(unitPath)
+	if err != nil {
+		return err
+	}
+	if !psiphonServiceUnitBelongsToProfile(unit, cfg) {
+		return fmt.Errorf("Psiphon unit %s does not match this ShahTunnel profile; refusing to stop it", service)
+	}
+	out, stopErr := exec.Command("systemctl", "stop", service).CombinedOutput()
+	if stopErr != nil {
+		state, _ := exec.Command("systemctl", "show", service, "-p", "LoadState", "--value").Output()
+		if strings.TrimSpace(string(state)) == "not-found" {
+			return nil
+		}
+		return fmt.Errorf("stop Psiphon service %s: %w: %s", service, stopErr, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// removePsiphonSystemdService removes only service/config/data paths owned by
+// this exact tunnel profile. Unknown units and paths outside ShahTunnel roots
+// are deliberately preserved.
+func removePsiphonSystemdService(cfg Config, agentService string) error {
+	if cfg.Role != "agent" || cfg.PsiphonConfig == "" {
+		return nil
+	}
+	service := psiphonServiceName(cfg.Name)
+	unitPath, err := psiphonServiceUnitPath(service)
+	if err != nil {
+		return err
+	}
+	if err := stopPsiphonSystemdService(cfg); err != nil {
+		return err
+	}
+	if st, statErr := os.Lstat(unitPath); statErr == nil {
+		if !st.Mode().IsRegular() {
+			return fmt.Errorf("Psiphon unit %s is not a regular file; refusing removal", service)
+		}
+		unit, readErr := os.ReadFile(unitPath)
+		if readErr != nil {
+			return readErr
+		}
+		if !psiphonServiceUnitBelongsToProfile(unit, cfg) {
+			return fmt.Errorf("Psiphon unit %s does not match this ShahTunnel profile; refusing removal", service)
+		}
+		if err := os.Remove(unitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+
+	if filepath.Base(agentService) != agentService || (!strings.HasPrefix(agentService, "ravanreverse@") && agentService != "ravanreverse") {
+		return fmt.Errorf("invalid Agent service name %q while removing Psiphon dependency", agentService)
+	}
+	dropInPath := filepath.Join("/etc/systemd/system", agentService+".service.d", "shah-tunnel-psiphon.conf")
+	if dropInInfo, dropInErr := os.Lstat(dropInPath); dropInErr == nil {
+		if !dropInInfo.Mode().IsRegular() {
+			return fmt.Errorf("Psiphon dependency drop-in %s is not a regular file; refusing removal", dropInPath)
+		}
+		dropIn, readErr := os.ReadFile(dropInPath)
+		if readErr != nil {
+			return readErr
+		}
+		text := string(dropIn)
+		if strings.Contains(text, "Requires="+service+"\n") && strings.Contains(text, "After="+service+"\n") {
+			if err := os.Remove(dropInPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	} else if !errors.Is(dropInErr, os.ErrNotExist) {
+		return dropInErr
+	}
+
+	configRoot := filepath.Clean(psiphonConfigDir) + string(os.PathSeparator)
+	configPath, absErr := filepath.Abs(cfg.PsiphonConfig)
+	if absErr != nil || !strings.HasPrefix(filepath.Clean(configPath), configRoot) || filepath.Base(configPath) != tunnelID(cfg.Name)+".json" {
+		return fmt.Errorf("refusing to remove Psiphon config outside the expected profile directory: %q", cfg.PsiphonConfig)
+	}
+	if configInfo, configErr := os.Lstat(configPath); configErr == nil {
+		if !configInfo.Mode().IsRegular() {
+			return fmt.Errorf("Psiphon config %s is not a regular file; refusing removal", configPath)
+		}
+		if err := os.Remove(configPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	} else if !errors.Is(configErr, os.ErrNotExist) {
+		return configErr
+	}
+
+	dataDir := strings.TrimSpace(cfg.PsiphonDataDir)
+	if dataDir == "" {
+		dataDir = filepath.Join(psiphonDataRoot, tunnelID(cfg.Name))
+	}
+	expectedDataDir := filepath.Join(psiphonDataRoot, tunnelID(cfg.Name))
+	cleanDataDir, dataErr := filepath.Abs(dataDir)
+	cleanExpected, expectedErr := filepath.Abs(expectedDataDir)
+	if dataErr != nil || expectedErr != nil || filepath.Clean(cleanDataDir) != filepath.Clean(cleanExpected) {
+		return fmt.Errorf("refusing to remove Psiphon data outside the expected profile directory: %q", dataDir)
+	}
+	if dataInfo, statErr := os.Lstat(cleanDataDir); statErr == nil {
+		if !dataInfo.IsDir() || dataInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("Psiphon data path %s is not a real directory; refusing removal", cleanDataDir)
+		}
+		if err := os.RemoveAll(cleanDataDir); err != nil {
+			return err
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	_ = os.Remove(filepath.Dir(configPath))
+	if err := systemdReload(); err != nil {
+		return err
+	}
+	_ = exec.Command("systemctl", "reset-failed", service).Run()
 	return nil
 }
 

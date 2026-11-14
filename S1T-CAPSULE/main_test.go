@@ -2879,7 +2879,7 @@ func TestHubPrefersFreshRTTOverStaleLowRTT(t *testing.T) {
 	}
 }
 
-func TestNewAgentStartsBeforeAutomaticPsiphonXraySetup(t *testing.T) {
+func TestNewAgentPreparesPsiphonXrayBeforeAgentStarts(t *testing.T) {
 	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("cannot locate test source")
@@ -2891,8 +2891,8 @@ func TestNewAgentStartsBeforeAutomaticPsiphonXraySetup(t *testing.T) {
 	text := string(source)
 	start := strings.Index(text, "connected, startErr := ensureTunnelRunning(true)")
 	setup := strings.Index(text, "autoApplyXrayPsiphonForNewAgent()")
-	if start < 0 || setup < 0 || setup < start {
-		t.Fatal("automatic Psiphon Xray sidecar setup must run after the selected Agent service is started")
+	if start < 0 || setup < 0 || setup > start {
+		t.Fatal("automatic Psiphon Xray sidecar setup must complete before the selected Agent service starts")
 	}
 }
 
@@ -2925,7 +2925,7 @@ func TestPsiphonSupervisorPreparedBeforeAgentServiceStart(t *testing.T) {
 	}
 }
 
-func TestStartSelectedTunnelRepairsMissingPsiphonSidecar(t *testing.T) {
+func TestStartSelectedTunnelPreparesPsiphonBeforeAgentStarts(t *testing.T) {
 	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("cannot locate test source")
@@ -2943,8 +2943,10 @@ func TestStartSelectedTunnelRepairsMissingPsiphonSidecar(t *testing.T) {
 	body := text[start : start+end]
 	ensure := strings.Index(body, "ensureTunnelRunning(restartActive)")
 	apply := strings.Index(body, "autoApplyXrayPsiphonForNewAgent()")
-	if ensure < 0 || apply < 0 || apply < ensure {
-		t.Fatal("start/restart must repair the Psiphon Xray sidecar after the Agent service starts")
+	sidecar := strings.Index(body, "ensureXrayPsiphonSidecar(cfg)")
+	ready := strings.Index(body, "ensurePsiphonUserEgressReady(cfg)")
+	if ensure < 0 || apply < 0 || sidecar < 0 || ready < 0 || apply > ensure || sidecar > ensure || ready > ensure {
+		t.Fatal("Psiphon egress and Xray sidecar must be prepared and verified before the Agent service starts")
 	}
 }
 

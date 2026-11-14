@@ -36,3 +36,39 @@ func TestXrayPsiphonUnitOwnershipAllowsOnlyExactProfileService(t *testing.T) {
 		t.Fatal("third-party systemd unit was accepted for replacement")
 	}
 }
+
+func TestXrayPsiphonLifecycleOwnershipRequiresExactProfileMetadata(t *testing.T) {
+	runtime := xrayRuntime{Binary: "/usr/local/bin/xray", CWD: "/usr/local/bin"}
+	cfg := Config{
+		Name:         "profile-s",
+		PsiphonProxy: "127.0.0.1:21083",
+		XrayPsiphon: &XrayPsiphonIntegration{
+			ConfigPath: "/etc/ravanreverse/xray-psiphon/profile-s/config.json",
+			Service:    "shah-tunnel-xray-psiphon-profile-s.service",
+			Proxy:      "127.0.0.1:21083",
+			Bindings:   []XrayPsiphonBinding{{MappingID: "main", OriginalTarget: "127.0.0.1:2083", PsiphonTarget: "127.0.0.1:31083"}},
+		},
+	}
+	unit, err := renderXrayPsiphonUnit(runtime, cfg.XrayPsiphon.ConfigPath, cfg.XrayPsiphon.Service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !xrayPsiphonUnitBelongsToConfig(unit, cfg) {
+		t.Fatal("profile's own Xray Psiphon unit was not recognized for lifecycle management")
+	}
+	other := cfg
+	other.Name = "another-profile"
+	if xrayPsiphonUnitBelongsToConfig(unit, other) {
+		t.Fatal("Xray Psiphon unit was accepted for a different profile")
+	}
+	other = cfg
+	other.PsiphonProxy = "127.0.0.1:21084"
+	if xrayPsiphonUnitBelongsToConfig(unit, other) {
+		t.Fatal("Xray Psiphon unit was accepted with a different SOCKS endpoint")
+	}
+	other = cfg
+	other.XrayPsiphon = &XrayPsiphonIntegration{ConfigPath: "/etc/ravanreverse/xray-psiphon/other/config.json", Service: cfg.XrayPsiphon.Service, Proxy: cfg.PsiphonProxy, Bindings: cfg.XrayPsiphon.Bindings}
+	if xrayPsiphonUnitBelongsToConfig(unit, other) {
+		t.Fatal("Xray Psiphon unit was accepted for a different managed config")
+	}
+}
