@@ -4,27 +4,17 @@ ShahTunnel 5.0.0 — بهینه‌سازی مسیر چندکاربره و اصل
 
 اصلاحات اصلی:
 - گزینهٔ ۹ چهار انتقال داخلی و Failover مستقل Direct/Psiphon/MASQUE فعال را برای Laneهای Agent↔Hub حفظ می‌کند.
-- پس از فعال‌شدن خروجی کاربران، زمان‌بند مستقل systemd هر یک ساعت کشور Psiphon را عوض می‌کند؛ کشور جدید فقط پس از تأیید IP و موقعیت واقعی پذیرفته می‌شود. هنگام تعویض ممکن است اتصال‌های جاری برای چند ثانیه قطع شوند، اما مسیر مستقیم VPS جایگزین نمی‌شود.
-- انتخاب کشور خروجی Psiphon به‌ترتیب فهرست درخواستی انجام می‌شود: ابتدا اتریش و در صورت ناموفق بودن، کشور بعدی. خروجی باید دقیقاً با کشور درخواستی منطبق و IP آن متفاوت از IP مستقیم VPS باشد؛ در غیر این صورت مسیر کاربران فعال نمی‌شود.
 - در گزینهٔ ۹، ترافیک TCP/DNS کاربران Xray نیز از Sidecar اختصاصی همان Agent و SOCKS5 سایفون عبور می‌کند؛ مسیر پیش‌فرض سرور یا SSH تغییر نمی‌کند.
 - UDP/QUIC و ICMP از SOCKS5 سایفون پشتیبانی نمی‌شوند؛ UDP در Sidecar مسدود می‌شود تا به‌صورت ناخواسته از IP مستقیم سرور خارج نشود.
 - گزینهٔ اختصاصی Psiphon / SOCKS5 نیز همچنان برای خروجی کاربران و Laneهای Agent از Psiphon استفاده می‌کند.
 - زمان‌بندی Laneها همچنان از RTT معتبر، تعداد جریان‌های فعال، فشار صف و زمان انتظار نوشتن استفاده می‌کند.
 - سرویس Psiphon مستقل از Restart سرویس Agent اجرا می‌شود؛ بنابراین Restart معمولی Agent تونل‌های گرم Psiphon را از بین نمی‌برد.
-- هنگام ساخت Agent، Sidecar Xray و خروجی HTTPS واقعی Psiphon پیش از شروع Agent آماده و بررسی می‌شوند؛ کشور خروجی به‌ترتیب اتریش، برزیل، سوئیس، جمهوری چک، آلمان، دانمارک، اسپانیا، بریتانیا، ایرلند، هند، ایتالیا، لیتوانی، هلند، نروژ، لهستان، رومانی و صربستان بررسی می‌شود.
-- IP خروجی SOCKS5 با IP مستقیم VPS مقایسه می‌شود؛ اگر یکسان باشند یا Mapping به Sidecar اختصاصی اشاره نکند، مسیر کاربر fail-closed باقی می‌ماند.
+- هنگام ساخت Agent، Sidecar Xray و خروجی HTTPS واقعی Psiphon پیش از شروع Agent آماده و بررسی می‌شوند؛ Start مجدد نیز قبل از در دسترس قراردادن کاربران، خروجی واقعی و Sidecar همان پروفایل را کنترل می‌کند.
 - عملیات Stop سرویس Agent، Sidecar اختصاصی Xray و Psiphon همان پروفایل را متوقف می‌کند؛ Start بعدی آن‌ها را دوباره راه‌اندازی می‌کند.
 - نسخهٔ برنامه، نصب‌کننده، بنر ترمینال و مستندات به 5.0.0 ارتقا یافته‌اند.
 
 نصب از مخزن:
-روش جایگزین نصب (بدون raw.githubusercontent.com):
-set -o pipefail
-curl -fsSL --connect-timeout 10 --max-time 30 \
-  -H 'Accept: application/vnd.github+json' \
-  -H 'User-Agent: ShahTunnel-bootstrap' \
-  'https://api.github.com/repos/ShahNetLab/ShahTunnel/contents/S1T-START.sh?ref=main' \
-| python3 -c 'import sys,json,base64; d=json.load(sys.stdin); sys.stdout.buffer.write(base64.b64decode(d["content"]))' \
-| bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ShahNetLab/ShahTunnel/main/S1T-START.sh)
 
 اعمال اصلاح روی Agent قدیمی با گزینهٔ ۹:
 1. نسخهٔ 5.0.0 اصلاح‌شده را روی Agent نصب/جایگزین کنید.
