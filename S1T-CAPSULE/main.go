@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "4.0.9"
+	version                          = "5.0.0"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -2814,6 +2814,11 @@ func validAuth(line, token string) bool { return authProtocol(line, token) != ""
 
 func runAgent(cfg Config) error {
 	cfg = normalizeConfig(cfg)
+	if migrated, err := migrateAdaptivePsiphonUserEgress(&cfg); err != nil {
+		return fmt.Errorf("migrate legacy option-9 Psiphon user egress: %w", err)
+	} else if migrated {
+		log.Printf("option 9 migration complete: restored the original Xray targets; Psiphon remains available only as an Agent-to-Hub fallback")
+	}
 	var cleanupUnderlay func()
 	cleanupUnderlay = func() {}
 	switch cfg.Underlay {
@@ -3418,12 +3423,11 @@ func startPsiphonForAgent(cfg Config) (func(), error) {
 			}, nil
 		}
 		if !adaptiveDeadline.IsZero() && time.Now().After(adaptiveDeadline) {
-			// In option 9 Psiphon is both an adaptive Agent underlay candidate and
-			// the isolated Xray user-egress provider. Do not cancel ConsoleClient
-			// merely because its first tunnel missed this startup window: doing so
-			// closes the loopback SOCKS listener just before Xray setup checks it.
-			// Keep the child alive under the Agent service; adaptive lanes can use
-			// Direct/WARP meanwhile and Xray setup can wait for verified Psiphon.
+			// In option 9 Psiphon is an adaptive Agent-to-Hub underlay candidate.
+			// Do not cancel ConsoleClient merely because its first tunnel missed
+			// this startup window: adaptive lanes may need it after Direct/WARP
+			// becomes unavailable. Keep background retries alive under the Agent
+			// service while the other configured paths remain available.
 			if !proxyReady {
 				log.Printf("Psiphon SOCKS5 listener is not ready after 90 seconds; keeping ConsoleClient alive for background retries")
 			} else {
@@ -3742,6 +3746,7 @@ func agentHubAddressForTransport(cfg Config, transport string) string {
 }
 
 func normalizeConfig(c Config) Config {
+	c.Version = version
 	if c.Role == "agent" {
 		c.Underlay = strings.ToLower(strings.TrimSpace(c.Underlay))
 		if c.Underlay == "" {
@@ -4580,7 +4585,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |               SHAH TUNNEL                |",
+	"        |            SHAH TUNNEL 5.0.0             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",

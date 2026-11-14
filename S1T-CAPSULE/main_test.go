@@ -2216,7 +2216,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |               SHAH TUNNEL                |",
+		"        |            SHAH TUNNEL 5.0.0             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -2945,5 +2945,83 @@ func TestStartSelectedTunnelRepairsMissingPsiphonSidecar(t *testing.T) {
 	apply := strings.Index(body, "autoApplyXrayPsiphonForNewAgent()")
 	if ensure < 0 || apply < 0 || apply < ensure {
 		t.Fatal("start/restart must repair the Psiphon Xray sidecar after the Agent service starts")
+	}
+}
+
+func TestOptionNineRestoresOriginalXrayTargets(t *testing.T) {
+	cfg := Config{
+		Version:  version,
+		Role:     "agent",
+		Underlay: underlayAdaptive,
+		Ports: []PortMapping{
+			{ID: "main", Target: "127.0.0.1:31001"},
+			{ID: "secondary", Target: "127.0.0.1:443"},
+		},
+		XrayPsiphon: &XrayPsiphonIntegration{
+			Bindings: []XrayPsiphonBinding{{
+				MappingID: "main", OriginalTarget: "127.0.0.1:2083", PsiphonTarget: "127.0.0.1:31001",
+			}},
+		},
+	}
+	got, changed, err := restoreAdaptivePsiphonMappings(cfg)
+	if err != nil {
+		t.Fatalf("restoreAdaptivePsiphonMappings: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected legacy option-9 Psiphon user egress to be migrated")
+	}
+	if got.XrayPsiphon != nil {
+		t.Fatal("legacy Xray Psiphon sidecar metadata was not removed")
+	}
+	if got.Ports[0].Target != "127.0.0.1:2083" {
+		t.Fatalf("main target = %q; want original 127.0.0.1:2083", got.Ports[0].Target)
+	}
+	if got.Ports[1].Target != "127.0.0.1:443" {
+		t.Fatalf("unrelated mapping target changed: %q", got.Ports[1].Target)
+	}
+	if got.Version != "5.0.0" {
+		t.Fatalf("migrated config version = %q; want 5.0.0", got.Version)
+	}
+}
+
+func TestOptionNineDoesNotAutomaticallyRouteUsersThroughPsiphon(t *testing.T) {
+	adaptive := Config{Role: "agent", Underlay: underlayAdaptive}
+	if requiresAutomaticPsiphonUserEgress(adaptive) {
+		t.Fatal("option 9 must not automatically create a Psiphon Xray user-egress sidecar")
+	}
+	dedicated := Config{Role: "agent", Underlay: underlayPsiphon}
+	if !requiresAutomaticPsiphonUserEgress(dedicated) {
+		t.Fatal("the dedicated Psiphon option must retain automatic Psiphon user egress")
+	}
+	if requiresAutomaticPsiphonUserEgress(Config{Role: "hub", Underlay: underlayPsiphon}) {
+		t.Fatal("Hub profiles must not create an Xray Psiphon user-egress sidecar")
+	}
+}
+
+func TestOptionNineMigrationRejectsUnknownMapping(t *testing.T) {
+	cfg := Config{
+		Role:     "agent",
+		Underlay: underlayAdaptive,
+		Ports:    []PortMapping{{ID: "main", Target: "127.0.0.1:31001"}},
+		XrayPsiphon: &XrayPsiphonIntegration{
+			Bindings: []XrayPsiphonBinding{{MappingID: "missing", OriginalTarget: "127.0.0.1:443"}},
+		},
+	}
+	if _, changed, err := restoreAdaptivePsiphonMappings(cfg); err == nil || changed {
+		t.Fatalf("unknown legacy mapping was not rejected safely: changed=%v err=%v", changed, err)
+	}
+}
+
+func TestOptionNineMigrationRejectsInvalidOriginalTarget(t *testing.T) {
+	cfg := Config{
+		Role:     "agent",
+		Underlay: underlayAdaptive,
+		Ports:    []PortMapping{{ID: "main", Target: "127.0.0.1:31001"}},
+		XrayPsiphon: &XrayPsiphonIntegration{
+			Bindings: []XrayPsiphonBinding{{MappingID: "main", OriginalTarget: "not-an-address"}},
+		},
+	}
+	if _, changed, err := restoreAdaptivePsiphonMappings(cfg); err == nil || changed {
+		t.Fatalf("invalid original target was not rejected safely: changed=%v err=%v", changed, err)
 	}
 }

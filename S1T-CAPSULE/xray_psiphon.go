@@ -440,8 +440,8 @@ func applyXrayPsiphonEgress(restartAgent, confirm bool) error {
 	if cfg.Role != "agent" {
 		return errors.New("per-tunnel Psiphon user egress can only be applied to an Agent profile")
 	}
-	if cfg.Underlay != underlayPsiphon && cfg.Underlay != underlayAdaptive {
-		return errors.New("select Psiphon SOCKS5 egress for this Agent profile first")
+	if cfg.Underlay != underlayPsiphon {
+		return errors.New("select the dedicated Psiphon SOCKS5 egress option for this Agent profile first; adaptive option 9 uses Psiphon only as a tunnel fallback")
 	}
 	if cfg.XrayPsiphon != nil {
 		return errors.New("this tunnel already has a dedicated Xray Psiphon route")
@@ -642,12 +642,85 @@ func removeXrayPsiphonIntegration(cfg *Config) error {
 	return nil
 }
 
+// restoreAdaptivePsiphonMappings removes only the legacy user-egress rewrite
+// from an option-9 Agent. Option 9 uses Psiphon as a standby transport for the
+// Agent-to-Hub lanes; it must not force every Xray subscriber through Psiphon.
+func restoreAdaptivePsiphonMappings(cfg Config) (Config, bool, error) {
+	if cfg.Role != "agent" || cfg.Underlay != underlayAdaptive || cfg.XrayPsiphon == nil {
+		return cfg, false, nil
+	}
+	if len(cfg.XrayPsiphon.Bindings) == 0 {
+		return Config{}, false, errors.New("legacy option-9 Psiphon integration has no mapping records to restore")
+	}
+	restored := cfg
+	restored.Ports = append([]PortMapping(nil), cfg.Ports...)
+	seen := make(map[string]bool, len(cfg.XrayPsiphon.Bindings))
+	for _, binding := range cfg.XrayPsiphon.Bindings {
+		if strings.TrimSpace(binding.MappingID) == "" || strings.TrimSpace(binding.OriginalTarget) == "" {
+			return Config{}, false, errors.New("legacy option-9 Psiphon integration contains an incomplete mapping record")
+		}
+		if seen[binding.MappingID] {
+			return Config{}, false, fmt.Errorf("legacy option-9 Psiphon integration contains duplicate mapping %q", binding.MappingID)
+		}
+		seen[binding.MappingID] = true
+		if err := validateTCPAddress("original target for mapping "+binding.MappingID, binding.OriginalTarget); err != nil {
+			return Config{}, false, err
+		}
+		found := false
+		for i := range restored.Ports {
+			if restored.Ports[i].ID == binding.MappingID {
+				restored.Ports[i].Target = binding.OriginalTarget
+				found = true
+				break
+			}
+		}
+		if !found {
+			return Config{}, false, fmt.Errorf("legacy option-9 Psiphon mapping %q is not present in the Agent profile", binding.MappingID)
+		}
+	}
+	restored.XrayPsiphon = nil
+	restored = normalizeConfig(restored)
+	return restored, true, nil
+}
+
+// migrateAdaptivePsiphonUserEgress is safe to run at every Agent startup. It
+// commits the original mapping targets before removing the managed sidecar, so
+// a failed config write never leaves a live profile pointing at a deleted one.
+func migrateAdaptivePsiphonUserEgress(cfg *Config) (bool, error) {
+	if cfg == nil {
+		return false, errors.New("nil Agent config")
+	}
+	restored, needed, err := restoreAdaptivePsiphonMappings(*cfg)
+	if err != nil || !needed {
+		return false, err
+	}
+	meta := cfg.XrayPsiphon
+	if _, err := xrayPsiphonUnitPath(meta.Service); err != nil {
+		return false, err
+	}
+	if _, err := xrayPsiphonConfigDirectory(meta.ConfigPath); err != nil {
+		return false, err
+	}
+	if err := saveConfig(restored); err != nil {
+		return false, fmt.Errorf("save restored Agent mapping targets: %w", err)
+	}
+	*cfg = restored
+	if err := removeXrayPsiphonSidecar(meta); err != nil {
+		return true, fmt.Errorf("Agent mappings were restored, but the obsolete managed Psiphon Xray sidecar could not be removed: %w", err)
+	}
+	return true, nil
+}
+
+func requiresAutomaticPsiphonUserEgress(cfg Config) bool {
+	return cfg.Role == "agent" && cfg.Underlay == underlayPsiphon
+}
+
 func autoApplyXrayPsiphonForNewAgent() error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
-	if cfg.Role != "agent" || (cfg.Underlay != underlayPsiphon && cfg.Underlay != underlayAdaptive) || cfg.XrayPsiphon != nil {
+	if !requiresAutomaticPsiphonUserEgress(cfg) || cfg.XrayPsiphon != nil {
 		return nil
 	}
 	uiInfo("Preparing isolated Xray user egress through the Agent's verified Psiphon SOCKS5 proxy...")
