@@ -369,12 +369,12 @@ func TestPsiphonEgressRegionPolicyBlocksUSAndDefaultsToAutomatic(t *testing.T) {
 	if got, err := normalizePsiphonEgressRegion(""); err != nil || got != "" {
 		t.Fatalf("empty region = %q, %v; want automatic selection", got, err)
 	}
-	for _, region := range []string{"US", "us", "CA", "ca", "XX"} {
+	for _, region := range []string{"US", "us", "CA", "ca", "BE", "be", "XX"} {
 		if got, err := normalizePsiphonEgressRegion(region); err == nil {
 			t.Fatalf("region %q unexpectedly accepted as %q", region, got)
 		}
 	}
-	for _, region := range []string{"AT", "AU", "BE", "BR", "SE", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IN", "IT", "LT", "NL", "NO", "PL", "RO", "RS"} {
+	for _, region := range []string{"AT", "AU", "BR", "SE", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IN", "IT", "LT", "NL", "NO", "PL", "RO", "RS"} {
 		if got, err := normalizePsiphonEgressRegion(region); err != nil || got != region {
 			t.Fatalf("approved region %q rejected: got=%q err=%v", region, got, err)
 		}
@@ -430,7 +430,7 @@ func TestTunePsiphonPerformanceConfigPreservesUnknownFields(t *testing.T) {
 }
 
 func TestPsiphonEgressRegionPriorityAndUSBlock(t *testing.T) {
-	want := []string{"AT", "AU", "BE", "BR", "SE", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IN", "IT", "LT", "NL", "NO", "PL", "RO", "RS"}
+	want := []string{"AT", "AU", "BR", "SE", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IN", "IT", "LT", "NL", "NO", "PL", "RO", "RS"}
 	if !reflect.DeepEqual(psiphonEgressRegionPriority, want) {
 		t.Fatalf("Psiphon region priority = %v; want %v", psiphonEgressRegionPriority, want)
 	}
@@ -439,10 +439,33 @@ func TestPsiphonEgressRegionPriorityAndUSBlock(t *testing.T) {
 			t.Fatalf("priority region %s was rejected: %v", region, err)
 		}
 	}
-	for _, blocked := range []string{"US", "us", "CA", "ca", "USA"} {
+	for _, blocked := range []string{"US", "us", "CA", "ca", "BE", "be", "USA"} {
 		if _, err := normalizePsiphonEgressRegion(blocked); err == nil {
 			t.Fatalf("blocked region %q was accepted", blocked)
 		}
+	}
+}
+
+func TestTunePsiphonPerformanceConfigMigratesBlockedBelgiumRegion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profile.json")
+	if err := os.WriteFile(path, []byte(`{"EgressRegion":"BE","TunnelPoolSize":4}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := tunePsiphonPerformanceConfigForProfile(path, psiphonPerformanceProfileForHost(4<<30, 2))
+	if err != nil || !changed {
+		t.Fatalf("tune blocked Belgium profile: changed=%t err=%v", changed, err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got["EgressRegion"]) != `"AT"` {
+		t.Fatalf("blocked BE profile migrated to %s; want AT", got["EgressRegion"])
 	}
 }
 
@@ -483,7 +506,10 @@ func TestRenderPsiphonSystemdServiceStaysWarmAcrossAgentRestarts(t *testing.T) {
 }
 
 func TestPsiphonCountrySelectionStartsAtAustriaAndKeepsOrderedFallback(t *testing.T) {
-	want := []string{"AT", "AU", "BE", "BR", "SE", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IN", "IT", "LT", "NL", "NO", "PL", "RO", "RS"}
+	want := []string{"AT", "AU", "BR", "SE", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IN", "IT", "LT", "NL", "NO", "PL", "RO", "RS"}
+	if got := psiphonRegionCandidates("BE"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("blocked legacy BE profile candidates=%v; want approved list without Belgium", got)
+	}
 	if got := psiphonRegionCandidates("DE"); !reflect.DeepEqual(got, want) {
 		t.Fatalf("legacy DE profile candidates=%v; want %v", got, want)
 	}

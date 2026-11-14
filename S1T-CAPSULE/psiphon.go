@@ -182,7 +182,7 @@ func psiphonHostPerformanceProfile() psiphonPerformanceProfile {
 // verified against this explicit allowlist before user traffic is enabled.
 // These are exactly the countries requested for ShahTunnel 5.0.0.
 var psiphonEgressRegionPriority = []string{
-	"AT", "AU", "BE", "BR", "SE", "CH", "CZ", "DE", "DK",
+	"AT", "AU", "BR", "SE", "CH", "CZ", "DE", "DK",
 	"ES", "GB", "IE", "IN", "IT", "LT", "NL", "NO", "PL", "RO", "RS",
 }
 
@@ -966,6 +966,14 @@ func tunePsiphonPerformanceConfigForProfile(configPath string, profile psiphonPe
 	// advances through the remaining allowlisted regions only when needed.
 	if existing, ok := raw["EgressRegion"]; !ok || string(existing) == `"DE"` || string(existing) == `""` {
 		settings["EgressRegion"] = psiphonEgressRegionPriority[0]
+	} else {
+		var existingRegion string
+		if json.Unmarshal(existing, &existingRegion) != nil {
+			settings["EgressRegion"] = psiphonEgressRegionPriority[0]
+		} else if normalized, regionErr := normalizePsiphonEgressRegion(existingRegion); regionErr != nil || normalized != existingRegion {
+			// Migrate profiles pinned to a country that is no longer approved.
+			settings["EgressRegion"] = psiphonEgressRegionPriority[0]
+		}
 	}
 	changed := false
 	for key, value := range settings {
