@@ -9,31 +9,6 @@ import (
 	"testing"
 )
 
-func TestVerifyTorExitCountryRejectsUSAndUnknown(t *testing.T) {
-	for _, country := range []string{"US", "us", "", "??", "Unknown", "USA"} {
-		if err := validateTorExitCountry(country); err == nil {
-			t.Errorf("Tor exit country %q was accepted", country)
-		}
-	}
-	for _, country := range []string{"DE", "TR", "NL", "FR"} {
-		if err := validateTorExitCountry(country); err != nil {
-			t.Errorf("approved non-US country %q was rejected: %v", country, err)
-		}
-	}
-}
-
-func TestParseTorPublicEgressIP(t *testing.T) {
-	got, err := parseTorPublicEgressIP([]byte("91.107.171.37\n"))
-	if err != nil || got != "91.107.171.37" {
-		t.Fatalf("valid public IP parse = %q, %v", got, err)
-	}
-	for _, raw := range []string{"127.0.0.1", "10.0.0.1", "", "not-an-ip", "2001:db8::1"} {
-		if _, err := parseTorPublicEgressIP([]byte(raw)); err == nil {
-			t.Errorf("invalid or non-public IPv4 %q was accepted", raw)
-		}
-	}
-}
-
 func TestBuildXrayTorConfigIsolatesTCPAndBlocksUDP(t *testing.T) {
 	original := []byte(`{
   "inbounds": [
@@ -159,20 +134,5 @@ func TestRollbackFailedTorAgentSetupRefusesForeignPaths(t *testing.T) {
 	data, readErr := os.ReadFile(foreign)
 	if readErr != nil || string(data) != "keep" {
 		t.Fatalf("foreign config file was changed: data=%q err=%v", data, readErr)
-	}
-}
-
-func TestResolveTorGeoVotesBlocksAnyUSAndAllowsNonUSDatabaseDisagreement(t *testing.T) {
-	if country, err := resolveTorGeoVotes([]string{"NL", "SC"}); err != nil || country != "NON-US" {
-		t.Fatalf("non-US provider disagreement should be accepted as non-US: country=%q err=%v", country, err)
-	}
-	if country, err := resolveTorGeoVotes([]string{"NL", "US"}); err != nil || country != "US" {
-		t.Fatalf("any US report must dominate: country=%q err=%v", country, err)
-	}
-	if _, err := resolveTorGeoVotes([]string{"NL"}); err == nil {
-		t.Fatal("one provider is not enough to verify a non-US exit")
-	}
-	if _, err := resolveTorGeoVotes([]string{"", "??"}); err == nil {
-		t.Fatal("unknown countries must fail closed")
 	}
 }

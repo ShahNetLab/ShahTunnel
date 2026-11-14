@@ -230,7 +230,7 @@ func removeXrayPsiphonSidecar(meta *XrayPsiphonIntegration) error {
 // proxy. It is used as a readiness proof, not inferred from the listener alone.
 func psiphonPublicEgressIP(proxyAddress string, timeout time.Duration) (string, error) {
 	if !isLoopbackProxyAddress(proxyAddress) {
-		return "", errors.New("SOCKS5 proxy must be loopback-only")
+		return "", errors.New("Psiphon proxy must be loopback-only")
 	}
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
@@ -244,11 +244,11 @@ func psiphonPublicEgressIP(proxyAddress string, timeout time.Duration) (string, 
 	client := &http.Client{Transport: transport, Timeout: timeout}
 	resp, err := client.Get("https://api.ipify.org")
 	if err != nil {
-		return "", fmt.Errorf("HTTPS egress test through SOCKS5 failed: %w", err)
+		return "", fmt.Errorf("HTTPS egress test through Psiphon failed: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("SOCKS5 egress test returned HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("Psiphon egress test returned HTTP %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 128))
 	if err != nil {
@@ -281,13 +281,13 @@ func waitForPsiphonPublicEgressIP(proxyAddress string, timeout time.Duration) (s
 		time.Sleep(1 * time.Second)
 	}
 	if lastErr != nil {
-		return "", fmt.Errorf("SOCKS5 is listening but no verified HTTPS egress became available within %s: %w", timeout, lastErr)
+		return "", fmt.Errorf("Psiphon SOCKS5 is listening but no verified HTTPS egress became available within %s: %w", timeout, lastErr)
 	}
 	return "", fmt.Errorf("Psiphon HTTPS egress did not become available within %s", timeout)
 }
 
 // parsePsiphonEgressGeo accepts only a geolocation response that echoes the
-// exact public IP already observed through the SOCKS5 connection.
+// exact public IP already observed through the Psiphon SOCKS5 connection.
 func parsePsiphonEgressGeo(body []byte, expectedIP string) (string, bool) {
 	expected := net.ParseIP(strings.TrimSpace(expectedIP))
 	if !isPublicIPv4(expected) {
@@ -323,11 +323,11 @@ func parsePsiphonEgressGeo(body []byte, expectedIP string) (string, bool) {
 }
 
 // psiphonPublicEgressCountry tries multiple geolocation providers through the
-// SOCKS5 path. The returned IP must match the observed exit IP; conflicting
+// Psiphon SOCKS5 path. The returned IP must match the actual exit IP; conflicting
 // country responses are rejected. Direct-IP lookup is handled separately below.
 func psiphonPublicEgressCountry(proxyAddress, exitIP string, timeout time.Duration) (string, error) {
 	if !isLoopbackProxyAddress(proxyAddress) {
-		return "", errors.New("SOCKS5 proxy must be loopback-only")
+		return "", errors.New("Psiphon proxy must be loopback-only")
 	}
 	if !isPublicIPv4(net.ParseIP(exitIP)) {
 		return "", fmt.Errorf("invalid Psiphon public exit IP %q", exitIP)
@@ -384,49 +384,30 @@ func psiphonPublicEgressCountry(proxyAddress, exitIP string, timeout time.Durati
 		}()
 	}
 	go func() { wg.Wait(); close(results) }()
-	var countries []string
+	verified := ""
 	for {
 		select {
 		case got, ok := <-results:
 			if !ok {
-				return resolveTorGeoVotes(countries)
+				if verified != "" {
+					return verified, nil
+				}
+				return "", errors.New("no geolocation provider verified the exact Psiphon exit IP through SOCKS")
 			}
-			if got.ok {
-				countries = append(countries, strings.ToUpper(strings.TrimSpace(got.country)))
+			if !got.ok {
+				continue
 			}
+			if verified != "" && verified != got.country {
+				return "", fmt.Errorf("Psiphon geolocation providers disagree for exit IP %s (%s vs %s)", exitIP, verified, got.country)
+			}
+			verified = got.country
 		case <-ctx.Done():
-			return "", fmt.Errorf("geolocation verification timed out before all providers completed: %w", ctx.Err())
+			if verified != "" {
+				return verified, nil
+			}
+			return "", fmt.Errorf("Psiphon SOCKS geolocation timed out: %w", ctx.Err())
 		}
 	}
-}
-
-// resolveTorGeoVotes enforces the actual policy: any provider reporting US
-// blocks the exit; otherwise at least two independent providers must identify
-// this exact SOCKS-observed IP as non-US. Different non-US country databases
-// (for example NL vs SC) do not imply a US exit and are accepted as NON-US.
-func resolveTorGeoVotes(countries []string) (string, error) {
-	unique := make(map[string]struct{})
-	validVotes := 0
-	for _, country := range countries {
-		country = strings.ToUpper(strings.TrimSpace(country))
-		if !isAlphaCountryCode(country) {
-			continue
-		}
-		validVotes++
-		if country == "US" {
-			return "US", nil
-		}
-		unique[country] = struct{}{}
-	}
-	if validVotes < 2 || len(unique) == 0 {
-		return "", errors.New("fewer than two independent geolocation providers verified a non-US country for the exact SOCKS exit IP")
-	}
-	if len(unique) == 1 {
-		for country := range unique {
-			return country, nil
-		}
-	}
-	return "NON-US", nil
 }
 
 // psiphonCountryFromDirectIPLookup performs an independent lookup of the exact
@@ -434,12 +415,12 @@ func resolveTorGeoVotes(countries []string) (string, error) {
 func psiphonCountryFromDirectIPLookup(exitIP string) (string, error) {
 	parsed := net.ParseIP(strings.TrimSpace(exitIP))
 	if !isPublicIPv4(parsed) {
-		return "", fmt.Errorf("expected a public proxy exit address, got %q", exitIP)
+		return "", fmt.Errorf("expected a public Psiphon exit address, got %q", exitIP)
 	}
 	expected := parsed.To4().String()
 	geo, ok := lookupCountryForIPv4(expected)
 	if !ok || !geo.Valid || geo.IP != expected || !isAlphaCountryCode(geo.CountryCode) {
-		return "", fmt.Errorf("no independent provider returned a verified country for proxy exit IP %s", expected)
+		return "", fmt.Errorf("no independent provider returned a verified country for Psiphon exit IP %s", expected)
 	}
 	return strings.ToUpper(geo.CountryCode), nil
 }

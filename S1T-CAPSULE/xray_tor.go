@@ -1,19 +1,14 @@
 package main
 
 import (
-	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -45,156 +40,6 @@ func buildXrayTorConfig(original []byte, profileID, proxyAddress string, mapping
 		})
 	}
 	return generated, bindings, outTag, nil
-}
-
-// parseTorPublicEgressIP accepts only a public IPv4 address returned by an
-// HTTPS identity endpoint queried through the profile's private Tor SOCKS5 proxy.
-func parseTorPublicEgressIP(body []byte) (string, error) {
-	ip := net.ParseIP(strings.TrimSpace(string(body)))
-	if !isPublicIPv4(ip) {
-		return "", fmt.Errorf("Tor egress endpoint returned a non-public IPv4 address: %q", strings.TrimSpace(string(body)))
-	}
-	return ip.To4().String(), nil
-}
-
-func torPublicEgressIP(proxyAddress string, timeout time.Duration) (string, error) {
-	if !isLoopbackProxyAddress(proxyAddress) {
-		return "", errors.New("Tor SOCKS5 proxy must be loopback-only")
-	}
-	if timeout <= 0 {
-		return "", errors.New("Tor public-IP verification timeout must be positive")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
-		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			return dialSOCKS5Context(ctx, proxyAddress, address)
-		},
-		ForceAttemptHTTP2: false,
-		DisableKeepAlives: true,
-	}
-	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, Timeout: timeout}
-	endpoints := []string{
-		"https://api4.ipify.org",
-		"https://ipv4.icanhazip.com",
-		"https://ipv4.ident.me",
-	}
-	type endpointResult struct {
-		endpoint string
-		ip       string
-		err      error
-	}
-	results := make(chan endpointResult, len(endpoints))
-	var wg sync.WaitGroup
-	for _, rawURL := range endpoints {
-		endpoint := rawURL
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-			if err != nil {
-				results <- endpointResult{endpoint: endpoint, err: err}
-				return
-			}
-			req.Header.Set("User-Agent", "ShahTunnel/"+version)
-			resp, err := client.Do(req)
-			if err != nil {
-				results <- endpointResult{endpoint: endpoint, err: err}
-				return
-			}
-			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 128))
-			_ = resp.Body.Close()
-			if readErr != nil || resp.StatusCode != http.StatusOK {
-				results <- endpointResult{endpoint: endpoint, err: fmt.Errorf("HTTP %d / read error %v", resp.StatusCode, readErr)}
-				return
-			}
-			ip, parseErr := parseTorPublicEgressIP(body)
-			results <- endpointResult{endpoint: endpoint, ip: ip, err: parseErr}
-		}()
-	}
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	verifiedIP := ""
-	var failures []string
-	for result := range results {
-		if result.err != nil {
-			failures = append(failures, result.endpoint+": "+result.err.Error())
-			continue
-		}
-		if verifiedIP != "" && verifiedIP != result.ip {
-			return "", fmt.Errorf("Tor SOCKS5 IP identity providers disagree (%s vs %s); refusing ambiguous egress", verifiedIP, result.ip)
-		}
-		verifiedIP = result.ip
-	}
-	if verifiedIP != "" {
-		return verifiedIP, nil
-	}
-	if ctx.Err() != nil {
-		return "", fmt.Errorf("Tor SOCKS5 public-IP verification timed out: %w (%s)", ctx.Err(), strings.Join(failures, "; "))
-	}
-	return "", fmt.Errorf("no HTTPS identity endpoint returned a valid public IPv4 through Tor SOCKS5 (%s)", strings.Join(failures, "; "))
-}
-
-func waitForTorPublicEgressIP(proxyAddress string, timeout time.Duration) (string, error) {
-	if timeout <= 0 {
-		return "", errors.New("Tor egress verification timeout must be positive")
-	}
-	deadline := time.Now().Add(timeout)
-	var lastErr error
-	for time.Now().Before(deadline) {
-		attemptTimeout := 8 * time.Second
-		if remaining := time.Until(deadline); remaining < attemptTimeout {
-			attemptTimeout = remaining
-		}
-		ip, err := torPublicEgressIP(proxyAddress, attemptTimeout)
-		if err == nil {
-			return ip, nil
-		}
-		lastErr = err
-		time.Sleep(time.Second)
-	}
-	if lastErr != nil {
-		return "", fmt.Errorf("Tor SOCKS5 did not provide verified HTTPS egress within %s: %w", timeout, lastErr)
-	}
-	return "", fmt.Errorf("Tor SOCKS5 did not provide verified HTTPS egress within %s", timeout)
-}
-
-// verifyTorPublicEgress proves that the profile's own Tor SOCKS endpoint has
-// real public HTTPS egress and that the observed exit country is known and non-US.
-// It reuses the shared SOCKS5/IP-geolocation verifier used by Psiphon.
-func verifyTorPublicEgress(proxyAddress string, timeout time.Duration) (string, string, error) {
-	if !isLoopbackProxyAddress(proxyAddress) {
-		return "", "", errors.New("Tor SOCKS5 proxy must be loopback-only")
-	}
-	ip, err := waitForTorPublicEgressIP(proxyAddress, timeout)
-	if err != nil {
-		return "", "", fmt.Errorf("Tor SOCKS5 has no verified public HTTPS egress: %w", err)
-	}
-	country, geoErr := psiphonPublicEgressCountry(proxyAddress, ip, 15*time.Second)
-	if geoErr != nil {
-		return "", "", fmt.Errorf("refusing Tor egress because the country for exit IP %s could not be verified through the Tor SOCKS5 path: %w; no direct-network geolocation fallback is permitted", ip, geoErr)
-	}
-	country = strings.ToUpper(strings.TrimSpace(country))
-	if err := validateTorExitCountry(country); err != nil {
-		return "", "", fmt.Errorf("refusing Tor exit %s: %w", ip, err)
-	}
-	return ip, country, nil
-}
-
-func validateTorExitCountry(country string) error {
-	country = strings.ToUpper(strings.TrimSpace(country))
-	if !isAlphaCountryCode(country) {
-		return errors.New("country is unknown or could not be verified")
-	}
-	if country == "US" {
-		return errors.New("United States is blocked; the emergency profile must not be enabled")
-	}
-	return nil
 }
 
 func xrayTorServiceName(profileID string) string {

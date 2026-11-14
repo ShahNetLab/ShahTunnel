@@ -15,8 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -93,26 +91,6 @@ func torBridgeLine(cfg Config) (string, error) {
 	}
 }
 
-func torGeoIPFilePaths() (string, string) {
-	return filepath.Join(torBundleRoot, "data", "geoip"), filepath.Join(torBundleRoot, "data", "geoip6")
-}
-
-// verifyTorGeoIPFiles fails closed: country-based relay exclusions are unsafe
-// if Tor cannot load the IPv4 and IPv6 relay-country databases.
-func verifyTorGeoIPFiles() error {
-	geo4, geo6 := torGeoIPFilePaths()
-	for label, path := range map[string]string{"IPv4 GeoIP database": geo4, "IPv6 GeoIP database": geo6} {
-		info, err := os.Stat(path)
-		if err != nil {
-			return fmt.Errorf("required Tor %s is missing at %s: %w; reinstall the official Tor Expert Bundle", label, path, err)
-		}
-		if !info.Mode().IsRegular() || info.Size() == 0 {
-			return fmt.Errorf("required Tor %s is empty or not a regular file: %s", label, path)
-		}
-	}
-	return nil
-}
-
 func buildTorClientConfig(cfg Config) (string, error) {
 	bridge, err := torBridgeLine(cfg)
 	if err != nil {
@@ -151,16 +129,6 @@ func buildTorClientConfig(cfg Config) (string, error) {
 	b.WriteString("AvoidDiskWrites 1\n")
 	b.WriteString("Log notice stdout\n")
 	b.WriteString("UseBridges 1\n")
-	geo4, geo6 := torGeoIPFilePaths()
-	b.WriteString("GeoIPFile " + geo4 + "\n")
-	b.WriteString("GeoIPv6File " + geo6 + "\n")
-	// Strict emergency policy: exclude U.S. and unknown-country nodes at every
-	// circuit position. Emergency mode is WebTunnel-only because Snowflake's
-	// rotating volunteer proxies cannot be country-pinned or guaranteed non-US.
-	// A WebTunnel bridge must therefore have a known non-US GeoIP entry too.
-	b.WriteString("ExcludeNodes {us},{??}\n")
-	b.WriteString("GeoIPExcludeUnknown 1\n")
-	b.WriteString("StrictNodes 1\n")
 	b.WriteString("DataDirectory " + cfg.TorDataDir + "\n")
 	b.WriteString("SocksPort " + cfg.TorProxy + " IsolateSOCKSAuth\n")
 	b.WriteString("ClientTransportPlugin snowflake,webtunnel exec " + cfg.TorPTBinary + "\n")
@@ -227,76 +195,34 @@ func executableFile(path string) bool {
 	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0
 }
 
-// compatibleLinuxELF rejects non-Linux, non-ELF and wrong-CPU executables.
-// The Tor Expert Bundle contains more than one file named "tor" on some
-// releases; blindly taking the first match can select a debug/helper artifact
-// which the kernel cannot execute (exec format error).
-func compatibleLinuxELF(path string) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-	var header [20]byte
-	if _, err := io.ReadFull(f, header[:]); err != nil {
-		return false
-	}
-	if string(header[:4]) != "\x7fELF" || header[5] != 1 {
-		return false
-	} // ELF, little endian
-	machine := binary.LittleEndian.Uint16(header[18:20])
-	switch runtime.GOARCH {
-	case "amd64":
-		return header[4] == 2 && machine == 62
-	case "arm64":
-		return header[4] == 2 && machine == 183
-	default:
-		return false
-	}
-}
-
-func findCompatibleExecutable(root, name string) string {
-	if root == "" {
-		return ""
-	}
-	var candidates []string
+func findExecutableInTree(root, name string) string {
+	var found string
 	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil || entry.IsDir() || entry.Name() != name {
+		if err != nil || found != "" {
 			return nil
 		}
-		if executableFile(path) && compatibleLinuxELF(path) {
-			candidates = append(candidates, path)
+		if entry.IsDir() || entry.Name() != name {
+			return nil
+		}
+		if executableFile(path) {
+			found = path
+			return filepath.SkipAll
 		}
 		return nil
 	})
-	// Prefer the official Expert Bundle runtime location over debug artifacts.
-	preferred := filepath.Join(root, "tor", "tor")
-	for _, candidate := range candidates {
-		if candidate == preferred {
-			return candidate
-		}
-	}
-	if len(candidates) > 0 {
-		sort.Strings(candidates)
-		return candidates[0]
-	}
-	return ""
+	return found
 }
 
 func locateTorBinaries() (string, string) {
-	torBinary := findCompatibleExecutable(torBundleRoot, "tor")
-	ptBinary := findCompatibleExecutable(torBundleRoot, "lyrebird")
+	torBinary := findExecutableInTree(torBundleRoot, "tor")
+	ptBinary := findExecutableInTree(torBundleRoot, "lyrebird")
 	if torBinary == "" {
-		if candidate, err := exec.LookPath("tor"); err == nil && compatibleLinuxELF(candidate) {
-			torBinary = candidate
-		}
+		torBinary, _ = exec.LookPath("tor")
 	}
 	if ptBinary == "" {
-		if candidate, err := exec.LookPath("lyrebird"); err == nil && compatibleLinuxELF(candidate) {
-			ptBinary = candidate
-		}
+		ptBinary, _ = exec.LookPath("lyrebird")
 	}
-	if torBinary == "" || ptBinary == "" {
+	if !executableFile(torBinary) || !executableFile(ptBinary) {
 		return "", ""
 	}
 	return torBinary, ptBinary
@@ -335,9 +261,6 @@ func prepareTorAgentProfile(cfg *Config) error {
 	}
 	torBinary, ptBinary, err := ensureTorBinaries()
 	if err != nil {
-		return err
-	}
-	if err := verifyTorGeoIPFiles(); err != nil {
 		return err
 	}
 	port, err := allocateTorSocksPort(cfg.Name)
@@ -469,22 +392,8 @@ func startTorForAgent(cfg Config) (func(), error) {
 	if cfg.Underlay != underlayTor {
 		return func() {}, nil
 	}
-	// Repair stale paths saved by earlier 5.0.0 builds. In particular, older
-	// installers could select tor-bundle/debug/tor merely because it appeared
-	// first in a filesystem walk. Resolve a CPU-compatible official runtime on
-	// every start and use it for this process without modifying other profiles.
-	if !compatibleLinuxELF(cfg.TorBinary) || !compatibleLinuxELF(cfg.TorPTBinary) {
-		torBinary, ptBinary, err := ensureTorBinaries()
-		if err != nil {
-			return nil, err
-		}
-		cfg.TorBinary, cfg.TorPTBinary = torBinary, ptBinary
-	}
-	if !executableFile(cfg.TorBinary) || !executableFile(cfg.TorPTBinary) || !compatibleLinuxELF(cfg.TorBinary) || !compatibleLinuxELF(cfg.TorPTBinary) {
-		return nil, errors.New("compatible Linux Tor/lyrebird executables are missing; rerun the updated ShahTunnel installer")
-	}
-	if err := verifyTorGeoIPFiles(); err != nil {
-		return nil, err
+	if !executableFile(cfg.TorBinary) || !executableFile(cfg.TorPTBinary) {
+		return nil, errors.New("Tor/lyrebird binaries are missing; recreate the Tor Agent profile with the updated installer")
 	}
 	if !isLoopbackProxyAddress(cfg.TorProxy) {
 		return nil, errors.New("Tor SOCKS5 proxy must be loopback-only")
