@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 5.5.0 installer.
+# Shah Tunnel 5.5.1 installer.
 # Downloads the pinned Go 1.26.1 toolchain, verifies its SHA-256, fetches the source,
 # and builds the Linux binary on the target server. No prebuilt release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="5.5.0"
+VERSION="5.5.1"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -582,9 +582,46 @@ build_from_official_go_toolchain() {
   return 0
 }
 
+ensure_sing_box() {
+  if command -v sing-box >/dev/null 2>&1; then
+    local installed_version
+    installed_version="$(sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)"
+    if [[ -n "$installed_version" ]] && dpkg --compare-versions "$installed_version" ge "1.13.0"; then
+      echo "sing-box ${installed_version} is already installed and supports TLS public-key pinning." >&2
+      return 0
+    fi
+    echo "Existing sing-box is missing or older than 1.13.0; upgrading from the official SagerNet repository." >&2
+  fi
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "sing-box is required for TUIC v5/Trojan profiles. Install it using the official SagerNet package instructions for this distribution." >&2
+    return 1
+  fi
+  echo "Installing sing-box from the official SagerNet APT repository (required for TUIC v5/Trojan)..." >&2
+  install -d -m 0755 /etc/apt/keyrings
+  curl_download "https://sing-box.app/gpg.key" "$TMP/sagernet.asc" --connect-timeout 12 --max-time 45 || return 1
+  install -o root -g root -m 0644 "$TMP/sagernet.asc" /etc/apt/keyrings/sagernet.asc
+  cat > /etc/apt/sources.list.d/sagernet.sources <<'EOF'
+Types: deb
+URIs: https://deb.sagernet.org/
+Suites: *
+Components: *
+Enabled: yes
+Signed-By: /etc/apt/keyrings/sagernet.asc
+EOF
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y sing-box
+  command -v sing-box >/dev/null 2>&1 || { echo "sing-box installation did not produce an executable." >&2; return 1; }
+  sing-box version >/dev/null 2>&1 || { echo "Installed sing-box failed its version check." >&2; return 1; }
+  echo "Official sing-box installation verified." >&2
+}
+
 if ! build_from_official_go_toolchain; then
   echo "Installation stopped: no verified ShahTunnel binary was built." >&2
   echo "Go archives must match the pinned SHA-256; ShahTunnel is built locally without GitHub Release assets." >&2
+  exit 1
+fi
+if ! ensure_sing_box; then
+  echo "Installation stopped: the official sing-box dependency is required for the integrated TUIC/Trojan feature set." >&2
   exit 1
 fi
 phase_start 2 "Installing binary and configuring service"
