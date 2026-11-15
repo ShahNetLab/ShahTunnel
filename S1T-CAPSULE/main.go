@@ -56,7 +56,7 @@ const (
 	msgPing                     byte = 6
 	msgPong                     byte = 7
 	maxStreams                       = 512
-	streamWindowFrames               = 256
+	streamWindowFrames               = 512
 	maxQueuedPayloadBytes            = int64(64 << 20)
 	wireWriteTimeout                 = 30 * time.Second
 	reverseStreamOpenTimeout         = 18 * time.Second
@@ -1793,6 +1793,26 @@ func (s *agentSession) run() {
 	}
 }
 
+// laneLoadPenalty gives each established TCP stream a meaningful share of the
+// lane score. RTT remains important, but a small RTT advantage must not pin
+// nearly every new flow to one lane while the other independent lanes sit idle.
+// The cap prevents an overloaded lane from producing unbounded score values.
+const (
+	laneStreamLoadPenalty = 2 * time.Millisecond
+	laneMaxLoadPenalty    = 500 * time.Millisecond
+)
+
+func laneLoadPenalty(activeStreams int) time.Duration {
+	if activeStreams <= 0 {
+		return 0
+	}
+	penalty := time.Duration(activeStreams) * laneStreamLoadPenalty
+	if penalty > laneMaxLoadPenalty {
+		return laneMaxLoadPenalty
+	}
+	return penalty
+}
+
 type hubServer struct {
 	cfg              Config
 	controlTLSConfig *tls.Config
@@ -1889,9 +1909,9 @@ func (h *hubServer) current() *hubSession {
 	}
 	if len(freshMetrics) > 0 {
 		best := freshMetrics[0]
-		bestScore := best.rtt + best.rtt*time.Duration(best.load)/time.Duration(maxStreams) + best.pressure
+		bestScore := best.rtt + laneLoadPenalty(best.load) + best.pressure
 		for _, metric := range freshMetrics[1:] {
-			score := metric.rtt + metric.rtt*time.Duration(metric.load)/time.Duration(maxStreams) + metric.pressure
+			score := metric.rtt + laneLoadPenalty(metric.load) + metric.pressure
 			if score < bestScore {
 				best, bestScore = metric, score
 			}
@@ -1900,12 +1920,12 @@ func (h *hubServer) current() *hubSession {
 		return best.session
 	}
 
-	// Before the first fresh RTT sample, use a combined least-load/queue score.
-	// This also avoids piling startup flows onto the first lane to reconnect.
+	// Before the first fresh RTT sample, use the same least-load/queue score.
+	// This avoids piling startup flows onto the first lane to reconnect.
 	bestScore := time.Duration(1<<62 - 1)
 	var best *hubSession
 	for _, metric := range metrics {
-		score := time.Duration(metric.load)*2*time.Millisecond + metric.pressure
+		score := laneLoadPenalty(metric.load) + metric.pressure
 		if score < bestScore {
 			best, bestScore = metric.session, score
 		}

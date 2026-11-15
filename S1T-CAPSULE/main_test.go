@@ -2484,14 +2484,14 @@ func TestTunnelIDIsStableAndSystemdSafe(t *testing.T) {
 }
 
 func TestUploadFlowControlWindowIsExpanded(t *testing.T) {
-	if streamWindowFrames < 256 {
-		t.Fatalf("stream window = %d frames; want at least 256", streamWindowFrames)
+	if streamWindowFrames < 512 {
+		t.Fatalf("stream window = %d frames; want at least 512", streamWindowFrames)
 	}
 	if maxFrame < 64*1024 {
 		t.Fatalf("maximum frame = %d bytes; want at least 64 KiB", maxFrame)
 	}
-	if got := int64(streamWindowFrames) * int64(maxFrame); got < 16<<20 {
-		t.Fatalf("per-stream in-flight window = %d bytes; want at least 16 MiB", got)
+	if got := int64(streamWindowFrames) * int64(maxFrame); got < 32<<20 {
+		t.Fatalf("per-stream in-flight window = %d bytes; want at least 32 MiB", got)
 	}
 	if maxQueuedPayloadBytes < 64<<20 {
 		t.Fatalf("global queued payload budget = %d bytes; want at least 64 MiB", maxQueuedPayloadBytes)
@@ -2883,14 +2883,49 @@ func TestHubBalancesMeasuredRTTAndLoad(t *testing.T) {
 		w.lastPongAt.Store(time.Now().UnixNano())
 		return &hubSession{id: id, streams: streams, wire: w}
 	}
-	// The 14ms lane has some load but a lower weighted RTT than the idle 30ms lane.
-	fast := mkSession(1, 32, 14*time.Millisecond)
-	slower := mkSession(2, 0, 30*time.Millisecond)
-	h := &hubServer{sessions: map[*hubSession]struct{}{fast: {}, slower: {}}}
-	for i := 0; i < 20; i++ {
-		if got := h.current(); got != fast {
-			t.Fatalf("selected lane %d (RTT %s, load %d), want the lower weighted RTT lane", got.id, got.wire.roundTripTime(), got.activeStreams())
+	// A small RTT advantage must not outweigh a large queue of established
+	// streams when another healthy lane is available.
+	loadedFast := mkSession(1, 32, 14*time.Millisecond)
+	idleSlower := mkSession(2, 0, 30*time.Millisecond)
+	h := &hubServer{sessions: map[*hubSession]struct{}{loadedFast: {}, idleSlower: {}}}
+	if got := h.current(); got != idleSlower {
+		t.Fatalf("selected lane %d (RTT %s, load %d); want the idle healthy lane %d", got.id, got.wire.roundTripTime(), got.activeStreams(), idleSlower.id)
+	}
+}
+
+func TestHubSpreadsStreamsAcrossFreshRTTLanes(t *testing.T) {
+	const lanes = 12
+	sessions := make([]*hubSession, lanes)
+	set := make(map[*hubSession]struct{}, lanes)
+	for i := 0; i < lanes; i++ {
+		w := &wire{done: make(chan struct{})}
+		w.rttNanos.Store(int64(20 * time.Millisecond))
+		w.lastPongAt.Store(time.Now().UnixNano())
+		sessions[i] = &hubSession{id: uint64(i + 1), streams: make(map[uint32]*hubStream), wire: w}
+		set[sessions[i]] = struct{}{}
+	}
+	h := &hubServer{sessions: set}
+	for streamID := 1; streamID <= 120; streamID++ {
+		selected := h.current()
+		if selected == nil {
+			t.Fatalf("no healthy lane selected for stream %d", streamID)
 		}
+		selected.mu.Lock()
+		selected.streams[uint32(streamID)] = &hubStream{}
+		selected.mu.Unlock()
+	}
+	minLoad, maxLoad := 121, 0
+	for _, session := range sessions {
+		load := session.activeStreams()
+		if load < minLoad {
+			minLoad = load
+		}
+		if load > maxLoad {
+			maxLoad = load
+		}
+	}
+	if maxLoad-minLoad > 1 {
+		t.Fatalf("fresh-RTT scheduler did not balance 120 streams over %d lanes: min=%d max=%d", lanes, minLoad, maxLoad)
 	}
 }
 
