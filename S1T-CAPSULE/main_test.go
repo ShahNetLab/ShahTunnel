@@ -2235,7 +2235,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.5.1             |",
+		"        |            SHAH TUNNEL 5.5.2             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -3087,6 +3087,49 @@ func TestSingBoxListenerIsReservedInProfile(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("sing-box listener was not included in profile port-conflict checks")
+	}
+}
+
+func TestTUICUDPPortCanShareNumberWithTCPMapping(t *testing.T) {
+	cfg := Config{
+		Version: version, Name: "hub-tuic-2083", Role: "hub", Transport: transportAdaptive,
+		Token: strings.Repeat("a", 64), ControlListen: "0.0.0.0:9443",
+		CertFile: "/etc/ravanreverse/hub.crt", KeyFile: "/etc/ravanreverse/hub.key",
+		ProxyProtocol: transportTUIC, TLSServerName: "37.32.12.244",
+		ProxyListen: "0.0.0.0:2083", ProxyPort: 2083,
+		ProxyPassword: strings.Repeat("t", 32), ProxyUUID: "d8d6a1e3-3d42-4ac1-8d1a-a5b6d6b84a71",
+		Ports: []PortMapping{{ID: "main", Listen: "0.0.0.0:2083"}},
+	}
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("TUIC UDP 2083 should be allowed alongside TCP mapping 2083: %v", err)
+	}
+	endpoints := profileListenEndpoints(cfg)
+	var gotTUICUDP, gotMappingTCP bool
+	for _, endpoint := range endpoints {
+		if endpoint.Address == "0.0.0.0:2083" && endpoint.Network == "udp" {
+			gotTUICUDP = true
+		}
+		if endpoint.Address == "0.0.0.0:2083" && endpoint.Network == "tcp" {
+			gotMappingTCP = true
+		}
+	}
+	if !gotTUICUDP || !gotMappingTCP {
+		t.Fatalf("expected same-number TCP and UDP listeners, got %#v", endpoints)
+	}
+}
+
+func TestTrojanTCPPortCannotShareNumberWithTCPMapping(t *testing.T) {
+	cfg := Config{
+		Version: version, Name: "hub-trojan-2083", Role: "hub", Transport: transportAdaptive,
+		Token: strings.Repeat("a", 64), ControlListen: "0.0.0.0:9443",
+		CertFile: "/etc/ravanreverse/hub.crt", KeyFile: "/etc/ravanreverse/hub.key",
+		ProxyProtocol: transportTrojan, TLSServerName: "37.32.12.244",
+		ProxyListen: "0.0.0.0:2083", ProxyPort: 2083,
+		ProxyPassword: strings.Repeat("t", 32),
+		Ports:         []PortMapping{{ID: "main", Listen: "0.0.0.0:2083"}},
+	}
+	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "TCP control/transport port") {
+		t.Fatalf("Trojan TCP 2083 should conflict with TCP mapping 2083, got %v", err)
 	}
 }
 

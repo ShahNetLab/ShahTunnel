@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.5.1"
+	version                          = "5.5.2"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -4277,30 +4277,34 @@ func validateConfig(c Config) error {
 		}
 		_, controlPortText, _ := net.SplitHostPort(c.ControlListen)
 		controlPort, _ := strconv.Atoi(controlPortText)
-		reservedPorts := map[int]bool{controlPort: true}
-		if c.ProxyProtocol != "" {
-			if reservedPorts[c.ProxyPort] {
-				return errors.New("TUIC/Trojan port conflicts with the ShahTunnel control listener")
+		// ShahTunnel mappings and control/CONNECT listeners use TCP. TUIC uses
+		// UDP, so its numeric port may intentionally match a TCP mapping port
+		// (for example users' TCP 2083 alongside TUIC UDP 2083). Only Trojan,
+		// which also uses TCP, must reserve its port against TCP listeners.
+		reservedTCPPorts := map[int]bool{controlPort: true}
+		if c.ProxyProtocol == transportTrojan {
+			if reservedTCPPorts[c.ProxyPort] {
+				return errors.New("Trojan TCP port conflicts with the ShahTunnel control listener")
 			}
-			reservedPorts[c.ProxyPort] = true
-			if c.ProxyProtocol == proxyAdaptiveAll {
-				if reservedPorts[c.ProxyTrojanPort] {
-					return errors.New("Trojan port conflicts with another ShahTunnel listener")
-				}
-				reservedPorts[c.ProxyTrojanPort] = true
+			reservedTCPPorts[c.ProxyPort] = true
+		}
+		if c.ProxyProtocol == proxyAdaptiveAll {
+			if reservedTCPPorts[c.ProxyTrojanPort] {
+				return errors.New("Trojan TCP port conflicts with another ShahTunnel listener")
 			}
+			reservedTCPPorts[c.ProxyTrojanPort] = true
 		}
 		if transportModeAllowsHTTP2(c.Transport) {
 			h2Addr, _ := adjacentPortAddress(c.ControlListen)
 			_, pText, _ := net.SplitHostPort(h2Addr)
 			p, _ := strconv.Atoi(pText)
-			reservedPorts[p] = true
+			reservedTCPPorts[p] = true
 		}
 		if transportModeAllowsHTTP1(c.Transport) {
 			h1Addr, _ := secondAdjacentPortAddress(c.ControlListen)
 			_, pText, _ := net.SplitHostPort(h1Addr)
 			p, _ := strconv.Atoi(pText)
-			reservedPorts[p] = true
+			reservedTCPPorts[p] = true
 		}
 		for _, p := range c.Ports {
 			if !validMappingID(p.ID) {
@@ -4315,8 +4319,8 @@ func validateConfig(c Config) error {
 			}
 			_, lpText, _ := net.SplitHostPort(p.Listen)
 			lp, _ := strconv.Atoi(lpText)
-			if reservedPorts[lp] {
-				return fmt.Errorf("mapping %q uses reserved control/transport port %s", p.ID, lpText)
+			if reservedTCPPorts[lp] {
+				return fmt.Errorf("mapping %q uses a TCP control/transport port %s", p.ID, lpText)
 			}
 			if addrs[p.Listen] {
 				return fmt.Errorf("duplicate listen address %q", p.Listen)
@@ -4672,9 +4676,59 @@ func listenAddressesConflict(a, b string) bool {
 	return ha == hb || wildcard(ha) || wildcard(hb)
 }
 
+type profileListenEndpoint struct {
+	Address string
+	Network string // "tcp" or "udp"
+}
+
+// profileListenEndpoints keeps transport protocols distinct: a TCP mapping
+// may share a numeric port with a TUIC UDP listener, but not with Trojan TCP.
+func profileListenEndpoints(c Config) []profileListenEndpoint {
+	var endpoints []profileListenEndpoint
+	add := func(address, network string) {
+		if strings.TrimSpace(address) != "" {
+			endpoints = append(endpoints, profileListenEndpoint{Address: address, Network: network})
+		}
+	}
+	switch c.Role {
+	case "hub":
+		if c.ProxyProtocol == transportTUIC || c.ProxyProtocol == proxyAdaptiveAll {
+			add(c.ProxyListen, "udp")
+		} else if c.ProxyProtocol == transportTrojan {
+			add(c.ProxyListen, "tcp")
+		}
+		if c.ProxyProtocol == proxyAdaptiveAll {
+			add(c.ProxyTrojanListen, "tcp")
+		}
+		add(c.ControlListen, "tcp")
+		if transportModeAllowsHTTP2(c.Transport) {
+			if addr, err := adjacentPortAddress(c.ControlListen); err == nil {
+				add(addr, "tcp")
+			}
+		}
+		if transportModeAllowsHTTP1(c.Transport) {
+			if addr, err := secondAdjacentPortAddress(c.ControlListen); err == nil {
+				add(addr, "tcp")
+			}
+		}
+		for _, mapping := range c.Ports {
+			add(mapping.Listen, "tcp")
+		}
+	case "agent":
+		if c.ProxyProtocol != "" {
+			add(c.ProxySocks, "tcp")
+		}
+	case "relay":
+		for _, mapping := range c.Ports {
+			add(mapping.Listen, "tcp")
+		}
+	}
+	return endpoints
+}
+
 func ensureNoPortConflicts(c Config, skipPath string) error {
-	newAddresses := profileListenAddresses(c)
-	if len(newAddresses) == 0 {
+	newEndpoints := profileListenEndpoints(c)
+	if len(newEndpoints) == 0 {
 		return nil
 	}
 	profiles, err := listTunnelProfiles()
@@ -4693,10 +4747,10 @@ func ensureNoPortConflicts(c Config, skipPath string) error {
 		if json.Unmarshal(data, &existing) != nil {
 			continue
 		}
-		for _, newAddr := range newAddresses {
-			for _, oldAddr := range profileListenAddresses(existing) {
-				if listenAddressesConflict(newAddr, oldAddr) {
-					return fmt.Errorf("listen address %s conflicts with tunnel %q (%s); choose a different port. Existing tunnel remains unchanged", newAddr, profile.Name, oldAddr)
+		for _, newEndpoint := range newEndpoints {
+			for _, oldEndpoint := range profileListenEndpoints(existing) {
+				if newEndpoint.Network == oldEndpoint.Network && listenAddressesConflict(newEndpoint.Address, oldEndpoint.Address) {
+					return fmt.Errorf("%s listen address %s conflicts with tunnel %q (%s); choose a different port. Existing tunnel remains unchanged", newEndpoint.Network, newEndpoint.Address, profile.Name, oldEndpoint.Address)
 				}
 			}
 		}
@@ -4973,7 +5027,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.5.1             |",
+	"        |            SHAH TUNNEL 5.5.2             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
