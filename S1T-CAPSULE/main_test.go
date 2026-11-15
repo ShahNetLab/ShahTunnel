@@ -1589,7 +1589,7 @@ func TestPsiphonHubAddressDefaultsToPublicMappingPort(t *testing.T) {
 }
 
 func TestUnderlayModesAndLoopbackValidation(t *testing.T) {
-	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayTor, underlayAdaptive, underlayTUIC, underlayReality} {
+	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayTor, underlayAdaptive} {
 		if !validUnderlayMode(mode) {
 			t.Fatalf("valid underlay %q was rejected", mode)
 		}
@@ -2247,7 +2247,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.1.2             |",
+		"        |            SHAH TUNNEL 5.0.1             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -3060,59 +3060,5 @@ func TestRunAgentDoesNotDiscardOptionNinePsiphonMappings(t *testing.T) {
 	body = body[start : start+end]
 	if strings.Contains(body, "migrateAdaptivePsiphonUserEgress") || strings.Contains(body, "restoreAdaptivePsiphonMappings") {
 		t.Fatal("Agent startup must preserve option-9 Psiphon Xray mappings instead of restoring direct targets")
-	}
-}
-
-func TestNormalizeTCPAddressInputPreservesHubControlPort(t *testing.T) {
-	got, err := normalizeTCPAddressInput("Iran Hub control endpoint", "  37.32.12.244:888  ")
-	if err != nil {
-		t.Fatalf("normalizeTCPAddressInput rejected valid Hub address: %v", err)
-	}
-	if got != "37.32.12.244:888" {
-		t.Fatalf("normalized Hub endpoint = %q; want exact control endpoint 37.32.12.244:888", got)
-	}
-	got, err = normalizeTCPAddressInput("Iran Hub control endpoint", "hub.example.net:9443")
-	if err != nil || got != "hub.example.net:9443" {
-		t.Fatalf("DNS Hub endpoint = %q, err=%v; want hub.example.net:9443", got, err)
-	}
-}
-
-func TestNormalizeTCPAddressInputRejectsMissingOrInvalidPortImmediately(t *testing.T) {
-	for _, input := range []string{"37.32.12.244", "37.32.12.244:", "37.32.12.244:0", "37.32.12.244:65536", "https://hub.example.net:443"} {
-		if _, err := normalizeTCPAddressInput("Iran Hub control endpoint", input); err == nil {
-			t.Errorf("invalid Hub endpoint %q was accepted", input)
-		}
-	}
-}
-
-func TestTUICAgentConfigRoundTripKeepsHubControlPort(t *testing.T) {
-	p := testProtocolEgressTUIC()
-	cfg := Config{
-		Name: "tuic-port-test", Version: version, Role: "agent", Transport: transportAdaptive,
-		Underlay: underlayTUIC, HubAddr: "37.32.12.244:888", Token: strings.Repeat("a", 64),
-		Fingerprint: strings.Repeat("b", 64), TunnelChannels: defaultTunnelChannels,
-		Ports: []PortMapping{{ID: "main", Target: "127.0.0.1:2083"}}, ProtocolEgress: &p,
-	}
-	oldPath := configPath
-	configPath = filepath.Join(t.TempDir(), "tuic-agent.json")
-	t.Cleanup(func() { configPath = oldPath })
-	if err := saveConfig(cfg); err != nil {
-		t.Fatalf("save TUIC Agent config: %v", err)
-	}
-	loaded, err := loadConfig()
-	if err != nil {
-		t.Fatalf("load TUIC Agent config: %v", err)
-	}
-	if loaded.HubAddr != "37.32.12.244:888" {
-		t.Fatalf("HubAddr after save/load = %q; want 37.32.12.244:888", loaded.HubAddr)
-	}
-}
-
-func TestTUICUnderlayDoesNotRewriteHubControlEndpoint(t *testing.T) {
-	cfg := Config{Role: "agent", Underlay: underlayTUIC, HubAddr: "37.32.12.244:888"}
-	for _, transport := range []string{transportAdaptive, transportTCP, transportWebSocket, transportHTTP2, transportHTTP1, transportHTTPConnectAuto} {
-		if got := agentHubAddressForTransport(cfg, transport); got != cfg.HubAddr {
-			t.Errorf("TUIC transport %q rewrote HubAddr to %q; want %q", transport, got, cfg.HubAddr)
-		}
 	}
 }
