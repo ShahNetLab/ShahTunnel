@@ -2224,7 +2224,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.0.0             |",
+		"        |            SHAH TUNNEL 5.0.1             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",

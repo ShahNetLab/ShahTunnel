@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.0.0"
+	version                          = "5.0.1"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -4600,7 +4600,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.0.0             |",
+	"        |            SHAH TUNNEL 5.0.1             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
