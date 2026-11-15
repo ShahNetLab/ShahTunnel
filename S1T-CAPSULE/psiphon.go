@@ -183,7 +183,7 @@ func psiphonHostPerformanceProfile() psiphonPerformanceProfile {
 // These are exactly the countries requested for ShahTunnel 5.0.1.
 var psiphonEgressRegionPriority = []string{
 	"AT", "BR", "CH", "CZ", "DE", "DK",
-	"ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO", "RS",
+	"ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO",
 }
 
 var psiphonAllowedEgressRegions = func() map[string]bool {
