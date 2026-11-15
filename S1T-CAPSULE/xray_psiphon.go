@@ -466,6 +466,24 @@ func readPsiphonPreferredRegion(configPath string) string {
 	return region
 }
 
+// psiphonBlockedExitIPs is a defensive denylist for specific exits reported
+// by the operator. The country allowlist remains the primary policy; this list
+// prevents a known-bad address from being accepted even if a GeoIP provider
+// later misclassifies it or returns inconsistent metadata.
+var psiphonBlockedExitIPs = map[string]struct{}{
+	"89.45.7.51":    {},
+	"146.70.42.162": {},
+}
+
+func isBlockedPsiphonExitIP(exitIP string) bool {
+	ip := net.ParseIP(strings.TrimSpace(exitIP))
+	if ip == nil || ip.To4() == nil {
+		return false
+	}
+	_, blocked := psiphonBlockedExitIPs[ip.To4().String()]
+	return blocked
+}
+
 func psiphonExitMatchesVPSDirectIP(exitIP, directIP string) bool {
 	exit := net.ParseIP(strings.TrimSpace(exitIP))
 	direct := net.ParseIP(strings.TrimSpace(directIP))
@@ -476,6 +494,9 @@ func verifyPsiphonExit(proxy, expectedRegion, directIP string) (string, string, 
 	ip, err := waitForPsiphonPublicEgressIP(proxy, 8*time.Second)
 	if err != nil {
 		return "", "", err
+	}
+	if isBlockedPsiphonExitIP(ip) {
+		return "", "", fmt.Errorf("Psiphon returned a manually blocked exit IP %s", ip)
 	}
 	if psiphonExitMatchesVPSDirectIP(ip, directIP) {
 		return "", "", fmt.Errorf("SOCKS5 returned the VPS direct public IP %s; refusing this as a Psiphon exit", ip)

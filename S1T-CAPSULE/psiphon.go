@@ -182,7 +182,7 @@ func psiphonHostPerformanceProfile() psiphonPerformanceProfile {
 // verified against this explicit allowlist before user traffic is enabled.
 // These are exactly the countries requested for ShahTunnel 5.0.1.
 var psiphonEgressRegionPriority = []string{
-	"AT", "BR", "CH", "CZ", "DE", "DK",
+	"AT", "BR", "CH", "CZ", "DE",
 	"ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO",
 }
 
