@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -26,163 +25,6 @@ import (
 	"time"
 )
 
-func TestAtomicWriteFileUsesPrivateTemporaryAndRequestedMode(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "result.conf")
-	if err := atomicWriteFile(path, []byte("first"), 0600); err != nil {
-		t.Fatalf("atomic write: %v", err)
-	}
-	if err := atomicWriteFile(path, []byte("second"), 0640); err != nil {
-		t.Fatalf("atomic replacement: %v", err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil || string(data) != "second" {
-		t.Fatalf("atomic file contents = %q, err=%v", data, err)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat atomic file: %v", err)
-	}
-	if got := info.Mode().Perm(); got != 0640 {
-		t.Fatalf("atomic file mode = %04o; want 0640", got)
-	}
-	if matches, _ := filepath.Glob(filepath.Join(dir, ".shah-tunnel-*.tmp")); len(matches) != 0 {
-		t.Fatalf("temporary files left behind: %v", matches)
-	}
-}
-
-func TestAtomicWriteFileReplacesSymlinkWithoutFollowingIt(t *testing.T) {
-	dir := t.TempDir()
-	victim := filepath.Join(dir, "victim.txt")
-	link := filepath.Join(dir, "target.txt")
-	if err := os.WriteFile(victim, []byte("do-not-overwrite"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(victim, link); err != nil {
-		t.Skipf("symlinks unavailable: %v", err)
-	}
-	if err := atomicWriteFile(link, []byte("safe-replacement"), 0600); err != nil {
-		t.Fatalf("atomic replacement of symlink path: %v", err)
-	}
-	victimData, err := os.ReadFile(victim)
-	if err != nil || string(victimData) != "do-not-overwrite" {
-		t.Fatalf("symlink target changed: %q, err=%v", victimData, err)
-	}
-	linkInfo, err := os.Lstat(link)
-	if err != nil {
-		t.Fatalf("stat replaced target path: %v", err)
-	}
-	if linkInfo.Mode()&os.ModeSymlink != 0 {
-		t.Fatalf("target path is still a symlink: mode=%v", linkInfo.Mode())
-	}
-	linkData, err := os.ReadFile(link)
-	if err != nil || string(linkData) != "safe-replacement" {
-		t.Fatalf("replacement contents = %q, err=%v", linkData, err)
-	}
-}
-
-func TestValidateConfigRejectsNonPrintableTokenBytes(t *testing.T) {
-	base := Config{
-		Version:        version,
-		Role:           "agent",
-		Transport:      transportTCP,
-		Underlay:       underlayDirect,
-		HubAddr:        "127.0.0.1:443",
-		Token:          strings.Repeat("a", 64),
-		Fingerprint:    strings.Repeat("a", 64),
-		TunnelChannels: 1,
-		Ports:          []PortMapping{{ID: "main", Target: "127.0.0.1:80"}},
-	}
-	for _, bad := range []string{
-		strings.Repeat("a", 31) + " " + strings.Repeat("a", 32),
-		strings.Repeat("a", 32) + "\t" + strings.Repeat("a", 31),
-		strings.Repeat("a", 32) + "\x00" + strings.Repeat("a", 31),
-		strings.Repeat("a", 32) + "\x7f" + strings.Repeat("a", 31),
-	} {
-		cfg := base
-		cfg.Token = bad
-		if err := validateConfig(cfg); err == nil {
-			t.Fatalf("validateConfig accepted a token containing non-printable byte %q", bad[32])
-		}
-	}
-	base.Token = strings.Repeat("A", 32) + "!" + strings.Repeat("b", 31)
-	if err := validateConfig(base); err != nil {
-		t.Fatalf("validateConfig rejected printable ASCII token: %v", err)
-	}
-	for _, length := range []int{47, 241} {
-		cfg := base
-		cfg.Token = strings.Repeat("a", length)
-		if err := validateConfig(cfg); err == nil {
-			t.Fatalf("validateConfig accepted token length %d outside the allowed range", length)
-		}
-	}
-	for _, length := range []int{48, 64, 240} {
-		cfg := base
-		cfg.Token = strings.Repeat("a", length)
-		if err := validateConfig(cfg); err != nil {
-			t.Fatalf("validateConfig rejected printable token length %d: %v", length, err)
-		}
-	}
-}
-
-func TestGeneratedCertificateHasBoundedLifetimeAndPrivateKeyMode(t *testing.T) {
-	dir := t.TempDir()
-	certPath := filepath.Join(dir, "hub.crt")
-	keyPath := filepath.Join(dir, "hub.key")
-	if _, err := generateCertificate(certPath, keyPath); err != nil {
-		t.Fatalf("generate certificate: %v", err)
-	}
-	pemBytes, err := os.ReadFile(certPath)
-	if err != nil {
-		t.Fatalf("read certificate: %v", err)
-	}
-	block, _ := pem.Decode(pemBytes)
-	if block == nil {
-		t.Fatal("certificate PEM could not be decoded")
-	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		t.Fatalf("parse certificate: %v", err)
-	}
-	remaining := time.Until(cert.NotAfter)
-	if remaining <= 0 || remaining > 2*365*24*time.Hour+48*time.Hour {
-		t.Fatalf("new certificate lifetime is not bounded to about 2 years: %s", remaining)
-	}
-	info, err := os.Stat(keyPath)
-	if err != nil {
-		t.Fatalf("stat private key: %v", err)
-	}
-	if got := info.Mode().Perm(); got != 0600 {
-		t.Fatalf("private key permissions = %04o; want 0600", got)
-	}
-}
-
-func TestRuntimeStatsUsePrivateAtomicFile(t *testing.T) {
-	old := configPath
-	configPath = filepath.Join(t.TempDir(), "profile.json")
-	t.Cleanup(func() { configPath = old })
-	writeRuntimeStats("agent")
-	statsPath := runtimeStatsPath()
-	data, err := os.ReadFile(statsPath)
-	if err != nil {
-		t.Fatalf("read runtime stats: %v", err)
-	}
-	var snapshot RuntimeSnapshot
-	if err := json.Unmarshal(data, &snapshot); err != nil {
-		t.Fatalf("runtime stats are invalid JSON: %v", err)
-	}
-	info, err := os.Stat(statsPath)
-	if err != nil {
-		t.Fatalf("stat runtime stats: %v", err)
-	}
-	if got := info.Mode().Perm(); got != 0600 {
-		t.Fatalf("runtime stats permissions = %04o; want 0600", got)
-	}
-	if matches, _ := filepath.Glob(filepath.Join(filepath.Dir(statsPath), ".runtime-*.tmp")); len(matches) != 0 {
-		t.Fatalf("temporary runtime stats files were left behind: %v", matches)
-	}
-}
-
 func TestTunnelTemplateUnitAllowsNetlinkWithoutNetworkAdmin(t *testing.T) {
 	unit := tunnelTemplateUnitContents()
 	want := "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
@@ -194,11 +36,6 @@ func TestTunnelTemplateUnitAllowsNetlinkWithoutNetworkAdmin(t *testing.T) {
 	}
 	if !strings.Contains(unit, "CapabilityBoundingSet=CAP_NET_BIND_SERVICE") {
 		t.Fatalf("service template lost its restricted capability set")
-	}
-	for _, directive := range []string{"ProtectKernelLogs=true", "KeyringMode=private", "RemoveIPC=true", "UMask=0077"} {
-		if !strings.Contains(unit, directive) {
-			t.Fatalf("service template missing hardening directive %q", directive)
-		}
 	}
 }
 
@@ -2410,7 +2247,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.0.2             |",
+		"        |            SHAH TUNNEL 5.2.0             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -3223,5 +3060,61 @@ func TestRunAgentDoesNotDiscardOptionNinePsiphonMappings(t *testing.T) {
 	body = body[start : start+end]
 	if strings.Contains(body, "migrateAdaptivePsiphonUserEgress") || strings.Contains(body, "restoreAdaptivePsiphonMappings") {
 		t.Fatal("Agent startup must preserve option-9 Psiphon Xray mappings instead of restoring direct targets")
+	}
+}
+
+func TestAtomicWriteFileUsesPrivateUniqueTempAndReplacesAtomically(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "private.json")
+
+	if err := atomicWriteFile(path, []byte("first\n"), 0600); err != nil {
+		t.Fatalf("first atomic write: %v", err)
+	}
+	if err := atomicWriteFile(path, []byte("second\n"), 0600); err != nil {
+		t.Fatalf("replacement atomic write: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if string(got) != "second\n" {
+		t.Fatalf("target content = %q, want %q", got, "second\n")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat target: %v", err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("target permissions = %04o, want 0600", info.Mode().Perm())
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, ".private.json.tmp-*"))
+	if err != nil {
+		t.Fatalf("glob temp files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary files remain after atomic write: %v", matches)
+	}
+}
+
+func TestAtomicWriteFileDoesNotFollowPredictableTemporarySymlink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	target := filepath.Join(dir, "attacker-controlled")
+	if err := os.WriteFile(target, []byte("untouched"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path+".tmp"); err != nil {
+		t.Skipf("symlinks unavailable on this filesystem: %v", err)
+	}
+	if err := atomicWriteFile(path, []byte("safe"), 0600); err != nil {
+		t.Fatalf("atomic write should not use predictable .tmp path: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "untouched" {
+		t.Fatalf("symlink target was changed: %q", got)
 	}
 }

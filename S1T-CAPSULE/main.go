@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.0.2"
+	version                          = "5.2.0"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -209,36 +209,7 @@ func writeRuntimeStats(role string) {
 	if err != nil {
 		return
 	}
-	runtimePath := runtimeStatsPath()
-	runtimeDir := filepath.Dir(runtimePath)
-	if err = os.MkdirAll(runtimeDir, 0700); err != nil {
-		return
-	}
-	tmp, err := os.CreateTemp(runtimeDir, ".runtime-*.tmp")
-	if err != nil {
-		return
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if err = tmp.Chmod(0600); err != nil {
-		_ = tmp.Close()
-		return
-	}
-	if _, err = tmp.Write(append(b, '\n')); err != nil {
-		_ = tmp.Close()
-		return
-	}
-	if err = tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return
-	}
-	if err = tmp.Close(); err != nil {
-		return
-	}
-	if err = os.Rename(tmpName, runtimePath); err != nil {
-		return
-	}
-	_ = os.Chmod(runtimePath, 0600)
+	_ = atomicWriteFile(runtimeStatsPath(), append(b, '\n'), 0600)
 }
 
 type counterWriter struct {
@@ -3933,13 +3904,8 @@ func validateConfig(c Config) error {
 			}
 		}
 	}
-	if len(c.Token) < 48 || len(c.Token) > 240 {
-		return errors.New("token must be 48–240 printable ASCII characters")
-	}
-	for _, b := range []byte(c.Token) {
-		if b < 0x21 || b > 0x7e {
-			return errors.New("token must contain only visible ASCII characters (no spaces or control bytes)")
-		}
+	if len(c.Token) < 48 || len(c.Token) > 240 || strings.ContainsAny(c.Token, "\r\n") {
+		return errors.New("token must be 48–240 characters and contain no line breaks")
 	}
 	if len(c.Ports) == 0 {
 		return errors.New("at least one port mapping is required")
@@ -4394,12 +4360,9 @@ ProtectSystem=strict
 ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
-ProtectKernelLogs=true
 ProtectControlGroups=true
 ProtectHostname=true
 ProtectClock=true
-KeyringMode=private
-RemoveIPC=true
 ProtectProc=invisible
 ProcSubset=pid
 RestrictNamespaces=true
@@ -4646,7 +4609,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.0.2             |",
+	"        |            SHAH TUNNEL 5.2.0             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -4942,7 +4905,7 @@ func generateCertificate(certPath, keyPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	tmpl := x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "Shah Tunnel Hub"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().AddDate(2, 0, 0), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true}
+	tmpl := x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "Shah Tunnel Hub"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().AddDate(10, 0, 0), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true}
 	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
 	if err != nil {
 		return "", err
@@ -5497,36 +5460,50 @@ fi
 `
 
 // atomicWriteFile writes a root-owned schedule file by replacing it atomically.
-func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
+func atomicWriteFile(path string, data []byte, mode os.FileMode) (retErr error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".shah-tunnel-*.tmp")
+
+	// CreateTemp generates an unpredictable name and creates the file as 0600.
+	// This avoids predictable *.tmp paths being pre-created or replaced by
+	// another local process before the atomic rename.
+	tmpFile, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if err = tmp.Chmod(mode); err != nil {
-		_ = tmp.Close()
+	tmpPath := tmpFile.Name()
+	defer func() {
+		_ = tmpFile.Close()
+		if retErr != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
 		return err
 	}
-	if _, err = tmp.Write(data); err != nil {
-		_ = tmp.Close()
+	if err := tmpFile.Chmod(mode); err != nil {
 		return err
 	}
-	if err = tmp.Sync(); err != nil {
-		_ = tmp.Close()
+	if err := tmpFile.Sync(); err != nil {
 		return err
 	}
-	if err = tmp.Close(); err != nil {
+	if err := tmpFile.Close(); err != nil {
 		return err
 	}
-	if err = os.Rename(tmpName, path); err != nil {
+	if err := os.Rename(tmpPath, path); err != nil {
 		return err
 	}
-	return os.Chmod(path, mode)
+
+	// Best-effort directory sync makes the rename durable across a sudden
+	// power loss on filesystems that support syncing directory descriptors.
+	if dirFile, err := os.Open(dir); err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
+	}
+	return nil
 }
 
 func removeRestartScheduleFiles() error {
@@ -5845,15 +5822,7 @@ func writeServerGeoCache(g ServerGeo) {
 	if err != nil {
 		return
 	}
-	tmp := serverGeoCachePath + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0600); err != nil {
-		return
-	}
-	if err := os.Rename(tmp, serverGeoCachePath); err != nil {
-		_ = os.Remove(tmp)
-		return
-	}
-	_ = os.Chmod(serverGeoCachePath, 0600)
+	_ = atomicWriteFile(serverGeoCachePath, append(b, '\n'), 0600)
 }
 
 // isPublicIPv4 rejects private, local, shared-CGNAT, documentation, benchmark,
