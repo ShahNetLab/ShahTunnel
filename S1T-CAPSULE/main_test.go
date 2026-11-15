@@ -7,8 +7,10 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -2233,7 +2235,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.5.0             |",
+		"        |            SHAH TUNNEL 5.5.1             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -3046,5 +3048,220 @@ func TestRunAgentDoesNotDiscardOptionNinePsiphonMappings(t *testing.T) {
 	body = body[start : start+end]
 	if strings.Contains(body, "migrateAdaptivePsiphonUserEgress") || strings.Contains(body, "restoreAdaptivePsiphonMappings") {
 		t.Fatal("Agent startup must preserve option-9 Psiphon Xray mappings instead of restoring direct targets")
+	}
+}
+
+func TestSingBoxProtocolMapping(t *testing.T) {
+	if got := singBoxProtocolType(transportTUIC); got != "tuic" {
+		t.Fatalf("TUIC sing-box type = %q", got)
+	}
+	if got := singBoxProtocolType(transportTrojan); got != "trojan" {
+		t.Fatalf("Trojan sing-box type = %q", got)
+	}
+	if got := singBoxProtocolType("unknown"); got != "" {
+		t.Fatalf("unknown protocol unexpectedly mapped to %q", got)
+	}
+}
+
+func TestTUICUUIDGeneration(t *testing.T) {
+	id, err := newUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !validUUID(id) {
+		t.Fatalf("generated invalid UUID %q", id)
+	}
+	if validUUID("not-a-uuid") {
+		t.Fatal("invalid UUID accepted")
+	}
+}
+
+func TestSingBoxListenerIsReservedInProfile(t *testing.T) {
+	cfg := Config{Role: "hub", Name: "unit-test", Transport: transportAdaptive, ControlListen: "0.0.0.0:9443", ProxyProtocol: transportTUIC, ProxyListen: "0.0.0.0:8443", ProxyPort: 8443, Ports: []PortMapping{{ID: "main", Listen: "0.0.0.0:443"}}}
+	addresses := profileListenAddresses(cfg)
+	found := false
+	for _, address := range addresses {
+		if address == "0.0.0.0:8443" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("sing-box listener was not included in profile port-conflict checks")
+	}
+}
+
+func TestSingBoxAdaptiveConfigsContainTUICAndTrojan(t *testing.T) {
+	binDir := t.TempDir()
+	fake := filepath.Join(binDir, "sing-box")
+	if err := os.WriteFile(fake, []byte(`#!/bin/sh
+if [ "$1" = version ]; then echo "sing-box version 1.14.4"; exit 0; fi
+exit 0
+`), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	oldRuntime := singBoxRuntimeDir
+	singBoxRuntimeDir = t.TempDir()
+	defer func() { singBoxRuntimeDir = oldRuntime }()
+	hub := Config{Name: "test-hub", Role: "hub", ProxyProtocol: proxyAdaptiveAll, TLSServerName: "edge.example.com", ProxyListen: "0.0.0.0:8443", ProxyPort: 8443, ProxyPassword: "tuic-password-long-enough", ProxyUUID: "d8d6a1e3-3d42-4ac1-8d1a-a5b6d6b84a71", ProxyTrojanListen: "0.0.0.0:8444", ProxyTrojanPort: 8444, ProxyTrojanPassword: "trojan-password-long-enough", CertFile: "/tmp/hub.crt", KeyFile: "/tmp/hub.key"}
+	path, err := writeSingBoxConfig(hub, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hubDoc map[string]interface{}
+	if err = json.Unmarshal(data, &hubDoc); err != nil {
+		t.Fatal(err)
+	}
+	inbounds := hubDoc["inbounds"].([]interface{})
+	if len(inbounds) != 2 {
+		t.Fatalf("Hub should expose two inbounds, got %d", len(inbounds))
+	}
+	types := map[string]bool{}
+	for _, raw := range inbounds {
+		types[raw.(map[string]interface{})["type"].(string)] = true
+	}
+	if !types["tuic"] || !types["trojan"] {
+		t.Fatalf("Hub inbound types = %#v", types)
+	}
+
+	pin := base64.StdEncoding.EncodeToString(make([]byte, sha256.Size))
+	agent := Config{Name: "test-agent", Role: "agent", ProxyProtocol: proxyAdaptiveAll, ProxyServer: "198.51.100.10", ProxyPort: 8443, ProxyPassword: "tuic-password-long-enough", ProxyUUID: hub.ProxyUUID, ProxyTrojanPort: 8444, ProxyTrojanPassword: "trojan-password-long-enough", ProxySocks: "127.0.0.1:19821", ProxyPin: pin, TLSServerName: "edge.example.com"}
+	path, err = writeSingBoxConfig(agent, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var agentDoc map[string]interface{}
+	if err = json.Unmarshal(data, &agentDoc); err != nil {
+		t.Fatal(err)
+	}
+	outbounds := agentDoc["outbounds"].([]interface{})
+	gotTypes := map[string]bool{}
+	hasURLTest := false
+	for _, raw := range outbounds {
+		ob := raw.(map[string]interface{})
+		gotTypes[ob["type"].(string)] = true
+		if ob["type"] == "tuic" || ob["type"] == "trojan" {
+			tls := ob["tls"].(map[string]interface{})
+			if tls["insecure"] != false {
+				t.Fatalf("%s TLS must not use insecure mode", ob["type"])
+			}
+			if len(tls["certificate_public_key_sha256"].([]interface{})) != 1 {
+				t.Fatalf("%s outbound missing SPKI pin", ob["type"])
+			}
+		}
+		if ob["type"] == "urltest" {
+			hasURLTest = true
+			if ob["interrupt_exist_connections"] != true {
+				t.Fatal("adaptive URLTest must interrupt failed-path streams so ShahTunnel can reconnect")
+			}
+		}
+	}
+	if !gotTypes["tuic"] || !gotTypes["trojan"] || !hasURLTest {
+		t.Fatalf("Agent outbounds missing adaptive TUIC/Trojan: %#v", gotTypes)
+	}
+	route := agentDoc["route"].(map[string]interface{})
+	if route["final"] != "shah-proxy-auto" {
+		t.Fatalf("Agent route final = %v", route["final"])
+	}
+}
+
+func TestOptionNineAdaptiveUnderlaysIncludeSingBoxProtocols(t *testing.T) {
+	cfg := Config{Role: "agent", Underlay: underlayAdaptive, ProxyProtocol: proxyAdaptiveAll, PsiphonConfig: "/etc/shah/psiphon.json"}
+	candidates := adaptiveUnderlayCandidates(cfg, underlayDirect)
+	found := false
+	for _, candidate := range candidates {
+		if candidate == underlaySingBox {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("option 9 candidates do not include the TUIC/Trojan sing-box path: %#v", candidates)
+	}
+}
+
+func TestAdaptiveAllHubAndAgentConfigsValidate(t *testing.T) {
+	hub := Config{
+		Name: "hub-adaptive", Role: "hub", Transport: transportAdaptive, Token: strings.Repeat("a", 64),
+		ControlListen: "0.0.0.0:9443", CertFile: "/etc/ravanreverse/hub.crt", KeyFile: "/etc/ravanreverse/hub.key",
+		ProxyProtocol: proxyAdaptiveAll, TLSServerName: "edge.example.com", ProxyListen: "0.0.0.0:8443", ProxyPort: 8443,
+		ProxyPassword: strings.Repeat("t", 32), ProxyUUID: "d8d6a1e3-3d42-4ac1-8d1a-a5b6d6b84a71",
+		ProxyTrojanListen: "0.0.0.0:8444", ProxyTrojanPort: 8444, ProxyTrojanPassword: strings.Repeat("r", 32),
+		Ports: []PortMapping{{ID: "main", Listen: "0.0.0.0:443"}},
+	}
+	if err := validateConfig(hub); err != nil {
+		t.Fatalf("valid adaptive Hub config rejected: %v", err)
+	}
+
+	pin := base64.StdEncoding.EncodeToString(make([]byte, sha256.Size))
+	agent := Config{
+		Name: "agent-adaptive", Role: "agent", Transport: transportAdaptive, Underlay: underlayAdaptive,
+		Token: strings.Repeat("a", 64), HubAddr: "198.51.100.10:9443", TunnelChannels: 1,
+		PsiphonConfig: "/etc/ravanreverse/psiphon.json", PsiphonProxy: "127.0.0.1:1080",
+		ProxyProtocol: proxyAdaptiveAll, ProxyServer: "198.51.100.10", ProxyPort: 8443,
+		ProxyPassword: strings.Repeat("t", 32), ProxyUUID: hub.ProxyUUID, ProxyTrojanPort: 8444,
+		ProxyTrojanPassword: strings.Repeat("r", 32), ProxySocks: defaultSingBoxSocksAddress("agent-adaptive"),
+		ProxyPin: pin, TLSServerName: "edge.example.com", Fingerprint: strings.Repeat("0", 64),
+		Ports: []PortMapping{{ID: "main", Target: "127.0.0.1:443"}},
+	}
+	if err := validateConfig(agent); err != nil {
+		t.Fatalf("valid adaptive Agent config rejected: %v", err)
+	}
+}
+
+func TestSingBoxSOCKSAddressIsProfileSpecific(t *testing.T) {
+	a := defaultSingBoxSocksAddress("profile-a")
+	b := defaultSingBoxSocksAddress("profile-b")
+	if a == b {
+		t.Fatalf("different profiles received the same default SOCKS address: %s", a)
+	}
+	if !isLoopbackProxyAddress(a) || !isLoopbackProxyAddress(b) {
+		t.Fatalf("default SOCKS addresses must be loopback-only: %s %s", a, b)
+	}
+}
+
+func TestGeneratedHubCertificateIncludesProxySANAndCA(t *testing.T) {
+	certPath := filepath.Join(t.TempDir(), "hub.crt")
+	keyPath := filepath.Join(t.TempDir(), "hub.key")
+	if _, err := generateCertificate(certPath, keyPath, "edge.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		t.Fatal("certificate PEM missing")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cert.IsCA {
+		t.Fatal("self-signed Hub certificate must be CA-capable for public-key pin trust")
+	}
+	if len(cert.DNSNames) != 1 || cert.DNSNames[0] != "edge.example.com" {
+		t.Fatalf("unexpected DNS SANs: %#v", cert.DNSNames)
+	}
+}
+
+func TestValidTLSNameOrIP(t *testing.T) {
+	for _, value := range []string{"edge.example.com", "198.51.100.10", "2001:db8::10"} {
+		if !validTLSNameOrIP(value) {
+			t.Fatalf("valid TLS SAN name/IP rejected: %q", value)
+		}
+	}
+	for _, value := range []string{"https://edge.example.com", "edge.example.com:443", "*.example.com", "bad name"} {
+		if validTLSNameOrIP(value) {
+			t.Fatalf("invalid TLS SAN name/IP accepted: %q", value)
+		}
 	}
 }
