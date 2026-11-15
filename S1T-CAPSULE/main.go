@@ -2939,12 +2939,10 @@ func adaptiveTransportCandidates(preferred string) []string {
 }
 
 func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
-	// Once this profile has an isolated Psiphon Xray user-egress integration,
-	// keep its Agent lanes on Psiphon too. A direct fallback would violate the
-	// profile's fail-closed egress policy during relay interruptions.
-	if cfg.XrayPsiphon != nil && strings.TrimSpace(cfg.PsiphonConfig) != "" {
-		return []string{underlayPsiphon}
-	}
+	// Agent-to-Hub lanes have their own adaptive egress policy, independent of
+	// the isolated Xray Psiphon sidecar used for mapped user TCP/DNS traffic.
+	// Falling back here does not change host routes or the sidecar's fail-closed
+	// user-traffic policy; it only keeps the authenticated control/data lanes up.
 	// WARP is only a candidate when its client reports a connected MASQUE path.
 	// Other WARP protocols are never selected by adaptive routing.
 	warpMode := detectActiveWarpUnderlay()

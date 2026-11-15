@@ -313,8 +313,8 @@ Description=ShahTunnel per-profile Psiphon ConsoleClient (%s)
 After=network-online.target
 Wants=network-online.target
 # Deliberately not PartOf=Agent: an Agent restart must not cold-restart Psiphon.
-# Agent Requires/After ordering starts Psiphon when needed; the manager stops it
-# explicitly when the profile is stopped or deleted.
+# Agent Wants/After ordering starts Psiphon when needed without coupling their
+# lifecycles; the manager stops it explicitly when the profile is stopped/deleted.
 
 [Service]
 Type=simple
@@ -413,12 +413,15 @@ func ensurePsiphonSystemdService(cfg Config) error {
 			return fmt.Errorf("write per-profile Psiphon systemd unit: %w", err)
 		}
 	}
-	// Make Agent startup depend on the independently supervised Psiphon unit.
+	// Pull in Psiphon and order Agent startup after it, but do not make the
+	// Agent lifecycle depend on Psiphon remaining active. Psiphon ConsoleClient
+	// can restart independently; systemd Requires= would stop the Agent with
+	// SIGTERM whenever Psiphon restarts, leaving it failed until manual start.
 	dropInDir := filepath.Join("/etc/systemd/system", agentService+".service.d")
 	if err := os.MkdirAll(dropInDir, 0755); err != nil {
 		return fmt.Errorf("create Agent Psiphon dependency drop-in: %w", err)
 	}
-	dropIn := []byte(fmt.Sprintf("[Unit]\nRequires=%s\nAfter=%s\n", service, service))
+	dropIn := []byte(fmt.Sprintf("[Unit]\nWants=%s\nAfter=%s\n", service, service))
 	if err := atomicReplaceFile(filepath.Join(dropInDir, "shah-tunnel-psiphon.conf"), dropIn, 0644); err != nil {
 		return fmt.Errorf("write Agent Psiphon dependency drop-in: %w", err)
 	}
@@ -550,7 +553,7 @@ func removePsiphonSystemdService(cfg Config, agentService string) error {
 			return readErr
 		}
 		text := string(dropIn)
-		if strings.Contains(text, "Requires="+service+"\n") && strings.Contains(text, "After="+service+"\n") {
+		if (strings.Contains(text, "Wants="+service+"\n") || strings.Contains(text, "Requires="+service+"\n")) && strings.Contains(text, "After="+service+"\n") {
 			if err := os.Remove(dropInPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}

@@ -52,6 +52,14 @@ func TestInstallerPersistsNetlinkPolicyForExistingAndNewUnits(t *testing.T) {
 	if !strings.Contains(installer, `"$dropin_dir/10-psiphon-netlink.conf"`) {
 		t.Fatalf("installer must generate the same 10-psiphon-netlink.conf override used by the successful manual repair")
 	}
+	if !strings.Contains(installer, `sed 's/^Requires=shah-tunnel-psiphon-/Wants=shah-tunnel-psiphon-/'`) {
+		t.Fatal("installer must migrate existing per-profile Psiphon Requires dependencies to Wants")
+	}
+	migrate := strings.Index(installer, "Migrate installed per-profile Psiphon dependencies")
+	reload := strings.Index(installer, "systemctl daemon-reload")
+	if migrate < 0 || reload < 0 || migrate > reload {
+		t.Fatal("old Psiphon Requires drop-ins must be migrated before systemd daemon-reload")
+	}
 	if !strings.Contains(installer, "RestrictAddressFamilies=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK") {
 		t.Fatalf("installer Netlink drop-in must reset and then reapply the explicit address-family allow-list")
 	}
@@ -1638,12 +1646,22 @@ func TestAdaptiveUnderlayCandidatesPreferLastSuccessfulEgress(t *testing.T) {
 	if !equalStrings(got, []string{underlayPsiphon, underlayDirect}) {
 		t.Fatalf("preferred Psiphon candidates = %v", got)
 	}
+	// The isolated Xray sidecar keeps mapped user TCP/DNS fail-closed through
+	// Psiphon, but Agent-to-Hub lanes retain independent adaptive failover.
 	strict := cfg
 	strict.XrayPsiphon = &XrayPsiphonIntegration{Proxy: "127.0.0.1:21082"}
-	for _, preferred := range []string{"", underlayDirect, underlayPsiphon, underlayMASQUE} {
-		got = adaptiveUnderlayCandidates(strict, preferred)
-		if !equalStrings(got, []string{underlayPsiphon}) {
-			t.Fatalf("Psiphon-integrated profile must fail closed; preferred=%q candidates=%v", preferred, got)
+	for _, tc := range []struct {
+		preferred string
+		want      []string
+	}{
+		{"", []string{underlayDirect, underlayPsiphon}},
+		{underlayDirect, []string{underlayDirect, underlayPsiphon}},
+		{underlayPsiphon, []string{underlayPsiphon, underlayDirect}},
+		{underlayMASQUE, []string{underlayPsiphon, underlayDirect}},
+	} {
+		got = adaptiveUnderlayCandidates(strict, tc.preferred)
+		if !equalStrings(got, tc.want) {
+			t.Fatalf("Psiphon-integrated Agent lane candidates for preferred=%q: got %v want %v", tc.preferred, got, tc.want)
 		}
 	}
 	got = adaptiveUnderlayCandidates(Config{Underlay: underlayAdaptive}, underlayPsiphon)
@@ -1674,6 +1692,11 @@ esac
 	}
 	if got, want := adaptiveUnderlayCandidates(cfg, ""), []string{underlayMASQUE, underlayPsiphon, underlayDirect}; !equalStrings(got, want) {
 		t.Fatalf("active MASQUE candidate order = %v; want %v", got, want)
+	}
+	withIsolatedUserEgress := cfg
+	withIsolatedUserEgress.XrayPsiphon = &XrayPsiphonIntegration{Proxy: "127.0.0.1:21082"}
+	if got, want := adaptiveUnderlayCandidates(withIsolatedUserEgress, ""), []string{underlayMASQUE, underlayPsiphon, underlayDirect}; !equalStrings(got, want) {
+		t.Fatalf("active MASQUE candidate order with isolated Psiphon user egress = %v; want %v", got, want)
 	}
 
 	t.Setenv("FAKE_WARP_SETTINGS", "WARP tunnel protocol: unsupported-protocol")
@@ -2928,8 +2951,11 @@ func TestPsiphonSupervisorPreparedBeforeAgentServiceStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(psiphonSource), `Requires=%s\nAfter=%s\n`) {
-		t.Fatal("Agent must have systemd Requires/After ordering for the Psiphon service")
+	if !strings.Contains(string(psiphonSource), `Wants=%s\nAfter=%s\n`) {
+		t.Fatal("Agent must pull in Psiphon with Wants/After ordering without being stopped when Psiphon restarts")
+	}
+	if strings.Contains(string(psiphonSource), `Requires=%s\nAfter=%s\n`) {
+		t.Fatal("Agent must not use Requires for Psiphon: Psiphon restarts must not terminate Agent lanes")
 	}
 }
 
