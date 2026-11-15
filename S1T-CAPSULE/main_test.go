@@ -218,11 +218,25 @@ func TestAdaptivePsiphonUsesPublicMappingPortAndALPNMultiplex(t *testing.T) {
 	if h.sessionCount() == 0 {
 		t.Fatal("adaptive Agent did not authenticate through Psiphon on the public Mapping listener")
 	}
-	if got, ok := agentPreferredUnderlay.Load(channel); !ok || got != underlayPsiphon {
-		t.Fatalf("successful route preference = %v (present=%v); want Psiphon", got, ok)
+	// The Hub observes authentication just before the Agent goroutine stores
+	// its successful route preference. Wait for both observations rather than
+	// racing that final client-side bookkeeping (especially under -race).
+	preferenceDeadline := time.Now().Add(2 * time.Second)
+	var preferredUnderlay, preferredTransport any
+	var underlayOK, transportOK bool
+	for time.Now().Before(preferenceDeadline) {
+		preferredUnderlay, underlayOK = agentPreferredUnderlay.Load(channel)
+		preferredTransport, transportOK = agentPreferredTransport.Load(channel)
+		if underlayOK && transportOK {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	if got, ok := agentPreferredTransport.Load(channel); !ok || got != transportTCP {
-		t.Fatalf("successful transport preference = %v (present=%v); want TCP/TLS", got, ok)
+	if !underlayOK || preferredUnderlay != underlayPsiphon {
+		t.Fatalf("successful route preference = %v (present=%v); want Psiphon", preferredUnderlay, underlayOK)
+	}
+	if !transportOK || preferredTransport != transportTCP {
+		t.Fatalf("successful transport preference = %v (present=%v); want TCP/TLS", preferredTransport, transportOK)
 	}
 	h.mu.RLock()
 	var active *hubSession

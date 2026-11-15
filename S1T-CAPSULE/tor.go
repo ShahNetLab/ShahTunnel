@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"debug/elf"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -196,22 +199,90 @@ func executableFile(path string) bool {
 	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0
 }
 
+// nativeELFExecutable rejects debug-symbol artifacts and binaries built for a
+// different CPU. A mere executable bit is not enough: execve would otherwise
+// fail later with the unhelpful "exec format error" seen on older profiles.
+func nativeELFExecutable(path string) bool {
+	if !executableFile(path) {
+		return false
+	}
+	f, err := elf.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if f.Class != elf.ELFCLASS64 || f.Data != elf.ELFDATA2LSB {
+		return false
+	}
+	switch runtime.GOARCH {
+	case "amd64":
+		return f.Machine == elf.EM_X86_64
+	case "arm64":
+		return f.Machine == elf.EM_AARCH64
+	default:
+		return false
+	}
+}
+
+func pathHasDebugComponent(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return true
+	}
+	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		part = strings.ToLower(part)
+		if part == "debug" || part == "debug-symbols" || part == "symbols" || strings.Contains(part, "debug-symbol") {
+			return true
+		}
+	}
+	return false
+}
+
+func preferredTorBundlePath(root, name string) string {
+	switch name {
+	case "tor":
+		return filepath.Join(root, "tor", "tor")
+	case "lyrebird":
+		return filepath.Join(root, "tor", "pluggable_transports", "lyrebird")
+	default:
+		return ""
+	}
+}
+
 func findExecutableInTree(root, name string) string {
-	var found string
+	// The official Expert Bundle layout is explicit. Prefer it before walking
+	// the archive, since debug/tor can appear earlier in lexical directory order.
+	preferred := preferredTorBundlePath(root, name)
+	if preferred != "" && !pathHasDebugComponent(root, preferred) && nativeELFExecutable(preferred) {
+		return preferred
+	}
+
+	var candidates []string
 	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil || found != "" {
+		if err != nil {
 			return nil
 		}
-		if entry.IsDir() || entry.Name() != name {
+		if entry.IsDir() || entry.Name() != name || pathHasDebugComponent(root, path) {
 			return nil
 		}
-		if executableFile(path) {
-			found = path
-			return filepath.SkipAll
+		if nativeELFExecutable(path) {
+			candidates = append(candidates, path)
 		}
 		return nil
 	})
-	return found
+	if len(candidates) == 0 {
+		return ""
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		relI, _ := filepath.Rel(root, candidates[i])
+		relJ, _ := filepath.Rel(root, candidates[j])
+		depthI, depthJ := strings.Count(relI, string(os.PathSeparator)), strings.Count(relJ, string(os.PathSeparator))
+		if depthI != depthJ {
+			return depthI < depthJ
+		}
+		return relI < relJ
+	})
+	return candidates[0]
 }
 
 func locateTorBinaries() (string, string) {
@@ -223,10 +294,31 @@ func locateTorBinaries() (string, string) {
 	if ptBinary == "" {
 		ptBinary, _ = exec.LookPath("lyrebird")
 	}
-	if !executableFile(torBinary) || !executableFile(ptBinary) {
+	if !nativeELFExecutable(torBinary) || !nativeELFExecutable(ptBinary) {
 		return "", ""
 	}
 	return torBinary, ptBinary
+}
+
+func validateTorBinary(path string) error {
+	if !nativeELFExecutable(path) {
+		return fmt.Errorf("Tor executable is not a native Linux/%s ELF binary: %s", runtime.GOARCH, path)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, "--version")
+	cmd.Env = torRuntimeEnvironment(Config{TorBinary: path})
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return errors.New("Tor --version self-test timed out")
+	}
+	if err != nil {
+		return fmt.Errorf("Tor --version self-test failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	if !strings.Contains(strings.ToLower(string(output)), "tor version") {
+		return fmt.Errorf("unexpected output from Tor executable %s: %s", path, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func torBundleVersionInstalled() string {
@@ -253,14 +345,16 @@ func ensureTorBinaries() (string, string, error) {
 	if torBinary != "" && ptBinary != "" {
 		// System Tor installations are left alone. A ShahTunnel-managed bundle,
 		// however, is reused only when its pinned metadata matches the current
-		// supported release; otherwise attempt an atomic upgrade.
-		if !isTorBundlePath(torBinary) || torBundleVersionInstalled() == torBundleVersion {
-			return torBinary, ptBinary, nil
+		// supported release. Always execute --version before trusting a path.
+		if err := validateTorBinary(torBinary); err == nil && nativeELFExecutable(ptBinary) {
+			if !isTorBundlePath(torBinary) || torBundleVersionInstalled() == torBundleVersion {
+				return torBinary, ptBinary, nil
+			}
 		}
 	}
 	oldTorBinary, oldPTBinary := torBinary, ptBinary
 	fallbackToExisting := func(reason error) (string, string, error) {
-		if executableFile(oldTorBinary) && executableFile(oldPTBinary) {
+		if validateTorBinary(oldTorBinary) == nil && nativeELFExecutable(oldPTBinary) {
 			log.Printf("WARNING: could not upgrade the existing Tor bundle to %s; continuing with the previously installed Tor/Lyrebird binaries so this Agent can still start: %v", torBundleVersion, reason)
 			return oldTorBinary, oldPTBinary, nil
 		}
@@ -284,7 +378,13 @@ func ensureTorBinaries() (string, string, error) {
 	}
 	torBinary, ptBinary = locateTorBinaries()
 	if torBinary == "" || ptBinary == "" {
-		return fallbackToExisting(errors.New("Tor installer completed but tor/lyrebird executables could not be found"))
+		return fallbackToExisting(errors.New("Tor installer completed but native-architecture tor/lyrebird executables could not be found outside debug directories"))
+	}
+	if err := validateTorBinary(torBinary); err != nil {
+		return fallbackToExisting(fmt.Errorf("Tor installer completed but the selected runtime Tor binary failed its native execution check: %w", err))
+	}
+	if !nativeELFExecutable(ptBinary) {
+		return fallbackToExisting(fmt.Errorf("Tor installer completed but Lyrebird is not a native Linux/%s ELF binary: %s", runtime.GOARCH, ptBinary))
 	}
 	if isTorBundlePath(torBinary) && torBundleVersionInstalled() != torBundleVersion {
 		return fallbackToExisting(fmt.Errorf("Tor installer completed but bundle metadata is not %s", torBundleVersion))
@@ -459,8 +559,11 @@ func startTorForAgent(cfg Config) (func(), error) {
 	}
 	cfg.TorBinary = torBinary
 	cfg.TorPTBinary = ptBinary
-	if !executableFile(cfg.TorBinary) || !executableFile(cfg.TorPTBinary) {
-		return nil, errors.New("Tor/lyrebird binaries are missing; rerun the updated ShahTunnel installer")
+	if err := validateTorBinary(cfg.TorBinary); err != nil {
+		return nil, fmt.Errorf("selected Tor executable failed validation: %w", err)
+	}
+	if !nativeELFExecutable(cfg.TorPTBinary) {
+		return nil, fmt.Errorf("selected Lyrebird executable is not a native Linux/%s ELF binary: %s", runtime.GOARCH, cfg.TorPTBinary)
 	}
 	if !isLoopbackProxyAddress(cfg.TorProxy) {
 		return nil, errors.New("Tor SOCKS5 proxy must be loopback-only")
