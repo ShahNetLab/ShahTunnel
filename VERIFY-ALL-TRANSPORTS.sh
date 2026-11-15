@@ -52,7 +52,7 @@ printf '\n== 1/7: Resolve Go module metadata ==\n'
 pass "Module metadata resolved"
 
 printf '\n== 2/7: Formatting ==\n'
-unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go S1T-CAPSULE/xray_warp.go S1T-CAPSULE/xray_psiphon.go S1T-CAPSULE/psiphon.go S1T-CAPSULE/psiphon_test.go S1T-CAPSULE/tor.go S1T-CAPSULE/tor_test.go S1T-CAPSULE/xray_tor.go S1T-CAPSULE/xray_tor_test.go)"
+unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go S1T-CAPSULE/xray_warp.go S1T-CAPSULE/xray_psiphon.go S1T-CAPSULE/psiphon.go S1T-CAPSULE/psiphon_test.go S1T-CAPSULE/tor.go S1T-CAPSULE/tor_test.go S1T-CAPSULE/xray_tor.go S1T-CAPSULE/xray_tor_test.go S1T-CAPSULE/singbox_egress.go S1T-CAPSULE/singbox_egress_test.go)"
 [[ -z "$unformatted" ]] || fail "gofmt required for: $unformatted"
 pass "Go source formatting"
 
@@ -61,6 +61,9 @@ bash -n S1T-START.sh
 bash -n scripts/install-psiphon.sh
 bash -n scripts/install-tor.sh
 bash -n scripts/repair-psiphon-profile.sh
+bash -n scripts/install-sing-box.sh
+bash -n scripts/setup-exit-node.sh
+bash -n S1T-EXIT-NODE.sh
 bash -n VERIFY-ALL-TRANSPORTS.sh
 grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/psiphon' S1T-START.sh || fail "Psiphon systemd data-directory permission is missing."
 grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/tor' S1T-START.sh || fail "Tor systemd data-directory permission is missing."
@@ -110,7 +113,11 @@ grep -Fq 'TestPsiphonPerformanceProfileIsMemoryAndCPUAware' S1T-CAPSULE/psiphon_
 grep -Fq 'TestTunePsiphonPerformanceConfigPreservesUnknownFields' S1T-CAPSULE/psiphon_test.go || fail "Psiphon profile tuning compatibility coverage is missing."
 grep -Fq 'lanePingInterval = 5 * time.Second' S1T-CAPSULE/main.go || fail "Five-second lane RTT sampling is missing."
 grep -Fq 'dnsConfig["disableCache"] = false' S1T-CAPSULE/xray_warp.go || fail "Xray DNS cache is not explicitly enabled."
-pass "Shell syntax, docs layout, Psiphon bootstrap/runtime, public-Mapping ALPN multiplex, MASQUE Local Proxy, and failover coverage"
+grep -Fq 'func buildSingBoxEgressConfig(p ProtocolEgress)' S1T-CAPSULE/singbox_egress.go || fail "TUIC/REALITY sing-box egress builder is missing."
+grep -Fq 'TestBuildSingBoxEgressConfigTUIC' S1T-CAPSULE/singbox_egress_test.go || fail "TUIC config tests are missing."
+grep -Fq 'TestBuildSingBoxEgressConfigVLESSReality' S1T-CAPSULE/singbox_egress_test.go || fail "VLESS REALITY config tests are missing."
+grep -Fq 'S1T-EXIT-NODE.sh' README.md || fail "Independent exit-node deployment instructions are missing."
+pass "Shell syntax, docs layout, Psiphon bootstrap/runtime, public-Mapping ALPN multiplex, MASQUE Local Proxy, TUIC/REALITY egress, and failover coverage"
 
 printf '\n== 4/7: Transport loopback suite ==\n'
 "$GO_BIN" test -count=20 ./S1T-CAPSULE || fail "Automated transport tests failed."
@@ -130,7 +137,7 @@ pass "go vet"
 
 printf '\n== 7/7: Linux build validation (temporary files only) ==\n'
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-amd64" ./S1T-CAPSULE
-[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 5.0.1 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 5.1.0 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-arm64" ./S1T-CAPSULE
 sha256sum "$BUILD_TMP/shah-tunnel-linux-amd64" "$BUILD_TMP/shah-tunnel-linux-arm64" > "$BUILD_TMP/SHA256SUMS"
 pass "Linux amd64 and arm64 binaries built and checksum-checked in a temporary directory (nothing added to the repository)"

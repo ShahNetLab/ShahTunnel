@@ -1,9 +1,9 @@
 <div align="center">
-# ShahTunnel 5.0.1
+# ShahTunnel 5.1.0
 
 <p align="center"><img src="docs/img/ShahTunnel-Logo-Round.png" alt="ShahTunnel logo" width="420" style="max-width: 92%; height: auto;"></p>
 
-[![Version](https://img.shields.io/badge/version-5.0.1-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-5.1.0-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -34,9 +34,23 @@ The Hub-to-Agent forwarding path and optional per-profile Internet egress are se
 Client → Hub public mapping → authenticated Agent lanes → Agent local target
 Selected Xray inbound → loopback-only Xray sidecar → WARP / Psiphon / Tor SOCKS5 → Internet
 ```
-## Version 5.0.1
+## Version 5.1.0
+### Independent TUIC v5 and VLESS + REALITY + Vision egress (5.1.0)
 
-Maintenance update: Psiphon exit selection and verification have been refined. The application version, installer, terminal banner, service ownership marker, tests and documentation are aligned on **5.0.1**. Existing profiles are revalidated against the current exit policy.
+Two independent Agent egress options are available: **TUIC v5** and **VLESS + REALITY + Vision**. Each profile owns a separate sing-box sidecar and isolated Xray inbound clone on loopback; the original Xray/X-UI configuration and other tunnel profiles are not rewritten. Agent↔Hub lanes and the selected Xray user mappings use the selected egress. A genuinely different public IP requires a separate exit VPS: extract the archive there and run `bash S1T-EXIT-NODE.sh`, then enter the generated client settings in the Agent wizard.
+
+- **Exit node setup:** the helper creates only `shah-tunnel-exit.service`. It does not alter firewall rules, default routes, SSH, or unrelated services. TUIC requires a valid TLS certificate and an open UDP port; REALITY requires an open TCP port and a reachable TLS handshake destination.
+- **Agent runtime:** the installer pins the official stable sing-box release and verifies its SHA-256 digest from the GitHub Release API. Generated sing-box configuration is checked with `sing-box check`; generated Xray configuration is tested by the actual Xray binary before the profile is switched.
+- **Fail-closed IP verification:** before activation, ShahTunnel checks the public IP through the selected proxy and the Agent's direct public IP independently. If it cannot verify that the egress differs, or the isolated Xray sidecar fails to start, the new profile is not enabled. The check is repeated when the Agent starts. These modes never fall back to Direct.
+- **Scope:** only mappings whose local targets are Xray inbounds and can be safely cloned into an isolated runtime are covered. Non-Xray services and ambiguous/shared runtimes are not automatically modified.
+- **Removal:** deleting a profile stops and removes only that profile's TUIC/REALITY and Xray sidecars, then restores the original mapping targets.
+
+Go unit tests cover the generated protocol configurations and validation. Live end-to-end confirmation still requires both VPSs, an open exit-node port, and a real public-IP check after deployment.
+
+**Transport distinction:** TUIC uses native QUIC/UDP and is the preferred option for UDP/QUIC traffic. VLESS + REALITY + Vision uses a TCP-based VLESS path; its XUDP packet encoding carries UDP through that stream and does not provide native QUIC transport characteristics. REALITY is therefore the TCP fallback, not a speed-equivalent substitute for TUIC.
+
+
+The release also refines Psiphon exit selection and verification. The application version, installer, terminal banner, service ownership marker, tests and documentation are aligned on **5.1.0**. Existing profiles are revalidated against the current exit policy.
 
 ## Capabilities
 
@@ -47,7 +61,8 @@ Maintenance update: Psiphon exit selection and verification have been refined. T
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Adaptive transport lanes** | Four implemented transports can be selected individually or used by adaptive failover modes. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Lane-level recovery** | Each Agent lane reconnects independently; one failed lane does not require dropping every healthy lane. New Agent profiles use 12 independent lanes by default (maximum 16). |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Multiple port mappings** | Mapping IDs pair Hub public listeners with Agent-side local targets. IDs must match on both ends. |
-| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **External Agent egress** | Agent tunnel lanes can use Direct, Cloudflare WARP/MASQUE, Psiphon/SOCKS5 or Tor Snowflake/WebTunnel. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **External Agent egress** | Agent tunnel lanes can use Direct, WARP/MASQUE, Psiphon, Tor, TUIC v5, or VLESS + REALITY + Vision. |
+| ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Independent TUIC and REALITY exits** | A separate exit VPS can provide a distinct public IP; each Agent profile uses isolated loopback sidecars and fails closed if the exit cannot be verified. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Per-profile Xray WARP** | A selected Xray inbound is cloned to a loopback-only sidecar and routed through the local WARP SOCKS5 proxy. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Automatic WARP DNS path** | The isolated sidecar handles client DNS and routes its DoH resolver traffic through the same WARP egress. |
 | ![✓](https://img.shields.io/badge/%E2%9C%93-included-168BFF?style=flat-square) | **Per-profile Psiphon and Tor user egress** | Selected Agent Xray inbounds are cloned into an isolated sidecar; TCP and DNS use the selected SOCKS5 path, while UDP is blocked to prevent direct leakage. |
@@ -112,7 +127,7 @@ The Agent's `EXTERNAL EGRESS` menu can use Tor. On profile creation, ShahTunnel 
 
 When Psiphon cannot reach the Hub control port (for example, a custom `9448`), the Agent uses the Hub public Mapping endpoint on `443` for Psiphon egress only; the Direct path continues to use the configured control port. The Step 06 default is independent of the control port and points to TCP/443. The Hub distinguishes ShahTunnel control traffic from ordinary TLS with the dedicated `shah-tunnel-control/1` ALPN and forwards normal ClientHello bytes unchanged. This does not take over the public port, move a Mapping, or modify X-UI.
 
-For the complete ShahTunnel 5.0.1 feature set, run **5.0.1 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
+For the complete ShahTunnel 5.1.0 feature set, run **5.1.0 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
 
 ### Automatic Psiphon setup
 
@@ -243,7 +258,7 @@ sudo shah-tunnel menu
 - Psiphon buffer limits remain enabled on hosts with less than 3 GiB RAM. On hosts with at least 3 GiB RAM, the Meek and relay buffer caps are removed and the SSH channel window is set to 16 (512 KiB); low-memory hosts retain the documented default window of 4 (128 KiB). CPU thread limiting remains enabled on single-core hosts. The Psiphon tunnel-pool default is retained.
 - These settings target TCP throughput and more responsive lane selection. They cannot remove the physical latency of the client's route to the Hub, the Psiphon relay, or the selected destination. A client-reported value such as 635 ms must be measured end-to-end before and after deployment; no fixed reduction is guaranteed.
 
-Full-feature deployments should keep Hub and Agent on the same ShahTunnel 5.0.1 release. Historical version numbers are retained only in migration/repair code where they are needed to recognize existing installations; they are not separate current releases.
+Full-feature deployments should keep Hub and Agent on the same ShahTunnel 5.1.0 release. Historical version numbers are retained only in migration/repair code where they are needed to recognize existing installations; they are not separate current releases.
 
 
 ## Multi-user performance notes (5.0.1)

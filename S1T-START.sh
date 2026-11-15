@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 5.0.1 installer.
+# Shah Tunnel 5.1.0 installer.
 # Downloads the pinned Go 1.26.1 toolchain, verifies its SHA-256, fetches the source,
 # and builds the Linux binary on the target server. No prebuilt release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="5.0.1"
+VERSION="5.1.0"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -508,7 +508,7 @@ build_from_official_go_toolchain() {
       cp -a "$script_dir/scripts" "$source_dir/" || return 1
     else
       mkdir -p "$source_dir/scripts"
-      for helper in install-psiphon.sh install-tor.sh repair-psiphon-profile.sh; do
+      for helper in install-psiphon.sh install-tor.sh repair-psiphon-profile.sh install-sing-box.sh; do
         [[ -s "$script_dir/$helper" ]] && cp -a "$script_dir/$helper" "$source_dir/scripts/" || {
           echo "Missing required helper: $helper" >&2; return 1;
         }
@@ -532,7 +532,7 @@ build_from_official_go_toolchain() {
   [[ -s "$source_dir/go.mod" && -s "$source_dir/S1T-CAPSULE/main.go" ]] \
     || { echo "The downloaded repository does not contain the expected ShahTunnel source files." >&2; return 1; }
   mkdir -p "$source_dir/scripts"
-  for helper in install-psiphon.sh install-tor.sh repair-psiphon-profile.sh; do
+  for helper in install-psiphon.sh install-tor.sh repair-psiphon-profile.sh install-sing-box.sh; do
     if [[ -s "$source_dir/scripts/$helper" ]]; then
       cp -f "$source_dir/scripts/$helper" "$source_dir/$helper" || return 1
     elif [[ -s "$source_dir/$helper" ]]; then
@@ -554,6 +554,11 @@ build_from_official_go_toolchain() {
   [[ -s "$source_dir/install-tor.sh" ]] || { echo "Pinned Tor auto-installer is missing from the ShahTunnel source." >&2; return 1; }
   if ! bash -n "$source_dir/install-tor.sh"; then
     echo "Tor auto-installer has invalid shell syntax; refusing to continue." >&2
+    return 1
+  fi
+  [[ -s "$source_dir/install-sing-box.sh" ]] || { echo "Pinned sing-box installer is missing from the ShahTunnel source." >&2; return 1; }
+  if ! bash -n "$source_dir/install-sing-box.sh"; then
+    echo "sing-box auto-installer has invalid shell syntax; refusing to continue." >&2
     return 1
   fi
   local source_fingerprint build_cache_dir cached_binary
@@ -603,6 +608,8 @@ install -o root -g root -m 0750 "$TMP/source/install-psiphon.sh" "$STATE_DIR/ins
 mv -f "$STATE_DIR/install-psiphon.sh.new" "$STATE_DIR/install-psiphon.sh"
 install -o root -g root -m 0750 "$TMP/source/install-tor.sh" "$STATE_DIR/install-tor.sh.new"
 mv -f "$STATE_DIR/install-tor.sh.new" "$STATE_DIR/install-tor.sh"
+install -o root -g root -m 0750 "$TMP/source/install-sing-box.sh" "$STATE_DIR/install-sing-box.sh.new"
+mv -f "$STATE_DIR/install-sing-box.sh.new" "$STATE_DIR/install-sing-box.sh"
 install -d -o root -g root -m 0700 /var/lib/shah-tunnel/tor
 [[ -s "$TMP/source/repair-psiphon-profile.sh" ]] || { echo "Psiphon profile repair helper is missing from the source archive." >&2; exit 1; }
 install -o root -g root -m 0750 "$TMP/source/repair-psiphon-profile.sh" "$STATE_DIR/repair-psiphon-profile.sh.new"
