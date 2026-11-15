@@ -4,8 +4,8 @@ set -Eeuo pipefail
 # Build the official Psiphon ConsoleClient from a pinned upstream source commit.
 # This helper is invoked automatically by ShahTunnel when Psiphon egress is selected.
 PSIPHON_REPO="https://github.com/Psiphon-Labs/psiphon-tunnel-core"
-PSIPHON_ARCHIVE="https://codeload.github.com/Psiphon-Labs/psiphon-tunnel-core/tar.gz/96f782c6f662cb0a884029d70e1375ab3c1dece2"
-PSIPHON_COMMIT="96f782c6f662cb0a884029d70e1375ab3c1dece2"
+PSIPHON_ARCHIVE="https://codeload.github.com/Psiphon-Labs/psiphon-tunnel-core/tar.gz/96f782c"
+PSIPHON_COMMIT="96f782c"
 PSIPHON_VERSION="v2.0.41"
 INSTALL_PATH="/usr/local/bin/psiphon-console-client"
 LICENSE_PATH="/usr/local/share/licenses/psiphon-tunnel-core/LICENSE"
@@ -35,9 +35,8 @@ fi
 
 GO_BIN=""
 for candidate in \
-  "${STATE_DIR}/toolchains/go1.27.4-${TARGET_ARCH}/bin/go" \
-  "${STATE_DIR}/toolchains/go1.26.5-${TARGET_ARCH}/bin/go" \
   "${STATE_DIR}/toolchains/go1.26.1-${TARGET_ARCH}/bin/go" \
+  "${STATE_DIR}/toolchains/go1.26.5-${TARGET_ARCH}/bin/go" \
   "/usr/local/go/bin/go" \
   "$(command -v go 2>/dev/null || true)"; do
   [[ -n "$candidate" && -x "$candidate" ]] || continue
@@ -58,22 +57,21 @@ curl -fL --proto '=https' --proto-redir '=https' \
   --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 900 \
   "$PSIPHON_ARCHIVE" -o "$ARCHIVE" || fail "could not download the pinned upstream source archive."
 
-[[ -s "${STATE_DIR}/safe_extract_tar.py" ]] || fail "secure archive extractor is missing; rerun the ShahTunnel installer."
-python3 "${STATE_DIR}/safe_extract_tar.py" "$ARCHIVE" "$SRC" ||
-  fail "downloaded Psiphon source archive failed path/link/size validation."
+tar -tzf "$ARCHIVE" >/dev/null 2>&1 || fail "downloaded source archive is invalid."
+tar -xzf "$ARCHIVE" -C "$SRC" --strip-components=1
 [[ -s "$SRC/go.mod" && -s "$SRC/ConsoleClient/main.go" && -s "$SRC/LICENSE" && -d "$SRC/vendor" ]] || \
   fail "upstream source archive is incomplete (go.mod, ConsoleClient, LICENSE or vendor missing)."
 grep -Eq '^go 1\.26\.0$' "$SRC/go.mod" || fail "unexpected Go module version in upstream source."
 grep -Eq '^toolchain go1\.26\.5$' "$SRC/go.mod" || fail "upstream toolchain directive changed; review before updating the pin."
 
-# The pinned ShahTunnel Go 1.27.4 toolchain is newer than Psiphon's go1.26.5
-# toolchain directive and can build it without auto-downloading a second toolchain.
-# Dependencies are built from the upstream vendor tree.
-echo "Building Psiphon ConsoleClient for linux/${TARGET_ARCH} with verified Go ${GO_BIN}..."
+# Psiphon v2.0.41 specifies Go 1.26.5. Starting from ShahTunnel's Go 1.26.1
+# toolchain, Go's official toolchain selection downloads/verifies the exact
+# required Go toolchain. Dependencies are built from the upstream vendor tree.
+echo "Building Psiphon ConsoleClient for linux/${TARGET_ARCH}; upstream toolchain go1.26.5..."
 (
   cd "$SRC"
-  env GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off \
-    GOOS=linux GOARCH="$TARGET_ARCH" CGO_ENABLED=0 \
+  env GOTOOLCHAIN=auto GOPROXY="https://proxy.golang.org,direct" \
+    GOSUMDB=sum.golang.org GOOS=linux GOARCH="$TARGET_ARCH" CGO_ENABLED=0 \
     GOMAXPROCS=1 GOGC=50 \
     "$GO_BIN" build -mod=vendor -p=1 -trimpath -buildvcs=false \
       -ldflags='-s -w' -o "$TMP/psiphon-console-client" ./ConsoleClient
@@ -113,7 +111,6 @@ version=${PSIPHON_VERSION}
 commit=${PSIPHON_COMMIT}
 architecture=${TARGET_ARCH}
 upstream_go_toolchain=1.26.5
-build_toolchain=1.27.4
 binary=${INSTALL_PATH}
 INFO
 chmod 0644 "${STATE_DIR}/psiphon-build.info"
