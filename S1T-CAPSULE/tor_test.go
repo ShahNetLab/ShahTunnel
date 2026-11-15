@@ -123,3 +123,32 @@ func TestTorRuntimeEnvironmentAddsOnlyBundleLibraryPaths(t *testing.T) {
 		t.Fatalf("system-installed binaries should not modify library lookup paths: %s", env)
 	}
 }
+
+func TestTorAgentReadinessRequiresBootstrapAndAuthenticatedLane(t *testing.T) {
+	installOnly := `Tor and Lyrebird are installed; the private per-profile SOCKS5 endpoint is configured`
+	boot, lane := torAgentReadinessFromJournal(installOnly)
+	if boot || lane {
+		t.Fatalf("installation messages must not be treated as runtime readiness: bootstrap=%t lane=%t", boot, lane)
+	}
+
+	bootstrapOnly := `[notice] Bootstrapped 100% (done): Done
+Tor transport bootstrapped successfully; SOCKS5 proxy is 127.0.0.1:19082`
+	boot, lane = torAgentReadinessFromJournal(bootstrapOnly)
+	if !boot || lane {
+		t.Fatalf("bootstrap-only journal parsed incorrectly: bootstrap=%t lane=%t", boot, lane)
+	}
+
+	ready := bootstrapOnly + `
+tunnel lane 1/12 connected via tcp_tls over tor_socks5; forwarding through 1 configured port mapping(s)`
+	boot, lane = torAgentReadinessFromJournal(ready)
+	if !boot || !lane {
+		t.Fatalf("fully ready Tor journal parsed incorrectly: bootstrap=%t lane=%t", boot, lane)
+	}
+
+	wrongUnderlay := bootstrapOnly + `
+tunnel lane 1/12 connected via tcp_tls over direct`
+	boot, lane = torAgentReadinessFromJournal(wrongUnderlay)
+	if !boot || lane {
+		t.Fatalf("direct lane must not satisfy Tor readiness: bootstrap=%t lane=%t", boot, lane)
+	}
+}

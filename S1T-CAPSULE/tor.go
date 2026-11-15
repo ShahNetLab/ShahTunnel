@@ -24,6 +24,7 @@ import (
 const (
 	torModeSnowflake     = "snowflake"
 	torModeWebTunnel     = "webtunnel"
+	torBundleVersion     = "16.0.1"
 	torInstallerPath     = "/usr/local/lib/shah-tunnel/install-tor.sh"
 	torBundleRoot        = "/usr/local/lib/shah-tunnel/tor-bundle"
 	torConfigDir         = "/etc/ravanreverse/tor"
@@ -228,26 +229,65 @@ func locateTorBinaries() (string, string) {
 	return torBinary, ptBinary
 }
 
+func torBundleVersionInstalled() string {
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(torBundleRoot), "tor-bundle.info"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "version=") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "version="))
+		}
+	}
+	return ""
+}
+
+func isTorBundlePath(path string) bool {
+	clean := filepath.Clean(path)
+	root := filepath.Clean(torBundleRoot) + string(os.PathSeparator)
+	return strings.HasPrefix(clean+string(os.PathSeparator), root)
+}
+
 func ensureTorBinaries() (string, string, error) {
-	if torBinary, ptBinary := locateTorBinaries(); torBinary != "" && ptBinary != "" {
-		return torBinary, ptBinary, nil
+	torBinary, ptBinary := locateTorBinaries()
+	if torBinary != "" && ptBinary != "" {
+		// System Tor installations are left alone. A ShahTunnel-managed bundle,
+		// however, is reused only when its pinned metadata matches the current
+		// supported release; otherwise attempt an atomic upgrade.
+		if !isTorBundlePath(torBinary) || torBundleVersionInstalled() == torBundleVersion {
+			return torBinary, ptBinary, nil
+		}
+	}
+	oldTorBinary, oldPTBinary := torBinary, ptBinary
+	fallbackToExisting := func(reason error) (string, string, error) {
+		if executableFile(oldTorBinary) && executableFile(oldPTBinary) {
+			log.Printf("WARNING: could not upgrade the existing Tor bundle to %s; continuing with the previously installed Tor/Lyrebird binaries so this Agent can still start: %v", torBundleVersion, reason)
+			return oldTorBinary, oldPTBinary, nil
+		}
+		return "", "", reason
 	}
 	if _, err := os.Stat(torInstallerPath); err != nil {
-		return "", "", errors.New("Tor installer is missing; rerun the updated ShahTunnel installer")
+		return fallbackToExisting(errors.New("Tor installer is missing; rerun the updated ShahTunnel installer"))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// Keep an upgrade attempt bounded. The installer stages and verifies a new
+	// archive before swapping directories, so timeout/failure leaves the old
+	// bundle in place and usable.
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", torInstallerPath)
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
-		return "", "", errors.New("Tor Expert Bundle installation timed out after five minutes")
+		return fallbackToExisting(errors.New("Tor Expert Bundle upgrade timed out after 90 seconds"))
 	}
 	if err != nil {
-		return "", "", fmt.Errorf("Tor transport installation failed: %w: %s", err, strings.TrimSpace(string(output)))
+		return fallbackToExisting(fmt.Errorf("Tor transport installation failed: %w: %s", err, strings.TrimSpace(string(output))))
 	}
-	torBinary, ptBinary := locateTorBinaries()
+	torBinary, ptBinary = locateTorBinaries()
 	if torBinary == "" || ptBinary == "" {
-		return "", "", errors.New("Tor installer completed but tor/lyrebird executables could not be found")
+		return fallbackToExisting(errors.New("Tor installer completed but tor/lyrebird executables could not be found"))
+	}
+	if isTorBundlePath(torBinary) && torBundleVersionInstalled() != torBundleVersion {
+		return fallbackToExisting(fmt.Errorf("Tor installer completed but bundle metadata is not %s", torBundleVersion))
 	}
 	return torBinary, ptBinary, nil
 }
@@ -306,6 +346,24 @@ func scanTorLog(reader io.Reader, bootstrap chan<- struct{}) {
 	if err := scanner.Err(); err != nil {
 		log.Printf("Tor log stream ended: %v", err)
 	}
+}
+
+// torAgentReadinessFromJournal distinguishes a running systemd process from a
+// usable Tor tunnel. Provisioning the binaries and reserving a SOCKS port do not
+// prove that Tor has bootstrapped or that an authenticated Hub lane is alive.
+func torAgentReadinessFromJournal(logText string) (bootstrapped, laneConnected bool) {
+	for _, line := range strings.Split(logText, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "Tor transport bootstrapped successfully") {
+			bootstrapped = true
+		}
+		if strings.Contains(line, "tunnel lane ") &&
+			strings.Contains(line, " connected via ") &&
+			strings.Contains(line, " over tor_socks5") {
+			laneConnected = true
+		}
+	}
+	return bootstrapped, laneConnected
 }
 
 func torRuntimeEnvironment(cfg Config) []string {
@@ -392,8 +450,17 @@ func startTorForAgent(cfg Config) (func(), error) {
 	if cfg.Underlay != underlayTor {
 		return func() {}, nil
 	}
+	// Refresh ShahTunnel-managed Tor bundles on service start as well as during
+	// profile creation. This upgrades existing profiles without deleting their
+	// saved configuration or Tor data directory.
+	torBinary, ptBinary, err := ensureTorBinaries()
+	if err != nil {
+		return nil, fmt.Errorf("prepare the Tor Expert Bundle for this Agent: %w", err)
+	}
+	cfg.TorBinary = torBinary
+	cfg.TorPTBinary = ptBinary
 	if !executableFile(cfg.TorBinary) || !executableFile(cfg.TorPTBinary) {
-		return nil, errors.New("Tor/lyrebird binaries are missing; recreate the Tor Agent profile with the updated installer")
+		return nil, errors.New("Tor/lyrebird binaries are missing; rerun the updated ShahTunnel installer")
 	}
 	if !isLoopbackProxyAddress(cfg.TorProxy) {
 		return nil, errors.New("Tor SOCKS5 proxy must be loopback-only")
