@@ -100,13 +100,14 @@ Choose a mode during tunnel creation. The Hub and Agent must use compatible sett
 
 ### Tor transport underlay: Snowflake and WebTunnel
 
-The Agent's `EXTERNAL EGRESS` menu can use Tor. On profile creation, ShahTunnel downloads the official Tor Expert Bundle 16.0 for amd64 or arm64, verifies its SHA-256 against the Tor Project's signed build manifest, and uses Tor with Lyrebird for Snowflake and WebTunnel. Installation occurs only when Tor is selected, so create and prepare the profile while the server still has download access.
+The Agent's `EXTERNAL EGRESS` menu can use Tor. On profile creation, ShahTunnel downloads the official Tor Expert Bundle 16.0.1 for amd64 or arm64, verifies its SHA-256 against the Tor Project's signed build manifest, and uses Tor with Lyrebird for Snowflake and WebTunnel. Installation occurs only when Tor is selected, so create and prepare the profile while the server still has download access.
 
 - **Snowflake** uses the documented default Tor bridge.
 - **WebTunnel** requires a valid bridge line obtained from Tor Bridges and entered in the wizard.
 - Each profile gets a private Tor data directory and a SOCKS5 listener bound only to `127.0.0.1`. Tor is supervised as a child process and restarted if it exits.
 - Tor routes both Agent-to-Hub TCP lanes and TCP/DNS from that Agent's selected Xray inbounds through its local SOCKS5 endpoint. The user sidecar sends UDP and unknown network types to a Blackhole outbound, preventing direct-IP fallback; UDP/QUIC and ICMP are unsupported. The Xray sidecar listens only on loopback and is stopped with its Agent service. The original X-UI/Xray config, unrelated inbounds, TUN devices, default routes, SSH and firewall rules are not changed.
 - Tor cannot create a network path when all IP/DNS connectivity between Agent and Hub is unavailable.
+- Setup confirmation now waits for Tor to report 100% bootstrap and for an authenticated Agent-to-Hub lane over `tor_socks5`. A running systemd process or a reserved SOCKS port alone is not reported as a working Tor tunnel. Existing ShahTunnel-managed Tor bundles are upgraded on the next Agent start when their recorded version is older than the pinned release; saved profiles and Tor data directories are retained. The upgrade attempt is bounded, and an existing working bundle is kept if the download fails.
 
 **DNSTT and Slipstream are not included in this release.** Both require a delegated DNS domain, keys and a matching server on the opposite side. They cannot work as a standalone SOCKS underlay in the current Agent-to-Hub topology. A real integration needs a coordinated inside/outside endpoint and connection-flow design; adding menu entries without that server would be non-functional. Psiphon was already present in the previous source and remains available.
 
