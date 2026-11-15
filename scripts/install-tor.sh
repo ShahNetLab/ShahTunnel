@@ -10,15 +10,44 @@ BASE_URL="https://archive.torproject.org/tor-package-archive/torbrowser/${TOR_VE
 
 fail() { echo "Tor installer: $*" >&2; exit 1; }
 [[ "${EUID:-$(id -u)}" -eq 0 ]] || fail "run as root (ShahTunnel invokes this automatically as root)."
-for cmd in curl sha256sum tar find install mv rm mktemp chmod cp chown mkdir grep; do
+for cmd in curl sha256sum tar find install mv rm mktemp chmod cp chown mkdir grep od tr; do
   command -v "$cmd" >/dev/null 2>&1 || fail "required command missing: $cmd"
 done
 
-# Reuse a complete previously installed bundle, including an alternative official layout.
+# Validate Linux ELF architecture before any binary is trusted. This deliberately
+# accepts only the official runtime paths below; debug/tor is never a runtime.
+native_elf() {
+  local path="$1" expected_machine magic elf_class elf_data machine
+  [[ -f "$path" && -x "$path" ]] || return 1
+  magic="$(od -An -t x1 -N 4 "$path" 2>/dev/null | tr -d '[:space:]')"
+  [[ "$magic" == "7f454c46" ]] || return 1
+  elf_class="$(od -An -t u1 -j 4 -N 1 "$path" 2>/dev/null | tr -d '[:space:]')"
+  elf_data="$(od -An -t u1 -j 5 -N 1 "$path" 2>/dev/null | tr -d '[:space:]')"
+  machine="$(od -An -t x1 -j 18 -N 2 "$path" 2>/dev/null | tr -d '[:space:]')"
+  [[ "$elf_class" == "2" && "$elf_data" == "1" ]] || return 1
+  case "$(uname -m)" in
+    x86_64|amd64) expected_machine="3e00" ;;
+    aarch64|arm64) expected_machine="b700" ;;
+    *) return 1 ;;
+  esac
+  [[ "$machine" == "$expected_machine" ]]
+}
+
+runtime_tor_self_test() {
+  local tor_path="$1" pt_dir="$2" output
+  native_elf "$tor_path" || return 1
+  native_elf "$pt_dir/lyrebird" || return 1
+  output="$(LD_LIBRARY_PATH="$(dirname "$tor_path"):$pt_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$tor_path" --version 2>&1)" || return 1
+  grep -qi 'Tor version' <<<"$output"
+}
+
+# Official Linux Expert Bundle layout. Avoid arbitrary find-first selection:
+# debug/tor is a debug artifact and has caused exec format errors on Agents.
+TOR_REL="tor/tor"
+LYREBIRD_REL="tor/pluggable_transports/lyrebird"
 if grep -Fxq "version=${TOR_VERSION}" "${STATE_DIR}/tor-bundle.info" 2>/dev/null && \
-   find "$BUNDLE_DIR" -type f -name tor -perm /111 -print -quit 2>/dev/null | grep -q . && \
-   find "$BUNDLE_DIR" -type f -name lyrebird -perm /111 -print -quit 2>/dev/null | grep -q .; then
-  echo "Official Tor Expert Bundle ${TOR_VERSION} is already installed."
+   runtime_tor_self_test "$BUNDLE_DIR/$TOR_REL" "$BUNDLE_DIR/tor/pluggable_transports"; then
+  echo "Official Tor Expert Bundle ${TOR_VERSION} is already installed and runtime-verified."
   exit 0
 fi
 
@@ -53,9 +82,13 @@ printf '%s  %s\n' "$EXPECTED_SHA256" "$ARCHIVE_PATH" | sha256sum -c - \
 tar -tzf "$ARCHIVE_PATH" >/dev/null 2>&1 || fail "downloaded Tor Expert Bundle is not a valid tar.gz archive."
 tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR" || fail "could not extract Tor Expert Bundle."
 
-TOR_BIN="$(find "$EXTRACT_DIR" -type f -name tor -perm /111 -print -quit)"
-LYREBIRD_BIN="$(find "$EXTRACT_DIR" -type f -name lyrebird -perm /111 -print -quit)"
-[[ -n "$TOR_BIN" && -n "$LYREBIRD_BIN" ]] || fail "official bundle does not contain both tor and lyrebird executables."
+TOR_BIN="${EXTRACT_DIR}/${TOR_REL}"
+LYREBIRD_BIN="${EXTRACT_DIR}/${LYREBIRD_REL}"
+native_elf "$TOR_BIN" || fail "official Tor runtime is missing, non-ELF, or not built for Linux/$(uname -m): ${TOR_REL}"
+native_elf "$LYREBIRD_BIN" || fail "official Lyrebird runtime is missing, non-ELF, or not built for Linux/$(uname -m): ${LYREBIRD_REL}"
+TOR_VERSION_OUTPUT="$(LD_LIBRARY_PATH="${EXTRACT_DIR}/tor:${EXTRACT_DIR}/tor/pluggable_transports${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$TOR_BIN" --version 2>&1)" \
+  || fail "official Tor runtime cannot execute on this VPS; refusing to install a broken bundle: ${TOR_VERSION_OUTPUT}"
+grep -qi 'Tor version' <<<"$TOR_VERSION_OUTPUT" || fail "unexpected output from official Tor runtime: ${TOR_VERSION_OUTPUT}"
 
 install -d -o root -g root -m 0755 "$STATE_DIR"
 NEW_DIR="${STATE_DIR}/tor-bundle.new.$$"
@@ -67,9 +100,14 @@ find "$NEW_DIR" -type d -exec chmod 0755 {} +
 find "$NEW_DIR" -type f -perm /111 -exec chmod 0755 {} +
 find "$NEW_DIR" -type f ! -perm /111 -exec chmod 0644 {} +
 
-# Verify that the expected executables survived the staged copy before swapping.
-[[ -x "${NEW_DIR}/${TOR_BIN#"$EXTRACT_DIR"/}" ]] || fail "staged Tor executable is missing."
-[[ -x "${NEW_DIR}/${LYREBIRD_BIN#"$EXTRACT_DIR"/}" ]] || fail "staged Lyrebird executable is missing."
+# Verify exact staged runtime paths and execute Tor after the copy, before swap.
+STAGED_TOR="${NEW_DIR}/${TOR_REL}"
+STAGED_LYREBIRD="${NEW_DIR}/${LYREBIRD_REL}"
+native_elf "$STAGED_TOR" || fail "staged Tor binary failed native ELF architecture validation."
+native_elf "$STAGED_LYREBIRD" || fail "staged Lyrebird binary failed native ELF architecture validation."
+STAGED_TOR_VERSION="$(LD_LIBRARY_PATH="${NEW_DIR}/tor:${NEW_DIR}/tor/pluggable_transports${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$STAGED_TOR" --version 2>&1)" \
+  || fail "staged Tor binary cannot execute after installation copy: ${STAGED_TOR_VERSION}"
+grep -qi 'Tor version' <<<"$STAGED_TOR_VERSION" || fail "staged Tor binary returned unexpected --version output: ${STAGED_TOR_VERSION}"
 
 if [[ -e "$BUNDLE_DIR" ]]; then mv "$BUNDLE_DIR" "$BACKUP_DIR"; fi
 if mv "$NEW_DIR" "$BUNDLE_DIR"; then
@@ -84,8 +122,8 @@ source=${BASE_URL}/${ARCHIVE}
 version=${TOR_VERSION}
 architecture=$(uname -m)
 sha256=${EXPECTED_SHA256}
-tor=${BUNDLE_DIR}/${TOR_BIN#"$EXTRACT_DIR"/}
-lyrebird=${BUNDLE_DIR}/${LYREBIRD_BIN#"$EXTRACT_DIR"/}
+tor=${BUNDLE_DIR}/${TOR_REL}
+lyrebird=${BUNDLE_DIR}/${LYREBIRD_REL}
 INFO
 chmod 0644 "${STATE_DIR}/tor-bundle.info"
 echo "Official Tor Expert Bundle ${TOR_VERSION} installed and SHA-256 verified."
