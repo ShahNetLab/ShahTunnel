@@ -1,7 +1,7 @@
 <div align="center">
 # ShahTunnel 5.0.1
 
-<p align="center"><img src="docs/img/ShahTunnel-Network.png" alt="ShahTunnel logo" width="72%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Logo-Round.png" alt="ShahTunnel logo" width="420" style="max-width: 92%; height: auto;"></p>
 
 [![Version](https://img.shields.io/badge/version-5.0.1-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)

@@ -1,7 +1,7 @@
 <div align="center">
 # شاه‌تونل 5.0.1
 
-<p align="center"><img src="docs/img/ShahTunnel-Network.png" alt="لوگوی شاه‌تونل" width="72%"></p>
+<p align="center"><img src="docs/img/ShahTunnel-Logo-Round.png" alt="لوگوی گرد شاه‌تونل" width="420" style="max-width: 92%; height: auto;"></p>
 
 [![نسخه](https://img.shields.io/badge/version-5.0.1-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![پلتفرم](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
