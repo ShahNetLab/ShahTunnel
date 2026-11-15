@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local verification helper. It reuses an existing Go 1.26.1 toolchain and never downloads one.
+# Local verification helper. It reuses an existing Go 1.26.11 toolchain and never downloads one.
 # Build outputs are kept under a temporary directory; no executable is left in the source tree.
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,7 +8,7 @@ BUILD_TMP="$(mktemp -d "${TMPDIR:-/tmp}/shah-tunnel-verify.XXXXXX")"
 cleanup() { rm -rf -- "$BUILD_TMP"; }
 trap cleanup EXIT
 
-GO_VERSION="1.26.1"
+GO_VERSION="1.26.11"
 GO_HOME="$ROOT/.toolchains/go${GO_VERSION}"
 GO_BIN=""
 
@@ -28,7 +28,7 @@ version_is_pinned() {
   [[ "$v" == *"go${GO_VERSION}"* ]]
 }
 
-# Reuse only an exact Go 1.26.1 binary. An older/newer system toolchain is not used.
+# Reuse only an exact Go 1.26.11 binary. An older/newer system toolchain is not used.
 for candidate in "$GO_HOME/bin/go" "/usr/local/lib/shah-tunnel/toolchains/go${GO_VERSION}-${TARGET_ARCH}/bin/go" "/usr/local/lib/shah-tunnel/go-${GO_VERSION}/bin/go" "$(command -v go 2>/dev/null || true)"; do
   if [[ -n "$candidate" ]] && version_is_pinned "$candidate"; then
     GO_BIN="$candidate"
@@ -64,6 +64,8 @@ bash -n scripts/repair-psiphon-profile.sh
 bash -n VERIFY-ALL-TRANSPORTS.sh
 grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/psiphon' S1T-START.sh || fail "Psiphon systemd data-directory permission is missing."
 grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/tor' S1T-START.sh || fail "Tor systemd data-directory permission is missing."
+python3 scripts/verify-source-pin.py . || fail "Source tree does not match installer SHA-256 pin."
+PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_*.py' -v || fail "Safe archive extraction tests failed."
 grep -Fq 'tor-expert-bundle-linux-x86_64-16.0.tar.gz' scripts/install-tor.sh || fail "Pinned official Tor Expert Bundle is missing."
 grep -Fq 'cc950ebe9acb80188325c3a2cd8817def7dd7237d6fdcd861bb87b234a0cb2fd' scripts/install-tor.sh || fail "Official Tor x86_64 checksum pin is missing."
 grep -Fq 'bed98744e093a0dc3a22be0eecfdce7a33cb36866d3f15fcf011a35bf3513d0d' scripts/install-tor.sh || fail "Official Tor arm64 checksum pin is missing."
@@ -130,7 +132,7 @@ pass "go vet"
 
 printf '\n== 7/7: Linux build validation (temporary files only) ==\n'
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-amd64" ./S1T-CAPSULE
-[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 5.0.1 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 5.0.2 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-arm64" ./S1T-CAPSULE
 sha256sum "$BUILD_TMP/shah-tunnel-linux-amd64" "$BUILD_TMP/shah-tunnel-linux-arm64" > "$BUILD_TMP/SHA256SUMS"
 pass "Linux amd64 and arm64 binaries built and checksum-checked in a temporary directory (nothing added to the repository)"

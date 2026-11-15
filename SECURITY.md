@@ -1,7 +1,7 @@
-# Security and abuse reports
+# Security Policy
 
-ShahTunnel is a general-purpose TCP relay intended for systems and services that the operator owns or is explicitly authorized to administer. Do not use it to access third-party systems without permission, relay abusive traffic, or disrupt services.
+Security fixes and the scope of the 5.0.2 review are documented in [SECURITY-HARDENING-5.0.2.md](SECURITY-HARDENING-5.0.2.md).
 
-For a vulnerability or abuse concern, use GitHub's private vulnerability reporting feature for this repository if it is enabled. Otherwise, open a repository issue asking for a private contact route; do not publish tokens, private keys, complete configuration files, or other secrets in a public issue.
+Do not publish tokens, private keys, complete tunnel configurations, or unsanitized service logs in public issues. Redact credentials before sharing diagnostics.
 
-When reporting a technical issue, include the ShahTunnel version, operating system, relevant sanitized logs, and steps to reproduce. Redact tokens, private keys, and other credentials first.
+For a security report, include the ShahTunnel version, Linux distribution, architecture, affected component, sanitized reproduction steps, and expected/actual behavior.
