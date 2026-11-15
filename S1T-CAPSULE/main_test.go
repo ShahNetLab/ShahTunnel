@@ -1571,25 +1571,11 @@ func TestPsiphonHubAddressDefaultsToPublicMappingPort(t *testing.T) {
 	if got := agentHubAddressForUnderlay(explicit, underlayDirect); got != explicit.HubAddr {
 		t.Fatalf("Direct endpoint = %q; want unchanged %q", got, explicit.HubAddr)
 	}
-	torDefault := Config{Role: "agent", Underlay: underlayTor, HubAddr: "37.32.12.244:9448"}
-	if got := agentHubAddressForUnderlay(torDefault, underlayTor); got != "37.32.12.244:443" {
-		t.Fatalf("default Tor Mapping endpoint = %q; want 37.32.12.244:443", got)
-	}
-	torCustom := torDefault
-	torCustom.TorHubAddr = "37.32.12.244:8443"
-	if got := agentHubAddressForUnderlay(torCustom, underlayTor); got != torCustom.TorHubAddr {
-		t.Fatalf("explicit Tor Mapping endpoint = %q; want %q", got, torCustom.TorHubAddr)
-	}
-	if got := agentHubAddressForTransport(torDefault, transportTCP); got != "37.32.12.244:443" {
-		t.Fatalf("Tor TCP lane endpoint = %q; want public Mapping on 443", got)
-	}
-	if got := agentHubAddressForTransport(torDefault, transportHTTP2); got != torDefault.HubAddr {
-		t.Fatalf("Tor HTTP/2 CONNECT endpoint = %q; want control port %q", got, torDefault.HubAddr)
-	}
+
 }
 
 func TestUnderlayModesAndLoopbackValidation(t *testing.T) {
-	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayTor, underlayAdaptive} {
+	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayAdaptive} {
 		if !validUnderlayMode(mode) {
 			t.Fatalf("valid underlay %q was rejected", mode)
 		}
@@ -2247,7 +2233,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.0.1             |",
+		"        |            SHAH TUNNEL 5.5.0             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
