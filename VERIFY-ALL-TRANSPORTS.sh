@@ -64,12 +64,18 @@ bash -n scripts/repair-psiphon-profile.sh
 bash -n VERIFY-ALL-TRANSPORTS.sh
 grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/psiphon' S1T-START.sh || fail "Psiphon systemd data-directory permission is missing."
 grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/tor' S1T-START.sh || fail "Tor systemd data-directory permission is missing."
-grep -Fq 'tor-expert-bundle-linux-x86_64-16.0.1.tar.gz' scripts/install-tor.sh || fail "Pinned official Tor Expert Bundle is missing."
+grep -Fq 'ARCHIVE="tor-expert-bundle-linux-x86_64-${TOR_VERSION}.tar.gz"' scripts/install-tor.sh || fail "Pinned official Tor amd64 Expert Bundle archive selection is missing."
+grep -Fq 'ARCHIVE="tor-expert-bundle-linux-aarch64-${TOR_VERSION}.tar.gz"' scripts/install-tor.sh || fail "Pinned official Tor arm64 Expert Bundle archive selection is missing."
 grep -Fq '7039cb16060ab22e669852e55774d894b55f25ea8bd0ab7194d3478429a58725' scripts/install-tor.sh || fail "Official Tor x86_64 checksum pin is missing."
 grep -Fq '67040520d44c87ccaaf5aa7df0dc1ff122eb938dbb600ae7722e8b6b75282a4b' scripts/install-tor.sh || fail "Official Tor arm64 checksum pin is missing."
 grep -Fq 'func startTorForAgent(cfg Config)' S1T-CAPSULE/tor.go || fail "Tor per-profile runtime is missing."
 grep -Fq 'func validateTorBridgeLine' S1T-CAPSULE/tor.go || fail "Tor WebTunnel bridge validation is missing."
 grep -Fq 'func waitForTorAgentReady' S1T-CAPSULE/main.go || fail "Tor bootstrap and authenticated Hub-lane readiness check is missing."
+grep -Fq 'go superviseTorUserEgress(torCtx, cfg)' S1T-CAPSULE/main.go || fail "Tor must retry in the background without restarting the Agent process."
+grep -Fq 'func waitForTorBootstrap(ctx context.Context' S1T-CAPSULE/tor.go || fail "Tor must wait for Snowflake bootstrap without a fixed deadline."
+if grep -Fq 'torBootstrapTimeout' S1T-CAPSULE/tor.go; then fail "Tor must not be killed by an arbitrary bootstrap deadline."; fi
+grep -Fq 'func autoMigrateFullTorProfileToSplit()' S1T-CAPSULE/main.go || fail "Automatic Full Tor to Split migration is missing."
+if grep -Fq 'menuItem("9", "⚡ Optimize Tor profile"' S1T-CAPSULE/main.go; then fail "Redundant Tor optimizer menu entry must not be present."; fi
 grep -Fq 'TestTorAgentReadinessRequiresBootstrapAndAuthenticatedLane' S1T-CAPSULE/tor_test.go || fail "Tor runtime readiness regression coverage is missing."
 grep -Fq 'torBinary, ptBinary, err := ensureTorBinaries()' S1T-CAPSULE/tor.go || fail "Existing Tor Agent profiles do not refresh their managed Tor bundle on startup."
 grep -Fq 'continuing with the previously installed Tor/Lyrebird binaries' S1T-CAPSULE/tor.go || fail "Tor bundle upgrade failure must preserve an existing working installation."
@@ -134,7 +140,7 @@ pass "go vet"
 
 printf '\n== 7/7: Linux build validation (temporary files only) ==\n'
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-amd64" ./S1T-CAPSULE
-[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 5.2.1 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 5.2.2 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-arm64" ./S1T-CAPSULE
 sha256sum "$BUILD_TMP/shah-tunnel-linux-amd64" "$BUILD_TMP/shah-tunnel-linux-arm64" > "$BUILD_TMP/SHA256SUMS"
 pass "Linux amd64 and arm64 binaries built and checksum-checked in a temporary directory (nothing added to the repository)"
