@@ -235,14 +235,40 @@ func singBoxBinary() (string, error) {
 	return "", fmt.Errorf("the pinned sing-box %s runtime is not installed; run the verified ShahTunnel installer", singBoxVersion)
 }
 
+// singBoxInstallerCandidates lists the canonical installer location used by
+// S1T-START.sh first, then the legacy location and a source-tree fallback.
+// Keeping the paths in one helper makes installer/runtime layout regressions
+// testable without touching the host filesystem.
+func singBoxInstallerCandidates(executable string) []string {
+	candidates := []string{
+		"/usr/local/lib/shah-tunnel/install-sing-box.sh",
+		"/var/lib/shah-tunnel/install-sing-box.sh", // legacy deployments
+	}
+	if executable != "" {
+		candidates = append(candidates, filepath.Join(filepath.Dir(executable), "scripts", "install-sing-box.sh"))
+	}
+	seen := make(map[string]bool, len(candidates))
+	unique := candidates[:0]
+	for _, candidate := range candidates {
+		candidate = filepath.Clean(candidate)
+		if candidate == "." || seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		unique = append(unique, candidate)
+	}
+	return unique
+}
+
 func ensureSingBoxInstalled() error {
 	if _, err := singBoxBinary(); err == nil {
 		return nil
 	}
-	candidates := []string{"/var/lib/shah-tunnel/install-sing-box.sh"}
+	executable := ""
 	if exe, err := os.Executable(); err == nil {
-		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "scripts", "install-sing-box.sh"))
+		executable = exe
 	}
+	candidates := singBoxInstallerCandidates(executable)
 	for _, path := range candidates {
 		if _, err := os.Stat(path); err != nil {
 			continue

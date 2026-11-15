@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.1.0"
+	version                          = "5.1.1"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -4075,18 +4075,34 @@ func validateConfig(c Config) error {
 	return nil
 }
 func validateTCPAddress(label, addr string) error {
-	host, port, err := net.SplitHostPort(addr)
+	host, port, err := net.SplitHostPort(strings.TrimSpace(addr))
 	if err != nil {
-		return fmt.Errorf("invalid %s address: %w", label, err)
+		return fmt.Errorf("invalid %s address %q (expected IP:PORT or hostname:PORT): %w", label, addr, err)
 	}
 	if strings.TrimSpace(host) == "" {
 		return fmt.Errorf("%s host/address cannot be empty; use an explicit IP or hostname", label)
+	}
+	if net.ParseIP(host) == nil && !validTLSServerName(host) {
+		return fmt.Errorf("%s host %q must be a valid IP address or DNS hostname", label, host)
 	}
 	n, err := strconv.Atoi(port)
 	if err != nil || n < 1 || n > 65535 {
 		return fmt.Errorf("%s port must be a number from 1 to 65535", label)
 	}
 	return nil
+}
+
+// normalizeTCPAddressInput validates and canonicalizes an interactive host:port
+// value before it is stored. The custom port is retained; no Hub port is inferred
+// from the public Mapping port or from a default.
+func normalizeTCPAddressInput(label, address string) (string, error) {
+	address = strings.TrimSpace(address)
+	if err := validateTCPAddress(label, address); err != nil {
+		return "", err
+	}
+	host, portText, _ := net.SplitHostPort(address)
+	port, _ := strconv.Atoi(portText)
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
 func validMappingID(s string) bool {
@@ -4655,7 +4671,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.1.0             |",
+	"        |            SHAH TUNNEL 5.1.1             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -5085,7 +5101,12 @@ func setup() error {
 	case "2", "agent", "outside":
 		c.Role = "agent"
 		c.TunnelChannels = defaultTunnelChannels
-		c.HubAddr = wizardAsk("Reachable Iran Hub address as IP:PORT or hostname:PORT (control port)", "")
+		hubAddressInput := wizardAsk("Reachable Iran Hub address as IP:PORT or hostname:PORT (control port)", "")
+		c.HubAddr, err = normalizeTCPAddressInput("Iran Hub control endpoint", hubAddressInput)
+		if err != nil {
+			return fmt.Errorf("STEP 03 rejected the Hub endpoint before any other settings were collected: %w", err)
+		}
+		uiInfo("Hub control endpoint accepted and preserved as " + c.HubAddr)
 		c.Transport, c.Underlay, _, err = wizardAskTransport("Agent transport mode (must be allowed by Hub)", "agent")
 		if err != nil {
 			return err
@@ -5117,6 +5138,7 @@ func setup() error {
 			}
 		}
 		if c.Underlay == underlayTUIC || c.Underlay == underlayReality {
+			uiInfo("Use the connection details printed by S1T-EXIT-NODE.sh on a THIRD, independent VPS. The exit VPS must be different from this Agent server and the Iran Hub; do not invent a UUID/password or reuse the Agent IP.")
 			protocol := egressTUIC
 			if c.Underlay == underlayReality {
 				protocol = egressReality

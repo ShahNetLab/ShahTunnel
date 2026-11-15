@@ -153,3 +153,30 @@ func TestValidateDistinctExitIP(t *testing.T) {
 		t.Fatal("missing direct IP accepted")
 	}
 }
+
+func TestSingBoxInstallerCandidatesFindsInstallerInstalledByS1TStart(t *testing.T) {
+	got := singBoxInstallerCandidates("/usr/local/bin/ravanreverse")
+	if len(got) < 3 {
+		t.Fatalf("installer candidates = %#v; want canonical, legacy and executable-relative paths", got)
+	}
+	if got[0] != "/usr/local/lib/shah-tunnel/install-sing-box.sh" {
+		t.Fatalf("first installer candidate = %q; want S1T-START.sh STATE_DIR path", got[0])
+	}
+	if got[1] != "/var/lib/shah-tunnel/install-sing-box.sh" {
+		t.Fatalf("second installer candidate = %q; want legacy compatibility path", got[1])
+	}
+	if got[2] != "/usr/local/bin/scripts/install-sing-box.sh" {
+		t.Fatalf("source fallback = %q; want executable-relative scripts path", got[2])
+	}
+}
+
+func TestSingBoxInstallerCandidatesDeduplicatesPaths(t *testing.T) {
+	got := singBoxInstallerCandidates("/usr/local/lib/shah-tunnel/ravanreverse")
+	seen := map[string]bool{}
+	for _, path := range got {
+		if seen[path] {
+			t.Fatalf("duplicate installer candidate %q in %#v", path, got)
+		}
+		seen[path] = true
+	}
+}
