@@ -1,98 +1,95 @@
 #!/usr/bin/env bash
-# ShahTunnel: verified sing-box installer (fixed asset URL handling)
-# Installs only the pinned official sing-box binary; does not alter ShahTunnel routes/services.
 set -Eeuo pipefail
 umask 077
+
+[[ "$(id -u)" -eq 0 ]] || { echo "Run this installer as root." >&2; exit 1; }
 
 VERSION="1.14.4"
 REPO="SagerNet/sing-box"
 BIN="/usr/local/bin/sing-box"
-API="https://api.github.com/repos/${REPO}/releases/tags/v${VERSION}"
 TMP="$(mktemp -d /tmp/shah-sing-box.XXXXXX)"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
-fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-
-[[ "$(id -u)" -eq 0 ]] || fail "Run this installer as root."
-
-for cmd in curl python3 tar sha256sum install awk find grep uname; do
-  command -v "$cmd" >/dev/null 2>&1 || fail "Missing required command: $cmd"
+for cmd in curl python3 tar sha256sum install; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "Missing required command: $cmd" >&2; exit 1; }
 done
 
 case "$(uname -m)" in
   x86_64|amd64) ARCH="amd64" ;;
   aarch64|arm64) ARCH="arm64" ;;
-  *) fail "Unsupported CPU architecture: $(uname -m)" ;;
+  *) echo "Unsupported CPU architecture: $(uname -m)" >&2; exit 1 ;;
 esac
-
 ASSET="sing-box-${VERSION}-linux-${ARCH}.tar.gz"
+API="https://api.github.com/repos/${REPO}/releases/tags/v${VERSION}"
 
-printf 'Fetching official %s release metadata...\n' "$VERSION"
-curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 90 \
+if [[ -x "$BIN" ]] && "$BIN" version 2>&1 | grep -Fq "sing-box version ${VERSION}"; then
+  echo "Verified sing-box ${VERSION} is already installed at ${BIN}; nothing to do."
+  exit 0
+fi
+
+curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 \
   -H 'Accept: application/vnd.github+json' \
   -H 'X-GitHub-Api-Version: 2022-11-28' \
   -H 'User-Agent: ShahTunnel-sing-box-installer' \
-  "$API" -o "$TMP/release.json" || fail "Could not download official GitHub release metadata. Check DNS/network and retry."
+  "$API" -o "$TMP/release.json"
 
-# Resolve the official asset digest from the GitHub API. Build the canonical URL
-# from the pinned repository/tag/name instead of trusting browser_download_url,
-# whose formatting can vary and caused the old helper to reject a valid asset.
-python3 - "$TMP/release.json" "$ASSET" "$VERSION" <<'PY' > "$TMP/asset.meta" || exit 1
+# The release API's tag_name already includes the leading "v". Construct
+# the canonical download URL from the verified repository, tag and exact asset
+# name instead of prefixing another "v" or trusting browser_download_url.
+if ! python3 - "$TMP/release.json" "$ASSET" "$VERSION" "$REPO" > "$TMP/asset.meta" <<'PY'
 import json, re, sys
-from pathlib import PurePosixPath
 
-json_path, wanted_name, version = sys.argv[1:]
+json_path, wanted_name, version, repository = sys.argv[1:]
 try:
-    with open(json_path, encoding="utf-8") as f:
-        obj = json.load(f)
+    with open(json_path, encoding="utf-8") as handle:
+        release = json.load(handle)
 except Exception as exc:
-    raise SystemExit(f"Invalid GitHub release JSON: {exc}")
+    raise SystemExit(f"Invalid GitHub release metadata: {exc}")
 
-tag = obj.get("tag_name", "")
-if tag not in (f"v{version}", version):
-    raise SystemExit(f"Unexpected official release tag: {tag!r}")
+expected_tag = f"v{version}"
+actual_tag = release.get("tag_name", "")
+if actual_tag != expected_tag:
+    raise SystemExit(f"Unexpected sing-box release tag {actual_tag!r}; expected {expected_tag!r}")
 
-matches = [a for a in obj.get("assets", []) if a.get("name") == wanted_name]
+matches = [asset for asset in release.get("assets", []) if asset.get("name") == wanted_name]
 if len(matches) != 1:
-    raise SystemExit(f"Expected exactly one official release asset {wanted_name!r}; found {len(matches)}")
+    raise SystemExit(f"Expected exactly one official asset {wanted_name!r}; found {len(matches)}")
 
 asset = matches[0]
 digest = asset.get("digest", "")
 if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
-    raise SystemExit("GitHub release metadata has no valid SHA-256 digest; refusing unverified install")
+    raise SystemExit("Official release metadata has no valid SHA-256 digest; refusing unverified install")
+if asset.get("state") not in (None, "uploaded"):
+    raise SystemExit(f"Official release asset is not uploaded: {asset.get('state')!r}")
 
-# Only the fixed, official project/release location is allowed.
-url = f"https://github.com/SagerNet/sing-box/releases/download/v{version}/{wanted_name}"
+url = f"https://github.com/{repository}/releases/download/{expected_tag}/{wanted_name}"
 print(url)
 print(digest.split(":", 1)[1].lower())
 PY
-
+then
+  echo "Could not resolve the uniquely named, SHA-256 verified official sing-box release asset." >&2
+  exit 1
+fi
 mapfile -t META < "$TMP/asset.meta"
-[[ "${#META[@]}" -eq 2 ]] || fail "Could not resolve a uniquely named, SHA-256 verified official release asset."
+[[ "${#META[@]}" -eq 2 ]] || { echo "Could not resolve the verified sing-box release asset." >&2; exit 1; }
 URL="${META[0]}"
 EXPECTED="${META[1]}"
 
-printf 'Downloading %s...\n' "$ASSET"
 curl -fL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300 \
   -H 'User-Agent: ShahTunnel-sing-box-installer' \
-  "$URL" -o "$TMP/sing-box.tar.gz" || fail "Official sing-box asset download failed."
-
+  "$URL" -o "$TMP/sing-box.tar.gz"
 ACTUAL="$(sha256sum "$TMP/sing-box.tar.gz" | awk '{print $1}')"
-[[ "$ACTUAL" == "$EXPECTED" ]] || fail "SHA-256 mismatch. Expected $EXPECTED; got $ACTUAL. Refusing installation."
-printf 'SHA-256 verified: %s\n' "$ACTUAL"
+[[ "$ACTUAL" == "$EXPECTED" ]] || { echo "sing-box archive SHA-256 mismatch; refusing installation." >&2; exit 1; }
 
-tar -xzf "$TMP/sing-box.tar.gz" -C "$TMP" || fail "Downloaded archive is not a valid gzip tar archive."
+tar -xzf "$TMP/sing-box.tar.gz" -C "$TMP"
 SOURCE="$(find "$TMP" -type f -name sing-box -perm /111 -print -quit)"
-[[ -n "$SOURCE" ]] || fail "sing-box executable was not found in the verified archive."
-
-install -d -o root -g root -m 0755 /usr/local/bin
+[[ -n "$SOURCE" ]] || { echo "sing-box executable was not found in the verified archive." >&2; exit 1; }
 install -o root -g root -m 0755 "$SOURCE" "${BIN}.new"
 if ! "${BIN}.new" version 2>&1 | grep -Fq "$VERSION"; then
   rm -f "${BIN}.new"
-  fail "Downloaded binary reported an unexpected version."
+  echo "Installed sing-box binary reported an unexpected version." >&2
+  exit 1
 fi
 mv -f "${BIN}.new" "$BIN"
-
-printf '\nSUCCESS: verified sing-box %s installed at %s (%s).\n' "$VERSION" "$BIN" "$ARCH"
-"$BIN" version
+echo "Verified sing-box ${VERSION} installed at ${BIN} (${ARCH}, SHA-256 verified)."
