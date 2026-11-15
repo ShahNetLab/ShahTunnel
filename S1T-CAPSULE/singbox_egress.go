@@ -326,7 +326,7 @@ PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
 ReadOnlyPaths=%s
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 LockPersonality=yes
 RestrictSUIDSGID=yes
 

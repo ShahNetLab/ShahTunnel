@@ -24,6 +24,24 @@ func testProtocolEgressReality() ProtocolEgress {
 	}
 }
 
+func TestRenderSingBoxUnitAllowsNetlinkForInterfaceDetection(t *testing.T) {
+	unit, err := renderSingBoxUnit(
+		"/usr/local/bin/sing-box",
+		"/etc/ravanreverse/sing-box/tuic/profile-s/config.json",
+		"shah-tunnel-singbox-tuic-profile-s.service",
+	)
+	if err != nil {
+		t.Fatalf("render sing-box service unit: %v", err)
+	}
+	text := string(unit)
+	if !strings.Contains(text, "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK") {
+		t.Fatalf("sing-box unit must allow AF_NETLINK for route.auto_detect_interface; generated unit:\n%s", text)
+	}
+	if strings.Contains(text, "CAP_NET_ADMIN") || strings.Contains(text, "CapabilityBoundingSet=CAP_NET_ADMIN") {
+		t.Fatalf("sing-box must not receive CAP_NET_ADMIN just to read interface metadata:\n%s", text)
+	}
+}
+
 func TestBuildSingBoxEgressConfigTUIC(t *testing.T) {
 	p := testProtocolEgressTUIC()
 	cfg, err := buildSingBoxEgressConfig(p)
@@ -47,8 +65,12 @@ func TestBuildSingBoxEgressConfigTUIC(t *testing.T) {
 	if tls["server_name"] != p.ServerName || tls["insecure"] != false {
 		t.Fatalf("invalid TLS verification config: %#v", tls)
 	}
-	if root["route"].(map[string]any)["final"] != "s1t-egress" {
+	route := root["route"].(map[string]any)
+	if route["final"] != "s1t-egress" {
 		t.Fatal("sing-box final route does not select protocol egress")
+	}
+	if route["auto_detect_interface"] != true {
+		t.Fatal("sing-box must retain automatic interface detection for the selected egress")
 	}
 }
 
