@@ -234,7 +234,7 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 // never modified. For TCP-only SOCKS egress (Psiphon and Tor), UDP and unknown
 // networks are explicitly blackholed instead of falling back to Direct.
 func buildXrayEgressConfig(original []byte, profileID, proxyAddress string, mappings []PortMapping, kind string, blockUDP bool) ([]byte, []XrayWarpBinding, string, error) {
-	if kind != "warp" && kind != "psiphon" && kind != "tor" {
+	if kind != "warp" && kind != "psiphon" && kind != "tor" && kind != egressTUIC && kind != egressReality {
 		return nil, nil, "", fmt.Errorf("unsupported isolated Xray egress kind %q", kind)
 	}
 	if _, _, err := net.SplitHostPort(proxyAddress); err != nil || !isLoopbackProxyAddress(proxyAddress) {

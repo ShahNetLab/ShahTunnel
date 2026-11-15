@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.0.1"
+	version                          = "5.1.0"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -147,6 +147,7 @@ type Config struct {
 	XrayWARP       *XrayWarpIntegration    `json:"xray_warp,omitempty"`
 	XrayPsiphon    *XrayPsiphonIntegration `json:"xray_psiphon,omitempty"`
 	XrayTor        *XrayTorIntegration     `json:"xray_tor,omitempty"`
+	ProtocolEgress *ProtocolEgress         `json:"protocol_egress,omitempty"`
 }
 
 type RuntimeSnapshot struct {
@@ -665,7 +666,7 @@ func validTransportMode(mode string) bool {
 }
 
 func validUnderlayMode(mode string) bool {
-	return mode == underlayDirect || mode == underlayMASQUE || mode == underlayPsiphon || mode == underlayTor || mode == underlayAdaptive
+	return mode == underlayDirect || mode == underlayMASQUE || mode == underlayPsiphon || mode == underlayTor || mode == underlayAdaptive || mode == underlayTUIC || mode == underlayReality
 }
 
 func isLoopbackProxyAddress(address string) bool {
@@ -2309,7 +2310,7 @@ func runAgentOverStream(conn net.Conn, cfg Config, channel int, displayTransport
 	if cfg.Transport == transportAdaptive {
 		agentPreferredTransport.Store(channel, displayTransport)
 	}
-	if cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE || cfg.Underlay == underlayTor {
+	if cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE || cfg.Underlay == underlayTor || cfg.Underlay == underlayTUIC || cfg.Underlay == underlayReality {
 		agentPreferredUnderlay.Store(channel, cfg.Underlay)
 	}
 	log.Printf("tunnel lane %d/%d connected via %s over %s; forwarding through %d configured port mapping(s)", channel, cfg.TunnelChannels, displayTransport, cfg.Underlay, len(normalizeConfig(cfg).Ports))
@@ -2849,6 +2850,22 @@ func runAgent(cfg Config) error {
 			return fmt.Errorf("start Tor %s egress: %w", cfg.TorMode, err)
 		}
 		cleanupUnderlay = cleanup
+	case underlayTUIC, underlayReality:
+		if err := validateProtocolEgressRuntime(cfg.ProtocolEgress); err != nil {
+			return fmt.Errorf("invalid %s egress runtime: %w", cfg.Underlay, err)
+		}
+		if err := ensureProtocolEgressServices(cfg); err != nil {
+			return fmt.Errorf("start %s egress: %w", cfg.Underlay, err)
+		}
+		exitIP, err := probeSOCKS5PublicIP(cfg.ProtocolEgress.Proxy)
+		if err != nil {
+			return fmt.Errorf("verify %s egress before starting tunnel lanes: %w", cfg.Underlay, err)
+		}
+		directIP := directPublicIP()
+		if directIP == "" || exitIP == directIP {
+			return fmt.Errorf("refusing to start protocol egress: remote exit IP (%s) is not independently verified as different from Agent direct IP (%s)", exitIP, directIP)
+		}
+		log.Printf("verified %s remote egress IP: %s (Agent direct IP: %s); no direct fallback is permitted", cfg.Underlay, exitIP, directIP)
 	case underlayAdaptive:
 		cleanup, err := startPsiphonForAgent(cfg)
 		if err != nil {
@@ -3160,7 +3177,7 @@ func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode s
 	if cfg.Transport == transportAdaptive {
 		agentPreferredTransport.Store(channel, mode)
 	}
-	if cfg.Underlay == underlayAdaptive || cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE || cfg.Underlay == underlayTor {
+	if cfg.Underlay == underlayAdaptive || cfg.Underlay == underlayDirect || cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayMASQUE || cfg.Underlay == underlayTor || cfg.Underlay == underlayTUIC || cfg.Underlay == underlayReality {
 		agentPreferredUnderlay.Store(channel, cfg.Underlay)
 	}
 	log.Printf("tunnel lane %d/%d connected via %s over %s; forwarding through %d configured port mapping(s)", channel, cfg.TunnelChannels, mode, cfg.Underlay, len(normalizeConfig(cfg).Ports))
@@ -3179,6 +3196,11 @@ func dialAgentUnderlay(ctx context.Context, cfg Config, network, address string)
 		return dialSOCKS5Context(ctx, cfg.PsiphonProxy, address)
 	case underlayTor:
 		return dialSOCKS5Context(ctx, cfg.TorProxy, address)
+	case underlayTUIC, underlayReality:
+		if cfg.ProtocolEgress == nil {
+			return nil, errors.New("selected protocol egress has no SOCKS5 sidecar configuration")
+		}
+		return dialSOCKS5Context(ctx, cfg.ProtocolEgress.Proxy, address)
 	case underlayMASQUE:
 		proxyAddress, localProxyMode, err := warpProxyAddressFromCLI()
 		if err != nil {
@@ -4000,6 +4022,16 @@ func validateConfig(c Config) error {
 		if _, err := normalizeFingerprint(c.Fingerprint); err != nil {
 			return err
 		}
+		if c.Underlay == underlayTUIC || c.Underlay == underlayReality {
+			if err := validProtocolEgress(c); err != nil {
+				return err
+			}
+		} else if c.ProtocolEgress != nil {
+			return errors.New("protocol_egress is only valid with the matching TUIC or VLESS REALITY underlay")
+		}
+		if c.ProtocolEgress != nil && (c.XrayWARP != nil || c.XrayPsiphon != nil || c.XrayTor != nil) {
+			return errors.New("an Agent profile can have only one isolated Xray egress integration")
+		}
 		if (c.XrayWARP != nil && c.XrayPsiphon != nil) || (c.XrayWARP != nil && c.XrayTor != nil) || (c.XrayPsiphon != nil && c.XrayTor != nil) {
 			return errors.New("an Agent profile can have only one isolated Xray egress integration")
 		}
@@ -4496,6 +4528,11 @@ func deleteOneTunnel() error {
 			return fmt.Errorf("tunnel stopped, but its isolated Xray Tor route could not be removed; tunnel profile was kept: %w", err)
 		}
 	}
+	if cfg.ProtocolEgress != nil {
+		if err := removeProtocolEgressIntegration(&cfg); err != nil {
+			return fmt.Errorf("tunnel stopped, but its isolated protocol egress could not be removed; tunnel profile was kept: %w", err)
+		}
+	}
 	if !selected.Legacy {
 		for _, certPath := range []string{cfg.CertFile, cfg.KeyFile} {
 			if certPath != "" && filepath.Clean(filepath.Dir(certPath)) == filepath.Clean(tunnelConfigDir) {
@@ -4618,7 +4655,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.0.1             |",
+	"        |            SHAH TUNNEL 5.1.0             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -4795,7 +4832,7 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 	fmt.Printf("  %s\n", paint(ansiGreen, "5) HTTP CONNECT fallback — HTTP/2, then HTTP/1.1"))
 	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
 	fmt.Printf("  %s\n", paint(ansiPinkGlow, "7) FULL ADAPTIVE FAILOVER — all 4 implemented transports"))
-	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "8) EXTERNAL EGRESS — Cloudflare MASQUE / Psiphon / Tor"))
+	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "8) EXTERNAL EGRESS — WARP / Psiphon / Tor / TUIC / VLESS REALITY"))
 	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) ALL-PROTOCOL ADAPTIVE — 4 transports + Psiphon user egress + lane failover"))
 	choice := wizardAsk(prompt+" (1-9)", "7")
 	switch choice {
@@ -4822,7 +4859,9 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 		fmt.Println("  1) Cloudflare WARP over MASQUE (WarpProxy / Local Proxy required; already Connected)")
 		fmt.Println("  2) Psiphon ConsoleClient via local SOCKS5")
 		fmt.Println("  3) Tor via Snowflake or WebTunnel (local SOCKS5; TCP tunnel only)")
-		sub := wizardAsk("Select external egress (1-3)", "1")
+		fmt.Println("  4) TUIC v5 over QUIC (independent exit server required)")
+		fmt.Println("  5) VLESS + REALITY + Vision (independent exit server required)")
+		sub := wizardAsk("Select external egress (1-5)", "1")
 		switch sub {
 		case "1":
 			if _, err := verifyWarpPerTunnelPrerequisites(); err != nil {
@@ -4839,8 +4878,12 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 			// Tor and Lyrebird are provisioned on demand. The Agent wizard asks
 			// for either Snowflake's built-in bridge or a user-supplied WebTunnel bridge.
 			return transportAdaptive, underlayTor, "", nil
+		case "4":
+			return transportAdaptive, underlayTUIC, "", nil
+		case "5":
+			return transportAdaptive, underlayReality, "", nil
 		default:
-			return "", "", "", errors.New("invalid external egress selection; enter 1, 2, or 3")
+			return "", "", "", errors.New("invalid external egress selection; enter 1, 2, 3, 4, or 5")
 		}
 	case "9":
 		if role != "agent" {
@@ -5073,6 +5116,34 @@ func setup() error {
 				c.TorHubAddr = defaultEndpoint
 			}
 		}
+		if c.Underlay == underlayTUIC || c.Underlay == underlayReality {
+			protocol := egressTUIC
+			if c.Underlay == underlayReality {
+				protocol = egressReality
+			}
+			server := wizardAsk("Independent egress server IP or hostname", "")
+			portText := wizardAsk("Egress server port", "443")
+			serverPort, portErr := strconv.Atoi(strings.TrimSpace(portText))
+			if portErr != nil || serverPort < 1 || serverPort > 65535 {
+				return errors.New("egress server port must be 1-65535")
+			}
+			serverName := wizardAsk("TLS server_name (DNS hostname on the egress server)", "")
+			uuid := wizardAsk("Protocol UUID", "")
+			p := &ProtocolEgress{Protocol: protocol, Server: strings.TrimSpace(server), ServerPort: serverPort, ServerName: strings.TrimSpace(serverName), UUID: strings.TrimSpace(uuid)}
+			if protocol == egressTUIC {
+				p.Password = wizardAsk("TUIC password", "")
+				p.CongestionControl = strings.ToLower(strings.TrimSpace(wizardAsk("Congestion control (bbr/cubic/new_reno)", "bbr")))
+			} else {
+				p.PublicKey = strings.TrimSpace(wizardAsk("REALITY server public key (never enter the private key)", ""))
+				p.ShortID = strings.TrimSpace(wizardAsk("REALITY short_id (hex, max 16 characters)", ""))
+				p.Fingerprint = strings.ToLower(strings.TrimSpace(wizardAsk("uTLS fingerprint", "chrome")))
+			}
+			c.ProtocolEgress = p
+			if err := validProtocolEgress(c); err != nil {
+				return fmt.Errorf("invalid protocol egress settings: %w", err)
+			}
+			uiInfo("A separate egress server is mandatory. This profile will not use Direct if its protocol egress fails.")
+		}
 		if transportModeAllowsHTTP2(c.Transport) {
 			uiInfo("HTTP/2 CONNECT uses TCP port " + nextPortLabel(c.HubAddr) + ". Open it in the Hub firewall if selected.")
 		}
@@ -5120,6 +5191,14 @@ func setup() error {
 			return err
 		}
 		uiInfo(fmt.Sprintf("Performance profile: %d independent tunnel lanes; transport=%s; egress=%s.", c.TunnelChannels, c.Transport, c.Underlay))
+		if c.Underlay == underlayTUIC || c.Underlay == underlayReality {
+			uiInfo("Installing the pinned sing-box runtime and preparing isolated protocol + Xray sidecars; existing host routes and other profiles remain unchanged...")
+			if err := applyProtocolEgressForAgent(&c); err != nil {
+				_ = os.Remove(configPath)
+				return fmt.Errorf("%s egress setup failed; the incomplete profile was removed and existing tunnel routes were not changed: %w", c.Underlay, err)
+			}
+			uiSuccess("Protocol egress ready; verified remote public IP: " + c.ProtocolEgress.VerifiedExitIP)
+		}
 		if c.Underlay == underlayMASQUE {
 			uiInfo("This Agent's Xray mappings and DNS use its isolated WARP Local Proxy sidecar; system routes and SSH are untouched.")
 		}
@@ -5128,6 +5207,9 @@ func setup() error {
 		}
 		if c.Underlay == underlayTor {
 			uiInfo("Tor starts as a per-profile child process. Agent-to-Hub TCP lanes and this Agent's isolated Xray user TCP/DNS mappings use its loopback SOCKS5 proxy. UDP, QUIC, and ICMP are blocked on the user path; no TUN device, default route, SSH, X-UI source config, or host firewall is changed.")
+		}
+		if c.Underlay == underlayTUIC || c.Underlay == underlayReality {
+			uiInfo("Agent-to-Hub lanes and selected Xray user traffic use the protocol's verified loopback SOCKS5 sidecar. No Direct fallback, TUN device, host default-route change, or unrelated Xray inbound modification is used.")
 		}
 		uiSuccess("Agent configuration saved. Reconnection is automatic if a lane drops.")
 	case "3", "relay", "front":
@@ -5704,6 +5786,11 @@ func uninstall() error {
 			if profileConfig.XrayPsiphon != nil {
 				if cleanupErr := removeXrayPsiphonIntegration(&profileConfig); cleanupErr != nil {
 					return fmt.Errorf("could not remove Xray Psiphon integration for profile %s; ShahTunnel files were kept: %w", profile.Name, cleanupErr)
+				}
+			}
+			if profileConfig.ProtocolEgress != nil {
+				if cleanupErr := removeProtocolEgressIntegration(&profileConfig); cleanupErr != nil {
+					return fmt.Errorf("could not remove protocol egress for profile %s; ShahTunnel files were kept: %w", profile.Name, cleanupErr)
 				}
 			}
 			if cleanupErr := removePsiphonSystemdService(profileConfig, profile.Service); cleanupErr != nil {

@@ -1589,7 +1589,7 @@ func TestPsiphonHubAddressDefaultsToPublicMappingPort(t *testing.T) {
 }
 
 func TestUnderlayModesAndLoopbackValidation(t *testing.T) {
-	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayTor, underlayAdaptive} {
+	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayTor, underlayAdaptive, underlayTUIC, underlayReality} {
 		if !validUnderlayMode(mode) {
 			t.Fatalf("valid underlay %q was rejected", mode)
 		}
@@ -2247,7 +2247,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.0.1             |",
+		"        |            SHAH TUNNEL 5.1.0             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
