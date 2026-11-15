@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.0.1"
+	version                          = "5.0.2"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -210,14 +210,34 @@ func writeRuntimeStats(role string) {
 		return
 	}
 	runtimePath := runtimeStatsPath()
-	tmp := runtimePath + ".tmp"
-	if err = os.MkdirAll(filepath.Dir(runtimePath), 0700); err != nil {
+	runtimeDir := filepath.Dir(runtimePath)
+	if err = os.MkdirAll(runtimeDir, 0700); err != nil {
 		return
 	}
-	if err = os.WriteFile(tmp, append(b, '\n'), 0600); err != nil {
+	tmp, err := os.CreateTemp(runtimeDir, ".runtime-*.tmp")
+	if err != nil {
 		return
 	}
-	_ = os.Rename(tmp, runtimePath)
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err = tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if _, err = tmp.Write(append(b, '\n')); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if err = tmp.Close(); err != nil {
+		return
+	}
+	if err = os.Rename(tmpName, runtimePath); err != nil {
+		return
+	}
 	_ = os.Chmod(runtimePath, 0600)
 }
 
@@ -3913,8 +3933,13 @@ func validateConfig(c Config) error {
 			}
 		}
 	}
-	if len(c.Token) < 48 || len(c.Token) > 240 || strings.ContainsAny(c.Token, "\r\n") {
-		return errors.New("token must be 48–240 characters and contain no line breaks")
+	if len(c.Token) < 48 || len(c.Token) > 240 {
+		return errors.New("token must be 48–240 printable ASCII characters")
+	}
+	for _, b := range []byte(c.Token) {
+		if b < 0x21 || b > 0x7e {
+			return errors.New("token must contain only visible ASCII characters (no spaces or control bytes)")
+		}
 	}
 	if len(c.Ports) == 0 {
 		return errors.New("at least one port mapping is required")
@@ -4369,9 +4394,12 @@ ProtectSystem=strict
 ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
 ProtectHostname=true
 ProtectClock=true
+KeyringMode=private
+RemoveIPC=true
 ProtectProc=invisible
 ProcSubset=pid
 RestrictNamespaces=true
@@ -4618,7 +4646,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.0.1             |",
+	"        |            SHAH TUNNEL 5.0.2             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -4914,7 +4942,7 @@ func generateCertificate(certPath, keyPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	tmpl := x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "Shah Tunnel Hub"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().AddDate(10, 0, 0), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true}
+	tmpl := x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "Shah Tunnel Hub"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().AddDate(2, 0, 0), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true}
 	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
 	if err != nil {
 		return "", err
@@ -4926,13 +4954,10 @@ func generateCertificate(certPath, keyPath string) (string, error) {
 	if err = os.MkdirAll(filepath.Dir(certPath), 0700); err != nil {
 		return "", err
 	}
-	if err = os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0644); err != nil {
+	if err = atomicWriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0644); err != nil {
 		return "", err
 	}
-	if err = os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0600); err != nil {
-		return "", err
-	}
-	if err = os.Chmod(keyPath, 0600); err != nil {
+	if err = atomicWriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0600); err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(der)
@@ -5473,22 +5498,35 @@ fi
 
 // atomicWriteFile writes a root-owned schedule file by replacing it atomically.
 func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
+	tmp, err := os.CreateTemp(dir, ".shah-tunnel-*.tmp")
+	if err != nil {
 		return err
 	}
-	if err := os.Chmod(tmp, mode); err != nil {
-		_ = os.Remove(tmp)
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err = tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
 		return err
 	}
-	return nil
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	return os.Chmod(path, mode)
 }
 
 func removeRestartScheduleFiles() error {
