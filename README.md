@@ -1,5 +1,4 @@
 <div align="center">
-# ShahTunnel 5.0.1
 
 <p align="center"><img src="docs/img/ShahTunnel-Logo-Round.png" alt="ShahTunnel logo" width="420" style="max-width: 92%; height: auto;"></p>
 
