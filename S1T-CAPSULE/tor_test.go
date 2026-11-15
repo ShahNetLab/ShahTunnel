@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testWebTunnelBridge = "Bridge webtunnel 203.0.113.5:443 0123456789abcdef0123456789abcdef01234567 url=https://bridge.example.net/ ver=0.0.1"
@@ -150,5 +152,45 @@ tunnel lane 1/12 connected via tcp_tls over direct`
 	boot, lane = torAgentReadinessFromJournal(wrongUnderlay)
 	if !boot || lane {
 		t.Fatalf("direct lane must not satisfy Tor readiness: bootstrap=%t lane=%t", boot, lane)
+	}
+}
+
+func TestWaitForTorBootstrapHasNoArbitraryDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	processDone := make(chan error, 1)
+	bootstrap := make(chan struct{}, 1)
+	result := make(chan bool, 1)
+	go func() {
+		ready, _ := waitForTorBootstrap(ctx, processDone, bootstrap)
+		result <- ready
+	}()
+
+	select {
+	case ready := <-result:
+		t.Fatalf("Tor bootstrap returned before the bridge reported readiness: %t", ready)
+	case <-time.After(80 * time.Millisecond):
+		// Expected: a still-running Tor process is allowed to keep bootstrapping.
+	}
+
+	bootstrap <- struct{}{}
+	select {
+	case ready := <-result:
+		if !ready {
+			t.Fatal("Tor bootstrap event was not recognized")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Tor bootstrap waiter did not return after readiness")
+	}
+}
+
+func TestWaitForTorBootstrapReturnsWhenProcessExits(t *testing.T) {
+	ctx := context.Background()
+	processDone := make(chan error, 1)
+	bootstrap := make(chan struct{})
+	processDone <- nil
+	ready, err := waitForTorBootstrap(ctx, processDone, bootstrap)
+	if ready || err == nil || !strings.Contains(err.Error(), "Tor exited before bootstrap") {
+		t.Fatalf("unexpected result for early Tor exit: ready=%t err=%v", ready, err)
 	}
 }

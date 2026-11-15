@@ -34,7 +34,6 @@ const (
 	torDataRoot          = "/var/lib/shah-tunnel/tor"
 	torSocksFirstPort    = 19000
 	torSocksPortCount    = 1000
-	torBootstrapTimeout  = 180 * time.Second
 	torRestartDelay      = 4 * time.Second
 	torProcessStopWindow = 5 * time.Second
 )
@@ -552,16 +551,18 @@ func stopTorProcess(cmd *exec.Cmd, done <-chan error) {
 	}
 }
 
-// superviseTorUserEgress keeps the Tor user exit independent from the fast
-// Agent-to-Hub route. It retries failed first bootstraps without taking down
-// the authenticated direct lane. The Xray sidecar has no Direct fallback, so
-// user traffic remains fail-closed until the Tor SOCKS endpoint is usable.
+// superviseTorUserEgress owns the per-profile Tor process independently from
+// the Agent process. A slow Snowflake/WebTunnel bootstrap must not cause Tor to
+// be killed and relaunched on a fixed deadline: some volunteer paths need much
+// longer than a few minutes. The Agent keeps running while Tor itself retries;
+// the Xray sidecar has no Direct fallback and remains fail-closed until SOCKS is
+// actually usable.
 func superviseTorUserEgress(ctx context.Context, cfg Config) {
 	const retryDelay = 15 * time.Second
 	for ctx.Err() == nil {
 		cleanup, err := startTorForAgent(cfg)
 		if err != nil {
-			log.Printf("Tor user egress is not ready; Agent-to-Hub remains independent and Xray stays fail-closed: %v", err)
+			log.Printf("Tor process could not be started; Agent-to-Hub remains independent and Xray stays fail-closed: %v", err)
 			timer := time.NewTimer(retryDelay)
 			select {
 			case <-timer.C:
@@ -576,10 +577,24 @@ func superviseTorUserEgress(ctx context.Context, cfg Config) {
 			}
 			continue
 		}
-		log.Printf("Tor user egress is ready on %s; direct Agent-to-Hub lanes remain independent", cfg.TorProxy)
+		log.Printf("Tor process supervisor is running for %s; SOCKS5 user egress stays fail-closed until Tor reports 100%% bootstrap", cfg.TorProxy)
 		<-ctx.Done()
 		cleanup()
 		return
+	}
+}
+
+// waitForTorBootstrap has deliberately no fixed bootstrap deadline. Tor/Snowflake
+// can take many minutes on a congested volunteer network; killing a live Tor
+// process because it missed an arbitrary timer repeatedly resets its progress.
+func waitForTorBootstrap(ctx context.Context, processDone <-chan error, bootstrap <-chan struct{}) (bool, error) {
+	select {
+	case <-bootstrap:
+		return true, nil
+	case processErr := <-processDone:
+		return false, fmt.Errorf("Tor exited before bootstrap completed: %v", processErr)
+	case <-ctx.Done():
+		return false, ctx.Err()
 	}
 }
 
@@ -631,65 +646,41 @@ func startTorForAgent(cfg Config) (func(), error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	ready := make(chan struct{})
+	started := make(chan struct{})
 	startupErr := make(chan error, 1)
 	supervisorDone := make(chan struct{})
 	go func() {
 		defer close(supervisorDone)
-		firstStart := true
-		for {
+		firstLaunch := true
+		for ctx.Err() == nil {
 			cmd, processDone, bootstrap, launchErr := launchTorProcess(cfg)
 			if launchErr != nil {
-				if firstStart {
+				if firstLaunch {
 					startupErr <- launchErr
 					return
 				}
 				log.Printf("Tor supervisor: could not restart Tor: %v", launchErr)
 			} else {
-				bootstrapTimer := time.NewTimer(torBootstrapTimeout)
-				select {
-				case <-bootstrap:
-					if firstStart {
-						close(ready)
-						firstStart = false
-					}
-					bootstrapTimer.Stop()
+				if firstLaunch {
+					close(started)
+					firstLaunch = false
+				}
+				bootstrapped, waitErr := waitForTorBootstrap(ctx, processDone, bootstrap)
+				if ctx.Err() != nil {
+					stopTorProcess(cmd, processDone)
+					return
+				}
+				if bootstrapped {
 					log.Printf("Tor transport bootstrapped successfully; SOCKS5 proxy is %s", cfg.TorProxy)
 					select {
 					case processErr := <-processDone:
-						log.Printf("Tor process exited; retrying in %s: %v", torRestartDelay, processErr)
+						log.Printf("Tor process exited after bootstrap; retrying in %s: %v", torRestartDelay, processErr)
 					case <-ctx.Done():
 						stopTorProcess(cmd, processDone)
 						return
 					}
-				case processErr := <-processDone:
-					if !bootstrapTimer.Stop() {
-						select {
-						case <-bootstrapTimer.C:
-						default:
-						}
-					}
-					if firstStart {
-						startupErr <- fmt.Errorf("Tor exited before bootstrap completed: %v", processErr)
-						return
-					}
-					log.Printf("Tor process exited before bootstrap; retrying in %s: %v", torRestartDelay, processErr)
-				case <-bootstrapTimer.C:
-					stopTorProcess(cmd, processDone)
-					if firstStart {
-						startupErr <- fmt.Errorf("Tor did not bootstrap within %s", torBootstrapTimeout)
-						return
-					}
-					log.Printf("Tor restart did not bootstrap within %s", torBootstrapTimeout)
-				case <-ctx.Done():
-					if !bootstrapTimer.Stop() {
-						select {
-						case <-bootstrapTimer.C:
-						default:
-						}
-					}
-					stopTorProcess(cmd, processDone)
-					return
+				} else if waitErr != nil {
+					log.Printf("Tor process ended before bootstrap; retrying in %s: %v", torRestartDelay, waitErr)
 				}
 			}
 			if ctx.Err() != nil {
@@ -710,13 +701,11 @@ func startTorForAgent(cfg Config) (func(), error) {
 		}
 	}()
 
+	// Return as soon as Tor has actually been launched, not when Snowflake has
+	// reached 100% bootstrap. This lets Agent startup complete while Tor makes
+	// progress in the background, even on very slow or congested volunteer paths.
 	select {
-	case <-ready:
-		if err := probeSOCKS5(cfg.TorProxy, 2*time.Second); err != nil {
-			cancel()
-			<-supervisorDone
-			return nil, fmt.Errorf("Tor reported bootstrap complete but its local SOCKS5 endpoint is unavailable: %w", err)
-		}
+	case <-started:
 		return func() {
 			cancel()
 			select {
@@ -729,9 +718,9 @@ func startTorForAgent(cfg Config) (func(), error) {
 		cancel()
 		<-supervisorDone
 		return nil, err
-	case <-time.After(torBootstrapTimeout + 10*time.Second):
+	case <-time.After(10 * time.Second):
 		cancel()
 		<-supervisorDone
-		return nil, errors.New("Tor startup did not complete before the bootstrap deadline")
+		return nil, errors.New("Tor process did not launch within 10 seconds")
 	}
 }

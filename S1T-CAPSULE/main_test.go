@@ -218,6 +218,17 @@ func TestAdaptivePsiphonUsesPublicMappingPortAndALPNMultiplex(t *testing.T) {
 	if h.sessionCount() == 0 {
 		t.Fatal("adaptive Agent did not authenticate through Psiphon on the public Mapping listener")
 	}
+	// The Hub publishes its session just before the Agent receives `OK` and
+	// stores the successful route preference. Wait for both sides of that
+	// handshake instead of racing the preference assertion against the client.
+	for time.Now().Before(deadline) {
+		underlay, underlayOK := agentPreferredUnderlay.Load(channel)
+		transport, transportOK := agentPreferredTransport.Load(channel)
+		if underlayOK && underlay == underlayPsiphon && transportOK && transport == transportTCP {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if got, ok := agentPreferredUnderlay.Load(channel); !ok || got != underlayPsiphon {
 		t.Fatalf("successful route preference = %v (present=%v); want Psiphon", got, ok)
 	}
@@ -1931,10 +1942,32 @@ func TestTorUserEgressEnabledOnlyForAgentTorProfiles(t *testing.T) {
 	}
 }
 
-func TestNormalizeConfigUpgradesAgentToTwelveLanes(t *testing.T) {
-	got := normalizeConfig(Config{Role: "agent", TunnelChannels: 4})
-	if got.TunnelChannels != 12 {
-		t.Fatalf("TunnelChannels = %d; want 12", got.TunnelChannels)
+func TestNormalizeConfigUsesFourDefaultAgentLanes(t *testing.T) {
+	got := normalizeConfig(Config{Role: "agent"})
+	if got.TunnelChannels != 4 {
+		t.Fatalf("TunnelChannels = %d; want 4", got.TunnelChannels)
+	}
+}
+
+func TestFastSplitTorConfigPreservesTorUserEgress(t *testing.T) {
+	sidecar := &XrayTorIntegration{Service: "shah-tunnel-xray-tor-test.service", Proxy: "127.0.0.1:19082"}
+	original := Config{
+		Role: "agent", Underlay: underlayTor, Transport: transportTCP,
+		TunnelChannels: torFullUnderlayChannels, XrayTor: sidecar,
+		TorProxy: "127.0.0.1:19082", TorMode: torModeSnowflake,
+	}
+	got := fastSplitTorConfig(original)
+	if got.Underlay != underlayDirect || !got.TorUserEgressOnly {
+		t.Fatalf("split config route = %q, TorUserEgressOnly=%t", got.Underlay, got.TorUserEgressOnly)
+	}
+	if got.Transport != transportTCP || got.TunnelChannels != defaultTunnelChannels {
+		t.Fatalf("split profile transport/lanes = %q/%d; want %q/%d", got.Transport, got.TunnelChannels, transportTCP, defaultTunnelChannels)
+	}
+	if got.XrayTor != sidecar || !torUserEgressEnabled(got) {
+		t.Fatal("split migration must preserve the isolated Tor sidecar and Tor user egress")
+	}
+	if original.Underlay != underlayTor || original.TorUserEgressOnly {
+		t.Fatal("fast split conversion modified the original config")
 	}
 }
 
@@ -2309,7 +2342,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.2.1             |",
+		"        |            SHAH TUNNEL 5.2.2             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -3178,5 +3211,14 @@ func TestAtomicWriteFileDoesNotFollowPredictableTemporarySymlink(t *testing.T) {
 	}
 	if string(got) != "untouched" {
 		t.Fatalf("symlink target was changed: %q", got)
+	}
+}
+
+func TestAgentLaneMaxBackoffIsShorterForTor(t *testing.T) {
+	if got := agentLaneMaxBackoff(Config{Underlay: underlayTor}); got != 5*time.Second {
+		t.Fatalf("Tor lane max backoff = %s, want 5s", got)
+	}
+	if got := agentLaneMaxBackoff(Config{Underlay: underlayDirect}); got != 30*time.Second {
+		t.Fatalf("direct lane max backoff = %s, want 30s", got)
 	}
 }
