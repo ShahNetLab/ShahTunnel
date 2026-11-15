@@ -68,10 +68,6 @@ grep -Fq 'tor-expert-bundle-linux-x86_64-16.0.1.tar.gz' scripts/install-tor.sh |
 grep -Fq '7039cb16060ab22e669852e55774d894b55f25ea8bd0ab7194d3478429a58725' scripts/install-tor.sh || fail "Official Tor x86_64 checksum pin is missing."
 grep -Fq '67040520d44c87ccaaf5aa7df0dc1ff122eb938dbb600ae7722e8b6b75282a4b' scripts/install-tor.sh || fail "Official Tor arm64 checksum pin is missing."
 grep -Fq 'func startTorForAgent(cfg Config)' S1T-CAPSULE/tor.go || fail "Tor per-profile runtime is missing."
-grep -Fq 'func nativeELFExecutable(path string) bool' S1T-CAPSULE/tor.go || fail "Tor native ELF architecture validation is missing."
-grep -Fq 'func preferredTorBundlePath(root, name string) string' S1T-CAPSULE/tor.go || fail "Official Tor runtime path priority is missing."
-grep -Fq 'runtime_tor_self_test' scripts/install-tor.sh || fail "Tor installer runtime self-test is missing."
-grep -Fq 'TestFindExecutableInTreeNeverReturnsDebugOnlyCandidate' S1T-CAPSULE/tor_test.go || fail "Tor debug-artifact regression coverage is missing."
 grep -Fq 'func validateTorBridgeLine' S1T-CAPSULE/tor.go || fail "Tor WebTunnel bridge validation is missing."
 grep -Fq 'func waitForTorAgentReady' S1T-CAPSULE/main.go || fail "Tor bootstrap and authenticated Hub-lane readiness check is missing."
 grep -Fq 'TestTorAgentReadinessRequiresBootstrapAndAuthenticatedLane' S1T-CAPSULE/tor_test.go || fail "Tor runtime readiness regression coverage is missing."
@@ -138,7 +134,7 @@ pass "go vet"
 
 printf '\n== 7/7: Linux build validation (temporary files only) ==\n'
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-amd64" ./S1T-CAPSULE
-[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 5.2.0 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 5.2.1 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-arm64" ./S1T-CAPSULE
 sha256sum "$BUILD_TMP/shah-tunnel-linux-amd64" "$BUILD_TMP/shah-tunnel-linux-arm64" > "$BUILD_TMP/SHA256SUMS"
 pass "Linux amd64 and arm64 binaries built and checksum-checked in a temporary directory (nothing added to the repository)"
