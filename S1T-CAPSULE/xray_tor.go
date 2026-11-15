@@ -234,8 +234,8 @@ func applyXrayTorEgress() error {
 	if err != nil {
 		return err
 	}
-	if !torUserEgressEnabled(cfg) {
-		return errors.New("per-tunnel Tor user egress requires Tor user egress to be enabled on an Agent profile")
+	if cfg.Role != "agent" || cfg.Underlay != underlayTor {
+		return errors.New("per-tunnel Tor user egress requires a Tor Agent profile")
 	}
 	if cfg.XrayTor != nil {
 		return errors.New("this tunnel already has a dedicated Xray Tor route")
@@ -335,42 +335,6 @@ func applyXrayTorEgress() error {
 	return nil
 }
 
-// ensureXrayTorSidecar re-enables the profile-owned sidecar after an Agent
-// stop/start cycle. PartOf propagates stop/restart, but a manual Agent start
-// must explicitly bring the enabled user-traffic sidecar back as well.
-func ensureXrayTorSidecar(cfg Config) error {
-	if cfg.XrayTor == nil {
-		return nil
-	}
-	unitPath, err := xrayTorUnitPath(cfg.XrayTor.Service)
-	if err != nil {
-		return err
-	}
-	configDir, err := xrayTorConfigDirectory(cfg.XrayTor.ConfigPath)
-	if err != nil {
-		return err
-	}
-	for _, path := range []string{unitPath, cfg.XrayTor.ConfigPath} {
-		st, statErr := os.Lstat(path)
-		if statErr != nil {
-			return fmt.Errorf("Tor Xray sidecar file %s is unavailable: %w", path, statErr)
-		}
-		if !st.Mode().IsRegular() {
-			return fmt.Errorf("Tor Xray sidecar file %s is not a regular file", path)
-		}
-	}
-	if st, statErr := os.Lstat(configDir); statErr != nil || !st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
-		if statErr != nil {
-			return fmt.Errorf("inspect Tor Xray sidecar directory: %w", statErr)
-		}
-		return errors.New("Tor Xray sidecar directory is not a real directory")
-	}
-	if out, startErr := exec.Command("systemctl", "enable", "--now", cfg.XrayTor.Service).CombinedOutput(); startErr != nil {
-		return fmt.Errorf("enable/start Tor Xray sidecar %s: %w: %s", cfg.XrayTor.Service, startErr, strings.TrimSpace(string(out)))
-	}
-	return waitForXrayTorInbounds(cfg.XrayTor.Service, cfg.XrayTor.Bindings)
-}
-
 func removeXrayTorIntegration(cfg *Config) error {
 	if cfg == nil || cfg.XrayTor == nil {
 		return nil
@@ -424,7 +388,7 @@ func autoApplyXrayTorForNewAgent() error {
 	if err != nil {
 		return err
 	}
-	if !torUserEgressEnabled(cfg) || cfg.XrayTor != nil {
+	if cfg.Role != "agent" || cfg.Underlay != underlayTor || cfg.XrayTor != nil {
 		return nil
 	}
 	uiInfo("Preparing isolated Xray user TCP/DNS egress through the Agent's private Tor SOCKS5 proxy...")

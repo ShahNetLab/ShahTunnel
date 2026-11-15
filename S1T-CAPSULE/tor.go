@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
-	"debug/elf"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -16,8 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -27,13 +24,13 @@ import (
 const (
 	torModeSnowflake     = "snowflake"
 	torModeWebTunnel     = "webtunnel"
-	torBundleVersion     = "16.0.1"
 	torInstallerPath     = "/usr/local/lib/shah-tunnel/install-tor.sh"
 	torBundleRoot        = "/usr/local/lib/shah-tunnel/tor-bundle"
 	torConfigDir         = "/etc/ravanreverse/tor"
 	torDataRoot          = "/var/lib/shah-tunnel/tor"
 	torSocksFirstPort    = 19000
 	torSocksPortCount    = 1000
+	torBootstrapTimeout  = 180 * time.Second
 	torRestartDelay      = 4 * time.Second
 	torProcessStopWindow = 5 * time.Second
 )
@@ -77,12 +74,6 @@ func validateTorBridgeLine(line string) error {
 		return errors.New("WebTunnel bridge line must include url=https://... and ver=0.0.1")
 	}
 	return nil
-}
-
-// torUserEgressEnabled is true for both the full Tor underlay (Hub lanes and
-// users) and the preferred split mode (only Xray user TCP/DNS through Tor).
-func torUserEgressEnabled(cfg Config) bool {
-	return cfg.Role == "agent" && (cfg.Underlay == underlayTor || cfg.TorUserEgressOnly)
 }
 
 func torBridgeLine(cfg Config) (string, error) {
@@ -204,90 +195,22 @@ func executableFile(path string) bool {
 	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0
 }
 
-// nativeELFExecutable rejects debug-symbol artifacts and binaries built for a
-// different CPU. A mere executable bit is not enough: execve would otherwise
-// fail later with the unhelpful "exec format error" seen on older profiles.
-func nativeELFExecutable(path string) bool {
-	if !executableFile(path) {
-		return false
-	}
-	f, err := elf.Open(path)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-	if f.Class != elf.ELFCLASS64 || f.Data != elf.ELFDATA2LSB {
-		return false
-	}
-	switch runtime.GOARCH {
-	case "amd64":
-		return f.Machine == elf.EM_X86_64
-	case "arm64":
-		return f.Machine == elf.EM_AARCH64
-	default:
-		return false
-	}
-}
-
-func pathHasDebugComponent(root, path string) bool {
-	rel, err := filepath.Rel(root, path)
-	if err != nil {
-		return true
-	}
-	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
-		part = strings.ToLower(part)
-		if part == "debug" || part == "debug-symbols" || part == "symbols" || strings.Contains(part, "debug-symbol") {
-			return true
-		}
-	}
-	return false
-}
-
-func preferredTorBundlePath(root, name string) string {
-	switch name {
-	case "tor":
-		return filepath.Join(root, "tor", "tor")
-	case "lyrebird":
-		return filepath.Join(root, "tor", "pluggable_transports", "lyrebird")
-	default:
-		return ""
-	}
-}
-
 func findExecutableInTree(root, name string) string {
-	// The official Expert Bundle layout is explicit. Prefer it before walking
-	// the archive, since debug/tor can appear earlier in lexical directory order.
-	preferred := preferredTorBundlePath(root, name)
-	if preferred != "" && !pathHasDebugComponent(root, preferred) && nativeELFExecutable(preferred) {
-		return preferred
-	}
-
-	var candidates []string
+	var found string
 	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
+		if err != nil || found != "" {
 			return nil
 		}
-		if entry.IsDir() || entry.Name() != name || pathHasDebugComponent(root, path) {
+		if entry.IsDir() || entry.Name() != name {
 			return nil
 		}
-		if nativeELFExecutable(path) {
-			candidates = append(candidates, path)
+		if executableFile(path) {
+			found = path
+			return filepath.SkipAll
 		}
 		return nil
 	})
-	if len(candidates) == 0 {
-		return ""
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		relI, _ := filepath.Rel(root, candidates[i])
-		relJ, _ := filepath.Rel(root, candidates[j])
-		depthI, depthJ := strings.Count(relI, string(os.PathSeparator)), strings.Count(relJ, string(os.PathSeparator))
-		if depthI != depthJ {
-			return depthI < depthJ
-		}
-		return relI < relJ
-	})
-	return candidates[0]
+	return found
 }
 
 func locateTorBinaries() (string, string) {
@@ -299,107 +222,39 @@ func locateTorBinaries() (string, string) {
 	if ptBinary == "" {
 		ptBinary, _ = exec.LookPath("lyrebird")
 	}
-	if !nativeELFExecutable(torBinary) || !nativeELFExecutable(ptBinary) {
+	if !executableFile(torBinary) || !executableFile(ptBinary) {
 		return "", ""
 	}
 	return torBinary, ptBinary
 }
 
-func validateTorBinary(path string) error {
-	if !nativeELFExecutable(path) {
-		return fmt.Errorf("Tor executable is not a native Linux/%s ELF binary: %s", runtime.GOARCH, path)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, path, "--version")
-	cmd.Env = torRuntimeEnvironment(Config{TorBinary: path})
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		return errors.New("Tor --version self-test timed out")
-	}
-	if err != nil {
-		return fmt.Errorf("Tor --version self-test failed: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	if !strings.Contains(strings.ToLower(string(output)), "tor version") {
-		return fmt.Errorf("unexpected output from Tor executable %s: %s", path, strings.TrimSpace(string(output)))
-	}
-	return nil
-}
-
-func torBundleVersionInstalled() string {
-	data, err := os.ReadFile(filepath.Join(filepath.Dir(torBundleRoot), "tor-bundle.info"))
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "version=") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "version="))
-		}
-	}
-	return ""
-}
-
-func isTorBundlePath(path string) bool {
-	clean := filepath.Clean(path)
-	root := filepath.Clean(torBundleRoot) + string(os.PathSeparator)
-	return strings.HasPrefix(clean+string(os.PathSeparator), root)
-}
-
 func ensureTorBinaries() (string, string, error) {
-	torBinary, ptBinary := locateTorBinaries()
-	if torBinary != "" && ptBinary != "" {
-		// System Tor installations are left alone. A ShahTunnel-managed bundle,
-		// however, is reused only when its pinned metadata matches the current
-		// supported release. Always execute --version before trusting a path.
-		if err := validateTorBinary(torBinary); err == nil && nativeELFExecutable(ptBinary) {
-			if !isTorBundlePath(torBinary) || torBundleVersionInstalled() == torBundleVersion {
-				return torBinary, ptBinary, nil
-			}
-		}
-	}
-	oldTorBinary, oldPTBinary := torBinary, ptBinary
-	fallbackToExisting := func(reason error) (string, string, error) {
-		if validateTorBinary(oldTorBinary) == nil && nativeELFExecutable(oldPTBinary) {
-			log.Printf("WARNING: could not upgrade the existing Tor bundle to %s; continuing with the previously installed Tor/Lyrebird binaries so this Agent can still start: %v", torBundleVersion, reason)
-			return oldTorBinary, oldPTBinary, nil
-		}
-		return "", "", reason
+	if torBinary, ptBinary := locateTorBinaries(); torBinary != "" && ptBinary != "" {
+		return torBinary, ptBinary, nil
 	}
 	if _, err := os.Stat(torInstallerPath); err != nil {
-		return fallbackToExisting(errors.New("Tor installer is missing; rerun the updated ShahTunnel installer"))
+		return "", "", errors.New("Tor installer is missing; rerun the updated ShahTunnel installer")
 	}
-	// Keep an upgrade attempt bounded. The installer stages and verifies a new
-	// archive before swapping directories, so timeout/failure leaves the old
-	// bundle in place and usable.
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", torInstallerPath)
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
-		return fallbackToExisting(errors.New("Tor Expert Bundle upgrade timed out after 90 seconds"))
+		return "", "", errors.New("Tor Expert Bundle installation timed out after five minutes")
 	}
 	if err != nil {
-		return fallbackToExisting(fmt.Errorf("Tor transport installation failed: %w: %s", err, strings.TrimSpace(string(output))))
+		return "", "", fmt.Errorf("Tor transport installation failed: %w: %s", err, strings.TrimSpace(string(output)))
 	}
-	torBinary, ptBinary = locateTorBinaries()
+	torBinary, ptBinary := locateTorBinaries()
 	if torBinary == "" || ptBinary == "" {
-		return fallbackToExisting(errors.New("Tor installer completed but native-architecture tor/lyrebird executables could not be found outside debug directories"))
-	}
-	if err := validateTorBinary(torBinary); err != nil {
-		return fallbackToExisting(fmt.Errorf("Tor installer completed but the selected runtime Tor binary failed its native execution check: %w", err))
-	}
-	if !nativeELFExecutable(ptBinary) {
-		return fallbackToExisting(fmt.Errorf("Tor installer completed but Lyrebird is not a native Linux/%s ELF binary: %s", runtime.GOARCH, ptBinary))
-	}
-	if isTorBundlePath(torBinary) && torBundleVersionInstalled() != torBundleVersion {
-		return fallbackToExisting(fmt.Errorf("Tor installer completed but bundle metadata is not %s", torBundleVersion))
+		return "", "", errors.New("Tor installer completed but tor/lyrebird executables could not be found")
 	}
 	return torBinary, ptBinary, nil
 }
 
 func prepareTorAgentProfile(cfg *Config) error {
-	if cfg == nil || !torUserEgressEnabled(*cfg) {
-		return errors.New("Tor can only be prepared for an Agent profile with Tor user egress enabled")
+	if cfg == nil || cfg.Role != "agent" || cfg.Underlay != underlayTor {
+		return errors.New("Tor can only be prepared for an Agent profile selecting Tor egress")
 	}
 	if _, err := torBridgeLine(*cfg); err != nil {
 		return err
@@ -451,24 +306,6 @@ func scanTorLog(reader io.Reader, bootstrap chan<- struct{}) {
 	if err := scanner.Err(); err != nil {
 		log.Printf("Tor log stream ended: %v", err)
 	}
-}
-
-// torAgentReadinessFromJournal distinguishes a running systemd process from a
-// usable Tor tunnel. Provisioning the binaries and reserving a SOCKS port do not
-// prove that Tor has bootstrapped or that an authenticated Hub lane is alive.
-func torAgentReadinessFromJournal(logText string) (bootstrapped, laneConnected bool) {
-	for _, line := range strings.Split(logText, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "Tor transport bootstrapped successfully") {
-			bootstrapped = true
-		}
-		if strings.Contains(line, "tunnel lane ") &&
-			strings.Contains(line, " connected via ") &&
-			strings.Contains(line, " over tor_socks5") {
-			laneConnected = true
-		}
-	}
-	return bootstrapped, laneConnected
 }
 
 func torRuntimeEnvironment(cfg Config) []string {
@@ -551,71 +388,12 @@ func stopTorProcess(cmd *exec.Cmd, done <-chan error) {
 	}
 }
 
-// superviseTorUserEgress owns the per-profile Tor process independently from
-// the Agent process. A slow Snowflake/WebTunnel bootstrap must not cause Tor to
-// be killed and relaunched on a fixed deadline: some volunteer paths need much
-// longer than a few minutes. The Agent keeps running while Tor itself retries;
-// the Xray sidecar has no Direct fallback and remains fail-closed until SOCKS is
-// actually usable.
-func superviseTorUserEgress(ctx context.Context, cfg Config) {
-	const retryDelay = 15 * time.Second
-	for ctx.Err() == nil {
-		cleanup, err := startTorForAgent(cfg)
-		if err != nil {
-			log.Printf("Tor process could not be started; Agent-to-Hub remains independent and Xray stays fail-closed: %v", err)
-			timer := time.NewTimer(retryDelay)
-			select {
-			case <-timer.C:
-			case <-ctx.Done():
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				return
-			}
-			continue
-		}
-		log.Printf("Tor process supervisor is running for %s; SOCKS5 user egress stays fail-closed until Tor reports 100%% bootstrap", cfg.TorProxy)
-		<-ctx.Done()
-		cleanup()
-		return
-	}
-}
-
-// waitForTorBootstrap has deliberately no fixed bootstrap deadline. Tor/Snowflake
-// can take many minutes on a congested volunteer network; killing a live Tor
-// process because it missed an arbitrary timer repeatedly resets its progress.
-func waitForTorBootstrap(ctx context.Context, processDone <-chan error, bootstrap <-chan struct{}) (bool, error) {
-	select {
-	case <-bootstrap:
-		return true, nil
-	case processErr := <-processDone:
-		return false, fmt.Errorf("Tor exited before bootstrap completed: %v", processErr)
-	case <-ctx.Done():
-		return false, ctx.Err()
-	}
-}
-
 func startTorForAgent(cfg Config) (func(), error) {
-	if !torUserEgressEnabled(cfg) {
+	if cfg.Underlay != underlayTor {
 		return func() {}, nil
 	}
-	// Refresh ShahTunnel-managed Tor bundles on service start as well as during
-	// profile creation. This upgrades existing profiles without deleting their
-	// saved configuration or Tor data directory.
-	torBinary, ptBinary, err := ensureTorBinaries()
-	if err != nil {
-		return nil, fmt.Errorf("prepare the Tor Expert Bundle for this Agent: %w", err)
-	}
-	cfg.TorBinary = torBinary
-	cfg.TorPTBinary = ptBinary
-	if err := validateTorBinary(cfg.TorBinary); err != nil {
-		return nil, fmt.Errorf("selected Tor executable failed validation: %w", err)
-	}
-	if !nativeELFExecutable(cfg.TorPTBinary) {
-		return nil, fmt.Errorf("selected Lyrebird executable is not a native Linux/%s ELF binary: %s", runtime.GOARCH, cfg.TorPTBinary)
+	if !executableFile(cfg.TorBinary) || !executableFile(cfg.TorPTBinary) {
+		return nil, errors.New("Tor/lyrebird binaries are missing; recreate the Tor Agent profile with the updated installer")
 	}
 	if !isLoopbackProxyAddress(cfg.TorProxy) {
 		return nil, errors.New("Tor SOCKS5 proxy must be loopback-only")
@@ -646,41 +424,65 @@ func startTorForAgent(cfg Config) (func(), error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	started := make(chan struct{})
+	ready := make(chan struct{})
 	startupErr := make(chan error, 1)
 	supervisorDone := make(chan struct{})
 	go func() {
 		defer close(supervisorDone)
-		firstLaunch := true
-		for ctx.Err() == nil {
+		firstStart := true
+		for {
 			cmd, processDone, bootstrap, launchErr := launchTorProcess(cfg)
 			if launchErr != nil {
-				if firstLaunch {
+				if firstStart {
 					startupErr <- launchErr
 					return
 				}
 				log.Printf("Tor supervisor: could not restart Tor: %v", launchErr)
 			} else {
-				if firstLaunch {
-					close(started)
-					firstLaunch = false
-				}
-				bootstrapped, waitErr := waitForTorBootstrap(ctx, processDone, bootstrap)
-				if ctx.Err() != nil {
-					stopTorProcess(cmd, processDone)
-					return
-				}
-				if bootstrapped {
+				bootstrapTimer := time.NewTimer(torBootstrapTimeout)
+				select {
+				case <-bootstrap:
+					if firstStart {
+						close(ready)
+						firstStart = false
+					}
+					bootstrapTimer.Stop()
 					log.Printf("Tor transport bootstrapped successfully; SOCKS5 proxy is %s", cfg.TorProxy)
 					select {
 					case processErr := <-processDone:
-						log.Printf("Tor process exited after bootstrap; retrying in %s: %v", torRestartDelay, processErr)
+						log.Printf("Tor process exited; retrying in %s: %v", torRestartDelay, processErr)
 					case <-ctx.Done():
 						stopTorProcess(cmd, processDone)
 						return
 					}
-				} else if waitErr != nil {
-					log.Printf("Tor process ended before bootstrap; retrying in %s: %v", torRestartDelay, waitErr)
+				case processErr := <-processDone:
+					if !bootstrapTimer.Stop() {
+						select {
+						case <-bootstrapTimer.C:
+						default:
+						}
+					}
+					if firstStart {
+						startupErr <- fmt.Errorf("Tor exited before bootstrap completed: %v", processErr)
+						return
+					}
+					log.Printf("Tor process exited before bootstrap; retrying in %s: %v", torRestartDelay, processErr)
+				case <-bootstrapTimer.C:
+					stopTorProcess(cmd, processDone)
+					if firstStart {
+						startupErr <- fmt.Errorf("Tor did not bootstrap within %s", torBootstrapTimeout)
+						return
+					}
+					log.Printf("Tor restart did not bootstrap within %s", torBootstrapTimeout)
+				case <-ctx.Done():
+					if !bootstrapTimer.Stop() {
+						select {
+						case <-bootstrapTimer.C:
+						default:
+						}
+					}
+					stopTorProcess(cmd, processDone)
+					return
 				}
 			}
 			if ctx.Err() != nil {
@@ -701,11 +503,13 @@ func startTorForAgent(cfg Config) (func(), error) {
 		}
 	}()
 
-	// Return as soon as Tor has actually been launched, not when Snowflake has
-	// reached 100% bootstrap. This lets Agent startup complete while Tor makes
-	// progress in the background, even on very slow or congested volunteer paths.
 	select {
-	case <-started:
+	case <-ready:
+		if err := probeSOCKS5(cfg.TorProxy, 2*time.Second); err != nil {
+			cancel()
+			<-supervisorDone
+			return nil, fmt.Errorf("Tor reported bootstrap complete but its local SOCKS5 endpoint is unavailable: %w", err)
+		}
 		return func() {
 			cancel()
 			select {
@@ -718,9 +522,9 @@ func startTorForAgent(cfg Config) (func(), error) {
 		cancel()
 		<-supervisorDone
 		return nil, err
-	case <-time.After(10 * time.Second):
+	case <-time.After(torBootstrapTimeout + 10*time.Second):
 		cancel()
 		<-supervisorDone
-		return nil, errors.New("Tor process did not launch within 10 seconds")
+		return nil, errors.New("Tor startup did not complete before the bootstrap deadline")
 	}
 }
