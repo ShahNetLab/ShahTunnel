@@ -725,6 +725,25 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 NETLINK
   install -o root -g root -m 0644 "$TMP/netlink-${unit}.conf" "$dropin_dir/10-psiphon-netlink.conf"
 done
+
+# Migrate installed per-profile Psiphon dependencies from Requires to Wants.
+# Requires makes systemd send SIGTERM to the Agent whenever ConsoleClient is
+# restarted; this is unsafe for adaptive lanes and leaves the Agent stopped.
+# Wants + After still starts Psiphon with the Agent, but Psiphon may recover
+# independently without taking down the authenticated Agent service.
+for dependency_dropin in \
+  /etc/systemd/system/ravanreverse@*.service.d/shah-tunnel-psiphon.conf \
+  /etc/systemd/system/ravanreverse.service.d/shah-tunnel-psiphon.conf; do
+  [[ -f "$dependency_dropin" ]] || continue
+  if grep -q '^Requires=shah-tunnel-psiphon-' "$dependency_dropin"; then
+    migrated_dropin="$TMP/psiphon-dependency-migrated.conf"
+    sed 's/^Requires=shah-tunnel-psiphon-/Wants=shah-tunnel-psiphon-/' \
+      "$dependency_dropin" > "$migrated_dropin"
+    install -o root -g root -m 0644 "$migrated_dropin" "$dependency_dropin"
+    echo "Migrated Psiphon dependency to non-fatal Wants/After: $dependency_dropin"
+  fi
+done
+
 if ! timeout --kill-after=3s 15s systemctl daemon-reload; then
   echo "systemd daemon-reload timed out. The binary is installed, but service metadata may need: systemctl daemon-reload" >&2
   exit 1
