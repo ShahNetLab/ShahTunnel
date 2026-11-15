@@ -80,6 +80,12 @@ func validateTorBridgeLine(line string) error {
 	return nil
 }
 
+// torUserEgressEnabled is true for both the full Tor underlay (Hub lanes and
+// users) and the preferred split mode (only Xray user TCP/DNS through Tor).
+func torUserEgressEnabled(cfg Config) bool {
+	return cfg.Role == "agent" && (cfg.Underlay == underlayTor || cfg.TorUserEgressOnly)
+}
+
 func torBridgeLine(cfg Config) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.TorMode)) {
 	case torModeSnowflake:
@@ -393,8 +399,8 @@ func ensureTorBinaries() (string, string, error) {
 }
 
 func prepareTorAgentProfile(cfg *Config) error {
-	if cfg == nil || cfg.Role != "agent" || cfg.Underlay != underlayTor {
-		return errors.New("Tor can only be prepared for an Agent profile selecting Tor egress")
+	if cfg == nil || !torUserEgressEnabled(*cfg) {
+		return errors.New("Tor can only be prepared for an Agent profile with Tor user egress enabled")
 	}
 	if _, err := torBridgeLine(*cfg); err != nil {
 		return err
@@ -546,8 +552,39 @@ func stopTorProcess(cmd *exec.Cmd, done <-chan error) {
 	}
 }
 
+// superviseTorUserEgress keeps the Tor user exit independent from the fast
+// Agent-to-Hub route. It retries failed first bootstraps without taking down
+// the authenticated direct lane. The Xray sidecar has no Direct fallback, so
+// user traffic remains fail-closed until the Tor SOCKS endpoint is usable.
+func superviseTorUserEgress(ctx context.Context, cfg Config) {
+	const retryDelay = 15 * time.Second
+	for ctx.Err() == nil {
+		cleanup, err := startTorForAgent(cfg)
+		if err != nil {
+			log.Printf("Tor user egress is not ready; Agent-to-Hub remains independent and Xray stays fail-closed: %v", err)
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+			}
+			continue
+		}
+		log.Printf("Tor user egress is ready on %s; direct Agent-to-Hub lanes remain independent", cfg.TorProxy)
+		<-ctx.Done()
+		cleanup()
+		return
+	}
+}
+
 func startTorForAgent(cfg Config) (func(), error) {
-	if cfg.Underlay != underlayTor {
+	if !torUserEgressEnabled(cfg) {
 		return func() {}, nil
 	}
 	// Refresh ShahTunnel-managed Tor bundles on service start as well as during

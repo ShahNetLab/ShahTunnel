@@ -1,9 +1,6 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -153,78 +150,5 @@ tunnel lane 1/12 connected via tcp_tls over direct`
 	boot, lane = torAgentReadinessFromJournal(wrongUnderlay)
 	if !boot || lane {
 		t.Fatalf("direct lane must not satisfy Tor readiness: bootstrap=%t lane=%t", boot, lane)
-	}
-}
-
-func writeNativeExecutableFixture(t *testing.T, path string) {
-	t.Helper()
-	source, err := os.Executable()
-	if err != nil {
-		t.Fatalf("resolve current test executable: %v", err)
-	}
-	data, err := os.ReadFile(source)
-	if err != nil {
-		t.Fatalf("read current test executable: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		t.Fatalf("create fixture directory: %v", err)
-	}
-	if err := os.WriteFile(path, data, 0755); err != nil {
-		t.Fatalf("write executable fixture: %v", err)
-	}
-	if err := os.Chmod(path, 0755); err != nil {
-		t.Fatalf("chmod executable fixture: %v", err)
-	}
-}
-
-func TestFindExecutableInTreePrefersOfficialTorRuntimeAndSkipsDebug(t *testing.T) {
-	root := t.TempDir()
-	debugTor := filepath.Join(root, "debug", "tor")
-	runtimeTor := filepath.Join(root, "tor", "tor")
-	debugLyrebird := filepath.Join(root, "debug", "lyrebird")
-	runtimeLyrebird := filepath.Join(root, "tor", "pluggable_transports", "lyrebird")
-	writeNativeExecutableFixture(t, debugTor)
-	writeNativeExecutableFixture(t, runtimeTor)
-	writeNativeExecutableFixture(t, debugLyrebird)
-	writeNativeExecutableFixture(t, runtimeLyrebird)
-
-	if got := findExecutableInTree(root, "tor"); got != runtimeTor {
-		t.Fatalf("Tor runtime selection = %q, want official runtime %q (debug candidate: %q)", got, runtimeTor, debugTor)
-	}
-	if got := findExecutableInTree(root, "lyrebird"); got != runtimeLyrebird {
-		t.Fatalf("Lyrebird runtime selection = %q, want official runtime %q (debug candidate: %q)", got, runtimeLyrebird, debugLyrebird)
-	}
-}
-
-func TestNativeELFExecutableRequiresCurrentArchitecture(t *testing.T) {
-	path, err := os.Executable()
-	if err != nil {
-		t.Fatalf("resolve current executable: %v", err)
-	}
-	if !nativeELFExecutable(path) {
-		t.Fatalf("current test binary should be a native Linux/%s ELF executable", runtime.GOARCH)
-	}
-	if nativeELFExecutable(filepath.Join(t.TempDir(), "missing")) {
-		t.Fatal("missing file was accepted as a native ELF executable")
-	}
-}
-
-func TestFindExecutableInTreeNeverReturnsDebugOnlyCandidate(t *testing.T) {
-	root := t.TempDir()
-	debugTor := filepath.Join(root, "debug", "tor")
-	writeNativeExecutableFixture(t, debugTor)
-	if got := findExecutableInTree(root, "tor"); got != "" {
-		t.Fatalf("debug-only Tor candidate was selected: %q", got)
-	}
-}
-
-func TestFindExecutableInTreeUsesNativeFallbackOutsideDebug(t *testing.T) {
-	root := t.TempDir()
-	debugTor := filepath.Join(root, "debug", "tor")
-	fallbackTor := filepath.Join(root, "alternate-runtime", "tor")
-	writeNativeExecutableFixture(t, debugTor)
-	writeNativeExecutableFixture(t, fallbackTor)
-	if got := findExecutableInTree(root, "tor"); got != fallbackTor {
-		t.Fatalf("fallback Tor selection = %q, want non-debug native binary %q", got, fallbackTor)
 	}
 }

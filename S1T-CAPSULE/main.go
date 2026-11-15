@@ -39,11 +39,16 @@ import (
 )
 
 const (
-	version                          = "5.2.0"
-	legacyConfigPath                 = "/etc/ravanreverse/config.json"
-	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
-	maxFrame                         = 64 * 1024
-	defaultTunnelChannels            = 12
+	version               = "5.2.1"
+	legacyConfigPath      = "/etc/ravanreverse/config.json"
+	tunnelConfigDir       = "/etc/ravanreverse/tunnels"
+	maxFrame              = 64 * 1024
+	defaultTunnelChannels = 12
+	// A full Tor underlay has one shared Snowflake/WebTunnel transport. A small
+	// lane count avoids creating a thundering herd of parallel streams through
+	// the same volunteer bridge and Tor circuit.
+	torFullUnderlayChannels          = 2
+	maxTorFullUnderlayChannels       = 3
 	maxPendingPublicConnections      = 2048
 	controlBurstLimit                = 8
 	streamAdmissionWait              = 5 * time.Second
@@ -147,6 +152,10 @@ type Config struct {
 	XrayWARP       *XrayWarpIntegration    `json:"xray_warp,omitempty"`
 	XrayPsiphon    *XrayPsiphonIntegration `json:"xray_psiphon,omitempty"`
 	XrayTor        *XrayTorIntegration     `json:"xray_tor,omitempty"`
+	// TorUserEgressOnly separates the slow Tor user exit from the Agent-to-Hub
+	// control path. When true, Hub lanes use the selected normal Underlay while
+	// only cloned Xray user TCP/DNS traffic uses the private Tor SOCKS5 proxy.
+	TorUserEgressOnly bool `json:"tor_user_egress_only,omitempty"`
 }
 
 type RuntimeSnapshot struct {
@@ -2827,17 +2836,35 @@ func runAgent(cfg Config) error {
 	cfg = normalizeConfig(cfg)
 	var cleanupUnderlay func()
 	cleanupUnderlay = func() {}
+	var torSupervisorCancel context.CancelFunc
+	if torUserEgressEnabled(cfg) {
+		if cfg.TorUserEgressOnly && cfg.Underlay != underlayTor {
+			// In split mode, establish the authenticated Agent-to-Hub path without
+			// waiting for a volunteer Snowflake/WebTunnel circuit. Tor user egress
+			// retries in the background; Xray remains fail-closed on its SOCKS5
+			// outbound until Tor is ready.
+			torCtx, cancel := context.WithCancel(context.Background())
+			torSupervisorCancel = cancel
+			go superviseTorUserEgress(torCtx, cfg)
+		} else {
+			cleanup, err := startTorForAgent(cfg)
+			if err != nil {
+				return fmt.Errorf("start Tor user egress (%s): %w", cfg.TorMode, err)
+			}
+			cleanupUnderlay = cleanup
+		}
+	}
+	defer func() {
+		cleanupUnderlay()
+		if torSupervisorCancel != nil {
+			torSupervisorCancel()
+		}
+	}()
 	switch cfg.Underlay {
 	case underlayPsiphon:
 		cleanup, err := startPsiphonForAgent(cfg)
 		if err != nil {
 			return err
-		}
-		cleanupUnderlay = cleanup
-	case underlayTor:
-		cleanup, err := startTorForAgent(cfg)
-		if err != nil {
-			return fmt.Errorf("start Tor %s egress: %w", cfg.TorMode, err)
 		}
 		cleanupUnderlay = cleanup
 	case underlayAdaptive:
@@ -2854,7 +2881,6 @@ func runAgent(cfg Config) error {
 			cleanupUnderlay = cleanup
 		}
 	}
-	defer cleanupUnderlay()
 	if cfg.Underlay == underlayAdaptive {
 		if warpMode := detectActiveWarpUnderlay(); warpMode != "" {
 			log.Printf("WARP is already connected with %s; adaptive egress will verify it before use (no route changes made)", warpMode)
@@ -3769,7 +3795,7 @@ func normalizeConfig(c Config) Config {
 		if (c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive) && strings.TrimSpace(c.PsiphonHubAddr) == "" && strings.TrimSpace(c.HubAddr) != "" {
 			c.PsiphonHubAddr = defaultPsiphonHubAddress(c.HubAddr)
 		}
-		if c.Underlay == underlayTor {
+		if torUserEgressEnabled(c) {
 			c.TorMode = strings.ToLower(strings.TrimSpace(c.TorMode))
 			if c.TorMode == "" {
 				c.TorMode = torModeSnowflake
@@ -3783,7 +3809,7 @@ func normalizeConfig(c Config) Config {
 			if c.TorConfigPath == "" && c.Name != "" {
 				c.TorConfigPath = filepath.Join(torConfigDir, tunnelID(c.Name)+".torrc")
 			}
-			if strings.TrimSpace(c.TorHubAddr) == "" && strings.TrimSpace(c.HubAddr) != "" {
+			if c.Underlay == underlayTor && strings.TrimSpace(c.TorHubAddr) == "" && strings.TrimSpace(c.HubAddr) != "" {
 				c.TorHubAddr = defaultPsiphonHubAddress(c.HubAddr)
 			}
 		}
@@ -3803,9 +3829,21 @@ func normalizeConfig(c Config) Config {
 			c.Transport = transportAuto
 		}
 	}
-	// Upgrade existing Agent profiles to the current independent-lane performance profile.
-	// Each lane reconnects independently; no Hub-side config change is required.
-	if c.Role == "agent" && c.TunnelChannels < defaultTunnelChannels {
+	// Tor's pluggable transport is one shared, high-latency path. More parallel
+	// Hub lanes do not make one TCP flow faster and can overload the same
+	// volunteer Snowflake/WebTunnel bridge. Keep full-Tor profiles deliberately
+	// small and use native TCP/TLS instead of four-way adaptive probing.
+	if c.Role == "agent" && c.Underlay == underlayTor {
+		if c.TunnelChannels < 1 {
+			c.TunnelChannels = torFullUnderlayChannels
+		}
+		if c.TunnelChannels > maxTorFullUnderlayChannels {
+			c.TunnelChannels = torFullUnderlayChannels
+		}
+		if c.Transport == transportAdaptive || c.Transport == transportAuto || c.Transport == "" {
+			c.Transport = transportTCP
+		}
+	} else if c.Role == "agent" && c.TunnelChannels < defaultTunnelChannels {
 		c.TunnelChannels = defaultTunnelChannels
 	}
 	if len(c.Ports) == 0 {
@@ -3867,6 +3905,9 @@ func validateConfig(c Config) error {
 		if c.Underlay == underlayAdaptive && c.Transport != transportAdaptive {
 			return errors.New("all-protocol adaptive egress requires transport=adaptive so all four inner transports can fail over")
 		}
+		if c.TorUserEgressOnly && c.Underlay != underlayDirect {
+			return errors.New("TorUserEgressOnly is supported only with the Direct Agent-to-Hub underlay")
+		}
 		usesPsiphon := c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive
 		if usesPsiphon {
 			if strings.TrimSpace(c.PsiphonConfig) == "" {
@@ -3879,7 +3920,7 @@ func validateConfig(c Config) error {
 				return errors.New("invalid Psiphon config path")
 			}
 		}
-		if c.Underlay == underlayTor {
+		if torUserEgressEnabled(c) {
 			if _, err := torBridgeLine(c); err != nil {
 				return err
 			}
@@ -4003,8 +4044,8 @@ func validateConfig(c Config) error {
 			}
 		}
 		if c.XrayTor != nil {
-			if c.Underlay != underlayTor {
-				return errors.New("isolated Xray Tor egress requires the Tor underlay")
+			if !torUserEgressEnabled(c) {
+				return errors.New("isolated Xray Tor egress requires Tor user egress to be enabled")
 			}
 			if !isLoopbackProxyAddress(c.XrayTor.Proxy) || c.XrayTor.Proxy != c.TorProxy {
 				return errors.New("isolated Xray Tor proxy must match the Agent's loopback-only Tor SOCKS5 endpoint")
@@ -4609,7 +4650,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.2.0             |",
+	"        |            SHAH TUNNEL 5.2.1             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -4777,7 +4818,7 @@ func wizardAsk(prompt, def string) string {
 	return readAnswer(def)
 }
 
-func wizardAskTransport(prompt string, role string) (string, string, string, error) {
+func wizardAskTransport(prompt string, role string) (string, string, string, bool, error) {
 	fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "OUTER TUNNEL TRANSPORT"))
 	fmt.Printf("  %s\n", paint(ansiGreen, "1) TCP/TLS — implemented"))
 	fmt.Printf("  %s\n", paint(ansiGreen, "2) WebSocket/TLS — implemented"))
@@ -4791,23 +4832,23 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 	choice := wizardAsk(prompt+" (1-9)", "7")
 	switch choice {
 	case "1":
-		return transportTCP, underlayDirect, "", nil
+		return transportTCP, underlayDirect, "", false, nil
 	case "2":
-		return transportWebSocket, underlayDirect, "", nil
+		return transportWebSocket, underlayDirect, "", false, nil
 	case "3":
-		return transportHTTP2, underlayDirect, "", nil
+		return transportHTTP2, underlayDirect, "", false, nil
 	case "4":
-		return transportHTTP1, underlayDirect, "", nil
+		return transportHTTP1, underlayDirect, "", false, nil
 	case "5":
-		return transportHTTPConnectAuto, underlayDirect, "", nil
+		return transportHTTPConnectAuto, underlayDirect, "", false, nil
 	case "6":
-		return transportAuto, underlayDirect, "", nil
+		return transportAuto, underlayDirect, "", false, nil
 	case "7":
-		return transportAdaptive, underlayDirect, "", nil
+		return transportAdaptive, underlayDirect, "", false, nil
 	case "8":
 		if role != "agent" {
 			uiInfo("Hub remains a listener. Choose the external egress on the Agent; the Hub accepts the adaptive inner transports.")
-			return transportAdaptive, underlayDirect, "", nil
+			return transportAdaptive, underlayDirect, "", false, nil
 		}
 		fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "EXTERNAL EGRESS PROVIDER"))
 		fmt.Println("  1) Cloudflare WARP over MASQUE (WarpProxy / Local Proxy required; already Connected)")
@@ -4817,32 +4858,41 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 		switch sub {
 		case "1":
 			if _, err := verifyWarpPerTunnelPrerequisites(); err != nil {
-				return "", "", "", fmt.Errorf("WARP user egress cannot be attached to this Agent profile: %w", err)
+				return "", "", "", false, fmt.Errorf("WARP user egress cannot be attached to this Agent profile: %w", err)
 			}
 			uiInfo("WARP and DNS will be attached automatically to this Agent profile before startup; other profiles and host routes remain unchanged.")
-			return transportAdaptive, underlayMASQUE, "", nil
+			return transportAdaptive, underlayMASQUE, "", false, nil
 		case "2":
 			// ConsoleClient, its pinned upstream source build, a per-profile JSON
 			// config, and a unique loopback SOCKS5 port are prepared automatically
 			// during Agent creation. No manual Psiphon files are requested.
-			return transportAdaptive, underlayPsiphon, "", nil
+			return transportAdaptive, underlayPsiphon, "", false, nil
 		case "3":
-			// Tor and Lyrebird are provisioned on demand. The Agent wizard asks
-			// for either Snowflake's built-in bridge or a user-supplied WebTunnel bridge.
-			return transportAdaptive, underlayTor, "", nil
+			fmt.Println("  1) FAST — Agent-to-Hub direct; only user TCP/DNS exits through Tor (recommended)")
+			fmt.Println("  2) FULL TOR — Agent-to-Hub and user traffic both pass through Tor (slower, hides Agent IP from Hub)")
+			route := wizardAsk("Select Tor routing profile (1-2)", "1")
+			if route == "1" {
+				uiWarn("Fast mode sends the Agent VPS public IP directly to the Hub. User TCP/DNS still exits through Tor.")
+				return transportTCP, underlayDirect, "", true, nil
+			}
+			if route == "2" {
+				uiWarn("Full Tor mode is more private from the Hub, but Tor carries both the Hub tunnel and user exit traffic and will be slower.")
+				return transportTCP, underlayTor, "", false, nil
+			}
+			return "", "", "", false, errors.New("invalid Tor routing profile; enter 1 or 2")
 		default:
-			return "", "", "", errors.New("invalid external egress selection; enter 1, 2, or 3")
+			return "", "", "", false, errors.New("invalid external egress selection; enter 1, 2, or 3")
 		}
 	case "9":
 		if role != "agent" {
 			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent for Psiphon user TCP/DNS egress and adaptive Agent-to-Hub lane failover.")
-			return transportAdaptive, underlayDirect, "", nil
+			return transportAdaptive, underlayDirect, "", false, nil
 		}
 		// Option 9 provisions Psiphon for mapped user TCP/DNS and also retains
 		// independent Direct/Psiphon/active-MASQUE failover for Agent-to-Hub lanes.
-		return transportAdaptive, underlayAdaptive, "", nil
+		return transportAdaptive, underlayAdaptive, "", false, nil
 	default:
-		return "", "", "", errors.New("invalid transport selection; enter a number from 1 to 9")
+		return "", "", "", false, errors.New("invalid transport selection; enter a number from 1 to 9")
 	}
 }
 
@@ -4967,7 +5017,9 @@ func setup() error {
 		c.Role = "hub"
 		c.ControlListen = wizardAsk("Agent control listener address", "0.0.0.0:9443")
 		var ignoredUnderlay, ignoredPsiphon string
-		c.Transport, ignoredUnderlay, ignoredPsiphon, err = wizardAskTransport("Hub accepted transport", "hub")
+		var ignoredTorUserOnly bool
+		c.Transport, ignoredUnderlay, ignoredPsiphon, ignoredTorUserOnly, err = wizardAskTransport("Hub accepted transport", "hub")
+		_ = ignoredTorUserOnly
 		_ = ignoredUnderlay
 		_ = ignoredPsiphon
 		if err != nil {
@@ -5031,11 +5083,11 @@ func setup() error {
 		c.Role = "agent"
 		c.TunnelChannels = defaultTunnelChannels
 		c.HubAddr = wizardAsk("Reachable Iran Hub address as IP:PORT or hostname:PORT (control port)", "")
-		c.Transport, c.Underlay, _, err = wizardAskTransport("Agent transport mode (must be allowed by Hub)", "agent")
+		c.Transport, c.Underlay, _, c.TorUserEgressOnly, err = wizardAskTransport("Agent transport mode (must be allowed by Hub)", "agent")
 		if err != nil {
 			return err
 		}
-		if c.Underlay == underlayTor {
+		if torUserEgressEnabled(c) {
 			c.TorMode = strings.ToLower(strings.TrimSpace(wizardAsk("Tor pluggable transport (snowflake/webtunnel)", torModeSnowflake)))
 			if c.TorMode == torModeWebTunnel {
 				c.TorBridge = wizardAsk("Paste one Tor WebTunnel bridge line from the Tor Bridges service", "")
@@ -5096,7 +5148,7 @@ func setup() error {
 			}
 			uiSuccess("Psiphon ConsoleClient installed; per-profile config and loopback SOCKS5 endpoint are ready: " + c.PsiphonProxy)
 		}
-		if c.Underlay == underlayTor {
+		if torUserEgressEnabled(c) {
 			uiInfo("Preparing the official Tor Expert Bundle and per-profile Snowflake/WebTunnel SOCKS5 configuration...")
 			if err = prepareTorAgentProfile(&c); err != nil {
 				return fmt.Errorf("automatic Tor setup failed; Agent profile was not saved: %w", err)
@@ -5115,7 +5167,9 @@ func setup() error {
 			uiInfo("A per-profile Psiphon service provides loopback SOCKS5. Agent-to-Hub lanes use adaptive Direct/Psiphon failover, while this Agent's isolated Xray user TCP/DNS egress uses Psiphon; UDP is blocked to prevent direct-IP leaks. No TUN device or host route changes are made.")
 		}
 		if c.Underlay == underlayTor {
-			uiInfo("Tor starts as a per-profile child process. Agent-to-Hub TCP lanes and this Agent's isolated Xray user TCP/DNS mappings use its loopback SOCKS5 proxy. UDP, QUIC, and ICMP are blocked on the user path; no TUN device, default route, SSH, X-UI source config, or host firewall is changed.")
+			uiInfo("Full Tor mode: Agent-to-Hub TCP lanes and isolated Xray user TCP/DNS mappings use the same per-profile Tor SOCKS5 proxy. This is privacy-first but slow; full Tor paths use only 2-3 lanes and TCP/TLS. UDP/QUIC/ICMP are blocked on the user path.")
+		} else if c.TorUserEgressOnly {
+			uiInfo("Fast Tor mode: Agent-to-Hub lanes use the selected direct/outer path; only this Agent's isolated Xray user TCP/DNS mappings use Tor. The Hub sees this Agent VPS IP. UDP/QUIC/ICMP remain blocked on the user path.")
 		}
 		uiSuccess("Agent configuration saved. Reconnection is automatic if a lane drops.")
 	case "3", "relay", "front":
@@ -5155,7 +5209,7 @@ func setup() error {
 			return err
 		}
 	}
-	if c.Role == "agent" && c.Underlay == underlayTor {
+	if c.Role == "agent" && torUserEgressEnabled(c) {
 		if err := autoApplyXrayTorForNewAgent(); err != nil {
 			if rollbackErr := rollbackFailedTorAgentSetup(configPath, c); rollbackErr != nil {
 				return fmt.Errorf("automatic Tor Xray egress setup failed: %w; profile rollback also failed: %v", err, rollbackErr)
@@ -5180,7 +5234,10 @@ func setup() error {
 	}
 	if c.Underlay == underlayPsiphon && !connected {
 		uiInfo("Agent service and local Psiphon SOCKS5 are running. Psiphon egress and/or the Agent-to-Hub lane may still be connecting; end-to-end connectivity is not yet confirmed.")
-	} else if c.Underlay == underlayTor && !connected {
+	} else if torUserEgressEnabled(c) && c.TorUserEgressOnly && c.Underlay != underlayTor {
+		uiSuccess("Direct Agent-to-Hub tunnel is connected; Tor user TCP/DNS egress is supervised in the background.")
+		uiInfo("Tor bootstrap may take longer on Snowflake/WebTunnel. Until it is ready, the isolated Xray path fails closed and does not fall back to the Agent public IP.")
+	} else if torUserEgressEnabled(c) && !connected {
 		uiWarn("The Agent service is running, but Tor bootstrap and an authenticated Hub lane were not both confirmed. This is not yet a verified working Tor tunnel; inspect the Tor and Agent logs.")
 	} else {
 		uiSuccess("Tunnel '" + name + "' is active. Existing tunnels were not changed.")
@@ -5273,9 +5330,55 @@ func ensureTunnelRunning(restartActive bool) (bool, error) {
 	underlayTunnelReady := true
 	if data, readErr := os.ReadFile(configPath); readErr == nil {
 		var selected Config
-		if json.Unmarshal(data, &selected) == nil && selected.Role == "agent" && serviceWasStarted {
-			switch selected.Underlay {
-			case underlayPsiphon:
+		if json.Unmarshal(data, &selected) == nil && selected.Role == "agent" {
+			selected = normalizeConfig(selected)
+			if torUserEgressEnabled(selected) {
+				if selected.XrayTor == nil {
+					return false, errors.New("Tor is selected for user egress, but this Agent profile has no isolated Xray Tor sidecar; run the profile's Tor egress preparation again")
+				}
+				if serviceWasStarted {
+					if selected.Underlay != underlayTor {
+						// Split mode's control tunnel is deliberately independent from Tor
+						// bootstrap. Confirm the direct authenticated Hub lane before exposing
+						// the profile. The Xray SOCKS5 outbound remains fail-closed meanwhile.
+						if waitErr := waitForAgentLaneReady(service, serviceStartTime, 60*time.Second); waitErr != nil {
+							showRecentLogs(60)
+							return false, fmt.Errorf("direct Agent-to-Hub lane did not become ready: %w", waitErr)
+						}
+					} else {
+						// Full Tor mode must prove both the SOCKS bootstrap and a Hub lane.
+						ready, waitErr := waitForTorAgentReady(service, serviceStartTime, torBootstrapTimeout+30*time.Second)
+						if waitErr != nil {
+							showRecentLogs(70)
+							return false, fmt.Errorf("Tor Agent startup failed: %w", waitErr)
+						}
+						underlayTunnelReady = ready.Bootstrapped && ready.AgentLaneConnected
+						if !underlayTunnelReady {
+							if !ready.Bootstrapped {
+								fmt.Println("Tor is installed and the Agent service is running, but Tor has NOT confirmed 100% bootstrap. The SOCKS5 egress is not yet verified.")
+							} else {
+								fmt.Println("Tor has bootstrapped, but no authenticated Agent-to-Hub lane is connected yet. Check the Hub Mapping address and port.")
+							}
+							showRecentLogs(50)
+						}
+					}
+				}
+				// The Xray sidecar is PartOf the Agent service, so systemd may stop
+				// it when the Agent is stopped. Re-enable it on every start request,
+				// including the case where the Agent was already active.
+				if sidecarErr := ensureXrayTorSidecar(selected); sidecarErr != nil {
+					return false, fmt.Errorf("start isolated Tor Xray sidecar: %w", sidecarErr)
+				}
+				if serviceWasStarted && selected.Underlay != underlayTor {
+					startMarker := serviceStartTime.UTC().Format(time.RFC3339Nano)
+					logs, _ := exec.Command("journalctl", "-u", service, "--since", startMarker, "--no-pager", "-o", "cat").CombinedOutput()
+					bootstrapped, _ := torAgentReadinessFromJournal(string(logs))
+					if !bootstrapped {
+						fmt.Println("Agent-to-Hub is connected directly. Tor user egress is bootstrapping in the background; user TCP/DNS stays fail-closed until Tor is ready.")
+					}
+				}
+			}
+			if serviceWasStarted && selected.Underlay == underlayPsiphon {
 				// A running local SOCKS listener is not proof that Psiphon has
 				// obtained an exit or that an authenticated Hub lane is alive.
 				ready, waitErr := waitForPsiphonAgentReady(service, serviceStartTime, 100*time.Second)
@@ -5286,23 +5389,6 @@ func ensureTunnelRunning(restartActive bool) (bool, error) {
 				underlayTunnelReady = ready
 				if !ready {
 					fmt.Println("Psiphon SOCKS5 is running locally; its first external tunnel is still connecting. ConsoleClient remains running and will retry. This is NOT yet a connected Agent lane.")
-				}
-			case underlayTor:
-				// Unlike the former behavior, do not treat an active systemd
-				// process as proof that Snowflake/WebTunnel has bootstrapped.
-				ready, waitErr := waitForTorAgentReady(service, serviceStartTime, torBootstrapTimeout+30*time.Second)
-				if waitErr != nil {
-					showRecentLogs(70)
-					return false, fmt.Errorf("Tor Agent startup failed: %w", waitErr)
-				}
-				underlayTunnelReady = ready.Bootstrapped && ready.AgentLaneConnected
-				if !underlayTunnelReady {
-					if !ready.Bootstrapped {
-						fmt.Println("Tor is installed and the Agent service is running, but Tor has NOT confirmed 100% bootstrap. The SOCKS5 egress is not yet verified.")
-					} else {
-						fmt.Println("Tor has bootstrapped, but no authenticated Agent-to-Hub lane is connected yet. Check the Hub Mapping address and port.")
-					}
-					showRecentLogs(50)
 				}
 			}
 		}
@@ -5354,11 +5440,62 @@ func startSelectedTunnel(restartActive bool) error {
 	return nil
 }
 
+// optimizeTorProfileForSpeed converts an existing full-Tor profile to split
+// mode only after an explicit privacy warning and direct Hub reachability test.
+// The Tor Xray sidecar is preserved, so user TCP/DNS keeps the same Tor exit.
+func optimizeTorProfileForSpeed() error {
+	if !chooseTunnel("Select the full-Tor Agent profile to optimize") {
+		return nil
+	}
+	oldCfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if oldCfg.Role != "agent" || oldCfg.Underlay != underlayTor || oldCfg.XrayTor == nil {
+		return errors.New("select an Agent profile currently using full Tor with its isolated Xray Tor sidecar")
+	}
+	uiWarn("FAST MODE changes only the Agent-to-Hub tunnel to a direct connection. The Hub will see this Agent VPS public IP. User TCP/DNS will continue to exit through Tor. UDP/QUIC/ICMP stay blocked.")
+	if !askYN("Proceed with the faster split route? (y/N)", "n") {
+		uiInfo("No changes were made.")
+		return nil
+	}
+	probe, probeErr := net.DialTimeout("tcp", oldCfg.HubAddr, 5*time.Second)
+	if probeErr != nil {
+		return fmt.Errorf("direct Hub control endpoint %s is not reachable from this Agent; keeping full Tor mode unchanged: %w", oldCfg.HubAddr, probeErr)
+	}
+	_ = probe.Close()
+
+	wasActive := tunnelIsActive()
+	fastCfg := oldCfg
+	fastCfg.Underlay = underlayDirect
+	fastCfg.TorUserEgressOnly = true
+	fastCfg.Transport = transportTCP
+	fastCfg.TunnelChannels = defaultTunnelChannels
+	if err := saveConfig(fastCfg); err != nil {
+		return fmt.Errorf("save fast Tor split-mode configuration: %w", err)
+	}
+	ready, startErr := ensureTunnelRunning(wasActive)
+	if startErr != nil || !ready {
+		_ = saveConfig(oldCfg)
+		_, rollbackErr := ensureTunnelRunning(true)
+		if rollbackErr != nil {
+			return fmt.Errorf("fast mode failed (ready=%t): %v; restoring full Tor also failed: %v", ready, startErr, rollbackErr)
+		}
+		if startErr != nil {
+			return fmt.Errorf("fast mode could not start; previous full-Tor configuration was restored: %w", startErr)
+		}
+		return errors.New("fast mode did not authenticate a direct Hub lane; previous full-Tor configuration was restored")
+	}
+	uiSuccess("FAST TOR mode is active: direct Agent-to-Hub connection + Tor-only user TCP/DNS egress.")
+	uiInfo("The user's public exit remains a Tor exit. The Hub now sees the Agent VPS address; only the Hub transport was removed from Tor.")
+	return nil
+}
+
 func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.Duration) (bool, error) {
 	if timeout <= 0 {
 		return false, errors.New("invalid Psiphon readiness timeout")
 	}
-	startMarker := fmt.Sprintf("@%d", startedAt.Unix())
+	startMarker := startedAt.UTC().Format(time.RFC3339Nano)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		logs, _ := exec.Command("journalctl", "-u", service, "--since", startMarker, "--no-pager", "-o", "cat").CombinedOutput()
@@ -5391,7 +5528,7 @@ func waitForTorAgentReady(service string, startedAt time.Time, timeout time.Dura
 	if timeout <= 0 {
 		return TorAgentReadiness{}, errors.New("invalid Tor readiness timeout")
 	}
-	startMarker := fmt.Sprintf("@%d", startedAt.Unix())
+	startMarker := startedAt.UTC().Format(time.RFC3339Nano)
 	deadline := time.Now().Add(timeout)
 	var latest TorAgentReadiness
 	for time.Now().Before(deadline) {
@@ -5406,6 +5543,53 @@ func waitForTorAgentReady(service string, startedAt time.Time, timeout time.Dura
 		time.Sleep(time.Second)
 	}
 	return latest, nil
+}
+
+// waitForTorBootstrapReady is used by split mode, where the Hub lanes are
+// direct/other-underlay but Xray user traffic still depends on the Tor SOCKS5
+// sidecar. It must not require a Hub lane over Tor.
+func waitForTorBootstrapReady(service string, startedAt time.Time, timeout time.Duration) error {
+	if timeout <= 0 {
+		return errors.New("invalid Tor bootstrap timeout")
+	}
+	startMarker := startedAt.UTC().Format(time.RFC3339Nano)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		logs, _ := exec.Command("journalctl", "-u", service, "--since", startMarker, "--no-pager", "-o", "cat").CombinedOutput()
+		if strings.Contains(string(logs), "Tor transport bootstrapped successfully") {
+			if exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
+				return nil
+			}
+		}
+		if exec.Command("systemctl", "is-active", "--quiet", service).Run() != nil {
+			return fmt.Errorf("Agent service %s stopped before Tor bootstrap completed", service)
+		}
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("Tor did not report 100%% bootstrap within %s", timeout)
+}
+
+// waitForAgentLaneReady confirms the optimized direct Agent-to-Hub route really
+// authenticated before the old full-Tor route is considered safe to replace.
+func waitForAgentLaneReady(service string, startedAt time.Time, timeout time.Duration) error {
+	if timeout <= 0 {
+		return errors.New("invalid Agent lane readiness timeout")
+	}
+	startMarker := startedAt.UTC().Format(time.RFC3339Nano)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		logs, _ := exec.Command("journalctl", "-u", service, "--since", startMarker, "--no-pager", "-o", "cat").CombinedOutput()
+		for _, line := range strings.Split(string(logs), "\n") {
+			if strings.Contains(line, "tunnel lane ") && strings.Contains(line, " connected via ") && strings.Contains(line, " over direct;") {
+				return nil
+			}
+		}
+		if exec.Command("systemctl", "is-active", "--quiet", service).Run() != nil {
+			return fmt.Errorf("Agent service %s stopped before a direct Hub lane authenticated", service)
+		}
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("no authenticated direct Agent-to-Hub lane appeared within %s", timeout)
 }
 
 type TorAgentReadiness struct {
@@ -6349,6 +6533,7 @@ func menu() {
 		menuItem("6", "⏰ Scheduled restart", "Restart active tunnels on interval")
 		menuItem("7", "🗑️ Delete one tunnel", "Delete this tunnel only")
 		menuItem("8", "💣 Complete uninstall", "Remove all tunnels")
+		menuItem("9", "⚡ Optimize Tor profile", "Keep Tor for users; remove Tor from Hub tunnel")
 		menuItem("0", "🚪 Exit", "Close menu")
 		uiRule()
 		choice := ask("Select an operation", "0")
@@ -6399,6 +6584,8 @@ func menu() {
 			if errors.Is(err, errUninstallCancelled) {
 				err = nil
 			}
+		case "9":
+			err = optimizeTorProfileForSpeed()
 		case "0":
 			return
 		default:

@@ -218,25 +218,11 @@ func TestAdaptivePsiphonUsesPublicMappingPortAndALPNMultiplex(t *testing.T) {
 	if h.sessionCount() == 0 {
 		t.Fatal("adaptive Agent did not authenticate through Psiphon on the public Mapping listener")
 	}
-	// The Hub observes authentication just before the Agent goroutine stores
-	// its successful route preference. Wait for both observations rather than
-	// racing that final client-side bookkeeping (especially under -race).
-	preferenceDeadline := time.Now().Add(2 * time.Second)
-	var preferredUnderlay, preferredTransport any
-	var underlayOK, transportOK bool
-	for time.Now().Before(preferenceDeadline) {
-		preferredUnderlay, underlayOK = agentPreferredUnderlay.Load(channel)
-		preferredTransport, transportOK = agentPreferredTransport.Load(channel)
-		if underlayOK && transportOK {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	if got, ok := agentPreferredUnderlay.Load(channel); !ok || got != underlayPsiphon {
+		t.Fatalf("successful route preference = %v (present=%v); want Psiphon", got, ok)
 	}
-	if !underlayOK || preferredUnderlay != underlayPsiphon {
-		t.Fatalf("successful route preference = %v (present=%v); want Psiphon", preferredUnderlay, underlayOK)
-	}
-	if !transportOK || preferredTransport != transportTCP {
-		t.Fatalf("successful transport preference = %v (present=%v); want TCP/TLS", preferredTransport, transportOK)
+	if got, ok := agentPreferredTransport.Load(channel); !ok || got != transportTCP {
+		t.Fatalf("successful transport preference = %v (present=%v); want TCP/TLS", got, ok)
 	}
 	h.mu.RLock()
 	var active *hubSession
@@ -1883,6 +1869,68 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
+func TestNormalizeConfigFullTorUsesConservativeTCPProfile(t *testing.T) {
+	cfg := normalizeConfig(Config{
+		Role:           "agent",
+		Underlay:       underlayTor,
+		Transport:      transportAdaptive,
+		TunnelChannels: 12,
+	})
+	if cfg.TunnelChannels != torFullUnderlayChannels {
+		t.Fatalf("full Tor lane count = %d; want %d", cfg.TunnelChannels, torFullUnderlayChannels)
+	}
+	if cfg.Transport != transportTCP {
+		t.Fatalf("full Tor transport = %q; want %q", cfg.Transport, transportTCP)
+	}
+	if !torUserEgressEnabled(cfg) {
+		t.Fatal("full Tor profile must enable Tor user egress")
+	}
+}
+
+func TestNormalizeConfigFastTorSplitKeepsDirectUnderlay(t *testing.T) {
+	cfg := normalizeConfig(Config{
+		Role:              "agent",
+		Underlay:          underlayDirect,
+		Transport:         transportTCP,
+		TunnelChannels:    defaultTunnelChannels,
+		TorUserEgressOnly: true,
+		TorMode:           torModeSnowflake,
+		TorProxy:          "127.0.0.1:19082",
+	})
+	if cfg.Underlay != underlayDirect {
+		t.Fatalf("split-mode Hub underlay = %q; want %q", cfg.Underlay, underlayDirect)
+	}
+	if cfg.TunnelChannels != defaultTunnelChannels {
+		t.Fatalf("split-mode lane count = %d; want %d", cfg.TunnelChannels, defaultTunnelChannels)
+	}
+	if !torUserEgressEnabled(cfg) {
+		t.Fatal("split mode must keep Tor enabled for user egress")
+	}
+	if got := agentHubAddressForTransport(cfg, transportTCP); got != cfg.HubAddr {
+		t.Fatalf("split mode Hub endpoint = %q; want direct control endpoint %q", got, cfg.HubAddr)
+	}
+}
+
+func TestTorUserEgressEnabledOnlyForAgentTorProfiles(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  Config
+		want bool
+	}{
+		{name: "full Tor Agent", cfg: Config{Role: "agent", Underlay: underlayTor}, want: true},
+		{name: "split Tor Agent", cfg: Config{Role: "agent", Underlay: underlayDirect, TorUserEgressOnly: true}, want: true},
+		{name: "ordinary Direct Agent", cfg: Config{Role: "agent", Underlay: underlayDirect}, want: false},
+		{name: "Hub cannot enable Tor user egress", cfg: Config{Role: "hub", Underlay: underlayTor, TorUserEgressOnly: true}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := torUserEgressEnabled(tc.cfg); got != tc.want {
+				t.Fatalf("torUserEgressEnabled() = %t; want %t", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestNormalizeConfigUpgradesAgentToTwelveLanes(t *testing.T) {
 	got := normalizeConfig(Config{Role: "agent", TunnelChannels: 4})
 	if got.TunnelChannels != 12 {
@@ -2261,7 +2309,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.2.0             |",
+		"        |            SHAH TUNNEL 5.2.1             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
