@@ -1,5 +1,4 @@
 <div align="center">
-# شاه‌تونل 5.0.1
 
 <p align="center"><img src="docs/img/ShahTunnel-Logo-Round.png" alt="لوگوی گرد شاه‌تونل" width="420" style="max-width: 92%; height: auto;"></p>
 
