@@ -35,7 +35,7 @@ fi
 
 GO_BIN=""
 for candidate in \
-  "${STATE_DIR}/toolchains/go1.26.1-${TARGET_ARCH}/bin/go" \
+  "${STATE_DIR}/toolchains/go1.26.11-${TARGET_ARCH}/bin/go" \
   "${STATE_DIR}/toolchains/go1.26.5-${TARGET_ARCH}/bin/go" \
   "/usr/local/go/bin/go" \
   "$(command -v go 2>/dev/null || true)"; do
@@ -57,16 +57,22 @@ curl -fL --proto '=https' --proto-redir '=https' \
   --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 900 \
   "$PSIPHON_ARCHIVE" -o "$ARCHIVE" || fail "could not download the pinned upstream source archive."
 
-tar -tzf "$ARCHIVE" >/dev/null 2>&1 || fail "downloaded source archive is invalid."
-tar -xzf "$ARCHIVE" -C "$SRC" --strip-components=1
+# The helper rejects path traversal, links, devices, duplicate paths and oversized archives.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SAFE_EXTRACTOR="${SCRIPT_DIR}/safe_extract_tar.py"
+[[ -s "$SAFE_EXTRACTOR" ]] || fail "safe archive extractor is missing: $SAFE_EXTRACTOR"
+python3 "$SAFE_EXTRACTOR" "$ARCHIVE" "$SRC" --strip-components 1 \
+  --expected-root-prefix "psiphon-tunnel-core-" \
+  || fail "downloaded Psiphon archive failed its path-safety validation."
+ARCHIVE_SHA256="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
 [[ -s "$SRC/go.mod" && -s "$SRC/ConsoleClient/main.go" && -s "$SRC/LICENSE" && -d "$SRC/vendor" ]] || \
   fail "upstream source archive is incomplete (go.mod, ConsoleClient, LICENSE or vendor missing)."
 grep -Eq '^go 1\.26\.0$' "$SRC/go.mod" || fail "unexpected Go module version in upstream source."
 grep -Eq '^toolchain go1\.26\.5$' "$SRC/go.mod" || fail "upstream toolchain directive changed; review before updating the pin."
 
-# Psiphon v2.0.41 specifies Go 1.26.5. Starting from ShahTunnel's Go 1.26.1
-# toolchain, Go's official toolchain selection downloads/verifies the exact
-# required Go toolchain. Dependencies are built from the upstream vendor tree.
+# Psiphon v2.0.41 specifies Go 1.26.5. ShahTunnel now supplies Go 1.26.11,
+# which is backward-compatible with that toolchain directive and includes the
+# latest Go 1.26 security fixes. Dependencies are built from the upstream vendor tree.
 echo "Building Psiphon ConsoleClient for linux/${TARGET_ARCH}; upstream toolchain go1.26.5..."
 (
   cd "$SRC"
@@ -109,6 +115,7 @@ cat > "${STATE_DIR}/psiphon-build.info" <<INFO
 source=${PSIPHON_REPO}
 version=${PSIPHON_VERSION}
 commit=${PSIPHON_COMMIT}
+archive_sha256=${ARCHIVE_SHA256}
 architecture=${TARGET_ARCH}
 upstream_go_toolchain=1.26.5
 binary=${INSTALL_PATH}
