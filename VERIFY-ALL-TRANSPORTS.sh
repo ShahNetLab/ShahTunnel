@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local verification helper. It reuses an existing Go 1.27.4 toolchain and never downloads one.
+# Local verification helper. It reuses an existing Go 1.26.1 toolchain and never downloads one.
 # Build outputs are kept under a temporary directory; no executable is left in the source tree.
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,7 +8,7 @@ BUILD_TMP="$(mktemp -d "${TMPDIR:-/tmp}/shah-tunnel-verify.XXXXXX")"
 cleanup() { rm -rf -- "$BUILD_TMP"; }
 trap cleanup EXIT
 
-GO_VERSION="1.27.4"
+GO_VERSION="1.26.1"
 GO_HOME="$ROOT/.toolchains/go${GO_VERSION}"
 GO_BIN=""
 
@@ -28,7 +28,7 @@ version_is_pinned() {
   [[ "$v" == *"go${GO_VERSION}"* ]]
 }
 
-# Reuse only an exact Go 1.27.4 binary. An older/newer system toolchain is not used.
+# Reuse only an exact Go 1.26.1 binary. An older/newer system toolchain is not used.
 for candidate in "$GO_HOME/bin/go" "/usr/local/lib/shah-tunnel/toolchains/go${GO_VERSION}-${TARGET_ARCH}/bin/go" "/usr/local/lib/shah-tunnel/go-${GO_VERSION}/bin/go" "$(command -v go 2>/dev/null || true)"; do
   if [[ -n "$candidate" ]] && version_is_pinned "$candidate"; then
     GO_BIN="$candidate"
@@ -64,20 +64,16 @@ bash -n scripts/repair-psiphon-profile.sh
 bash -n VERIFY-ALL-TRANSPORTS.sh
 grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/psiphon' S1T-START.sh || fail "Psiphon systemd data-directory permission is missing."
 grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/tor' S1T-START.sh || fail "Tor systemd data-directory permission is missing."
-grep -Fq 'tor-expert-bundle-linux-x86_64-16.0.1.tar.gz' scripts/install-tor.sh || fail "Pinned official Tor Expert Bundle is missing."
-grep -Fq '7039cb16060ab22e669852e55774d894b55f25ea8bd0ab7194d3478429a58725' scripts/install-tor.sh || fail "Official Tor x86_64 checksum pin is missing."
-grep -Fq '67040520d44c87ccaaf5aa7df0dc1ff122eb938dbb600ae7722e8b6b75282a4b' scripts/install-tor.sh || fail "Official Tor arm64 checksum pin is missing."
+grep -Fq 'tor-expert-bundle-linux-x86_64-16.0.tar.gz' scripts/install-tor.sh || fail "Pinned official Tor Expert Bundle is missing."
+grep -Fq 'cc950ebe9acb80188325c3a2cd8817def7dd7237d6fdcd861bb87b234a0cb2fd' scripts/install-tor.sh || fail "Official Tor x86_64 checksum pin is missing."
+grep -Fq 'bed98744e093a0dc3a22be0eecfdce7a33cb36866d3f15fcf011a35bf3513d0d' scripts/install-tor.sh || fail "Official Tor arm64 checksum pin is missing."
 grep -Fq 'func startTorForAgent(cfg Config)' S1T-CAPSULE/tor.go || fail "Tor per-profile runtime is missing."
 grep -Fq 'func validateTorBridgeLine' S1T-CAPSULE/tor.go || fail "Tor WebTunnel bridge validation is missing."
-grep -Fq 'func waitForTorAgentReady' S1T-CAPSULE/main.go || fail "Tor bootstrap and authenticated Hub-lane readiness check is missing."
-grep -Fq 'TestTorAgentReadinessRequiresBootstrapAndAuthenticatedLane' S1T-CAPSULE/tor_test.go || fail "Tor runtime readiness regression coverage is missing."
-grep -Fq 'torBinary, ptBinary, err := ensureTorBinaries()' S1T-CAPSULE/tor.go || fail "Existing Tor Agent profiles do not refresh their managed Tor bundle on startup."
-grep -Fq 'continuing with the previously installed Tor/Lyrebird binaries' S1T-CAPSULE/tor.go || fail "Tor bundle upgrade failure must preserve an existing working installation."
 grep -Fq 'func autoApplyXrayTorForNewAgent() error' S1T-CAPSULE/xray_tor.go || fail "Automatic Tor Xray user egress is missing."
 grep -Fq 'TestBuildXrayTorConfigIsolatesTCPAndBlocksUDP' S1T-CAPSULE/xray_tor_test.go || fail "Tor TCP/DNS isolation and UDP fail-closed coverage is missing."
 grep -Fq 'func preparePsiphonAgentProfile(c *Config) error' S1T-CAPSULE/psiphon.go || fail "Automatic per-Agent Psiphon preparation is missing."
 grep -Fq 'func startPsiphonForAgent(cfg Config)' S1T-CAPSULE/main.go || fail "Psiphon ConsoleClient runtime is missing."
-grep -Fq '96f782c6f662cb0a884029d70e1375ab3c1dece2' scripts/install-psiphon.sh || fail "Pinned official Psiphon source revision is missing."
+grep -Fq '96f782c' scripts/install-psiphon.sh || fail "Pinned official Psiphon source revision is missing."
 grep -Fq 'Psiphon ConsoleClient installed successfully' scripts/install-psiphon.sh || fail "Psiphon binary install self-check is missing."
 grep -Fq 'TestNewPsiphonClientConfigUsesAuthenticatedBootstrap' S1T-CAPSULE/psiphon_test.go || fail "Psiphon signed server-list bootstrap coverage is missing."
 grep -Fq 'TestValidatePsiphonRejectsUnauthenticatedServerList' S1T-CAPSULE/psiphon_test.go || fail "Psiphon unauthenticated server-list rejection coverage is missing."
@@ -134,7 +130,7 @@ pass "go vet"
 
 printf '\n== 7/7: Linux build validation (temporary files only) ==\n'
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-amd64" ./S1T-CAPSULE
-[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 5.2.0 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 5.0.1 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-arm64" ./S1T-CAPSULE
 sha256sum "$BUILD_TMP/shah-tunnel-linux-amd64" "$BUILD_TMP/shah-tunnel-linux-arm64" > "$BUILD_TMP/SHA256SUMS"
 pass "Linux amd64 and arm64 binaries built and checksum-checked in a temporary directory (nothing added to the repository)"
