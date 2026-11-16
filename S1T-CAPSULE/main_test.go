@@ -2233,7 +2233,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.5.6             |",
+		"        |            SHAH TUNNEL 5.5.7             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -2647,14 +2647,11 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 		t.Fatalf("sidecar DNS disableCache=%v; repeat lookups should use the Xray cache", dnsConfig["disableCache"])
 	}
 	dnsServers := dnsConfig["servers"].([]any)
-	if len(dnsServers) != 2 || dnsServers[0] != "https://cloudflare-dns.com/dns-query" || dnsServers[1] != "https://dns.google/dns-query" {
-		t.Fatalf("sidecar DNS servers were not normalized for routed DoH: %#v", dnsServers)
+	if len(dnsServers) != 2 || dnsServers[0] != "https://1.1.1.1/dns-query" || dnsServers[1] != "https://8.8.8.8/dns-query" {
+		t.Fatalf("sidecar DNS servers do not match the known-good IP-based DoH endpoints: %#v", dnsServers)
 	}
-	if dnsConfig["tag"] != "s1t-warp-warp-profile-dns-in" {
-		t.Fatalf("sidecar must use a unique DNS routing tag, got %v", dnsConfig["tag"])
-	}
-	if dnsConfig["enableParallelQuery"] != false {
-		t.Fatalf("sidecar DNS requests must be serial over the SOCKS tunnel, got %v", dnsConfig["enableParallelQuery"])
+	if dnsConfig["tag"] != "dns_inbound" {
+		t.Fatalf("sidecar must preserve the source DNS routing tag, got %v", dnsConfig["tag"])
 	}
 	outboundsWithDNS := got["outbounds"].([]any)
 	dnsOutboundTag := "s1t-warp-warp-profile-dns-out"
@@ -2677,7 +2674,7 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 		t.Fatalf("client DNS is not intercepted before the default WARP route: %#v", dnsHijack)
 	}
 	dnsEgress := rules[1].(map[string]any)
-	if dnsEgress["inboundTag"].([]any)[0] != "s1t-warp-warp-profile-dns-in" || dnsEgress["outboundTag"] != outTag {
+	if dnsEgress["inboundTag"].([]any)[0] != "dns_inbound" || dnsEgress["outboundTag"] != outTag {
 		t.Fatalf("internal DNS requests are not routed through WARP: %#v", dnsEgress)
 	}
 	first := rules[2].(map[string]any)
@@ -2812,14 +2809,11 @@ func TestBuildXrayPsiphonConfigIsolatesTCPAndBlocksUDP(t *testing.T) {
 	}
 	dnsConfig := got["dns"].(map[string]any)
 	if dnsConfig["tag"] != "s1t-psiphon-psiphon-profile-dns-in" {
-		t.Fatalf("Psiphon DNS module must have a unique sidecar tag, got %v", dnsConfig["tag"])
-	}
-	if dnsConfig["enableParallelQuery"] != false {
-		t.Fatalf("Psiphon DNS queries must be serialized, got %v", dnsConfig["enableParallelQuery"])
+		t.Fatalf("Psiphon DNS module must create a private tag when source has none, got %v", dnsConfig["tag"])
 	}
 	dnsServers := dnsConfig["servers"].([]any)
-	if len(dnsServers) != 2 || dnsServers[0] != "https://cloudflare-dns.com/dns-query" || dnsServers[1] != "https://dns.google/dns-query" {
-		t.Fatalf("unexpected Psiphon DoH servers: %#v", dnsServers)
+	if len(dnsServers) != 2 || dnsServers[0] != "https://1.1.1.1/dns-query" || dnsServers[1] != "https://8.8.8.8/dns-query" {
+		t.Fatalf("unexpected Psiphon fixed-IP DoH servers: %#v", dnsServers)
 	}
 	tcpRule := rules[2].(map[string]any)
 	if tcpRule["network"] != "tcp" || tcpRule["outboundTag"] != outTag {

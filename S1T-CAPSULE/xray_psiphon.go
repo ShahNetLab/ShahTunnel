@@ -87,7 +87,7 @@ func renderXrayPsiphonUnit(runtime xrayRuntime, configPath, service string) ([]b
 		}
 	}
 	unit := fmt.Sprintf(`[Unit]
-# Managed-By: ShahTunnel 5.5.6
+# Managed-By: ShahTunnel 5.5.7
 Description=ShahTunnel isolated Psiphon Xray (%s)
 After=network-online.target
 Wants=network-online.target
@@ -449,12 +449,6 @@ func migrateXrayPsiphonDNSConfig(data []byte, profileID, proxyOutboundTag string
 			usedTags[tag] = true
 		}
 	}
-	if usedTags[dnsInboundTag] {
-		// A sidecar produced by the new version already uses this as the DNS
-		// module tag, not as an inbound/outbound tag. The old Xray JSON should
-		// not contain it in either array; reject unexpected ownership instead.
-		return nil, false, fmt.Errorf("Psiphon DNS tag %q collides with an inbound/outbound", dnsInboundTag)
-	}
 	if !usedTags[proxyOutboundTag] {
 		return nil, false, fmt.Errorf("Psiphon SOCKS outbound %q is missing from the sidecar", proxyOutboundTag)
 	}
@@ -509,15 +503,23 @@ func migrateXrayPsiphonDNSConfig(data []byte, profileID, proxyOutboundTag string
 		dnsConfig = map[string]any{}
 		root["dns"] = dnsConfig
 	}
-	// Use provider hostnames so TLS SNI and certificate validation remain
-	// explicit. Xray's non-local DNS requests carry dnsInboundTag into routing;
-	// the profile-specific rule sends them through the Psiphon SOCKS outbound,
-	// where the remote proxy resolves the destination hostname.
+	// Preserve the DNS module tag already present in the reference config.
+	// ShahTunnel 5.0 used fixed-IP DoH endpoints, avoiding any bootstrap DNS
+	// lookup for the resolver hostname. Keep that known-good behavior for both
+	// newly generated and migrated Psiphon sidecars.
+	dnsInboundTag, _ = dnsConfig["tag"].(string)
+	dnsInboundTag = strings.TrimSpace(dnsInboundTag)
+	if dnsInboundTag == "" {
+		dnsInboundTag = "s1t-psiphon-" + shortID + "-dns-in"
+	}
+	if usedTags[dnsInboundTag] {
+		return nil, false, fmt.Errorf("Psiphon DNS module tag %q collides with an inbound or outbound", dnsInboundTag)
+	}
 	dnsConfig["tag"] = dnsInboundTag
-	dnsConfig["servers"] = []any{"https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query"}
+	dnsConfig["servers"] = []any{"https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"}
 	dnsConfig["queryStrategy"] = "UseIPv4"
 	dnsConfig["disableCache"] = false
-	dnsConfig["enableParallelQuery"] = false
+	delete(dnsConfig, "enableParallelQuery")
 
 	routing, ok := root["routing"].(map[string]any)
 	if !ok {
@@ -920,8 +922,8 @@ func verifyPsiphonDoHEgress(proxyAddress string, timeout time.Duration) error {
 	}
 	encoded := base64.RawURLEncoding.EncodeToString(query)
 	endpoints := []string{
-		"https://cloudflare-dns.com/dns-query?dns=" + encoded,
-		"https://dns.google/dns-query?dns=" + encoded,
+		"https://1.1.1.1/dns-query?dns=" + encoded,
+		"https://8.8.8.8/dns-query?dns=" + encoded,
 	}
 	perEndpoint := timeout / time.Duration(len(endpoints))
 	if perEndpoint < time.Second {

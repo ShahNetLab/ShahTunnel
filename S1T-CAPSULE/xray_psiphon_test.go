@@ -38,7 +38,7 @@ func TestXrayPsiphonUnitOwnershipAllowsOnlyExactProfileService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(unit), "Managed-By: ShahTunnel 5.5.6") {
+	if !strings.Contains(string(unit), "Managed-By: ShahTunnel 5.5.7") {
 		t.Fatal("rendered sidecar unit is missing the ShahTunnel ownership marker")
 	}
 	if !xrayPsiphonUnitBelongsToProfile(unit, runtime, configPath, service) {
@@ -205,7 +205,7 @@ func TestMigrateXrayPsiphonDNSConfig(t *testing.T) {
     {"tag":"s1t-psiphon-profile-s-out","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":21082}]}},
     {"tag":"s1t-psiphon-profile-s-dns-out","protocol":"dns","settings":{}}
   ],
-  "dns": {"tag":"dns_inbound","servers":["https://cloudflare-dns.com/dns-query"]},
+  "dns": {"tag":"dns_inbound","servers":["https://1.1.1.1/dns-query"]},
   "routing": {"rules":[
     {"type":"field","inboundTag":["s1t-psiphon-profile-s-main"],"network":"tcp,udp","port":"53","outboundTag":"s1t-psiphon-profile-s-dns-out","ruleTag":"s1t-psiphon-profile-s-dns-hijack"},
     {"type":"field","inboundTag":["dns_inbound"],"outboundTag":"s1t-psiphon-profile-s-out","ruleTag":"s1t-psiphon-profile-s-dns-egress"},
@@ -225,15 +225,15 @@ func TestMigrateXrayPsiphonDNSConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	dns := config["dns"].(map[string]any)
-	if dns["tag"] != "s1t-psiphon-profile-s-dns-in" {
-		t.Fatalf("DNS tag=%v", dns["tag"])
+	if dns["tag"] != "dns_inbound" {
+		t.Fatalf("DNS tag was not preserved: %v", dns["tag"])
 	}
-	if dns["enableParallelQuery"] != false {
-		t.Fatalf("parallel DNS should be disabled: %v", dns["enableParallelQuery"])
+	if _, exists := dns["enableParallelQuery"]; exists {
+		t.Fatalf("migration should restore the reference default for parallel DNS: %v", dns["enableParallelQuery"])
 	}
 	servers := dns["servers"].([]any)
-	if len(servers) != 2 || servers[0] != "https://cloudflare-dns.com/dns-query" || servers[1] != "https://dns.google/dns-query" {
-		t.Fatalf("unexpected DoH servers: %#v", servers)
+	if len(servers) != 2 || servers[0] != "https://1.1.1.1/dns-query" || servers[1] != "https://8.8.8.8/dns-query" {
+		t.Fatalf("unexpected fixed-IP DoH servers: %#v", servers)
 	}
 	rules := config["routing"].(map[string]any)["rules"].([]any)
 	if len(rules) != 3 {
@@ -244,7 +244,7 @@ func TestMigrateXrayPsiphonDNSConfig(t *testing.T) {
 		t.Fatalf("first DNS hijack rule not migrated: %#v", first)
 	}
 	second := rules[1].(map[string]any)
-	if second["inboundTag"].([]any)[0] != "s1t-psiphon-profile-s-dns-in" || second["outboundTag"] != "s1t-psiphon-profile-s-out" {
+	if second["inboundTag"].([]any)[0] != "dns_inbound" || second["outboundTag"] != "s1t-psiphon-profile-s-out" {
 		t.Fatalf("DNS egress not routed through Psiphon: %#v", second)
 	}
 	third := rules[2].(map[string]any)
@@ -257,6 +257,49 @@ func TestMigrateXrayPsiphonDNSConfig(t *testing.T) {
 	}
 	if changedAgain || string(again) != string(got) {
 		t.Fatal("DNS migration must be idempotent")
+	}
+}
+
+func TestMigrateXrayPsiphonDNSConfigPreservesPreviousPrivateTag(t *testing.T) {
+	input := []byte(`{
+  "inbounds": [{"tag":"s1t-psiphon-profile-s-main","listen":"127.0.0.1","port":35627,"protocol":"vless"}],
+  "outbounds": [
+    {"tag":"s1t-psiphon-profile-s-out","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":21082}]}},
+    {"tag":"s1t-psiphon-profile-s-dns-out","protocol":"dns","settings":{}}
+  ],
+  "dns": {"tag":"s1t-psiphon-profile-s-dns-in","servers":["https://cloudflare-dns.com/dns-query","https://dns.google/dns-query"],"enableParallelQuery":false},
+  "routing": {"rules":[
+    {"type":"field","inboundTag":["s1t-psiphon-profile-s-main"],"network":"tcp,udp","port":"53","outboundTag":"s1t-psiphon-profile-s-dns-out","ruleTag":"s1t-psiphon-profile-s-dns-hijack"},
+    {"type":"field","inboundTag":["s1t-psiphon-profile-s-dns-in"],"outboundTag":"s1t-psiphon-profile-s-out","ruleTag":"s1t-psiphon-profile-s-dns-egress"},
+    {"type":"field","domain":["geosite:category-ads-all"],"outboundTag":"block"}
+  ]}
+}`)
+	bindings := []XrayPsiphonBinding{{MappingID: "main", OriginalTarget: "127.0.0.1:2083", PsiphonTarget: "127.0.0.1:35627", InboundTag: "s1t-psiphon-profile-s-main"}}
+	got, changed, err := migrateXrayPsiphonDNSConfig(input, "profile-s", "s1t-psiphon-profile-s-out", bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("previous hostname-based DoH config should be migrated")
+	}
+	var config map[string]any
+	if err := json.Unmarshal(got, &config); err != nil {
+		t.Fatal(err)
+	}
+	dns := config["dns"].(map[string]any)
+	if dns["tag"] != "s1t-psiphon-profile-s-dns-in" {
+		t.Fatalf("previous profile-specific DNS tag was not preserved: %v", dns["tag"])
+	}
+	servers := dns["servers"].([]any)
+	if len(servers) != 2 || servers[0] != "https://1.1.1.1/dns-query" || servers[1] != "https://8.8.8.8/dns-query" {
+		t.Fatalf("previous hostname DoH endpoints were not restored to fixed IPs: %#v", servers)
+	}
+	if _, exists := dns["enableParallelQuery"]; exists {
+		t.Fatalf("reference DNS behavior should not force parallel-query configuration: %v", dns["enableParallelQuery"])
+	}
+	rules := config["routing"].(map[string]any)["rules"].([]any)
+	if rules[1].(map[string]any)["inboundTag"].([]any)[0] != "s1t-psiphon-profile-s-dns-in" {
+		t.Fatalf("existing private DNS egress tag was not preserved in routing: %#v", rules[1])
 	}
 }
 
