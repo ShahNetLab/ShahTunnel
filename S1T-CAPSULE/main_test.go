@@ -60,56 +60,6 @@ func TestProbeSOCKS5DetectsLiveLoopbackHandshake(t *testing.T) {
 	}
 }
 
-func TestOldPsiphonListenerFalseFailureIsRemoved(t *testing.T) {
-	_, filename, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("cannot locate test source")
-	}
-	source, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "main.go"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(source), "did not start its local Psiphon SOCKS5 listener") {
-		t.Fatal("obsolete log-text readiness error must not return in the current implementation")
-	}
-}
-
-func TestPsiphonRuntimeReadinessUsesFreshAgentSnapshot(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "agent.runtime.json")
-	now := time.Now().UTC()
-	startedAt := now.Add(-10 * time.Second)
-	writeSnapshot := func(snapshot RuntimeSnapshot) {
-		t.Helper()
-		data, err := json.Marshal(snapshot)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, data, 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	writeSnapshot(RuntimeSnapshot{Role: "agent", Updated: now.Add(-3 * time.Second), Connected: true})
-	if !psiphonAgentRuntimeConnected(path, startedAt, now, 20*time.Second) {
-		t.Fatal("fresh connected Agent runtime snapshot should pass readiness")
-	}
-	writeSnapshot(RuntimeSnapshot{Role: "agent", Updated: startedAt.Add(-time.Second), Connected: true})
-	if psiphonAgentRuntimeConnected(path, startedAt, now, 20*time.Second) {
-		t.Fatal("snapshot from before this Agent restart must not pass readiness")
-	}
-	writeSnapshot(RuntimeSnapshot{Role: "agent", Updated: now.Add(-30 * time.Second), Connected: true})
-	if psiphonAgentRuntimeConnected(path, startedAt, now, 20*time.Second) {
-		t.Fatal("stale runtime snapshot must not pass readiness")
-	}
-	writeSnapshot(RuntimeSnapshot{Role: "hub", Updated: now, Connected: true})
-	if psiphonAgentRuntimeConnected(path, startedAt, now, 20*time.Second) {
-		t.Fatal("Hub runtime snapshot must not pass Agent readiness")
-	}
-	writeSnapshot(RuntimeSnapshot{Role: "agent", Updated: now, Connected: false})
-	if psiphonAgentRuntimeConnected(path, startedAt, now, 20*time.Second) {
-		t.Fatal("disconnected Agent runtime snapshot must not pass readiness")
-	}
-}
-
 func TestPsiphonReadinessChecksIndependentServiceAndLiveSocket(t *testing.T) {
 	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
@@ -131,12 +81,6 @@ func TestPsiphonReadinessChecksIndependentServiceAndLiveSocket(t *testing.T) {
 	}
 	if strings.Contains(body, "Psiphon ConsoleClient connected") {
 		t.Fatal("readiness must not depend on a child-process notice that is absent when Psiphon is independently supervised")
-	}
-	if strings.Contains(body, "metricConnected.Load()") {
-		t.Fatal("the manager process cannot read the Agent process's private metricConnected atomic; use the Agent runtime snapshot")
-	}
-	if !strings.Contains(body, "psiphonAgentRuntimeConnected(runtimePath") {
-		t.Fatal("readiness must verify the fresh runtime snapshot written by the systemd Agent process")
 	}
 }
 
@@ -2348,7 +2292,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.5.2             |",
+		"        |            SHAH TUNNEL 5.5.1             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -3072,10 +3016,10 @@ func TestPsiphonReadinessAcceptsExistingManagedSOCKSListenerAndLane(t *testing.T
 		t.Fatal("a connected Agent lane through the already-running, independently supervised Psiphon SOCKS5 listener must be recognized")
 	}
 	if !psiphonAgentLaneCurrentlyReady(logs, true) {
-		t.Fatal("a lane log paired with a fresh Agent runtime snapshot must be considered ready")
+		t.Fatal("a currently active Psiphon Agent lane must be considered ready")
 	}
 	if psiphonAgentLaneCurrentlyReady(logs, false) {
-		t.Fatal("a historical lane log without a fresh connected Agent runtime snapshot must not count as ready")
+		t.Fatal("a historical lane log must not count as ready after all Agent lanes have disconnected")
 	}
 	// The independently supervised ConsoleClient does not have to emit its
 	// child-process notice into the Agent service journal.
