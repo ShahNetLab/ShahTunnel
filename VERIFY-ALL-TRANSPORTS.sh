@@ -72,7 +72,7 @@ grep -Fq 'shah-tunnel-control/1' S1T-CAPSULE/main.go || fail "Dedicated TLS ALPN
 grep -Fq 'func sniffS1TControlClientHello' S1T-CAPSULE/main.go || fail "Public Mapping TLS control demultiplexer is missing."
 grep -Fq 'PsiphonHubAddr' S1T-CAPSULE/main.go || fail "Per-egress Psiphon Hub endpoint is missing."
 grep -Fq 'adaptiveTransportCandidatesForUnderlay' S1T-CAPSULE/main.go || fail "Psiphon-specific adaptive transport filtering is missing."
-grep -Fq 'validatePsiphonHubAddress' S1T-CAPSULE/main.go || fail "Psiphon Hub destination-port validation is missing."
+grep -Fq 'validatePsiphonHubAddress' S1T-CAPSULE/main.go || fail "Psiphon Hub endpoint validation is missing."
 grep -Fq 'TestPsiphonAdaptiveTransportCandidatesExcludeAdjacentConnectPorts' S1T-CAPSULE/main_test.go || fail "Psiphon CONNECT-port exclusion test is missing."
 grep -Fq 'TestTLSClientHelloALPNSnifferPreservesAllBytes' S1T-CAPSULE/main_test.go || fail "TLS ALPN byte-preservation coverage is missing."
 grep -Fq 'TestAdaptivePsiphonUsesPublicMappingPortAndALPNMultiplex' S1T-CAPSULE/main_test.go || fail "Psiphon public-Mapping integration coverage is missing."
@@ -124,7 +124,7 @@ pass "go vet"
 
 printf '\n== 7/7: Linux build validation (temporary files only) ==\n'
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-amd64" ./S1T-CAPSULE
-[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 5.5.8 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 5.5.9 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-arm64" ./S1T-CAPSULE
 sha256sum "$BUILD_TMP/shah-tunnel-linux-amd64" "$BUILD_TMP/shah-tunnel-linux-arm64" > "$BUILD_TMP/SHA256SUMS"
 pass "Linux amd64 and arm64 binaries built and checksum-checked in a temporary directory (nothing added to the repository)"
