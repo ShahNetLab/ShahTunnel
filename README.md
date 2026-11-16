@@ -1,9 +1,9 @@
 <div align="center">
-# ShahTunnel 5.5.1
+# ShahTunnel 5.5.3
 
 <p align="center"><img src="docs/img/ShahTunnel-Logo-Round.png" alt="ShahTunnel logo" width="420" style="max-width: 92%; height: auto;"></p>
 
-[![Version](https://img.shields.io/badge/version-5.5.1-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-5.5.3-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -34,9 +34,20 @@ The Hub-to-Agent forwarding path and optional per-profile Internet egress are se
 Client → Hub public mapping → authenticated Agent lanes → Agent local target
 Selected Xray inbound → loopback-only Xray sidecar → WARP / Psiphon SOCKS5 → Internet
 ```
-## Version 5.5.1
+## Version 5.5.3 — Psiphon user-connectivity repair
 
-Maintenance update: Psiphon exit selection and verification have been refined, and the dedicated Psiphon startup check now tests the real loopback SOCKS5 handshake and the independently supervised Psiphon systemd unit. It no longer waits for a ConsoleClient child-process notice in the Agent journal, which is absent when the already-running Psiphon service owns the listener. If SOCKS5 is healthy but the first Hub lane is still reconnecting, the Agent remains active in a pending state instead of being incorrectly reported as a failed startup. The application version, installer, terminal banner, tests and documentation are aligned on **5.5.1**.
+This release fixes two issues in the profile-local Psiphon Xray sidecar:
+
+- The sidecar now uses `ProtectHome=read-only` instead of masking `/root` and `/home`. This allows Xray to read TLS certificate and private-key files referenced by the original X-UI inbound when they are stored in those locations, without allowing the sidecar to write to home directories.
+- During a 5.5.3 install/upgrade (before the Agent is restarted), and whenever the profile is later started from the menu, an existing ShahTunnel-owned Psiphon sidecar is migrated only after its service name and exact profile config path match the saved profile metadata. The old `ProtectHome=yes` unit is updated and restarted automatically; unrelated systemd units are never adopted. The installer saves the previous unit before migration and restores it if the sidecar cannot restart.
+- Sidecar DNS now has a unique per-profile routing tag and uses hostname-based DoH endpoints. Resolver connections are routed through the same profile-local SOCKS5/Psiphon outbound; DNS caching remains enabled and parallel duplicate queries are disabled.
+- The Agent startup check now distinguishes a live local SOCKS5 listener from a connected Hub lane. It checks the independent Psiphon service and a real SOCKS5 handshake, and it no longer waits for Psiphon ConsoleClient messages that belong to a different systemd journal. A healthy local listener with a still-retrying Hub lane remains a pending state rather than a false startup failure.
+
+The repair preserves the original X-UI source configuration, original inbound ports, saved client credentials, selected Agent mapping IDs, SSH, and host routes. The existing mapping continues to point only to its dedicated loopback Xray sidecar; it is not changed back to a direct Xray target.
+
+## Version 5.5.0
+
+Historical release note: ShahTunnel 5.5.0 refined Psiphon exit selection and verification. Its application version, installer, terminal banner, service ownership marker, tests and documentation were aligned on **5.5.0** at that release. The current release is 5.5.3.
 
 ## Capabilities
 
@@ -63,7 +74,7 @@ When a new Agent profile is created with Psiphon egress, ShahTunnel first instal
 
 If a previous setup was interrupted after systemd installed the profile's `shah-tunnel-xray-psiphon-*.service`, retrying the same Agent profile now safely recognizes and updates that exact ShahTunnel-owned unit and its profile-local config. Unknown units, symlinks, and services pointing at another config path are rejected rather than overwritten; users do not need to delete systemd files manually.
 
-**5.5.1 Psiphon performance tuning:** Tunnel-lane PING/PONG sampling runs every 5 seconds, uses a quicker 1/4 EWMA, and ranks only RTT samples fresher than 15 seconds; stale measurements cannot keep a degraded lane selected. Active-stream load remains part of the score. The isolated Xray sidecar keeps DNS caching enabled. Psiphon buffer limits are selected from actual host resources: below 3 GiB RAM, conservative Meek/relay limits and the documented SSH channel window default of 4 (128 KiB) are retained; at or above 3 GiB, Meek/relay caps are lifted and the SSH channel window is set to 16 (512 KiB) to improve TCP throughput on high-RTT paths. CPU-thread limiting is lifted only on hosts with at least 2 CPUs, and Psiphon's tunnel-pool size scales with detected RAM/CPU from 2 to 16 independent tunnels. These are throughput and path-selection optimisations, not a promise that the physical Psiphon route or a client app's end-to-end connection time will have a lower RTT. The SOCKS5 user path carries TCP/DNS only; UDP/QUIC and ICMP ping are not supported and are blocked rather than sent Direct.
+**5.5.0 Psiphon performance tuning:** Tunnel-lane PING/PONG sampling runs every 5 seconds, uses a quicker 1/4 EWMA, and ranks only RTT samples fresher than 15 seconds; stale measurements cannot keep a degraded lane selected. Active-stream load remains part of the score. The isolated Xray sidecar keeps DNS caching enabled. Psiphon buffer limits are selected from actual host resources: below 3 GiB RAM, conservative Meek/relay limits and the documented SSH channel window default of 4 (128 KiB) are retained; at or above 3 GiB, Meek/relay caps are lifted and the SSH channel window is set to 16 (512 KiB) to improve TCP throughput on high-RTT paths. CPU-thread limiting is lifted only on hosts with at least 2 CPUs, and Psiphon's tunnel-pool size scales with detected RAM/CPU from 2 to 16 independent tunnels. These are throughput and path-selection optimisations, not a promise that the physical Psiphon route or a client app's end-to-end connection time will have a lower RTT. The SOCKS5 user path carries TCP/DNS only; UDP/QUIC and ICMP ping are not supported and are blocked rather than sent Direct.
 
 ## Hub↔Agent transport modes
 
@@ -94,7 +105,7 @@ Choose a mode during tunnel creation. The Hub and Agent must use compatible sett
 
 When Psiphon cannot reach the Hub control port (for example, a custom `9448`), the Agent uses the Hub public Mapping endpoint on `443` for Psiphon egress only; the Direct path continues to use the configured control port. The Step 06 default is independent of the control port and points to TCP/443. The Hub distinguishes ShahTunnel control traffic from ordinary TLS with the dedicated `shah-tunnel-control/1` ALPN and forwards normal ClientHello bytes unchanged. This does not take over the public port, move a Mapping, or modify X-UI.
 
-For the complete ShahTunnel 5.5.1 feature set, run **5.5.1 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
+For the complete ShahTunnel 5.5.3 feature set, run **5.5.3 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
 
 ### Automatic Psiphon setup
 
@@ -216,7 +227,7 @@ sudo shah-tunnel menu
 
 ---
 
-## Psiphon behavior and performance in 5.5.1
+## Psiphon behavior and performance in 5.5.0
 
 - A local SOCKS5 listener is not treated as proof that Psiphon has established an external tunnel. The Agent remains active while ConsoleClient retries, and the wizard reports a pending state until a real tunnel and Agent lanes are ready.
 - For the selected Agent profile, TCP and DNS from its cloned Xray inbounds use that profile's loopback Psiphon SOCKS5 proxy. UDP, QUIC and unknown network types are blocked in the isolated sidecar rather than falling back to the server's direct route. ICMP ping is not carried by this SOCKS5 path.
@@ -225,10 +236,10 @@ sudo shah-tunnel menu
 - Psiphon buffer limits remain enabled on hosts with less than 3 GiB RAM. On hosts with at least 3 GiB RAM, the Meek and relay buffer caps are removed and the SSH channel window is set to 16 (512 KiB); low-memory hosts retain the documented default window of 4 (128 KiB). CPU thread limiting remains enabled on single-core hosts. The Psiphon tunnel-pool default is retained.
 - These settings target TCP throughput and more responsive lane selection. They cannot remove the physical latency of the client's route to the Hub, the Psiphon relay, or the selected destination. A client-reported value such as 635 ms must be measured end-to-end before and after deployment; no fixed reduction is guaranteed.
 
-Full-feature deployments should keep Hub and Agent on the same ShahTunnel 5.5.1 release. Historical version numbers are retained only in migration/repair code where they are needed to recognize existing installations; they are not separate current releases.
+Full-feature deployments should keep Hub and Agent on the same ShahTunnel 5.5.3 release. Historical version numbers are retained only in migration/repair code where they are needed to recognize existing installations; they are not separate current releases.
 
 
-## Multi-user performance notes (5.5.1)
+## Multi-user performance notes (5.5.0)
 
 The Hub lane scheduler considers authenticated RTT, active stream count, pending payload bytes, and recent data-write wait. Active streams now have a meaningful load weight even when RTT samples are fresh, so a small RTT advantage cannot keep pinning new connections to one busy lane. The per-stream in-flight window is 512 × 64 KiB (32 MiB), while the process-wide queued-payload ceiling remains 64 MiB; this adds bandwidth-delay-product headroom without allowing unbounded aggregate buffering. Queue-pressure and write-wait telemetry continue to steer new flows away from congested lanes. Important: the current protocol distributes independent TCP connections across lanes; one long-lived TCP connection remains pinned to one lane and its bandwidth is not the sum of all 12 lanes. Psiphon `TunnelPoolSize` is selected from RAM/CPU (2–16); exit candidates outside the configured policy are rejected and live egress-IP verification remains mandatory. In option 9, each Agent profile gets one isolated Xray sidecar that sends mapped TCP/DNS flows through its own Psiphon SOCKS5 endpoint; the Agent-to-Hub lanes retain independent Direct/Psiphon/active-MASQUE failover. This is not a host-wide route and does not change SSH or unrelated Xray inbounds. Psiphon capacity is still shared by users of that profile and can be the throughput bottleneck under concurrency. WARP per-tunnel proxy integration currently supports Cloudflare MASQUE Local Proxy only; WireGuard is not advertised as a compatible Xray Local Proxy underlay. 
 

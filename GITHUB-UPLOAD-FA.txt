@@ -1,0 +1,20 @@
+راهنمای آپلود ShahTunnel 5.5.3 در GitHub
+
+این آرشیو به شکل مخزن کامل آماده شده است. فایل‌های داخل ZIP در ریشهٔ مخزن قرار دارند؛ پوشهٔ واسط اضافه وجود ندارد.
+
+در GitHub:
+1) مخزن ShahNetLab/ShahTunnel را باز کنید.
+2) فایل‌های قبلی را با محتویات این بسته جایگزین کنید؛ مخصوصاً S1T-START.sh، go.mod، پوشهٔ S1T-CAPSULE و پوشهٔ scripts؛ از جمله scripts/migrate-xray-psiphon-units.py.
+3) ساختار باید در ریشهٔ مخزن چنین باشد:
+   S1T-START.sh
+   go.mod
+   S1T-CAPSULE/main.go
+   S1T-CAPSULE/xray_psiphon.go
+   S1T-CAPSULE/xray_warp.go
+   scripts/install-psiphon.sh
+   scripts/repair-psiphon-profile.sh
+   scripts/migrate-xray-psiphon-units.py
+4) تغییرات را روی شاخهٔ main ثبت کنید.
+5) نصب آسان قبلی از GitHub را اجرا کنید. نصب‌کننده سورس شاخهٔ main را دریافت می‌کند و باینری را روی VPS می‌سازد.
+
+فقط آپلود کردن ZIP به‌صورت یک فایل در مخزن کافی نیست؛ محتویات آن باید در ریشهٔ مخزن قرار بگیرد تا نصب‌کننده فایل S1T-START.sh و مسیر S1T-CAPSULE را پیدا کند.
