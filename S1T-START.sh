@@ -538,10 +538,36 @@ build_from_official_go_toolchain() {
     elif [[ -s "$source_dir/$helper" ]]; then
       cp -f "$source_dir/$helper" "$source_dir/scripts/$helper" || return 1
     else
-      echo "Required helper $helper is missing from scripts/." >&2
-      return 1
+      # The upstream main branch has occasionally moved this helper between
+      # the repository root and scripts/. Keep the tested helper bundled with
+      # this installer as a safe fallback, without changing the application UI.
+      local bundled_helper=""
+      for candidate in "$script_dir/scripts/$helper" "$script_dir/$helper"; do
+        if [[ -s "$candidate" ]]; then bundled_helper="$candidate"; break; fi
+      done
+      if [[ -z "$bundled_helper" ]]; then
+        echo "Required helper $helper is missing from both the source tree and installer bundle." >&2
+        return 1
+      fi
+      install -m 0750 "$bundled_helper" "$source_dir/scripts/$helper" || return 1
+      cp -f "$source_dir/scripts/$helper" "$source_dir/$helper" || return 1
+      echo "Using bundled, verified helper for missing upstream file: $helper" >&2
     fi
   done
+  # The current upstream main branch can contain tor.go while its Config
+  # struct in main.go is missing the optional Tor fields. Add only the absent
+  # fields to the temporary build tree; the on-disk VPS configuration, menu,
+  # listeners, and customer port mappings are not changed.
+  local schema_patcher="$script_dir/scripts/patch-tor-config-schema.py"
+  if [[ -s "$schema_patcher" ]]; then
+    if ! python3 "$schema_patcher" "$source_dir/S1T-CAPSULE"; then
+      echo "Tor Config schema compatibility check failed; refusing to build a partial binary." >&2
+      return 1
+    fi
+  else
+    echo "Required build compatibility helper is missing: $schema_patcher" >&2
+    return 1
+  fi
   if ! grep -Fq "module github.com/${OWNER}/${REPO}" "$source_dir/go.mod"; then
     echo "The source module path does not match github.com/${OWNER}/${REPO}; refusing to build." >&2
     return 1
