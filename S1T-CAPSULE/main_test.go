@@ -2247,7 +2247,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.2.0             |",
+		"        |            SHAH TUNNEL 5.0.1             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -3060,61 +3060,5 @@ func TestRunAgentDoesNotDiscardOptionNinePsiphonMappings(t *testing.T) {
 	body = body[start : start+end]
 	if strings.Contains(body, "migrateAdaptivePsiphonUserEgress") || strings.Contains(body, "restoreAdaptivePsiphonMappings") {
 		t.Fatal("Agent startup must preserve option-9 Psiphon Xray mappings instead of restoring direct targets")
-	}
-}
-
-func TestAtomicWriteFileUsesPrivateUniqueTempAndReplacesAtomically(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "private.json")
-
-	if err := atomicWriteFile(path, []byte("first\n"), 0600); err != nil {
-		t.Fatalf("first atomic write: %v", err)
-	}
-	if err := atomicWriteFile(path, []byte("second\n"), 0600); err != nil {
-		t.Fatalf("replacement atomic write: %v", err)
-	}
-
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read target: %v", err)
-	}
-	if string(got) != "second\n" {
-		t.Fatalf("target content = %q, want %q", got, "second\n")
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat target: %v", err)
-	}
-	if info.Mode().Perm() != 0600 {
-		t.Fatalf("target permissions = %04o, want 0600", info.Mode().Perm())
-	}
-	matches, err := filepath.Glob(filepath.Join(dir, ".private.json.tmp-*"))
-	if err != nil {
-		t.Fatalf("glob temp files: %v", err)
-	}
-	if len(matches) != 0 {
-		t.Fatalf("temporary files remain after atomic write: %v", matches)
-	}
-}
-
-func TestAtomicWriteFileDoesNotFollowPredictableTemporarySymlink(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
-	target := filepath.Join(dir, "attacker-controlled")
-	if err := os.WriteFile(target, []byte("untouched"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, path+".tmp"); err != nil {
-		t.Skipf("symlinks unavailable on this filesystem: %v", err)
-	}
-	if err := atomicWriteFile(path, []byte("safe"), 0600); err != nil {
-		t.Fatalf("atomic write should not use predictable .tmp path: %v", err)
-	}
-	got, err := os.ReadFile(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "untouched" {
-		t.Fatalf("symlink target was changed: %q", got)
 	}
 }

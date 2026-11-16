@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.2.0"
+	version                          = "5.0.1"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -209,7 +209,16 @@ func writeRuntimeStats(role string) {
 	if err != nil {
 		return
 	}
-	_ = atomicWriteFile(runtimeStatsPath(), append(b, '\n'), 0600)
+	runtimePath := runtimeStatsPath()
+	tmp := runtimePath + ".tmp"
+	if err = os.MkdirAll(filepath.Dir(runtimePath), 0700); err != nil {
+		return
+	}
+	if err = os.WriteFile(tmp, append(b, '\n'), 0600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, runtimePath)
+	_ = os.Chmod(runtimePath, 0600)
 }
 
 type counterWriter struct {
@@ -4609,7 +4618,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.2.0             |",
+	"        |            SHAH TUNNEL 5.0.1             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -4917,10 +4926,13 @@ func generateCertificate(certPath, keyPath string) (string, error) {
 	if err = os.MkdirAll(filepath.Dir(certPath), 0700); err != nil {
 		return "", err
 	}
-	if err = atomicWriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0644); err != nil {
+	if err = os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0644); err != nil {
 		return "", err
 	}
-	if err = atomicWriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0600); err != nil {
+	if err = os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0600); err != nil {
+		return "", err
+	}
+	if err = os.Chmod(keyPath, 0600); err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(der)
@@ -5460,48 +5472,21 @@ fi
 `
 
 // atomicWriteFile writes a root-owned schedule file by replacing it atomically.
-func atomicWriteFile(path string, data []byte, mode os.FileMode) (retErr error) {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-
-	// CreateTemp generates an unpredictable name and creates the file as 0600.
-	// This avoids predictable *.tmp paths being pre-created or replaced by
-	// another local process before the atomic rename.
-	tmpFile, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
-	if err != nil {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, mode); err != nil {
 		return err
 	}
-	tmpPath := tmpFile.Name()
-	defer func() {
-		_ = tmpFile.Close()
-		if retErr != nil {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
-	if _, err := tmpFile.Write(data); err != nil {
+	if err := os.Chmod(tmp, mode); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
-	if err := tmpFile.Chmod(mode); err != nil {
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
 		return err
-	}
-	if err := tmpFile.Sync(); err != nil {
-		return err
-	}
-	if err := tmpFile.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return err
-	}
-
-	// Best-effort directory sync makes the rename durable across a sudden
-	// power loss on filesystems that support syncing directory descriptors.
-	if dirFile, err := os.Open(dir); err == nil {
-		_ = dirFile.Sync()
-		_ = dirFile.Close()
 	}
 	return nil
 }
@@ -5822,7 +5807,15 @@ func writeServerGeoCache(g ServerGeo) {
 	if err != nil {
 		return
 	}
-	_ = atomicWriteFile(serverGeoCachePath, append(b, '\n'), 0600)
+	tmp := serverGeoCachePath + ".tmp"
+	if err := os.WriteFile(tmp, append(b, '\n'), 0600); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, serverGeoCachePath); err != nil {
+		_ = os.Remove(tmp)
+		return
+	}
+	_ = os.Chmod(serverGeoCachePath, 0600)
 }
 
 // isPublicIPv4 rejects private, local, shared-CGNAT, documentation, benchmark,
