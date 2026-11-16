@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 5.0.0 installer.
+# Shah Tunnel 5.5.7 installer.
 # Downloads the pinned Go 1.26.1 toolchain, verifies its SHA-256, fetches the source,
 # and builds the Linux binary on the target server. No prebuilt release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="5.0.0"
+VERSION="5.5.7"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
 STATE_DIR="/usr/local/lib/shah-tunnel"
 GO_CACHE_DIR="/var/cache/shah-tunnel"
 PHASE_HAS_DOWNLOAD=0
-RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/main"
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64) TARGET_ARCH="amd64" ;;
   Linux:aarch64|Linux:arm64) TARGET_ARCH="arm64" ;;
   *) echo "Shah Tunnel ${VERSION} supports Linux amd64 and arm64 only." >&2; exit 1 ;;
 esac
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-  echo "Run as root: bash <(curl -fsSL ${RAW_BASE}/S1T-START.sh)" >&2
+  echo "Run as root. If raw.githubusercontent.com is blocked, fetch this installer through the GitHub API:" >&2
+  echo "set -o pipefail; curl -fsSL --connect-timeout 10 --max-time 30 -H 'Accept: application/vnd.github+json' -H 'User-Agent: ShahTunnel-bootstrap' 'https://api.github.com/repos/${OWNER}/${REPO}/contents/S1T-START.sh?ref=main' | python3 -c 'import sys,json,base64; d=json.load(sys.stdin); sys.stdout.buffer.write(base64.b64decode(d[\"content\"]))' | bash" >&2
   exit 1
 fi
 command -v systemctl >/dev/null 2>&1 || { echo "systemd/systemctl is required." >&2; exit 1; }
@@ -508,7 +508,7 @@ build_from_official_go_toolchain() {
       cp -a "$script_dir/scripts" "$source_dir/" || return 1
     else
       mkdir -p "$source_dir/scripts"
-      for helper in install-psiphon.sh install-tor.sh repair-psiphon-profile.sh; do
+      for helper in install-psiphon.sh repair-psiphon-profile.sh; do
         [[ -s "$script_dir/$helper" ]] && cp -a "$script_dir/$helper" "$source_dir/scripts/" || {
           echo "Missing required helper: $helper" >&2; return 1;
         }
@@ -532,7 +532,7 @@ build_from_official_go_toolchain() {
   [[ -s "$source_dir/go.mod" && -s "$source_dir/S1T-CAPSULE/main.go" ]] \
     || { echo "The downloaded repository does not contain the expected ShahTunnel source files." >&2; return 1; }
   mkdir -p "$source_dir/scripts"
-  for helper in install-psiphon.sh install-tor.sh repair-psiphon-profile.sh; do
+  for helper in install-psiphon.sh repair-psiphon-profile.sh; do
     if [[ -s "$source_dir/scripts/$helper" ]]; then
       cp -f "$source_dir/scripts/$helper" "$source_dir/$helper" || return 1
     elif [[ -s "$source_dir/$helper" ]]; then
@@ -549,11 +549,6 @@ build_from_official_go_toolchain() {
   [[ -s "$source_dir/install-psiphon.sh" ]] || { echo "Pinned Psiphon auto-installer is missing from the ShahTunnel source." >&2; return 1; }
   if ! bash -n "$source_dir/install-psiphon.sh"; then
     echo "Psiphon auto-installer has invalid shell syntax; refusing to continue." >&2
-    return 1
-  fi
-  [[ -s "$source_dir/install-tor.sh" ]] || { echo "Pinned Tor auto-installer is missing from the ShahTunnel source." >&2; return 1; }
-  if ! bash -n "$source_dir/install-tor.sh"; then
-    echo "Tor auto-installer has invalid shell syntax; refusing to continue." >&2
     return 1
   fi
   local source_fingerprint build_cache_dir cached_binary
@@ -601,9 +596,6 @@ install -d -o root -g root -m 0755 "$STATE_DIR"
 # built on-demand only when an Agent selects Psiphon; no TUN/routes are created.
 install -o root -g root -m 0750 "$TMP/source/install-psiphon.sh" "$STATE_DIR/install-psiphon.sh.new"
 mv -f "$STATE_DIR/install-psiphon.sh.new" "$STATE_DIR/install-psiphon.sh"
-install -o root -g root -m 0750 "$TMP/source/install-tor.sh" "$STATE_DIR/install-tor.sh.new"
-mv -f "$STATE_DIR/install-tor.sh.new" "$STATE_DIR/install-tor.sh"
-install -d -o root -g root -m 0700 /var/lib/shah-tunnel/tor
 [[ -s "$TMP/source/repair-psiphon-profile.sh" ]] || { echo "Psiphon profile repair helper is missing from the source archive." >&2; exit 1; }
 install -o root -g root -m 0750 "$TMP/source/repair-psiphon-profile.sh" "$STATE_DIR/repair-psiphon-profile.sh.new"
 mv -f "$STATE_DIR/repair-psiphon-profile.sh.new" "$STATE_DIR/repair-psiphon-profile.sh"
@@ -615,6 +607,21 @@ fi
 install -o root -g root -m 0750 "$TMP/S1T-CORE" /usr/local/bin/ravanreverse.new
 mv -f /usr/local/bin/ravanreverse.new "$BIN"
 ln -sfn /usr/local/bin/ravanreverse /usr/local/bin/shah-tunnel
+
+# Remove legacy Tor/Snowflake components from older ShahTunnel releases.
+# Only ShahTunnel-owned units, drop-ins, and private state paths are touched.
+shopt -s nullglob
+for old_unit in /etc/systemd/system/shah-tunnel-xray-tor-*.service; do
+  old_name="$(basename "$old_unit")"
+  systemctl disable --now "$old_name" >/dev/null 2>&1 || true
+  rm -f -- "$old_unit" "/etc/systemd/system/multi-user.target.wants/$old_name"
+done
+for dropin in /etc/systemd/system/ravanreverse.service.d/tor.conf /etc/systemd/system/ravanreverse@.service.d/tor.conf /etc/systemd/system/ravanreverse@*.service.d/tor.conf; do
+  rm -f -- "$dropin"
+done
+rm -f /etc/ravanreverse/runtime/emergency-tor-snowflake.json "$STATE_DIR/install-tor.sh"
+rm -rf /etc/ravanreverse/xray-tor /var/lib/shah-tunnel/tor "$STATE_DIR/tor-bundle"
+shopt -u nullglob
 # Preserve a working service unit on upgrades; create one only for a fresh install.
 if [[ ! -f /etc/systemd/system/ravanreverse.service ]]; then
   cat > "$TMP/ravanreverse.service" <<'UNIT'
@@ -652,7 +659,7 @@ LockPersonality=true
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
-ReadWritePaths=/etc/ravanreverse /var/lib/shah-tunnel/tor
+ReadWritePaths=/etc/ravanreverse
 [Install]
 WantedBy=multi-user.target
 UNIT
@@ -693,7 +700,7 @@ LockPersonality=true
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
-ReadWritePaths=/etc/ravanreverse /var/lib/shah-tunnel/tor
+ReadWritePaths=/etc/ravanreverse
 [Install]
 WantedBy=multi-user.target
 UNIT
@@ -709,12 +716,6 @@ for unit in ravanreverse.service ravanreverse@.service; do
 ReadWritePaths=/var/lib/shah-tunnel/psiphon
 DROPIN
   install -o root -g root -m 0644 "$TMP/psiphon-${unit}.conf" "$dropin_dir/psiphon.conf"
-  cat > "$TMP/tor-${unit}.conf" <<'TOR_DROPIN'
-[Service]
-ReadWritePaths=/var/lib/shah-tunnel/tor
-TOR_DROPIN
-  install -o root -g root -m 0644 "$TMP/tor-${unit}.conf" "$dropin_dir/tor.conf"
-
   # Keep this as the same standalone override that fixed the live Agent
   # manually. It is deliberately installed under the template drop-in so
   # every existing and future ravanreverse@PROFILE.service inherits it.
@@ -725,8 +726,72 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 NETLINK
   install -o root -g root -m 0644 "$TMP/netlink-${unit}.conf" "$dropin_dir/10-psiphon-netlink.conf"
 done
+
+# Migrate installed per-profile Psiphon dependencies from Requires to Wants.
+# Requires makes systemd send SIGTERM to the Agent whenever ConsoleClient is
+# restarted; this is unsafe for adaptive lanes and leaves the Agent stopped.
+# Wants + After still starts Psiphon with the Agent, but Psiphon may recover
+# independently without taking down the authenticated Agent service.
+for dependency_dropin in \
+  /etc/systemd/system/ravanreverse@*.service.d/shah-tunnel-psiphon.conf \
+  /etc/systemd/system/ravanreverse.service.d/shah-tunnel-psiphon.conf; do
+  [[ -f "$dependency_dropin" ]] || continue
+  if grep -q '^Requires=shah-tunnel-psiphon-' "$dependency_dropin"; then
+    migrated_dropin="$TMP/psiphon-dependency-migrated.conf"
+    sed 's/^Requires=shah-tunnel-psiphon-/Wants=shah-tunnel-psiphon-/' \
+      "$dependency_dropin" > "$migrated_dropin"
+    install -o root -g root -m 0644 "$migrated_dropin" "$dependency_dropin"
+    echo "Migrated Psiphon dependency to non-fatal Wants/After: $dependency_dropin"
+  fi
+done
+
 if ! timeout --kill-after=3s 15s systemctl daemon-reload; then
   echo "systemd daemon-reload timed out. The binary is installed, but service metadata may need: systemctl daemon-reload" >&2
+  exit 1
+fi
+
+# Upgrade existing profile-local Psiphon Xray sidecars in place before an
+# Agent is restarted. This uses an existing binary command and embeds the
+# profile scan here so the GitHub repository keeps its exact original file set.
+# It changes only the managed sidecar's read-only certificate visibility and
+# profile-specific DNS route; ports, cloned inbound credentials, X-UI config,
+# and the Agent mapping are preserved.
+repair_existing_psiphon_xray_sidecars() {
+  local config
+  local -a profile_configs=()
+  [[ -s /etc/ravanreverse/config.json ]] && profile_configs+=("/etc/ravanreverse/config.json")
+  shopt -s nullglob
+  for config in /etc/ravanreverse/tunnels/*.json; do
+    [[ -s "$config" ]] && profile_configs+=("$config")
+  done
+  shopt -u nullglob
+
+  for config in "${profile_configs[@]}"; do
+    if ! python3 - "$config" <<'PYPROFILE'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        cfg = json.load(f)
+except Exception:
+    raise SystemExit(1)
+meta = cfg.get("xray_psiphon")
+raise SystemExit(0 if cfg.get("role") == "agent" and
+    cfg.get("underlay") in ("psiphon_socks5", "adaptive_external") and
+    isinstance(meta, dict) and meta else 1)
+PYPROFILE
+    then
+      continue
+    fi
+    echo "Validating and repairing the existing Psiphon Xray sidecar for ${config}..."
+    if ! timeout --kill-after=5s 90s "$BIN" repair-psiphon-sidecar --config "$config"; then
+      echo "ERROR: safe Psiphon Xray sidecar repair failed for ${config}. The Agent upgrade restart was cancelled." >&2
+      return 1
+    fi
+  done
+}
+
+if ! repair_existing_psiphon_xray_sidecars; then
+  echo "Installation stopped before Agent restart because an existing Psiphon user-egress sidecar could not be repaired safely." >&2
   exit 1
 fi
 
