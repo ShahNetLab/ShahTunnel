@@ -231,10 +231,10 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 
 // buildXrayEgressConfig creates a private Xray sidecar containing only cloned
 // inbounds for the selected ShahTunnel mappings. The original X-UI config is
-// never modified. For TCP-only SOCKS egress (Psiphon), UDP and unknown
+// never modified. For TCP-only SOCKS egress (Psiphon and Tor), UDP and unknown
 // networks are explicitly blackholed instead of falling back to Direct.
 func buildXrayEgressConfig(original []byte, profileID, proxyAddress string, mappings []PortMapping, kind string, blockUDP bool) ([]byte, []XrayWarpBinding, string, error) {
-	if kind != "warp" && kind != "psiphon" {
+	if kind != "warp" && kind != "psiphon" && kind != "tor" {
 		return nil, nil, "", fmt.Errorf("unsupported isolated Xray egress kind %q", kind)
 	}
 	if _, _, err := net.SplitHostPort(proxyAddress); err != nil || !isLoopbackProxyAddress(proxyAddress) {
@@ -415,14 +415,12 @@ func configureXrayProxyDNS(root map[string]any, shortID, proxyOutboundTag string
 		dnsConfig = map[string]any{}
 		root["dns"] = dnsConfig
 	}
-	// Never reuse the source X-UI DNS tag. Existing X-UI routing rules may
-	// send that tag to Direct or another outbound. A unique per-sidecar tag
-	// guarantees that this profile's resolver traffic follows its own proxy.
-	dnsInboundTag := "s1t-" + kind + "-" + shortID + "-dns-in"
-	if usedTags[dnsInboundTag] {
-		return nil, nil, fmt.Errorf("Xray DNS tag %q already exists; refusing to share an existing DNS route", dnsInboundTag)
+	dnsInboundTag, _ := dnsConfig["tag"].(string)
+	dnsInboundTag = strings.TrimSpace(dnsInboundTag)
+	if dnsInboundTag == "" {
+		dnsInboundTag = "s1t-" + kind + "-" + shortID + "-dns-in"
+		dnsConfig["tag"] = dnsInboundTag
 	}
-	dnsConfig["tag"] = dnsInboundTag
 	dnsOutboundTag := "s1t-" + kind + "-" + shortID + "-dns-out"
 	if usedTags[dnsOutboundTag] || dnsOutboundTag == proxyOutboundTag {
 		return nil, nil, fmt.Errorf("Xray DNS outbound tag %q already exists; refusing to overwrite it", dnsOutboundTag)
@@ -430,16 +428,11 @@ func configureXrayProxyDNS(root map[string]any, shortID, proxyOutboundTag string
 	if len(inboundTags) == 0 {
 		return nil, nil, errors.New("no cloned inbound tags available for isolated DNS routing")
 	}
-	// These are non-local DoH servers. Xray tags their internal requests
-	// with dnsInboundTag; the matching routing rule sends the hostname-based
-	// HTTPS connection through this profile's SOCKS5 outbound. This preserves
-	// provider SNI/certificate validation while keeping resolver traffic off
-	// the Agent's direct network path.
-	dnsConfig["servers"] = []any{"https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query"}
+	// Provider IPs avoid needing a DNS lookup to bootstrap the DoH connection.
+	dnsConfig["servers"] = []any{"https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"}
 	dnsConfig["queryStrategy"] = "UseIPv4"
+	// Keep Xray's DNS cache enabled so repeat lookups avoid another DoH round trip.
 	dnsConfig["disableCache"] = false
-	// Avoid parallel duplicate DoH requests over a single Psiphon SOCKS pool.
-	dnsConfig["enableParallelQuery"] = false
 	dnsOutbound := map[string]any{"tag": dnsOutboundTag, "protocol": "dns", "settings": map[string]any{}}
 	dnsRules := []any{
 		map[string]any{

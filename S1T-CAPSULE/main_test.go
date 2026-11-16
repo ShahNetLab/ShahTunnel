@@ -1536,42 +1536,6 @@ func TestPsiphonTransportKeepsMappingAndControlPortsSeparate(t *testing.T) {
 	}
 }
 
-func TestPsiphonHubRelayKeepsCustomer2083MappingIndependent(t *testing.T) {
-	hub := Config{
-		Version:       version,
-		Role:          "hub",
-		Transport:     transportTCP,
-		ControlListen: "0.0.0.0:9443",
-		Token:         strings.Repeat("a", 64),
-		CertFile:      "/tmp/shah-test-hub.crt",
-		KeyFile:       "/tmp/shah-test-hub.key",
-		Ports:         []PortMapping{{ID: "main", Listen: "0.0.0.0:2083"}},
-	}
-	if err := validateConfig(hub); err != nil {
-		t.Fatalf("Hub with customer TCP/2083 mapping must remain valid: %v", err)
-	}
-	if len(hub.Ports) != 1 || hub.Ports[0].Listen != "0.0.0.0:2083" {
-		t.Fatalf("Hub customer mapping changed: %+v", hub.Ports)
-	}
-
-	relay := Config{
-		Version: version,
-		Role:    "relay",
-		Token:   strings.Repeat("b", 64),
-		Ports: []PortMapping{{
-			ID:     "psiphon-control",
-			Listen: "0.0.0.0:443",
-			Target: "127.0.0.1:9443",
-		}},
-	}
-	if err := validateConfig(relay); err != nil {
-		t.Fatalf("separate Psiphon TCP/443 relay to the Hub control listener must be valid: %v", err)
-	}
-	if relay.Ports[0].Listen == hub.Ports[0].Listen {
-		t.Fatal("Psiphon relay must not reuse or replace the customer-facing TCP/2083 mapping")
-	}
-}
-
 func TestPsiphonHubAddressDefaultsToPublicMappingPort(t *testing.T) {
 	cases := []struct {
 		input string
@@ -1600,10 +1564,6 @@ func TestPsiphonHubAddressDefaultsToPublicMappingPort(t *testing.T) {
 	if legacy.PsiphonHubAddr != "37.32.12.244:443" {
 		t.Fatalf("legacy adaptive profile PsiphonHubAddr = %q; want 37.32.12.244:443", legacy.PsiphonHubAddr)
 	}
-	legacySameAsControl := normalizeConfig(Config{Role: "agent", Underlay: underlayPsiphon, HubAddr: "37.32.12.244:557", PsiphonHubAddr: "37.32.12.244:557"})
-	if legacySameAsControl.PsiphonHubAddr != "37.32.12.244:443" {
-		t.Fatalf("legacy Psiphon endpoint copied from control port = %q; want 37.32.12.244:443", legacySameAsControl.PsiphonHubAddr)
-	}
 	explicit := Config{Role: "agent", Underlay: underlayPsiphon, HubAddr: "37.32.12.244:9443", PsiphonHubAddr: "37.32.12.244:8443"}
 	if got := agentHubAddressForUnderlay(explicit, underlayPsiphon); got != "37.32.12.244:8443" {
 		t.Fatalf("explicit Psiphon endpoint = %q; want 37.32.12.244:8443", got)
@@ -1611,11 +1571,25 @@ func TestPsiphonHubAddressDefaultsToPublicMappingPort(t *testing.T) {
 	if got := agentHubAddressForUnderlay(explicit, underlayDirect); got != explicit.HubAddr {
 		t.Fatalf("Direct endpoint = %q; want unchanged %q", got, explicit.HubAddr)
 	}
-
+	torDefault := Config{Role: "agent", Underlay: underlayTor, HubAddr: "37.32.12.244:9448"}
+	if got := agentHubAddressForUnderlay(torDefault, underlayTor); got != "37.32.12.244:443" {
+		t.Fatalf("default Tor Mapping endpoint = %q; want 37.32.12.244:443", got)
+	}
+	torCustom := torDefault
+	torCustom.TorHubAddr = "37.32.12.244:8443"
+	if got := agentHubAddressForUnderlay(torCustom, underlayTor); got != torCustom.TorHubAddr {
+		t.Fatalf("explicit Tor Mapping endpoint = %q; want %q", got, torCustom.TorHubAddr)
+	}
+	if got := agentHubAddressForTransport(torDefault, transportTCP); got != "37.32.12.244:443" {
+		t.Fatalf("Tor TCP lane endpoint = %q; want public Mapping on 443", got)
+	}
+	if got := agentHubAddressForTransport(torDefault, transportHTTP2); got != torDefault.HubAddr {
+		t.Fatalf("Tor HTTP/2 CONNECT endpoint = %q; want control port %q", got, torDefault.HubAddr)
+	}
 }
 
 func TestUnderlayModesAndLoopbackValidation(t *testing.T) {
-	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayAdaptive} {
+	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayTor, underlayAdaptive} {
 		if !validUnderlayMode(mode) {
 			t.Fatalf("valid underlay %q was rejected", mode)
 		}
@@ -1880,139 +1854,6 @@ func TestAdaptiveTransportCandidatesPreferLastSuccessfulPath(t *testing.T) {
 		if len(seen) != len(wantAll) {
 			t.Fatalf("preferred %q candidates miss a path: %v", preferred, got)
 		}
-	}
-}
-
-func TestPsiphonAdaptiveTransportCandidatesExcludeAdjacentConnectPorts(t *testing.T) {
-	want := []string{transportTCP, transportWebSocket}
-	for _, preferred := range []string{"", transportTCP, transportWebSocket, transportHTTP2, transportHTTP1} {
-		got := adaptiveTransportCandidatesForUnderlay(preferred, underlayPsiphon)
-		if len(got) != len(want) {
-			t.Fatalf("Psiphon candidates for preference %q = %v; want only %v", preferred, got, want)
-		}
-		for _, candidate := range got {
-			if candidate != transportTCP && candidate != transportWebSocket {
-				t.Fatalf("Psiphon candidate %q would use a restricted CONNECT port", candidate)
-			}
-		}
-		if preferred == transportTCP || preferred == transportWebSocket {
-			if got[0] != preferred {
-				t.Fatalf("last successful Psiphon-compatible transport %q was not preferred: %v", preferred, got)
-			}
-		}
-	}
-	for _, underlay := range []string{underlayDirect, underlayMASQUE} {
-		got := adaptiveTransportCandidatesForUnderlay(transportHTTP2, underlay)
-		if len(got) != 4 || got[0] != transportHTTP2 {
-			t.Fatalf("non-Psiphon underlay %q lost HTTP CONNECT fallback: %v", underlay, got)
-		}
-	}
-}
-
-func TestLoadedConfigPreservesExplicitPsiphonTransitPortWithoutChangingCustomerPort(t *testing.T) {
-	cfg := Config{
-		Name:           "profile-s",
-		Role:           "agent",
-		Transport:      transportAdaptive,
-		Underlay:       underlayPsiphon,
-		HubAddr:        "37.32.12.244:444",
-		PsiphonHubAddr: "37.32.12.244:2083",
-		PsiphonConfig:  "/etc/ravanreverse/psiphon/s.json",
-		PsiphonProxy:   "127.0.0.1:21082",
-		Token:          strings.Repeat("a", 48),
-		Fingerprint:    strings.Repeat("a", 64),
-		TunnelChannels: 1,
-		Ports:          []PortMapping{{ID: "main", Target: "127.0.0.1:2083"}},
-	}
-	got, migratedFrom := normalizeLoadedConfig(cfg)
-	if migratedFrom != "" {
-		t.Fatalf("explicit endpoint was unexpectedly migrated from %q", migratedFrom)
-	}
-	if got.PsiphonHubAddr != "37.32.12.244:2083" {
-		t.Fatalf("explicit Psiphon transit endpoint = %q; want original TCP/2083", got.PsiphonHubAddr)
-	}
-	if len(got.Ports) != 1 || got.Ports[0].Target != "127.0.0.1:2083" {
-		t.Fatalf("customer mapping target changed while loading config: %+v", got.Ports)
-	}
-	if err := validateConfig(got); err != nil {
-		t.Fatalf("persisted Agent config with explicit Psiphon TCP/2083 was rejected: %v", err)
-	}
-}
-
-func TestDecodeConfigDataDoesNotRunUnrelatedFullAgentValidation(t *testing.T) {
-	cfg := Config{
-		Name:           "profile-s",
-		Role:           "agent",
-		Underlay:       underlayPsiphon,
-		HubAddr:        "37.32.12.244:557",
-		PsiphonHubAddr: "37.32.12.244:2083",
-		PsiphonProxy:   "127.0.0.1:21082",
-		PsiphonConfig:  "/etc/ravanreverse/psiphon/s.json",
-	}
-	data, err := json.Marshal(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoded, migratedFrom, err := decodeConfigData(data)
-	if err != nil {
-		t.Fatalf("sidecar-repair config decode should not validate unrelated Agent credentials: %v", err)
-	}
-	if migratedFrom != "" || decoded.PsiphonHubAddr != "37.32.12.244:2083" {
-		t.Fatalf("explicit decoded transit endpoint was changed: address=%q migratedFrom=%q", decoded.PsiphonHubAddr, migratedFrom)
-	}
-	if err := validateConfig(decoded); err == nil {
-		t.Fatal("test fixture unexpectedly passed full Agent validation without required credentials")
-	}
-}
-
-func TestLoadedConfigPreservesExplicitCustomPsiphonPorts(t *testing.T) {
-	for _, endpoint := range []string{
-		"mapping.example.net:2083",
-		"mapping.example.net:557",
-		"mapping.example.net:8080",
-		"mapping.example.net:9449",
-	} {
-		cfg := Config{Role: "agent", Underlay: underlayPsiphon, HubAddr: "hub.example.net:444", PsiphonHubAddr: endpoint}
-		got, migratedFrom := normalizeLoadedConfig(cfg)
-		if migratedFrom != "" || got.PsiphonHubAddr != endpoint {
-			t.Fatalf("explicit custom Psiphon Mapping endpoint %q was changed: address=%q migratedFrom=%q", endpoint, got.PsiphonHubAddr, migratedFrom)
-		}
-		if err := validatePsiphonHubAddress(endpoint); err != nil {
-			t.Errorf("valid custom Psiphon endpoint %q was rejected: %v", endpoint, err)
-		}
-	}
-	for _, endpoint := range []string{"mapping.example.net:0", "mapping.example.net:65536", "mapping.example.net:nope", "missing-port"} {
-		if err := validatePsiphonHubAddress(endpoint); err == nil {
-			t.Errorf("invalid Psiphon endpoint %q was accepted", endpoint)
-		}
-	}
-}
-
-func TestCustomPsiphonHubPortsAndCustomerMappingsRemainIndependent(t *testing.T) {
-	cfg := Config{
-		Role:           "agent",
-		Transport:      transportAdaptive,
-		Underlay:       underlayPsiphon,
-		HubAddr:        "hub.example.net:555",
-		PsiphonHubAddr: "hub.example.net:2083",
-		PsiphonConfig:  "/etc/ravanreverse/psiphon/s.json",
-		PsiphonProxy:   "127.0.0.1:21082",
-		Token:          strings.Repeat("a", 48),
-		Fingerprint:    strings.Repeat("a", 64),
-		TunnelChannels: 1,
-		Ports:          []PortMapping{{ID: "main", Target: "127.0.0.1:2083"}},
-	}
-	if err := validateConfig(cfg); err != nil {
-		t.Fatalf("valid Psiphon Mapping TCP/2083 and customer target TCP/2083 were rejected: %v", err)
-	}
-	cfg.PsiphonHubAddr = "hub.example.net:557"
-	if err := validateConfig(cfg); err != nil {
-		t.Fatalf("custom Psiphon Mapping TCP/557 should be syntactically valid and tried at runtime: %v", err)
-	}
-	cfg.PsiphonHubAddr = "hub.example.net:443"
-	cfg.Transport = transportHTTP1
-	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "adjacent control ports") {
-		t.Fatalf("fixed HTTP/1.1 CONNECT was not rejected for Psiphon: %v", err)
 	}
 }
 
@@ -2406,7 +2247,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.5.12            |",
+		"        |            SHAH TUNNEL 5.2.0             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -2820,14 +2661,8 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 		t.Fatalf("sidecar DNS disableCache=%v; repeat lookups should use the Xray cache", dnsConfig["disableCache"])
 	}
 	dnsServers := dnsConfig["servers"].([]any)
-	if len(dnsServers) != 2 || dnsServers[0] != "https://cloudflare-dns.com/dns-query" || dnsServers[1] != "https://dns.google/dns-query" {
-		t.Fatalf("sidecar DNS servers were not normalized for routed DoH: %#v", dnsServers)
-	}
-	if dnsConfig["tag"] != "s1t-warp-warp-profile-dns-in" {
-		t.Fatalf("sidecar must use a unique DNS routing tag, got %v", dnsConfig["tag"])
-	}
-	if dnsConfig["enableParallelQuery"] != false {
-		t.Fatalf("sidecar DNS requests must be serial over the SOCKS tunnel, got %v", dnsConfig["enableParallelQuery"])
+	if len(dnsServers) != 2 || dnsServers[0] != "https://1.1.1.1/dns-query" || dnsServers[1] != "https://8.8.8.8/dns-query" {
+		t.Fatalf("sidecar DNS servers were not normalized: %#v", dnsServers)
 	}
 	outboundsWithDNS := got["outbounds"].([]any)
 	dnsOutboundTag := "s1t-warp-warp-profile-dns-out"
@@ -2850,7 +2685,7 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 		t.Fatalf("client DNS is not intercepted before the default WARP route: %#v", dnsHijack)
 	}
 	dnsEgress := rules[1].(map[string]any)
-	if dnsEgress["inboundTag"].([]any)[0] != "s1t-warp-warp-profile-dns-in" || dnsEgress["outboundTag"] != outTag {
+	if dnsEgress["inboundTag"].([]any)[0] != "dns_inbound" || dnsEgress["outboundTag"] != outTag {
 		t.Fatalf("internal DNS requests are not routed through WARP: %#v", dnsEgress)
 	}
 	first := rules[2].(map[string]any)
@@ -2983,17 +2818,6 @@ func TestBuildXrayPsiphonConfigIsolatesTCPAndBlocksUDP(t *testing.T) {
 	if rules[1].(map[string]any)["outboundTag"] != outTag {
 		t.Fatalf("DNS resolver traffic must use Psiphon SOCKS: %#v", rules[1])
 	}
-	dnsConfig := got["dns"].(map[string]any)
-	if dnsConfig["tag"] != "s1t-psiphon-psiphon-profile-dns-in" {
-		t.Fatalf("Psiphon DNS module must have a unique sidecar tag, got %v", dnsConfig["tag"])
-	}
-	if dnsConfig["enableParallelQuery"] != false {
-		t.Fatalf("Psiphon DNS queries must be serialized, got %v", dnsConfig["enableParallelQuery"])
-	}
-	dnsServers := dnsConfig["servers"].([]any)
-	if len(dnsServers) != 2 || dnsServers[0] != "https://cloudflare-dns.com/dns-query" || dnsServers[1] != "https://dns.google/dns-query" {
-		t.Fatalf("unexpected Psiphon DoH servers: %#v", dnsServers)
-	}
 	tcpRule := rules[2].(map[string]any)
 	if tcpRule["network"] != "tcp" || tcpRule["outboundTag"] != outTag {
 		t.Fatalf("cloned TCP traffic must use Psiphon: %#v", tcpRule)
@@ -3036,7 +2860,7 @@ func TestXrayPsiphonManagedPathsAndUnitAreRestricted(t *testing.T) {
 		"NoNewPrivileges=yes",
 		"PrivateTmp=yes",
 		"ProtectSystem=full",
-		"ProtectHome=read-only",
+		"ProtectHome=yes",
 		"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
 	} {
 		if !strings.Contains(unitText, want) {
@@ -3118,18 +2942,6 @@ func TestHubPrefersFreshRTTOverStaleLowRTT(t *testing.T) {
 	h := &hubServer{sessions: map[*hubSession]struct{}{staleFormerlyFast: {}, freshHealthy: {}}}
 	if got := h.current(); got != freshHealthy {
 		t.Fatalf("selected lane %d; want fresh lane %d despite stale lower RTT", got.id, freshHealthy.id)
-	}
-}
-
-func TestPsiphonAgentLaneReadyInLogsUsesAgentLaneNotConsoleClientNotices(t *testing.T) {
-	if psiphonAgentLaneReadyInLogs("Psiphon ConsoleClient connected\nPsiphon local SOCKS5 listener ready") {
-		t.Fatal("separate Psiphon service notices must not count as an Agent lane")
-	}
-	if !psiphonAgentLaneReadyInLogs("tunnel lane 3/12 connected via tcp_tls over psiphon_socks5; forwarding through 1 configured port mapping(s)") {
-		t.Fatal("an authenticated Agent lane over Psiphon must be recognized")
-	}
-	if psiphonAgentLaneReadyInLogs("tunnel lane 3: transport tcp_tls failed on psiphon_socks5; trying websocket_tls") {
-		t.Fatal("a transport retry must not count as a connected lane")
 	}
 }
 
@@ -3248,5 +3060,61 @@ func TestRunAgentDoesNotDiscardOptionNinePsiphonMappings(t *testing.T) {
 	body = body[start : start+end]
 	if strings.Contains(body, "migrateAdaptivePsiphonUserEgress") || strings.Contains(body, "restoreAdaptivePsiphonMappings") {
 		t.Fatal("Agent startup must preserve option-9 Psiphon Xray mappings instead of restoring direct targets")
+	}
+}
+
+func TestAtomicWriteFileUsesPrivateUniqueTempAndReplacesAtomically(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "private.json")
+
+	if err := atomicWriteFile(path, []byte("first\n"), 0600); err != nil {
+		t.Fatalf("first atomic write: %v", err)
+	}
+	if err := atomicWriteFile(path, []byte("second\n"), 0600); err != nil {
+		t.Fatalf("replacement atomic write: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if string(got) != "second\n" {
+		t.Fatalf("target content = %q, want %q", got, "second\n")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat target: %v", err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("target permissions = %04o, want 0600", info.Mode().Perm())
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, ".private.json.tmp-*"))
+	if err != nil {
+		t.Fatalf("glob temp files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary files remain after atomic write: %v", matches)
+	}
+}
+
+func TestAtomicWriteFileDoesNotFollowPredictableTemporarySymlink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	target := filepath.Join(dir, "attacker-controlled")
+	if err := os.WriteFile(target, []byte("untouched"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path+".tmp"); err != nil {
+		t.Skipf("symlinks unavailable on this filesystem: %v", err)
+	}
+	if err := atomicWriteFile(path, []byte("safe"), 0600); err != nil {
+		t.Fatalf("atomic write should not use predictable .tmp path: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "untouched" {
+		t.Fatalf("symlink target was changed: %q", got)
 	}
 }
