@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -87,7 +88,7 @@ func renderXrayPsiphonUnit(runtime xrayRuntime, configPath, service string) ([]b
 		}
 	}
 	unit := fmt.Sprintf(`[Unit]
-# Managed-By: ShahTunnel 5.5.9
+# Managed-By: ShahTunnel 5.5.10
 Description=ShahTunnel isolated Psiphon Xray (%s)
 After=network-online.target
 Wants=network-online.target
@@ -976,7 +977,132 @@ func verifyPsiphonDoHEgress(proxyAddress string, timeout time.Duration) error {
 	return fmt.Errorf("no DoH resolver returned a valid DNS response through Psiphon SOCKS5: %s", strings.Join(failures, ": "))
 }
 
-func verifyPsiphonExit(proxy, expectedRegion, directIP string) (string, string, error) {
+// psiphonHubProbeEndpoint returns the exact endpoint used by Agent control
+// lanes over Psiphon. It is deliberately independent of customer-facing
+// mappings and Agent-side Xray target ports.
+func psiphonHubProbeEndpoint(cfg Config) string {
+	if cfg.Role != "agent" || (cfg.Underlay != underlayPsiphon && cfg.Underlay != underlayAdaptive) {
+		return ""
+	}
+	// Adaptive profiles using only CONNECT transports cannot use Psiphon for
+	// their control lanes; they may still use the isolated Psiphon Xray egress.
+	if cfg.Underlay == underlayAdaptive {
+		switch cfg.Transport {
+		case transportHTTP2, transportHTTP1, transportHTTPConnectAuto:
+			return ""
+		}
+	}
+	return strings.TrimSpace(agentHubAddressForUnderlay(cfg, underlayPsiphon))
+}
+
+func psiphonHubProbeTransports(configured string) []string {
+	switch configured {
+	case transportTCP:
+		return []string{transportTCP}
+	case transportWebSocket:
+		return []string{transportWebSocket}
+	case transportHTTP2, transportHTTP1, transportHTTPConnectAuto:
+		return nil
+	default:
+		// auto/adaptive use TCP/TLS first and then WebSocket/TLS over Psiphon.
+		return []string{transportTCP, transportWebSocket}
+	}
+}
+
+// verifyPsiphonHubControlPath authenticates a short-lived Agent control
+// connection through the selected SOCKS5 exit. Checking only api.ipify.org or
+// DoH is insufficient: an exit may allow HTTPS but reject the Hub's actual
+// destination port. This probe uses the same endpoint, TLS pin, ALPN, optional
+// WebSocket upgrade, and token handshake as a real Agent lane.
+func verifyPsiphonHubControlPath(cfg Config, proxyAddress string, timeout time.Duration) error {
+	endpoint := psiphonHubProbeEndpoint(cfg)
+	if endpoint == "" {
+		return nil
+	}
+	if err := validatePsiphonHubAddress(endpoint); err != nil {
+		return fmt.Errorf("invalid Psiphon Hub transit endpoint: %w", err)
+	}
+	transports := psiphonHubProbeTransports(cfg.Transport)
+	if len(transports) == 0 {
+		return fmt.Errorf("configured transport %s cannot establish Agent control lanes over Psiphon", cfg.Transport)
+	}
+	if timeout <= 0 {
+		return errors.New("invalid Psiphon Hub probe timeout")
+	}
+	perTransport := timeout / time.Duration(len(transports))
+	if perTransport < 2*time.Second {
+		perTransport = 2 * time.Second
+	}
+	var failures []string
+	for _, transport := range transports {
+		if err := verifyPsiphonHubControlTransport(cfg, proxyAddress, endpoint, transport, perTransport); err == nil {
+			log.Printf("Psiphon Hub transit verified: authenticated %s lane through SOCKS5", transport)
+			return nil
+		} else {
+			failures = append(failures, transport+": "+err.Error())
+		}
+	}
+	return fmt.Errorf("Hub transit endpoint %s is not reachable/authenticatable through this Psiphon exit: %s", endpoint, strings.Join(failures, " | "))
+}
+
+func verifyPsiphonHubControlTransport(cfg Config, proxyAddress, endpoint, transport string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	raw, err := dialSOCKS5Context(ctx, proxyAddress, endpoint)
+	if err != nil {
+		return err
+	}
+	defer raw.Close()
+	_ = raw.SetDeadline(time.Now().Add(timeout))
+
+	pin, err := normalizeFingerprint(cfg.Fingerprint)
+	if err != nil {
+		return fmt.Errorf("invalid Hub certificate fingerprint: %w", err)
+	}
+	host, _, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return fmt.Errorf("invalid Hub transit endpoint %q: %w", endpoint, err)
+	}
+	sni := strings.TrimSpace(cfg.TLSServerName)
+	if sni == "" && net.ParseIP(host) == nil {
+		sni = host
+	}
+	tlsConfig := agentTLSConfig(pin, sni)
+	tlsConfig.NextProtos = []string{controlALPN}
+	tlsConn := tls.Client(raw, tlsConfig)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return fmt.Errorf("TLS handshake: %w", err)
+	}
+
+	var authConn net.Conn = tlsConn
+	if transport == transportWebSocket {
+		wsHost := sni
+		if wsHost == "" {
+			wsHost = host
+		}
+		_, port, splitErr := net.SplitHostPort(endpoint)
+		if splitErr == nil {
+			wsHost = net.JoinHostPort(wsHost, port)
+		}
+		authConn, err = clientWebSocketUpgrade(tlsConn, wsHost)
+		if err != nil {
+			return fmt.Errorf("WebSocket upgrade: %w", err)
+		}
+	}
+	if err := writeFull(authConn, []byte("RREV3 "+cfg.Token+"\n")); err != nil {
+		return fmt.Errorf("write Hub authentication preface: %w", err)
+	}
+	reply, err := bufio.NewReaderSize(authConn, 256).ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read Hub authentication response: %w", err)
+	}
+	if reply != "OK\n" {
+		return fmt.Errorf("Hub rejected Agent authentication/transport (%q)", strings.TrimSpace(reply))
+	}
+	return nil
+}
+
+func verifyPsiphonExit(cfg Config, proxy, expectedRegion, directIP string) (string, string, error) {
 	ip, err := waitForPsiphonPublicEgressIP(proxy, 8*time.Second)
 	if err != nil {
 		return "", "", err
@@ -1002,6 +1128,9 @@ func verifyPsiphonExit(proxy, expectedRegion, directIP string) (string, string, 
 	}
 	if err := verifyPsiphonDoHEgress(proxy, 8*time.Second); err != nil {
 		return "", "", fmt.Errorf("Psiphon exit %s (%s) passed HTTPS IP verification but DNS-over-HTTPS through SOCKS5 failed: %w", ip, country, err)
+	}
+	if err := verifyPsiphonHubControlPath(cfg, proxy, 16*time.Second); err != nil {
+		return "", "", fmt.Errorf("Psiphon exit %s (%s) passed general egress checks but failed the actual ShahTunnel Hub path: %w", ip, country, err)
 	}
 	log.Printf("Psiphon DNS-over-HTTPS verified through the profile SOCKS5 path")
 	return ip, country, nil
@@ -1046,7 +1175,7 @@ func selectPsiphonExitByPriority(cfg Config) (string, string, error) {
 				continue
 			}
 		}
-		if ip, country, probeErr := verifyPsiphonExit(proxy, region, directIP); probeErr == nil {
+		if ip, country, probeErr := verifyPsiphonExit(cfg, proxy, region, directIP); probeErr == nil {
 			log.Printf("Psiphon selected preferred exit: country=%s ip=%s direct_vps_ip=%s", country, ip, directIP)
 			return ip, country, nil
 		} else {
@@ -1266,7 +1395,7 @@ func rotatePsiphonCountry(cfg Config) error {
 	if oldRegion == "" {
 		return errors.New("country rotation refused: current Psiphon country is not explicitly configured")
 	}
-	oldIP, oldCountry, oldErr := verifyPsiphonExit(proxy, oldRegion, directIP)
+	oldIP, oldCountry, oldErr := verifyPsiphonExit(cfg, proxy, oldRegion, directIP)
 	if oldErr != nil {
 		log.Printf("Psiphon rotation: current exit %s is not presently verifiable; trying the next allowlisted country for recovery: %v", oldRegion, oldErr)
 	}
@@ -1283,7 +1412,7 @@ func rotatePsiphonCountry(cfg Config) error {
 			failures = append(failures, region+": Psiphon restart: "+err.Error())
 			continue
 		}
-		if ip, country, verifyErr := verifyPsiphonExit(proxy, region, directIP); verifyErr == nil {
+		if ip, country, verifyErr := verifyPsiphonExit(cfg, proxy, region, directIP); verifyErr == nil {
 			log.Printf("Psiphon hourly country rotation succeeded: country=%s ip=%s previous_country=%s previous_ip=%s", country, ip, oldCountry, oldIP)
 			return nil
 		} else {
@@ -1294,7 +1423,7 @@ func rotatePsiphonCountry(cfg Config) error {
 	// Do not leave the profile stranded on a region that failed verification.
 	if _, err := setPsiphonEgressRegionPreference(cfg.PsiphonConfig, oldRegion); err == nil {
 		if restartErr := runSystemctl("restart", service); restartErr == nil {
-			if ip, country, verifyErr := verifyPsiphonExit(proxy, oldRegion, directIP); verifyErr == nil {
+			if ip, country, verifyErr := verifyPsiphonExit(cfg, proxy, oldRegion, directIP); verifyErr == nil {
 				log.Printf("Psiphon country rotation kept previous verified exit: country=%s ip=%s", country, ip)
 				return fmt.Errorf("no alternate country could be verified; retained previous country %s (%s): %s", country, ip, strings.Join(failures, " | "))
 			}

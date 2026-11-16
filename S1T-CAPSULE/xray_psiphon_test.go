@@ -1,9 +1,13 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
+	"net"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBuildPsiphonDoHProbeQueryAndResponseValidation(t *testing.T) {
@@ -30,6 +34,87 @@ func TestBuildPsiphonDoHProbeQueryAndResponseValidation(t *testing.T) {
 	}
 }
 
+func TestPsiphonHubProbeAuthenticatesThroughTheConfiguredMappingEndpoint(t *testing.T) {
+	certDir := t.TempDir()
+	certPath, keyPath := filepath.Join(certDir, "hub.crt"), filepath.Join(certDir, "hub.key")
+	fingerprint, err := generateCertificate(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("generate Hub certificate: %v", err)
+	}
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("load Hub certificate: %v", err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	h := &hubServer{
+		cfg:              Config{Role: "hub", Transport: transportAdaptive, Token: strings.Repeat("ab", 32)},
+		controlTLSConfig: hubTLSConfig(cert),
+		sessions:         make(map[*hubSession]struct{}),
+		pendingPublic:    make(chan struct{}, maxPendingPublicConnections),
+	}
+	go h.acceptPublic(listener, "main")
+	proxyAddress := startTestSOCKS5Relay(t, listener.Addr().String())
+
+	cfg := Config{
+		Role:           "agent",
+		Transport:      transportAdaptive,
+		Underlay:       underlayPsiphon,
+		HubAddr:        "127.0.0.1:9443",
+		PsiphonHubAddr: listener.Addr().String(),
+		PsiphonProxy:   proxyAddress,
+		TLSServerName:  "localhost",
+		Token:          h.cfg.Token,
+		Fingerprint:    fingerprint,
+		Ports:          []PortMapping{{ID: "main", Target: "127.0.0.1:2083"}},
+	}
+	if err := verifyPsiphonHubControlPath(cfg, proxyAddress, 8*time.Second); err != nil {
+		t.Fatalf("authenticated Hub probe through Psiphon failed: %v", err)
+	}
+	if got := psiphonHubProbeEndpoint(cfg); got != listener.Addr().String() {
+		t.Fatalf("probe endpoint = %q; want explicit Mapping endpoint %q", got, listener.Addr().String())
+	}
+	if got := cfg.Ports[0].Target; got != "127.0.0.1:2083" {
+		t.Fatalf("customer Xray target was changed by the Hub probe: %q", got)
+	}
+}
+
+func TestPsiphonHubProbeReportsSOCKSRefusalForTheActualTransitPort(t *testing.T) {
+	target, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transitEndpoint := target.Addr().String()
+	if err := target.Close(); err != nil {
+		t.Fatal(err)
+	}
+	proxyAddress := startTestSOCKS5Relay(t, transitEndpoint)
+	cfg := Config{
+		Role:           "agent",
+		Transport:      transportTCP,
+		Underlay:       underlayPsiphon,
+		HubAddr:        "127.0.0.1:9443",
+		PsiphonHubAddr: transitEndpoint,
+		PsiphonProxy:   proxyAddress,
+		Token:          strings.Repeat("cd", 32),
+		Fingerprint:    strings.Repeat("a", 64),
+		Ports:          []PortMapping{{ID: "main", Target: "127.0.0.1:2083"}},
+	}
+	err = verifyPsiphonHubControlPath(cfg, proxyAddress, 3*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "SOCKS5 CONNECT rejected (reply=5)") {
+		t.Fatalf("expected the actual transit-port SOCKS5 refusal to be reported, got %v", err)
+	}
+	if !strings.Contains(err.Error(), transitEndpoint) {
+		t.Fatalf("probe error does not identify the configured transit endpoint %q: %v", transitEndpoint, err)
+	}
+	if got := cfg.Ports[0].Target; got != "127.0.0.1:2083" {
+		t.Fatalf("customer Xray target was changed after a rejected Hub probe: %q", got)
+	}
+}
+
 func TestXrayPsiphonUnitOwnershipAllowsOnlyExactProfileService(t *testing.T) {
 	runtime := xrayRuntime{Binary: "/usr/local/bin/xray", CWD: "/usr/local/bin"}
 	service := "shah-tunnel-xray-psiphon-s.service"
@@ -38,7 +123,7 @@ func TestXrayPsiphonUnitOwnershipAllowsOnlyExactProfileService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(unit), "Managed-By: ShahTunnel 5.5.9") {
+	if !strings.Contains(string(unit), "Managed-By: ShahTunnel 5.5.10") {
 		t.Fatal("rendered sidecar unit is missing the ShahTunnel ownership marker")
 	}
 	if !xrayPsiphonUnitBelongsToProfile(unit, runtime, configPath, service) {
