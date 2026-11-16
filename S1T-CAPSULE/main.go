@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.0.1"
+	version                          = "5.2.0"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -56,7 +56,7 @@ const (
 	msgPing                     byte = 6
 	msgPong                     byte = 7
 	maxStreams                       = 512
-	streamWindowFrames               = 256
+	streamWindowFrames               = 512
 	maxQueuedPayloadBytes            = int64(64 << 20)
 	wireWriteTimeout                 = 30 * time.Second
 	reverseStreamOpenTimeout         = 18 * time.Second
@@ -209,16 +209,7 @@ func writeRuntimeStats(role string) {
 	if err != nil {
 		return
 	}
-	runtimePath := runtimeStatsPath()
-	tmp := runtimePath + ".tmp"
-	if err = os.MkdirAll(filepath.Dir(runtimePath), 0700); err != nil {
-		return
-	}
-	if err = os.WriteFile(tmp, append(b, '\n'), 0600); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, runtimePath)
-	_ = os.Chmod(runtimePath, 0600)
+	_ = atomicWriteFile(runtimeStatsPath(), append(b, '\n'), 0600)
 }
 
 type counterWriter struct {
@@ -1793,6 +1784,26 @@ func (s *agentSession) run() {
 	}
 }
 
+// laneLoadPenalty gives each established TCP stream a meaningful share of the
+// lane score. RTT remains important, but a small RTT advantage must not pin
+// nearly every new flow to one lane while the other independent lanes sit idle.
+// The cap prevents an overloaded lane from producing unbounded score values.
+const (
+	laneStreamLoadPenalty = 2 * time.Millisecond
+	laneMaxLoadPenalty    = 500 * time.Millisecond
+)
+
+func laneLoadPenalty(activeStreams int) time.Duration {
+	if activeStreams <= 0 {
+		return 0
+	}
+	penalty := time.Duration(activeStreams) * laneStreamLoadPenalty
+	if penalty > laneMaxLoadPenalty {
+		return laneMaxLoadPenalty
+	}
+	return penalty
+}
+
 type hubServer struct {
 	cfg              Config
 	controlTLSConfig *tls.Config
@@ -1889,9 +1900,9 @@ func (h *hubServer) current() *hubSession {
 	}
 	if len(freshMetrics) > 0 {
 		best := freshMetrics[0]
-		bestScore := best.rtt + best.rtt*time.Duration(best.load)/time.Duration(maxStreams) + best.pressure
+		bestScore := best.rtt + laneLoadPenalty(best.load) + best.pressure
 		for _, metric := range freshMetrics[1:] {
-			score := metric.rtt + metric.rtt*time.Duration(metric.load)/time.Duration(maxStreams) + metric.pressure
+			score := metric.rtt + laneLoadPenalty(metric.load) + metric.pressure
 			if score < bestScore {
 				best, bestScore = metric, score
 			}
@@ -1900,12 +1911,12 @@ func (h *hubServer) current() *hubSession {
 		return best.session
 	}
 
-	// Before the first fresh RTT sample, use a combined least-load/queue score.
-	// This also avoids piling startup flows onto the first lane to reconnect.
+	// Before the first fresh RTT sample, use the same least-load/queue score.
+	// This avoids piling startup flows onto the first lane to reconnect.
 	bestScore := time.Duration(1<<62 - 1)
 	var best *hubSession
 	for _, metric := range metrics {
-		score := time.Duration(metric.load)*2*time.Millisecond + metric.pressure
+		score := laneLoadPenalty(metric.load) + metric.pressure
 		if score < bestScore {
 			best, bestScore = metric.session, score
 		}
@@ -2939,12 +2950,10 @@ func adaptiveTransportCandidates(preferred string) []string {
 }
 
 func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
-	// Once this profile has an isolated Psiphon Xray user-egress integration,
-	// keep its Agent lanes on Psiphon too. A direct fallback would violate the
-	// profile's fail-closed egress policy during relay interruptions.
-	if cfg.XrayPsiphon != nil && strings.TrimSpace(cfg.PsiphonConfig) != "" {
-		return []string{underlayPsiphon}
-	}
+	// Agent-to-Hub lanes have their own adaptive egress policy, independent of
+	// the isolated Xray Psiphon sidecar used for mapped user TCP/DNS traffic.
+	// Falling back here does not change host routes or the sidecar's fail-closed
+	// user-traffic policy; it only keeps the authenticated control/data lanes up.
 	// WARP is only a candidate when its client reports a connected MASQUE path.
 	// Other WARP protocols are never selected by adaptive routing.
 	warpMode := detectActiveWarpUnderlay()
@@ -4600,7 +4609,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.0.1             |",
+	"        |            SHAH TUNNEL 5.2.0             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -4908,13 +4917,10 @@ func generateCertificate(certPath, keyPath string) (string, error) {
 	if err = os.MkdirAll(filepath.Dir(certPath), 0700); err != nil {
 		return "", err
 	}
-	if err = os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0644); err != nil {
+	if err = atomicWriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0644); err != nil {
 		return "", err
 	}
-	if err = os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0600); err != nil {
-		return "", err
-	}
-	if err = os.Chmod(keyPath, 0600); err != nil {
+	if err = atomicWriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0600); err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(der)
@@ -5454,21 +5460,48 @@ fi
 `
 
 // atomicWriteFile writes a root-owned schedule file by replacing it atomically.
-func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+func atomicWriteFile(path string, data []byte, mode os.FileMode) (retErr error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
+
+	// CreateTemp generates an unpredictable name and creates the file as 0600.
+	// This avoids predictable *.tmp paths being pre-created or replaced by
+	// another local process before the atomic rename.
+	tmpFile, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
 		return err
 	}
-	if err := os.Chmod(tmp, mode); err != nil {
-		_ = os.Remove(tmp)
+	tmpPath := tmpFile.Name()
+	defer func() {
+		_ = tmpFile.Close()
+		if retErr != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if err := tmpFile.Chmod(mode); err != nil {
 		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+
+	// Best-effort directory sync makes the rename durable across a sudden
+	// power loss on filesystems that support syncing directory descriptors.
+	if dirFile, err := os.Open(dir); err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
 	}
 	return nil
 }
@@ -5789,15 +5822,7 @@ func writeServerGeoCache(g ServerGeo) {
 	if err != nil {
 		return
 	}
-	tmp := serverGeoCachePath + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0600); err != nil {
-		return
-	}
-	if err := os.Rename(tmp, serverGeoCachePath); err != nil {
-		_ = os.Remove(tmp)
-		return
-	}
-	_ = os.Chmod(serverGeoCachePath, 0600)
+	_ = atomicWriteFile(serverGeoCachePath, append(b, '\n'), 0600)
 }
 
 // isPublicIPv4 rejects private, local, shared-CGNAT, documentation, benchmark,
