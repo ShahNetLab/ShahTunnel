@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 5.0.1 installer.
+# Shah Tunnel 5.0.0 installer.
 # Downloads the pinned Go 1.26.1 toolchain, verifies its SHA-256, fetches the source,
 # and builds the Linux binary on the target server. No prebuilt release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="5.0.1"
+VERSION="5.0.0"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
 STATE_DIR="/usr/local/lib/shah-tunnel"
 GO_CACHE_DIR="/var/cache/shah-tunnel"
 PHASE_HAS_DOWNLOAD=0
+RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/main"
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64) TARGET_ARCH="amd64" ;;
   Linux:aarch64|Linux:arm64) TARGET_ARCH="arm64" ;;
   *) echo "Shah Tunnel ${VERSION} supports Linux amd64 and arm64 only." >&2; exit 1 ;;
 esac
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-  echo "Run as root. If raw.githubusercontent.com is blocked, fetch this installer through the GitHub API:" >&2
-  echo "set -o pipefail; curl -fsSL --connect-timeout 10 --max-time 30 -H 'Accept: application/vnd.github+json' -H 'User-Agent: ShahTunnel-bootstrap' 'https://api.github.com/repos/${OWNER}/${REPO}/contents/S1T-START.sh?ref=main' | python3 -c 'import sys,json,base64; d=json.load(sys.stdin); sys.stdout.buffer.write(base64.b64decode(d[\"content\"]))' | bash" >&2
+  echo "Run as root: bash <(curl -fsSL ${RAW_BASE}/S1T-START.sh)" >&2
   exit 1
 fi
 command -v systemctl >/dev/null 2>&1 || { echo "systemd/systemctl is required." >&2; exit 1; }
@@ -725,25 +725,6 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 NETLINK
   install -o root -g root -m 0644 "$TMP/netlink-${unit}.conf" "$dropin_dir/10-psiphon-netlink.conf"
 done
-
-# Migrate installed per-profile Psiphon dependencies from Requires to Wants.
-# Requires makes systemd send SIGTERM to the Agent whenever ConsoleClient is
-# restarted; this is unsafe for adaptive lanes and leaves the Agent stopped.
-# Wants + After still starts Psiphon with the Agent, but Psiphon may recover
-# independently without taking down the authenticated Agent service.
-for dependency_dropin in \
-  /etc/systemd/system/ravanreverse@*.service.d/shah-tunnel-psiphon.conf \
-  /etc/systemd/system/ravanreverse.service.d/shah-tunnel-psiphon.conf; do
-  [[ -f "$dependency_dropin" ]] || continue
-  if grep -q '^Requires=shah-tunnel-psiphon-' "$dependency_dropin"; then
-    migrated_dropin="$TMP/psiphon-dependency-migrated.conf"
-    sed 's/^Requires=shah-tunnel-psiphon-/Wants=shah-tunnel-psiphon-/' \
-      "$dependency_dropin" > "$migrated_dropin"
-    install -o root -g root -m 0644 "$migrated_dropin" "$dependency_dropin"
-    echo "Migrated Psiphon dependency to non-fatal Wants/After: $dependency_dropin"
-  fi
-done
-
 if ! timeout --kill-after=3s 15s systemctl daemon-reload; then
   echo "systemd daemon-reload timed out. The binary is installed, but service metadata may need: systemctl daemon-reload" >&2
   exit 1
