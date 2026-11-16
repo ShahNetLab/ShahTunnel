@@ -21,9 +21,9 @@ done
 [[ -x "$BIN" ]] || { echo "ERROR: ShahTunnel binary not found: $BIN" >&2; exit 1; }
 [[ -s "$TUNNEL_CONFIG" ]] || { echo "ERROR: Agent config not found: $TUNNEL_CONFIG" >&2; exit 1; }
 
-VERSION_OUT="$($BIN version 2>&1 || true)"
-[[ "$VERSION_OUT" =~ ^Shah\ Tunnel\ 5\.5\.[0-9]+\ \(linux/(amd64|arm64)\)$ ]] || {
-  echo "ERROR: this repair requires a ShahTunnel 5.5.x Psiphon-enabled Linux binary; installed: ${VERSION_OUT:-unknown}" >&2
+VERSION_OUT="$("$BIN" version 2>&1 || true)"
+[[ "$VERSION_OUT" == "Shah Tunnel 3.0.6 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.6 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.7 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.8 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.7 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.8 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.9 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.9 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.10 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 3.0.10 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 4.0.0 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 4.0.0 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 4.0.1 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 4.0.1 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 4.0.2 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 4.0.2 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 4.0.7 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 4.0.7 (linux/arm64)" || "$VERSION_OUT" == "Shah Tunnel 4.0.9 (linux/amd64)" || "$VERSION_OUT" == "Shah Tunnel 4.0.9 (linux/arm64)" ]] || {
+  echo "ERROR: this repair requires a compatible ShahTunnel Psiphon-enabled Linux binary; installed: ${VERSION_OUT:-unknown}" >&2
   echo "Run the updated S1T-START.sh installer first." >&2
   exit 1
 }
@@ -52,9 +52,6 @@ DATA_DIR="${META[2]:-}"
 [[ "$PSIPHON_CONFIG" == /etc/ravanreverse/psiphon/* && -s "$PSIPHON_CONFIG" ]] || { echo "ERROR: unexpected or missing Psiphon config path" >&2; exit 1; }
 [[ "$PSIPHON_PROXY" =~ ^127\.0\.0\.1:[0-9]{1,5}$ ]] || { echo "ERROR: Psiphon proxy must be loopback-only" >&2; exit 1; }
 [[ "$DATA_DIR" == /var/lib/shah-tunnel/psiphon/* ]] || { echo "ERROR: unexpected Psiphon data directory" >&2; exit 1; }
-
-# Upgrade only this profile's existing Xray sidecar before restarting the Agent.
-"$BIN" repair-psiphon-sidecar --config "$TUNNEL_CONFIG"
 
 # Stop only this profile before backing up and re-running its one service.
 if systemctl is-active --quiet "$UNIT"; then
@@ -88,34 +85,23 @@ if ! systemctl start "$UNIT"; then
 fi
 
 echo "Checking the local Psiphon SOCKS5 listener and Agent lane (up to 100 seconds)..."
-PSIPHON_SERVICE="shah-tunnel-psiphon-${PROFILE}.service"
+PROXY_READY=0
+PSIPHON_READY=0
 LANE_READY=0
 for ((i=0; i<100; i++)); do
   LOGS="$(journalctl -u "$UNIT" --since "$START_MARK" --no-pager -o cat 2>/dev/null || true)"
+  if grep -Fq "Psiphon local SOCKS5 listener ready" <<<"$LOGS"; then PROXY_READY=1; fi
+  if grep -Fq "Psiphon ConsoleClient connected" <<<"$LOGS"; then PSIPHON_READY=1; fi
   if grep -Eq 'tunnel lane [0-9]+/[0-9]+ connected via .* over psiphon_socks5' <<<"$LOGS"; then LANE_READY=1; fi
-  PROXY_READY=0
-  if python3 - "$PSIPHON_PROXY" <<'PYPROBE'
-import socket, sys
-host, port = sys.argv[1].rsplit(":", 1)
-s = socket.create_connection((host, int(port)), timeout=1.5)
-try:
-    s.sendall(b"\x05\x01\x00")
-    reply = s.recv(2)
-    raise SystemExit(0 if reply == b"\x05\x00" else 1)
-finally:
-    s.close()
-PYPROBE
-  then PROXY_READY=1; fi
-  PSIPHON_ACTIVE=0
-  systemctl is-active --quiet "$PSIPHON_SERVICE" && PSIPHON_ACTIVE=1
-  if [[ "$PROXY_READY" == 1 && "$PSIPHON_ACTIVE" == 1 && "$LANE_READY" == 1 ]] && systemctl is-active --quiet "$UNIT"; then
-    echo "SUCCESS: SOCKS5 is live and an authenticated Agent lane reached the Hub through Psiphon."
+  if [[ "$PSIPHON_READY" == 1 && "$LANE_READY" == 1 ]] && systemctl is-active --quiet "$UNIT"; then
+    echo "SUCCESS: Psiphon is connected and an Agent lane reached the Hub through its private SOCKS5 proxy."
     echo "Profile: $PROFILE | SOCKS5: $PSIPHON_PROXY | Backup: $BACKUP"
     journalctl -u "$UNIT" --since "$START_MARK" -n 20 --no-pager -o cat
     exit 0
   fi
-  if [[ "$PROXY_READY" == 1 && "$PSIPHON_ACTIVE" == 1 ]] && systemctl is-active --quiet "$UNIT"; then
-    echo "PENDING: Psiphon SOCKS5 is healthy; the Agent lane is still retrying and will reconnect automatically."
+  if [[ "$PROXY_READY" == 1 ]] && systemctl is-active --quiet "$UNIT"; then
+    echo "PENDING: local Psiphon SOCKS5 is ready, but the complete Psiphon-to-Hub Agent path is not yet verified."
+    echo "The service is deliberately left running; ConsoleClient will keep retrying. No Hub lane is claimed connected."
     echo "Profile: $PROFILE | SOCKS5: $PSIPHON_PROXY | Config backup: $BACKUP"
     journalctl -u "$UNIT" --since "$START_MARK" -n 35 --no-pager -o cat
     exit 0
