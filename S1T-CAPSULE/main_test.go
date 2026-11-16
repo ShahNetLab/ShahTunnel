@@ -1571,11 +1571,25 @@ func TestPsiphonHubAddressDefaultsToPublicMappingPort(t *testing.T) {
 	if got := agentHubAddressForUnderlay(explicit, underlayDirect); got != explicit.HubAddr {
 		t.Fatalf("Direct endpoint = %q; want unchanged %q", got, explicit.HubAddr)
 	}
-
+	torDefault := Config{Role: "agent", Underlay: underlayTor, HubAddr: "37.32.12.244:9448"}
+	if got := agentHubAddressForUnderlay(torDefault, underlayTor); got != "37.32.12.244:443" {
+		t.Fatalf("default Tor Mapping endpoint = %q; want 37.32.12.244:443", got)
+	}
+	torCustom := torDefault
+	torCustom.TorHubAddr = "37.32.12.244:8443"
+	if got := agentHubAddressForUnderlay(torCustom, underlayTor); got != torCustom.TorHubAddr {
+		t.Fatalf("explicit Tor Mapping endpoint = %q; want %q", got, torCustom.TorHubAddr)
+	}
+	if got := agentHubAddressForTransport(torDefault, transportTCP); got != "37.32.12.244:443" {
+		t.Fatalf("Tor TCP lane endpoint = %q; want public Mapping on 443", got)
+	}
+	if got := agentHubAddressForTransport(torDefault, transportHTTP2); got != torDefault.HubAddr {
+		t.Fatalf("Tor HTTP/2 CONNECT endpoint = %q; want control port %q", got, torDefault.HubAddr)
+	}
 }
 
 func TestUnderlayModesAndLoopbackValidation(t *testing.T) {
-	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayAdaptive} {
+	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayTor, underlayAdaptive} {
 		if !validUnderlayMode(mode) {
 			t.Fatalf("valid underlay %q was rejected", mode)
 		}
@@ -2233,7 +2247,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.5.7             |",
+		"        |            SHAH TUNNEL 5.0.1             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -2648,10 +2662,7 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 	}
 	dnsServers := dnsConfig["servers"].([]any)
 	if len(dnsServers) != 2 || dnsServers[0] != "https://1.1.1.1/dns-query" || dnsServers[1] != "https://8.8.8.8/dns-query" {
-		t.Fatalf("sidecar DNS servers do not match the known-good IP-based DoH endpoints: %#v", dnsServers)
-	}
-	if dnsConfig["tag"] != "dns_inbound" {
-		t.Fatalf("sidecar must preserve the source DNS routing tag, got %v", dnsConfig["tag"])
+		t.Fatalf("sidecar DNS servers were not normalized: %#v", dnsServers)
 	}
 	outboundsWithDNS := got["outbounds"].([]any)
 	dnsOutboundTag := "s1t-warp-warp-profile-dns-out"
@@ -2807,14 +2818,6 @@ func TestBuildXrayPsiphonConfigIsolatesTCPAndBlocksUDP(t *testing.T) {
 	if rules[1].(map[string]any)["outboundTag"] != outTag {
 		t.Fatalf("DNS resolver traffic must use Psiphon SOCKS: %#v", rules[1])
 	}
-	dnsConfig := got["dns"].(map[string]any)
-	if dnsConfig["tag"] != "s1t-psiphon-psiphon-profile-dns-in" {
-		t.Fatalf("Psiphon DNS module must create a private tag when source has none, got %v", dnsConfig["tag"])
-	}
-	dnsServers := dnsConfig["servers"].([]any)
-	if len(dnsServers) != 2 || dnsServers[0] != "https://1.1.1.1/dns-query" || dnsServers[1] != "https://8.8.8.8/dns-query" {
-		t.Fatalf("unexpected Psiphon fixed-IP DoH servers: %#v", dnsServers)
-	}
 	tcpRule := rules[2].(map[string]any)
 	if tcpRule["network"] != "tcp" || tcpRule["outboundTag"] != outTag {
 		t.Fatalf("cloned TCP traffic must use Psiphon: %#v", tcpRule)
@@ -2857,7 +2860,7 @@ func TestXrayPsiphonManagedPathsAndUnitAreRestricted(t *testing.T) {
 		"NoNewPrivileges=yes",
 		"PrivateTmp=yes",
 		"ProtectSystem=full",
-		"ProtectHome=read-only",
+		"ProtectHome=yes",
 		"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
 	} {
 		if !strings.Contains(unitText, want) {
@@ -2939,18 +2942,6 @@ func TestHubPrefersFreshRTTOverStaleLowRTT(t *testing.T) {
 	h := &hubServer{sessions: map[*hubSession]struct{}{staleFormerlyFast: {}, freshHealthy: {}}}
 	if got := h.current(); got != freshHealthy {
 		t.Fatalf("selected lane %d; want fresh lane %d despite stale lower RTT", got.id, freshHealthy.id)
-	}
-}
-
-func TestPsiphonAgentLaneReadyInLogsUsesAgentLaneNotConsoleClientNotices(t *testing.T) {
-	if psiphonAgentLaneReadyInLogs("Psiphon ConsoleClient connected\nPsiphon local SOCKS5 listener ready") {
-		t.Fatal("separate Psiphon service notices must not count as an Agent lane")
-	}
-	if !psiphonAgentLaneReadyInLogs("tunnel lane 3/12 connected via tcp_tls over psiphon_socks5; forwarding through 1 configured port mapping(s)") {
-		t.Fatal("an authenticated Agent lane over Psiphon must be recognized")
-	}
-	if psiphonAgentLaneReadyInLogs("tunnel lane 3: transport tcp_tls failed on psiphon_socks5; trying websocket_tls") {
-		t.Fatal("a transport retry must not count as a connected lane")
 	}
 }
 

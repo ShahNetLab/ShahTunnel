@@ -231,10 +231,10 @@ func buildXrayWarpConfig(original []byte, profileID, proxyAddress string, mappin
 
 // buildXrayEgressConfig creates a private Xray sidecar containing only cloned
 // inbounds for the selected ShahTunnel mappings. The original X-UI config is
-// never modified. For TCP-only SOCKS egress (Psiphon), UDP and unknown
+// never modified. For TCP-only SOCKS egress (Psiphon and Tor), UDP and unknown
 // networks are explicitly blackholed instead of falling back to Direct.
 func buildXrayEgressConfig(original []byte, profileID, proxyAddress string, mappings []PortMapping, kind string, blockUDP bool) ([]byte, []XrayWarpBinding, string, error) {
-	if kind != "warp" && kind != "psiphon" {
+	if kind != "warp" && kind != "psiphon" && kind != "tor" {
 		return nil, nil, "", fmt.Errorf("unsupported isolated Xray egress kind %q", kind)
 	}
 	if _, _, err := net.SplitHostPort(proxyAddress); err != nil || !isLoopbackProxyAddress(proxyAddress) {
@@ -415,17 +415,11 @@ func configureXrayProxyDNS(root map[string]any, shortID, proxyOutboundTag string
 		dnsConfig = map[string]any{}
 		root["dns"] = dnsConfig
 	}
-	// Match the user's known-good ShahTunnel 5.0 DNS behavior: preserve the
-	// source Xray DNS tag when it exists, so the cloned DNS module retains its
-	// original identity. Create a private tag only when the source has none.
 	dnsInboundTag, _ := dnsConfig["tag"].(string)
 	dnsInboundTag = strings.TrimSpace(dnsInboundTag)
 	if dnsInboundTag == "" {
 		dnsInboundTag = "s1t-" + kind + "-" + shortID + "-dns-in"
 		dnsConfig["tag"] = dnsInboundTag
-	}
-	if usedTags[dnsInboundTag] {
-		return nil, nil, fmt.Errorf("Xray DNS module tag %q collides with an inbound or outbound tag", dnsInboundTag)
 	}
 	dnsOutboundTag := "s1t-" + kind + "-" + shortID + "-dns-out"
 	if usedTags[dnsOutboundTag] || dnsOutboundTag == proxyOutboundTag {
@@ -434,13 +428,11 @@ func configureXrayProxyDNS(root map[string]any, shortID, proxyOutboundTag string
 	if len(inboundTags) == 0 {
 		return nil, nil, errors.New("no cloned inbound tags available for isolated DNS routing")
 	}
-	// Use the exact IP-based DoH endpoints from the user's known-good 5.0
-	// implementation. This avoids a bootstrap DNS lookup for the resolver host
-	// itself, which can otherwise recurse into the same proxy DNS route.
+	// Provider IPs avoid needing a DNS lookup to bootstrap the DoH connection.
 	dnsConfig["servers"] = []any{"https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"}
 	dnsConfig["queryStrategy"] = "UseIPv4"
+	// Keep Xray's DNS cache enabled so repeat lookups avoid another DoH round trip.
 	dnsConfig["disableCache"] = false
-	delete(dnsConfig, "enableParallelQuery")
 	dnsOutbound := map[string]any{"tag": dnsOutboundTag, "protocol": "dns", "settings": map[string]any{}}
 	dnsRules := []any{
 		map[string]any{

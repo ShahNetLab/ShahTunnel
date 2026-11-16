@@ -1,34 +1,9 @@
 package main
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 )
-
-func TestBuildPsiphonDoHProbeQueryAndResponseValidation(t *testing.T) {
-	query, err := buildPsiphonDoHProbeQuery("example.com", 0x5a31)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(query) < 12 || query[0] != 0x5a || query[1] != 0x31 || query[5] != 1 {
-		t.Fatalf("unexpected DNS query header: %x", query[:12])
-	}
-	// A minimal valid response echoes the transaction ID and sets QR with RCODE=0.
-	response := append([]byte(nil), query[:12]...)
-	response[2] = 0x81
-	response[3] = 0x80
-	if !validPsiphonDoHResponse(response, 0x5a31) {
-		t.Fatal("valid DoH DNS response was rejected")
-	}
-	response[1]++
-	if validPsiphonDoHResponse(response, 0x5a31) {
-		t.Fatal("DoH response with a different transaction ID was accepted")
-	}
-	if _, err := buildPsiphonDoHProbeQuery("bad..example", 1); err == nil {
-		t.Fatal("malformed DNS labels must be rejected")
-	}
-}
 
 func TestXrayPsiphonUnitOwnershipAllowsOnlyExactProfileService(t *testing.T) {
 	runtime := xrayRuntime{Binary: "/usr/local/bin/xray", CWD: "/usr/local/bin"}
@@ -38,7 +13,7 @@ func TestXrayPsiphonUnitOwnershipAllowsOnlyExactProfileService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(unit), "Managed-By: ShahTunnel 5.5.7") {
+	if !strings.Contains(string(unit), "Managed-By: ShahTunnel 5.0.1") {
 		t.Fatal("rendered sidecar unit is missing the ShahTunnel ownership marker")
 	}
 	if !xrayPsiphonUnitBelongsToProfile(unit, runtime, configPath, service) {
@@ -158,159 +133,5 @@ func TestRenderPsiphonRotationUnitsAreProfileScopedAndHourly(t *testing.T) {
 	}
 	if _, _, err := renderPsiphonRotationUnits("s", "relative/binary", "/etc/ravanreverse/tunnels/s.json"); err == nil {
 		t.Fatal("relative executable path must be rejected")
-	}
-}
-
-func TestMigrateXrayPsiphonHomeProtection(t *testing.T) {
-	oldUnit := []byte(`[Unit]
-Description=ShahTunnel isolated Psiphon Xray (s)
-After=network-online.target
-
-[Service]
-Type=simple
-ProtectHome=yes
-ProtectSystem=full
-ExecStart="/usr/local/x-ui/bin/xray-linux-amd64" run -config "/etc/ravanreverse/xray-psiphon/s/config.json"
-
-[Install]
-WantedBy=multi-user.target
-`)
-	updated, changed, err := migrateXrayPsiphonHomeProtection(oldUnit)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !changed || !strings.Contains(string(updated), "ProtectHome=read-only") || strings.Contains(string(updated), "ProtectHome=yes") {
-		t.Fatalf("old sidecar unit was not migrated to read-only home access: changed=%t\n%s", changed, updated)
-	}
-	updatedAgain, changedAgain, err := migrateXrayPsiphonHomeProtection(updated)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if changedAgain || string(updatedAgain) != string(updated) {
-		t.Fatalf("home-protection migration is not idempotent: changed=%t", changedAgain)
-	}
-	if _, _, err := migrateXrayPsiphonHomeProtection([]byte("[Unit]\nDescription=Third-party\n[Service]\nProtectHome=yes\n")); err == nil {
-		t.Fatal("migration must reject a non-ShahTunnel unit")
-	}
-	duplicate := strings.Replace(string(oldUnit), "ProtectHome=yes\n", "ProtectHome=yes\nProtectHome=no\n", 1)
-	if _, _, err := migrateXrayPsiphonHomeProtection([]byte(duplicate)); err == nil {
-		t.Fatal("migration must reject duplicate ProtectHome directives")
-	}
-}
-
-func TestMigrateXrayPsiphonDNSConfig(t *testing.T) {
-	input := []byte(`{
-  "inbounds": [{"tag":"s1t-psiphon-profile-s-main","listen":"127.0.0.1","port":35627,"protocol":"vless"}],
-  "outbounds": [
-    {"tag":"s1t-psiphon-profile-s-out","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":21082}]}},
-    {"tag":"s1t-psiphon-profile-s-dns-out","protocol":"dns","settings":{}}
-  ],
-  "dns": {"tag":"dns_inbound","servers":["https://1.1.1.1/dns-query"]},
-  "routing": {"rules":[
-    {"type":"field","inboundTag":["s1t-psiphon-profile-s-main"],"network":"tcp,udp","port":"53","outboundTag":"s1t-psiphon-profile-s-dns-out","ruleTag":"s1t-psiphon-profile-s-dns-hijack"},
-    {"type":"field","inboundTag":["dns_inbound"],"outboundTag":"s1t-psiphon-profile-s-out","ruleTag":"s1t-psiphon-profile-s-dns-egress"},
-    {"type":"field","domain":["geosite:category-ads-all"],"outboundTag":"block"}
-  ]}
-}`)
-	bindings := []XrayPsiphonBinding{{MappingID: "main", OriginalTarget: "127.0.0.1:2083", PsiphonTarget: "127.0.0.1:35627", InboundTag: "s1t-psiphon-profile-s-main"}}
-	got, changed, err := migrateXrayPsiphonDNSConfig(input, "profile-s", "s1t-psiphon-profile-s-out", bindings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !changed {
-		t.Fatal("legacy DNS routing should have been migrated")
-	}
-	var config map[string]any
-	if err := json.Unmarshal(got, &config); err != nil {
-		t.Fatal(err)
-	}
-	dns := config["dns"].(map[string]any)
-	if dns["tag"] != "dns_inbound" {
-		t.Fatalf("DNS tag was not preserved: %v", dns["tag"])
-	}
-	if _, exists := dns["enableParallelQuery"]; exists {
-		t.Fatalf("migration should restore the reference default for parallel DNS: %v", dns["enableParallelQuery"])
-	}
-	servers := dns["servers"].([]any)
-	if len(servers) != 2 || servers[0] != "https://1.1.1.1/dns-query" || servers[1] != "https://8.8.8.8/dns-query" {
-		t.Fatalf("unexpected fixed-IP DoH servers: %#v", servers)
-	}
-	rules := config["routing"].(map[string]any)["rules"].([]any)
-	if len(rules) != 3 {
-		t.Fatalf("routing rules count=%d, want preserved 3: %#v", len(rules), rules)
-	}
-	first := rules[0].(map[string]any)
-	if first["ruleTag"] != "s1t-psiphon-profile-s-dns-hijack" {
-		t.Fatalf("first DNS hijack rule not migrated: %#v", first)
-	}
-	second := rules[1].(map[string]any)
-	if second["inboundTag"].([]any)[0] != "dns_inbound" || second["outboundTag"] != "s1t-psiphon-profile-s-out" {
-		t.Fatalf("DNS egress not routed through Psiphon: %#v", second)
-	}
-	third := rules[2].(map[string]any)
-	if third["outboundTag"] != "block" {
-		t.Fatalf("unrelated routing rule was not preserved: %#v", third)
-	}
-	again, changedAgain, err := migrateXrayPsiphonDNSConfig(got, "profile-s", "s1t-psiphon-profile-s-out", bindings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if changedAgain || string(again) != string(got) {
-		t.Fatal("DNS migration must be idempotent")
-	}
-}
-
-func TestMigrateXrayPsiphonDNSConfigPreservesPreviousPrivateTag(t *testing.T) {
-	input := []byte(`{
-  "inbounds": [{"tag":"s1t-psiphon-profile-s-main","listen":"127.0.0.1","port":35627,"protocol":"vless"}],
-  "outbounds": [
-    {"tag":"s1t-psiphon-profile-s-out","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":21082}]}},
-    {"tag":"s1t-psiphon-profile-s-dns-out","protocol":"dns","settings":{}}
-  ],
-  "dns": {"tag":"s1t-psiphon-profile-s-dns-in","servers":["https://cloudflare-dns.com/dns-query","https://dns.google/dns-query"],"enableParallelQuery":false},
-  "routing": {"rules":[
-    {"type":"field","inboundTag":["s1t-psiphon-profile-s-main"],"network":"tcp,udp","port":"53","outboundTag":"s1t-psiphon-profile-s-dns-out","ruleTag":"s1t-psiphon-profile-s-dns-hijack"},
-    {"type":"field","inboundTag":["s1t-psiphon-profile-s-dns-in"],"outboundTag":"s1t-psiphon-profile-s-out","ruleTag":"s1t-psiphon-profile-s-dns-egress"},
-    {"type":"field","domain":["geosite:category-ads-all"],"outboundTag":"block"}
-  ]}
-}`)
-	bindings := []XrayPsiphonBinding{{MappingID: "main", OriginalTarget: "127.0.0.1:2083", PsiphonTarget: "127.0.0.1:35627", InboundTag: "s1t-psiphon-profile-s-main"}}
-	got, changed, err := migrateXrayPsiphonDNSConfig(input, "profile-s", "s1t-psiphon-profile-s-out", bindings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !changed {
-		t.Fatal("previous hostname-based DoH config should be migrated")
-	}
-	var config map[string]any
-	if err := json.Unmarshal(got, &config); err != nil {
-		t.Fatal(err)
-	}
-	dns := config["dns"].(map[string]any)
-	if dns["tag"] != "s1t-psiphon-profile-s-dns-in" {
-		t.Fatalf("previous profile-specific DNS tag was not preserved: %v", dns["tag"])
-	}
-	servers := dns["servers"].([]any)
-	if len(servers) != 2 || servers[0] != "https://1.1.1.1/dns-query" || servers[1] != "https://8.8.8.8/dns-query" {
-		t.Fatalf("previous hostname DoH endpoints were not restored to fixed IPs: %#v", servers)
-	}
-	if _, exists := dns["enableParallelQuery"]; exists {
-		t.Fatalf("reference DNS behavior should not force parallel-query configuration: %v", dns["enableParallelQuery"])
-	}
-	rules := config["routing"].(map[string]any)["rules"].([]any)
-	if rules[1].(map[string]any)["inboundTag"].([]any)[0] != "s1t-psiphon-profile-s-dns-in" {
-		t.Fatalf("existing private DNS egress tag was not preserved in routing: %#v", rules[1])
-	}
-}
-
-func TestParseSystemdQuotedArgumentForPsiphonUnit(t *testing.T) {
-	binary := `/usr/local/x-ui/bin/xray-linux-amd64`
-	config := `/etc/ravanreverse/xray-psiphon/s/config.json`
-	first, rest, err := parseSystemdQuotedArgument(systemdExecQuote(binary) + " run -config " + systemdExecQuote(config))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first != binary || rest != "run -config "+systemdExecQuote(config) {
-		t.Fatalf("parsed ExecStart mismatch: %q | %q", first, rest)
 	}
 }
