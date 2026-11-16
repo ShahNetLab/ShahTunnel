@@ -87,7 +87,7 @@ func renderXrayPsiphonUnit(runtime xrayRuntime, configPath, service string) ([]b
 		}
 	}
 	unit := fmt.Sprintf(`[Unit]
-# Managed-By: ShahTunnel 5.5.7
+# Managed-By: ShahTunnel 5.5.8
 Description=ShahTunnel isolated Psiphon Xray (%s)
 After=network-online.target
 Wants=network-online.target

@@ -1873,6 +1873,70 @@ func TestPsiphonAdaptiveTransportCandidatesExcludeAdjacentConnectPorts(t *testin
 	}
 }
 
+func TestLoadedConfigMigratesUnsupportedPsiphonTransitPortWithoutChangingCustomerPort(t *testing.T) {
+	cfg := Config{
+		Name:           "profile-s",
+		Role:           "agent",
+		Transport:      transportAdaptive,
+		Underlay:       underlayPsiphon,
+		HubAddr:        "37.32.12.244:557",
+		PsiphonHubAddr: "37.32.12.244:2083",
+		PsiphonConfig:  "/etc/ravanreverse/psiphon/s.json",
+		PsiphonProxy:   "127.0.0.1:21082",
+		Token:          strings.Repeat("a", 48),
+		Fingerprint:    strings.Repeat("a", 64),
+		TunnelChannels: 1,
+		Ports:          []PortMapping{{ID: "main", Target: "127.0.0.1:2083"}},
+	}
+	got, migratedFrom := normalizeLoadedConfig(cfg)
+	if migratedFrom != "37.32.12.244:2083" {
+		t.Fatalf("migration source = %q; want old Agent-to-Hub endpoint", migratedFrom)
+	}
+	if got.PsiphonHubAddr != "37.32.12.244:443" {
+		t.Fatalf("migrated Psiphon transit endpoint = %q; want TCP/443", got.PsiphonHubAddr)
+	}
+	if len(got.Ports) != 1 || got.Ports[0].Target != "127.0.0.1:2083" {
+		t.Fatalf("customer mapping target changed during migration: %+v", got.Ports)
+	}
+	if err := validateConfig(got); err != nil {
+		t.Fatalf("migrated persisted Agent config is still invalid: %v", err)
+	}
+}
+
+func TestDecodeConfigDataDoesNotRunUnrelatedFullAgentValidation(t *testing.T) {
+	cfg := Config{
+		Name:           "profile-s",
+		Role:           "agent",
+		Underlay:       underlayPsiphon,
+		HubAddr:        "37.32.12.244:557",
+		PsiphonHubAddr: "37.32.12.244:2083",
+		PsiphonProxy:   "127.0.0.1:21082",
+		PsiphonConfig:  "/etc/ravanreverse/psiphon/s.json",
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, migratedFrom, err := decodeConfigData(data)
+	if err != nil {
+		t.Fatalf("sidecar-repair config decode should not validate unrelated Agent credentials: %v", err)
+	}
+	if migratedFrom != "37.32.12.244:2083" || decoded.PsiphonHubAddr != "37.32.12.244:443" {
+		t.Fatalf("unexpected decoded transit endpoint: address=%q migratedFrom=%q", decoded.PsiphonHubAddr, migratedFrom)
+	}
+	if err := validateConfig(decoded); err == nil {
+		t.Fatal("test fixture unexpectedly passed full Agent validation without required credentials")
+	}
+}
+
+func TestLoadedConfigPreservesExplicitPsiphonAllowedPort(t *testing.T) {
+	cfg := Config{Role: "agent", Underlay: underlayPsiphon, HubAddr: "hub.example.net:557", PsiphonHubAddr: "mapping.example.net:8080"}
+	got, migratedFrom := normalizeLoadedConfig(cfg)
+	if migratedFrom != "" || got.PsiphonHubAddr != "mapping.example.net:8080" {
+		t.Fatalf("allowed custom Psiphon Mapping endpoint was changed: address=%q migratedFrom=%q", got.PsiphonHubAddr, migratedFrom)
+	}
+}
+
 func TestPsiphonHubPortRestrictionDoesNotConstrainCustomerMappingPorts(t *testing.T) {
 	for _, port := range []int{53, 80, 443, 465, 587, 993, 995, 8080} {
 		if !isPsiphonAllowedDestinationPort(port) {
@@ -2302,7 +2366,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.5.7             |",
+		"        |            SHAH TUNNEL 5.5.8             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",

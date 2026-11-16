@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.5.7"
+	version                          = "5.5.8"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -4071,16 +4071,85 @@ func normalizeFingerprint(s string) ([]byte, error) {
 	}
 	return b, nil
 }
-func loadConfig() (Config, error) {
+
+// normalizeLoadedConfig migrates stale persisted Psiphon transit endpoints.
+// The Agent-to-Hub transit endpoint is distinct from every customer Xray target.
+// Psiphon cannot connect to arbitrary destination ports, so a saved unsupported
+// endpoint is moved to TCP/443 on the same host. This migration never reads,
+// reserves, or changes customer mapping target ports.
+func normalizeLoadedConfig(c Config) (Config, string) {
+	c = normalizeConfig(c)
+	if !supportsPsiphonUserEgress(c) || strings.TrimSpace(c.PsiphonHubAddr) == "" {
+		return c, ""
+	}
+	if validateErr := validatePsiphonHubAddress(c.PsiphonHubAddr); validateErr == nil {
+		return c, ""
+	}
+
+	oldAddress := strings.TrimSpace(c.PsiphonHubAddr)
+	host, _, splitErr := net.SplitHostPort(oldAddress)
+	if splitErr != nil || strings.TrimSpace(host) == "" {
+		host, _, splitErr = net.SplitHostPort(strings.TrimSpace(c.HubAddr))
+	}
+	if splitErr != nil || strings.TrimSpace(host) == "" {
+		return c, ""
+	}
+	corrected := net.JoinHostPort(host, "443")
+	if validatePsiphonHubAddress(corrected) != nil {
+		return c, ""
+	}
+	c.PsiphonHubAddr = corrected
+	return c, oldAddress
+}
+
+func decodeConfigData(data []byte) (Config, string, error) {
+	var c Config
+	if err := json.Unmarshal(data, &c); err != nil {
+		return Config{}, "", fmt.Errorf("parse config: %w", err)
+	}
+	c, migratedFrom := normalizeLoadedConfig(c)
+	return c, migratedFrom, nil
+}
+
+func readConfigData() ([]byte, error) {
 	b, err := os.ReadFile(configPath)
 	if err != nil {
-		return Config{}, fmt.Errorf("read %s: %w; run 'ravanreverse setup' first", configPath, err)
+		return nil, fmt.Errorf("read %s: %w; run 'ravanreverse setup' first", configPath, err)
 	}
-	var c Config
-	if err = json.Unmarshal(b, &c); err != nil {
-		return Config{}, fmt.Errorf("parse config: %w", err)
+	return b, nil
+}
+
+func loadConfigForPsiphonSidecarRepair() (Config, error) {
+	b, err := readConfigData()
+	if err != nil {
+		return Config{}, err
 	}
-	c = normalizeConfig(c)
+	c, migratedFrom, err := decodeConfigData(b)
+	if err != nil {
+		return Config{}, err
+	}
+	if migratedFrom != "" {
+		log.Printf("migrated saved Agent-to-Hub Psiphon transit endpoint %s to %s; customer Xray targets and mappings were not changed; ensure the Hub public Mapping listens on TCP/443", migratedFrom, c.PsiphonHubAddr)
+	}
+	// Deliberately do not run full Agent config validation here. The sidecar
+	// repair owns only the profile-local Xray/Psiphon files and validates its
+	// own mapping and systemd ownership metadata in repairXrayPsiphonSidecar.
+	// A stale Hub transport address must not block this independent repair.
+	return c, nil
+}
+
+func loadConfig() (Config, error) {
+	b, err := readConfigData()
+	if err != nil {
+		return Config{}, err
+	}
+	c, migratedFrom, err := decodeConfigData(b)
+	if err != nil {
+		return Config{}, err
+	}
+	if migratedFrom != "" {
+		log.Printf("migrated saved Agent-to-Hub Psiphon transit endpoint %s to %s; customer Xray targets and mappings were not changed; ensure the Hub public Mapping listens on TCP/443", migratedFrom, c.PsiphonHubAddr)
+	}
 	if err = validateConfig(c); err != nil {
 		return Config{}, err
 	}
@@ -4606,7 +4675,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.5.7             |",
+	"        |            SHAH TUNNEL 5.5.8             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -6437,7 +6506,7 @@ func main() {
 		if !gotConfig {
 			log.Fatal("repair-psiphon-sidecar requires --config PATH")
 		}
-		cfg, err := loadConfig()
+		cfg, err := loadConfigForPsiphonSidecarRepair()
 		if err != nil {
 			log.Fatal(err)
 		}
