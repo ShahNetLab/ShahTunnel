@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.0.0"
+	version                          = "5.2.0"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -56,7 +56,7 @@ const (
 	msgPing                     byte = 6
 	msgPong                     byte = 7
 	maxStreams                       = 512
-	streamWindowFrames               = 256
+	streamWindowFrames               = 512
 	maxQueuedPayloadBytes            = int64(64 << 20)
 	wireWriteTimeout                 = 30 * time.Second
 	reverseStreamOpenTimeout         = 18 * time.Second
@@ -209,16 +209,7 @@ func writeRuntimeStats(role string) {
 	if err != nil {
 		return
 	}
-	runtimePath := runtimeStatsPath()
-	tmp := runtimePath + ".tmp"
-	if err = os.MkdirAll(filepath.Dir(runtimePath), 0700); err != nil {
-		return
-	}
-	if err = os.WriteFile(tmp, append(b, '\n'), 0600); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, runtimePath)
-	_ = os.Chmod(runtimePath, 0600)
+	_ = atomicWriteFile(runtimeStatsPath(), append(b, '\n'), 0600)
 }
 
 type counterWriter struct {
@@ -1793,6 +1784,26 @@ func (s *agentSession) run() {
 	}
 }
 
+// laneLoadPenalty gives each established TCP stream a meaningful share of the
+// lane score. RTT remains important, but a small RTT advantage must not pin
+// nearly every new flow to one lane while the other independent lanes sit idle.
+// The cap prevents an overloaded lane from producing unbounded score values.
+const (
+	laneStreamLoadPenalty = 2 * time.Millisecond
+	laneMaxLoadPenalty    = 500 * time.Millisecond
+)
+
+func laneLoadPenalty(activeStreams int) time.Duration {
+	if activeStreams <= 0 {
+		return 0
+	}
+	penalty := time.Duration(activeStreams) * laneStreamLoadPenalty
+	if penalty > laneMaxLoadPenalty {
+		return laneMaxLoadPenalty
+	}
+	return penalty
+}
+
 type hubServer struct {
 	cfg              Config
 	controlTLSConfig *tls.Config
@@ -1889,9 +1900,9 @@ func (h *hubServer) current() *hubSession {
 	}
 	if len(freshMetrics) > 0 {
 		best := freshMetrics[0]
-		bestScore := best.rtt + best.rtt*time.Duration(best.load)/time.Duration(maxStreams) + best.pressure
+		bestScore := best.rtt + laneLoadPenalty(best.load) + best.pressure
 		for _, metric := range freshMetrics[1:] {
-			score := metric.rtt + metric.rtt*time.Duration(metric.load)/time.Duration(maxStreams) + metric.pressure
+			score := metric.rtt + laneLoadPenalty(metric.load) + metric.pressure
 			if score < bestScore {
 				best, bestScore = metric, score
 			}
@@ -1900,12 +1911,12 @@ func (h *hubServer) current() *hubSession {
 		return best.session
 	}
 
-	// Before the first fresh RTT sample, use a combined least-load/queue score.
-	// This also avoids piling startup flows onto the first lane to reconnect.
+	// Before the first fresh RTT sample, use the same least-load/queue score.
+	// This avoids piling startup flows onto the first lane to reconnect.
 	bestScore := time.Duration(1<<62 - 1)
 	var best *hubSession
 	for _, metric := range metrics {
-		score := time.Duration(metric.load)*2*time.Millisecond + metric.pressure
+		score := laneLoadPenalty(metric.load) + metric.pressure
 		if score < bestScore {
 			best, bestScore = metric.session, score
 		}
@@ -2832,9 +2843,12 @@ func runAgent(cfg Config) error {
 	case underlayAdaptive:
 		cleanup, err := startPsiphonForAgent(cfg)
 		if err != nil {
-			// Option 9 must retain the direct path even when Psiphon cannot
-			// start at boot. Its SOCKS candidate will fail fast and the lane
-			// remains able to use the other configured egress path.
+			// A profile with an isolated Psiphon Xray sidecar is explicitly
+			// fail-closed: do not start Agent lanes on a direct underlay.
+			if cfg.XrayPsiphon != nil {
+				return fmt.Errorf("Psiphon is required by this profile's user-egress policy; refusing direct fallback: %w", err)
+			}
+			// Generic adaptive mode retains its documented Direct fallback.
 			log.Printf("Psiphon is not ready at startup; direct egress remains enabled: %v", err)
 		} else {
 			cleanupUnderlay = cleanup
@@ -2936,6 +2950,10 @@ func adaptiveTransportCandidates(preferred string) []string {
 }
 
 func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
+	// Agent-to-Hub lanes have their own adaptive egress policy, independent of
+	// the isolated Xray Psiphon sidecar used for mapped user TCP/DNS traffic.
+	// Falling back here does not change host routes or the sidecar's fail-closed
+	// user-traffic policy; it only keeps the authenticated control/data lanes up.
 	// WARP is only a candidate when its client reports a connected MASQUE path.
 	// Other WARP protocols are never selected by adaptive routing.
 	warpMode := detectActiveWarpUnderlay()
@@ -4591,7 +4609,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.0.0             |",
+	"        |            SHAH TUNNEL 5.2.0             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -4899,13 +4917,10 @@ func generateCertificate(certPath, keyPath string) (string, error) {
 	if err = os.MkdirAll(filepath.Dir(certPath), 0700); err != nil {
 		return "", err
 	}
-	if err = os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0644); err != nil {
+	if err = atomicWriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0644); err != nil {
 		return "", err
 	}
-	if err = os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0600); err != nil {
-		return "", err
-	}
-	if err = os.Chmod(keyPath, 0600); err != nil {
+	if err = atomicWriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0600); err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(der)
@@ -5086,7 +5101,7 @@ func setup() error {
 			if err = prepareTorAgentProfile(&c); err != nil {
 				return fmt.Errorf("automatic Tor setup failed; Agent profile was not saved: %w", err)
 			}
-			uiSuccess("Tor and Lyrebird are installed; per-profile loopback SOCKS5 endpoint is ready: " + c.TorProxy)
+			uiSuccess("Tor and Lyrebird are installed; the private per-profile SOCKS5 endpoint is configured at: " + c.TorProxy)
 		}
 		c = normalizeConfig(c)
 		if err = saveConfig(c); err != nil {
@@ -5165,6 +5180,8 @@ func setup() error {
 	}
 	if c.Underlay == underlayPsiphon && !connected {
 		uiInfo("Agent service and local Psiphon SOCKS5 are running. Psiphon egress and/or the Agent-to-Hub lane may still be connecting; end-to-end connectivity is not yet confirmed.")
+	} else if c.Underlay == underlayTor && !connected {
+		uiWarn("The Agent service is running, but Tor bootstrap and an authenticated Hub lane were not both confirmed. This is not yet a verified working Tor tunnel; inspect the Tor and Agent logs.")
 	} else {
 		uiSuccess("Tunnel '" + name + "' is active. Existing tunnels were not changed.")
 	}
@@ -5253,27 +5270,45 @@ func ensureTunnelRunning(restartActive bool) (bool, error) {
 		}
 		return false, errors.New("service did not reach active state; recent logs are shown above")
 	}
-	psiphonTunnelReady := true
-	// For dedicated Psiphon mode, distinguish a ready local SOCKS listener
-	// from an established Psiphon tunnel. The latter may take longer than the
-	// menu's startup window; keep the service running and let ConsoleClient
-	// continue its own retries rather than reporting a false install failure.
+	underlayTunnelReady := true
 	if data, readErr := os.ReadFile(configPath); readErr == nil {
 		var selected Config
-		if json.Unmarshal(data, &selected) == nil && selected.Role == "agent" && selected.Underlay == underlayPsiphon && serviceWasStarted {
-			ready, waitErr := waitForPsiphonAgentReady(service, serviceStartTime, 100*time.Second)
-			if waitErr != nil {
-				showRecentLogs(55)
-				return false, fmt.Errorf("Psiphon Agent startup failed: %w", waitErr)
-			}
-			psiphonTunnelReady = ready
-			if !ready {
-				fmt.Println("Psiphon SOCKS5 is running locally; its first external tunnel is still connecting. ConsoleClient remains running and will retry. This is NOT yet a connected Agent lane.")
+		if json.Unmarshal(data, &selected) == nil && selected.Role == "agent" && serviceWasStarted {
+			switch selected.Underlay {
+			case underlayPsiphon:
+				// A running local SOCKS listener is not proof that Psiphon has
+				// obtained an exit or that an authenticated Hub lane is alive.
+				ready, waitErr := waitForPsiphonAgentReady(service, serviceStartTime, 100*time.Second)
+				if waitErr != nil {
+					showRecentLogs(55)
+					return false, fmt.Errorf("Psiphon Agent startup failed: %w", waitErr)
+				}
+				underlayTunnelReady = ready
+				if !ready {
+					fmt.Println("Psiphon SOCKS5 is running locally; its first external tunnel is still connecting. ConsoleClient remains running and will retry. This is NOT yet a connected Agent lane.")
+				}
+			case underlayTor:
+				// Unlike the former behavior, do not treat an active systemd
+				// process as proof that Snowflake/WebTunnel has bootstrapped.
+				ready, waitErr := waitForTorAgentReady(service, serviceStartTime, torBootstrapTimeout+30*time.Second)
+				if waitErr != nil {
+					showRecentLogs(70)
+					return false, fmt.Errorf("Tor Agent startup failed: %w", waitErr)
+				}
+				underlayTunnelReady = ready.Bootstrapped && ready.AgentLaneConnected
+				if !underlayTunnelReady {
+					if !ready.Bootstrapped {
+						fmt.Println("Tor is installed and the Agent service is running, but Tor has NOT confirmed 100% bootstrap. The SOCKS5 egress is not yet verified.")
+					} else {
+						fmt.Println("Tor has bootstrapped, but no authenticated Agent-to-Hub lane is connected yet. Check the Hub Mapping address and port.")
+					}
+					showRecentLogs(50)
+				}
 			}
 		}
 	}
 	fmt.Printf("Tunnel service %s is active; automatic startup at boot is enabled.\n", service)
-	return psiphonTunnelReady, nil
+	return underlayTunnelReady, nil
 }
 
 // startSelectedTunnel prepares and verifies all profile-local Psiphon
@@ -5346,6 +5381,36 @@ func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.
 		time.Sleep(time.Second)
 	}
 	return false, fmt.Errorf("service %s did not start its local Psiphon SOCKS5 listener within %s", service, timeout)
+}
+
+// waitForTorAgentReady waits for two independent runtime signals: Tor reports
+// a completed bootstrap, and at least one Agent lane authenticates to the Hub
+// over the Tor SOCKS5 underlay. A merely active ravanreverse@.service is not
+// sufficient because Tor may still be bootstrapping or repeatedly restarting.
+func waitForTorAgentReady(service string, startedAt time.Time, timeout time.Duration) (TorAgentReadiness, error) {
+	if timeout <= 0 {
+		return TorAgentReadiness{}, errors.New("invalid Tor readiness timeout")
+	}
+	startMarker := fmt.Sprintf("@%d", startedAt.Unix())
+	deadline := time.Now().Add(timeout)
+	var latest TorAgentReadiness
+	for time.Now().Before(deadline) {
+		logs, _ := exec.Command("journalctl", "-u", service, "--since", startMarker, "--no-pager", "-o", "cat").CombinedOutput()
+		latest.Bootstrapped, latest.AgentLaneConnected = torAgentReadinessFromJournal(string(logs))
+		if latest.Bootstrapped && latest.AgentLaneConnected && exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
+			return latest, nil
+		}
+		if exec.Command("systemctl", "is-active", "--quiet", service).Run() != nil {
+			return latest, fmt.Errorf("service %s stopped before Tor bootstrap and Hub-lane readiness were both confirmed", service)
+		}
+		time.Sleep(time.Second)
+	}
+	return latest, nil
+}
+
+type TorAgentReadiness struct {
+	Bootstrapped       bool
+	AgentLaneConnected bool
 }
 
 func showRecentLogs(n int) {
@@ -5445,21 +5510,48 @@ fi
 `
 
 // atomicWriteFile writes a root-owned schedule file by replacing it atomically.
-func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+func atomicWriteFile(path string, data []byte, mode os.FileMode) (retErr error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
+
+	// CreateTemp generates an unpredictable name and creates the file as 0600.
+	// This avoids predictable *.tmp paths being pre-created or replaced by
+	// another local process before the atomic rename.
+	tmpFile, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
 		return err
 	}
-	if err := os.Chmod(tmp, mode); err != nil {
-		_ = os.Remove(tmp)
+	tmpPath := tmpFile.Name()
+	defer func() {
+		_ = tmpFile.Close()
+		if retErr != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if err := tmpFile.Chmod(mode); err != nil {
 		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+
+	// Best-effort directory sync makes the rename durable across a sudden
+	// power loss on filesystems that support syncing directory descriptors.
+	if dirFile, err := os.Open(dir); err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
 	}
 	return nil
 }
@@ -5780,15 +5872,7 @@ func writeServerGeoCache(g ServerGeo) {
 	if err != nil {
 		return
 	}
-	tmp := serverGeoCachePath + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0600); err != nil {
-		return
-	}
-	if err := os.Rename(tmp, serverGeoCachePath); err != nil {
-		_ = os.Remove(tmp)
-		return
-	}
-	_ = os.Chmod(serverGeoCachePath, 0600)
+	_ = atomicWriteFile(serverGeoCachePath, append(b, '\n'), 0600)
 }
 
 // isPublicIPv4 rejects private, local, shared-CGNAT, documentation, benchmark,
@@ -6371,6 +6455,25 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+	case "rotate-psiphon-country":
+		if !ensureRoot() {
+			os.Exit(1)
+		}
+		for i := 2; i < len(os.Args); i++ {
+			if os.Args[i] == "--config" && i+1 < len(os.Args) {
+				configPath = filepath.Clean(os.Args[i+1])
+				i++
+			} else {
+				log.Fatalf("unknown rotate-psiphon-country argument %q", os.Args[i])
+			}
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := rotatePsiphonCountry(cfg); err != nil {
+			log.Fatal(err)
+		}
 	case "uninstall":
 		if !ensureRoot() {
 			os.Exit(1)
@@ -6381,7 +6484,7 @@ func main() {
 	case "version", "--version", "-v":
 		fmt.Printf("Shah Tunnel %s (%s)\n", version, runtimeArch())
 	default:
-		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|run [--config PATH]|uninstall|version]\n", version)
+		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|run [--config PATH]|rotate-psiphon-country --config PATH|uninstall|version]\n", version)
 	}
 }
 
