@@ -1,11 +1,8 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -88,7 +85,7 @@ func renderXrayPsiphonUnit(runtime xrayRuntime, configPath, service string) ([]b
 		}
 	}
 	unit := fmt.Sprintf(`[Unit]
-# Managed-By: ShahTunnel 5.5.12
+# Managed-By: ShahTunnel 5.0.1
 Description=ShahTunnel isolated Psiphon Xray (%s)
 After=network-online.target
 Wants=network-online.target
@@ -104,9 +101,7 @@ LimitNOFILE=1048576
 KillSignal=SIGINT
 NoNewPrivileges=yes
 PrivateTmp=yes
-# X-UI TLS certificate/key files may live below /root or /home.
-# Permit reads only; do not expose those paths as writable to this sidecar.
-ProtectHome=read-only
+ProtectHome=yes
 ProtectSystem=full
 ReadWritePaths=/etc/ravanreverse/psiphon /run/lock
 ProtectKernelTunables=yes
@@ -360,304 +355,23 @@ func xrayPsiphonUnitBelongsToConfig(unit []byte, cfg Config) bool {
 	return false
 }
 
-// migrateXrayPsiphonHomeProtection changes only the [Service] ProtectHome
-// directive on a positively identified ShahTunnel sidecar. Older units used
-// ProtectHome=yes, which hides /root and /home and can make Xray's copied
-// inbound fail TLS handshakes when the certificate/key is stored there.
-func migrateXrayPsiphonHomeProtection(unit []byte) ([]byte, bool, error) {
-	if len(unit) == 0 || !strings.Contains(string(unit), "Description=ShahTunnel isolated Psiphon Xray (") {
-		return nil, false, errors.New("refusing to migrate a non-ShahTunnel Xray sidecar unit")
-	}
-	lines := strings.Split(string(unit), "\n")
-	inService, serviceFound, directiveFound, changed := false, false, false, false
-	insertAt := -1
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "[Service]" {
-			inService, serviceFound, insertAt = true, true, i+1
-			continue
-		}
-		if strings.HasPrefix(trimmed, "[") {
-			inService = false
-		}
-		if !inService || !strings.HasPrefix(trimmed, "ProtectHome=") {
-			continue
-		}
-		if directiveFound {
-			return nil, false, errors.New("managed Xray sidecar unit contains duplicate ProtectHome directives")
-		}
-		directiveFound = true
-		if trimmed != "ProtectHome=read-only" {
-			indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
-			lines[i] = indent + "ProtectHome=read-only"
-			changed = true
-		}
-	}
-	if !serviceFound {
-		return nil, false, errors.New("managed Xray sidecar unit has no [Service] section")
-	}
-	if !directiveFound {
-		lines = append(lines[:insertAt], append([]string{"ProtectHome=read-only"}, lines[insertAt:]...)...)
-		changed = true
-	}
-	return []byte(strings.Join(lines, "\n")), changed, nil
-}
-
-// migrateXrayPsiphonDNSConfig upgrades an already-generated sidecar without
-// changing its cloned client inbounds, ports, credentials, or other routing.
-// It gives Xray's internal DNS client a unique route tag so inherited X-UI
-// DNS rules cannot divert its DoH traffic away from this profile's SOCKS5.
-func migrateXrayPsiphonDNSConfig(data []byte, profileID, proxyOutboundTag string, bindings []XrayPsiphonBinding) ([]byte, bool, error) {
-	if len(bindings) == 0 || strings.TrimSpace(profileID) == "" || strings.TrimSpace(proxyOutboundTag) == "" {
-		return nil, false, errors.New("incomplete profile metadata for Psiphon DNS migration")
-	}
-	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
-		return nil, false, fmt.Errorf("read existing Psiphon Xray JSON: %w", err)
-	}
-	inbounds, ok := root["inbounds"].([]any)
-	if !ok || len(inbounds) == 0 {
-		return nil, false, errors.New("Psiphon sidecar has no inbounds array")
-	}
-	outbounds, ok := root["outbounds"].([]any)
-	if !ok || len(outbounds) == 0 {
-		return nil, false, errors.New("Psiphon sidecar has no outbounds array")
-	}
-	shortID := safeXrayTag(profileID)
-	dnsInboundTag := "s1t-psiphon-" + shortID + "-dns-in"
-	dnsOutboundTag := "s1t-psiphon-" + shortID + "-dns-out"
-	dnsHijackRuleTag := "s1t-psiphon-" + shortID + "-dns-hijack"
-	dnsEgressRuleTag := "s1t-psiphon-" + shortID + "-dns-egress"
-
-	usedTags := map[string]bool{}
-	clonedInboundTags := map[string]bool{}
-	for _, raw := range inbounds {
-		item, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		if tag, _ := item["tag"].(string); tag != "" {
-			usedTags[tag] = true
-			clonedInboundTags[tag] = true
-		}
-	}
-	for _, raw := range outbounds {
-		item, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		if tag, _ := item["tag"].(string); tag != "" {
-			usedTags[tag] = true
-		}
-	}
-	if usedTags[dnsInboundTag] {
-		// A sidecar produced by the new version already uses this as the DNS
-		// module tag, not as an inbound/outbound tag. The old Xray JSON should
-		// not contain it in either array; reject unexpected ownership instead.
-		return nil, false, fmt.Errorf("Psiphon DNS tag %q collides with an inbound/outbound", dnsInboundTag)
-	}
-	if !usedTags[proxyOutboundTag] {
-		return nil, false, fmt.Errorf("Psiphon SOCKS outbound %q is missing from the sidecar", proxyOutboundTag)
-	}
-	wantedInboundTags := make([]string, 0, len(bindings))
-	seen := map[string]bool{}
-	for _, binding := range bindings {
-		if strings.TrimSpace(binding.InboundTag) == "" || !clonedInboundTags[binding.InboundTag] {
-			return nil, false, fmt.Errorf("Psiphon mapping %q has no matching cloned inbound tag", binding.MappingID)
-		}
-		if !seen[binding.InboundTag] {
-			wantedInboundTags = append(wantedInboundTags, binding.InboundTag)
-			seen[binding.InboundTag] = true
-		}
-	}
-
-	dnsOutboundFound := false
-	proxyOutboundFound := false
-	for _, raw := range outbounds {
-		item, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		if item["tag"] == proxyOutboundTag {
-			if item["protocol"] != "socks" {
-				return nil, false, fmt.Errorf("Psiphon egress outbound tag %q is not a SOCKS outbound", proxyOutboundTag)
-			}
-			proxyOutboundFound = true
-		}
-		if item["tag"] == dnsOutboundTag {
-			if item["protocol"] != "dns" {
-				return nil, false, fmt.Errorf("Psiphon DNS outbound tag %q is owned by a non-DNS outbound", dnsOutboundTag)
-			}
-			dnsOutboundFound = true
-		}
-	}
-	if !proxyOutboundFound {
-		return nil, false, fmt.Errorf("Psiphon SOCKS outbound %q is missing or has the wrong protocol", proxyOutboundTag)
-	}
-	if !dnsOutboundFound {
-		if usedTags[dnsOutboundTag] {
-			return nil, false, fmt.Errorf("Psiphon DNS outbound tag %q collides with an existing inbound", dnsOutboundTag)
-		}
-		outbounds = append(outbounds, map[string]any{"tag": dnsOutboundTag, "protocol": "dns", "settings": map[string]any{}})
-		root["outbounds"] = outbounds
-	}
-
-	dnsConfig, ok := root["dns"].(map[string]any)
-	if !ok {
-		if root["dns"] != nil {
-			return nil, false, errors.New("Psiphon sidecar dns section is not an object")
-		}
-		dnsConfig = map[string]any{}
-		root["dns"] = dnsConfig
-	}
-	// Use provider hostnames so TLS SNI and certificate validation remain
-	// explicit. Xray's non-local DNS requests carry dnsInboundTag into routing;
-	// the profile-specific rule sends them through the Psiphon SOCKS outbound,
-	// where the remote proxy resolves the destination hostname.
-	dnsConfig["tag"] = dnsInboundTag
-	dnsConfig["servers"] = []any{"https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query"}
-	dnsConfig["queryStrategy"] = "UseIPv4"
-	dnsConfig["disableCache"] = false
-	dnsConfig["enableParallelQuery"] = false
-
-	routing, ok := root["routing"].(map[string]any)
-	if !ok {
-		if root["routing"] != nil {
-			return nil, false, errors.New("Psiphon sidecar routing section is not an object")
-		}
-		routing = map[string]any{}
-		root["routing"] = routing
-	}
-	rules, ok := routing["rules"].([]any)
-	if !ok && routing["rules"] != nil {
-		return nil, false, errors.New("Psiphon sidecar routing.rules is not an array")
-	}
-	filtered := make([]any, 0, len(rules)+2)
-	for _, raw := range rules {
-		item, ok := raw.(map[string]any)
-		if ok {
-			ruleTag, _ := item["ruleTag"].(string)
-			if ruleTag == dnsHijackRuleTag || ruleTag == dnsEgressRuleTag {
-				continue
-			}
-		}
-		filtered = append(filtered, raw)
-	}
-	dnsRules := []any{
-		map[string]any{
-			"type": "field", "inboundTag": stringSliceToAny(wantedInboundTags),
-			"network": "tcp,udp", "port": "53", "outboundTag": dnsOutboundTag,
-			"ruleTag": dnsHijackRuleTag,
-		},
-		map[string]any{
-			"type": "field", "inboundTag": []any{dnsInboundTag},
-			"outboundTag": proxyOutboundTag, "ruleTag": dnsEgressRuleTag,
-		},
-	}
-	routing["rules"] = append(dnsRules, filtered...)
-
-	generated, err := json.MarshalIndent(root, "", "  ")
-	if err != nil {
-		return nil, false, err
-	}
-	generated = append(generated, '\n')
-	return generated, !bytes.Equal(data, generated), nil
-}
-
-// parseSystemdQuotedArgument parses the double-quoted arguments emitted by
-// systemdExecQuote. It is deliberately limited to the managed ShahTunnel unit.
-func parseSystemdQuotedArgument(value string) (string, string, error) {
-	value = strings.TrimSpace(value)
-	if !strings.HasPrefix(value, `"`) {
-		return "", "", errors.New("expected a quoted systemd ExecStart argument")
-	}
-	var out strings.Builder
-	for i := 1; i < len(value); i++ {
-		c := value[i]
-		if c == '"' {
-			return out.String(), strings.TrimSpace(value[i+1:]), nil
-		}
-		if c == '\\' {
-			i++
-			if i >= len(value) {
-				return "", "", errors.New("truncated systemd ExecStart escape")
-			}
-			switch value[i] {
-			case '\\', '"':
-				out.WriteByte(value[i])
-			case 'n':
-				out.WriteByte('\n')
-			case 'r':
-				out.WriteByte('\r')
-			default:
-				out.WriteByte(value[i])
-			}
-			continue
-		}
-		if c == '%' && i+1 < len(value) && value[i+1] == '%' {
-			out.WriteByte('%')
-			i++
-			continue
-		}
-		out.WriteByte(c)
-	}
-	return "", "", errors.New("unterminated systemd ExecStart argument")
-}
-
-func xrayRuntimeFromPsiphonUnit(unit []byte, configPath string) (xrayRuntime, error) {
-	var binary, cwd string
-	for _, line := range strings.Split(string(unit), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "WorkingDirectory=") {
-			cwd = strings.TrimSpace(strings.TrimPrefix(line, "WorkingDirectory="))
-		}
-		if strings.HasPrefix(line, "ExecStart=") {
-			first, rest, err := parseSystemdQuotedArgument(strings.TrimPrefix(line, "ExecStart="))
-			if err != nil {
-				return xrayRuntime{}, err
-			}
-			binary = first
-			if rest != "run -config "+systemdExecQuote(configPath) {
-				return xrayRuntime{}, errors.New("managed Psiphon Xray ExecStart does not match its exact profile config")
-			}
-		}
-	}
-	if !filepath.IsAbs(binary) || !filepath.IsAbs(cwd) {
-		return xrayRuntime{}, errors.New("managed Psiphon Xray unit has invalid binary or working-directory paths")
-	}
-	if _, err := os.Stat(binary); err != nil {
-		return xrayRuntime{}, fmt.Errorf("managed Psiphon Xray binary %q is unavailable: %w", binary, err)
-	}
-	return xrayRuntime{Binary: binary, CWD: cwd, ConfigPath: configPath}, nil
-}
-
-// repairXrayPsiphonSidecar upgrades a pre-existing profile sidecar in place.
-// Only the exact service/config pair in this Agent's saved metadata is touched.
-// Existing client ports, inbound JSON, credentials, Hub mappings and X-UI
-// source config remain byte-for-byte unchanged.
-func repairXrayPsiphonSidecar(cfg Config, startIfInactive bool) error {
+// ensureXrayPsiphonSidecar starts a previously-created profile-local Xray
+// sidecar before Agent startup. It never adopts a unit that does not point to
+// this exact profile config.
+func ensureXrayPsiphonSidecar(cfg Config) error {
 	if cfg.XrayPsiphon == nil {
 		return nil
 	}
-	if cfg.Role != "agent" || !supportsPsiphonUserEgress(cfg) {
-		return errors.New("saved Psiphon Xray integration does not belong to a Psiphon/Adaptive Agent")
-	}
-	if err := validatePsiphonMappingTargets(cfg); err != nil {
-		return err
-	}
 	meta := cfg.XrayPsiphon
-	if meta.OutboundTag != "s1t-psiphon-"+safeXrayTag(cfg.Name)+"-out" {
-		return errors.New("saved Psiphon Xray outbound tag does not match the profile")
-	}
 	unitPath, err := xrayPsiphonUnitPath(meta.Service)
 	if err != nil {
 		return err
 	}
-	unitInfo, err := os.Lstat(unitPath)
+	st, err := os.Lstat(unitPath)
 	if err != nil {
 		return fmt.Errorf("inspect profile Psiphon Xray unit: %w", err)
 	}
-	if !unitInfo.Mode().IsRegular() {
+	if !st.Mode().IsRegular() {
 		return fmt.Errorf("profile Psiphon Xray unit %s is not a regular file", meta.Service)
 	}
 	unit, err := os.ReadFile(unitPath)
@@ -667,116 +381,17 @@ func repairXrayPsiphonSidecar(cfg Config, startIfInactive bool) error {
 	if !xrayPsiphonUnitBelongsToConfig(unit, cfg) {
 		return fmt.Errorf("profile Psiphon Xray unit %s does not match saved profile metadata", meta.Service)
 	}
-	configInfo, err := os.Lstat(meta.ConfigPath)
-	if err != nil {
-		return fmt.Errorf("inspect profile Psiphon Xray config: %w", err)
-	}
-	if !configInfo.Mode().IsRegular() {
-		return errors.New("profile Psiphon Xray config is not a regular file")
-	}
-	oldConfig, err := os.ReadFile(meta.ConfigPath)
-	if err != nil {
-		return err
-	}
-	oldUnit := append([]byte(nil), unit...)
-
-	newUnit, unitChanged, err := migrateXrayPsiphonHomeProtection(unit)
-	if err != nil {
-		return err
-	}
-	newConfig, configChanged, err := migrateXrayPsiphonDNSConfig(oldConfig, cfg.Name, meta.OutboundTag, meta.Bindings)
-	if err != nil {
-		return err
-	}
-	if !unitChanged && !configChanged {
-		if !startIfInactive {
-			return nil
-		}
-		if err := systemdReload(); err != nil {
-			return err
-		}
-		out, startErr := exec.Command("systemctl", "enable", "--now", meta.Service).CombinedOutput()
-		if startErr != nil {
-			return fmt.Errorf("start profile Psiphon Xray sidecar %s: %w: %s; journal: %s", meta.Service, startErr, strings.TrimSpace(string(out)), xrayPsiphonJournal(meta.Service))
-		}
-		return waitForXrayPsiphonInbounds(meta.Service, meta.Bindings)
-	}
-
-	wasActive := exec.Command("systemctl", "is-active", "--quiet", meta.Service).Run() == nil
-	wasEnabled := exec.Command("systemctl", "is-enabled", "--quiet", meta.Service).Run() == nil
-	runtime, err := xrayRuntimeFromPsiphonUnit(unit, meta.ConfigPath)
-	if err != nil {
-		return err
-	}
-	if configChanged {
-		tmp, createErr := os.CreateTemp(filepath.Dir(meta.ConfigPath), ".s1t-psiphon-validate-*.json")
-		if createErr != nil {
-			return createErr
-		}
-		tmpPath := tmp.Name()
-		defer os.Remove(tmpPath)
-		if chmodErr := tmp.Chmod(0600); chmodErr != nil {
-			_ = tmp.Close()
-			return chmodErr
-		}
-		if _, writeErr := tmp.Write(newConfig); writeErr != nil {
-			_ = tmp.Close()
-			return writeErr
-		}
-		if closeErr := tmp.Close(); closeErr != nil {
-			return closeErr
-		}
-		if validateErr := validateXrayConfig(runtime, tmpPath); validateErr != nil {
-			return fmt.Errorf("Xray rejected the migrated Psiphon sidecar config: %w", validateErr)
-		}
-	}
-
-	if configChanged {
-		if err := atomicReplaceFile(meta.ConfigPath, newConfig, 0600); err != nil {
-			return fmt.Errorf("replace Psiphon Xray config: %w", err)
-		}
-	}
-	if unitChanged {
-		if err := atomicReplaceFile(unitPath, newUnit, 0644); err != nil {
-			_ = atomicReplaceFile(meta.ConfigPath, oldConfig, 0600)
-			return fmt.Errorf("replace Psiphon Xray unit: %w", err)
-		}
-	}
-	rollback := func(cause error) error {
-		restoreErr := restoreXrayPsiphonSidecar(meta.Service, unitPath, meta.ConfigPath, oldUnit, oldConfig, true, wasActive, wasEnabled)
-		if restoreErr != nil {
-			return fmt.Errorf("%w; previous Psiphon sidecar restoration also failed: %v", cause, restoreErr)
-		}
-		return cause
-	}
 	if err := systemdReload(); err != nil {
-		return rollback(err)
+		return err
 	}
-	if wasActive {
-		out, restartErr := exec.Command("systemctl", "restart", meta.Service).CombinedOutput()
-		if restartErr != nil {
-			return rollback(fmt.Errorf("restart repaired Psiphon Xray sidecar %s: %w: %s; journal: %s", meta.Service, restartErr, strings.TrimSpace(string(out)), xrayPsiphonJournal(meta.Service)))
-		}
-		if err := waitForXrayPsiphonInbounds(meta.Service, meta.Bindings); err != nil {
-			return rollback(err)
-		}
-	} else if startIfInactive {
-		out, startErr := exec.Command("systemctl", "enable", "--now", meta.Service).CombinedOutput()
-		if startErr != nil {
-			return rollback(fmt.Errorf("start repaired Psiphon Xray sidecar %s: %w: %s; journal: %s", meta.Service, startErr, strings.TrimSpace(string(out)), xrayPsiphonJournal(meta.Service)))
-		}
-		if err := waitForXrayPsiphonInbounds(meta.Service, meta.Bindings); err != nil {
-			return rollback(err)
-		}
+	out, err := exec.Command("systemctl", "enable", "--now", meta.Service).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("start profile Psiphon Xray sidecar %s: %w: %s; journal: %s", meta.Service, err, strings.TrimSpace(string(out)), xrayPsiphonJournal(meta.Service))
 	}
-	log.Printf("repaired profile Psiphon Xray sidecar %s: TLS certificate reads and isolated DoH routing are enabled", meta.Service)
+	if err := waitForXrayPsiphonInbounds(meta.Service, meta.Bindings); err != nil {
+		return err
+	}
 	return nil
-}
-
-// ensureXrayPsiphonSidecar repairs and starts only the selected profile's
-// managed sidecar before Agent startup.
-func ensureXrayPsiphonSidecar(cfg Config) error {
-	return repairXrayPsiphonSidecar(cfg, true)
 }
 
 // stopXrayPsiphonSidecar stops, but does not disable, the selected profile's
@@ -875,235 +490,8 @@ func psiphonExitMatchesVPSDirectIP(exitIP, directIP string) bool {
 	return exit != nil && direct != nil && exit.To4() != nil && direct.To4() != nil && exit.To4().Equal(direct.To4())
 }
 
-// buildPsiphonDoHProbeQuery creates a minimal RFC 1035 A query used to verify
-// that the selected Psiphon SOCKS5 path can reach a real DoH resolver. The
-// destination hostname is deliberately retained so the SOCKS proxy performs
-// remote resolution and TLS SNI/certificate validation remains standard.
-func buildPsiphonDoHProbeQuery(name string, id uint16) ([]byte, error) {
-	name = strings.TrimSuffix(strings.TrimSpace(name), ".")
-	if name == "" || len(name) > 253 {
-		return nil, errors.New("invalid DNS probe name")
-	}
-	query := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-	for _, label := range strings.Split(name, ".") {
-		if len(label) == 0 || len(label) > 63 {
-			return nil, errors.New("invalid DNS probe label")
-		}
-		query = append(query, byte(len(label)))
-		query = append(query, label...)
-	}
-	query = append(query, 0x00, 0x00, 0x01, 0x00, 0x01) // QNAME terminator, A, IN
-	return query, nil
-}
-
-func validPsiphonDoHResponse(body []byte, id uint16) bool {
-	if len(body) < 12 {
-		return false
-	}
-	responseID := uint16(body[0])<<8 | uint16(body[1])
-	return responseID == id && body[2]&0x80 != 0 && body[3]&0x0f == 0
-}
-
-// verifyPsiphonDoHEgress proves that DNS-over-HTTPS works over the same
-// profile-local SOCKS5 route that the Xray sidecar will use. A listening
-// SOCKS port or a successful generic HTTPS request alone is not sufficient.
-func verifyPsiphonDoHEgress(proxyAddress string, timeout time.Duration) error {
-	if !isLoopbackProxyAddress(proxyAddress) {
-		return errors.New("Psiphon DoH probe requires a loopback SOCKS5 proxy")
-	}
-	if timeout <= 0 {
-		return errors.New("invalid Psiphon DoH probe timeout")
-	}
-	const queryID = 0x5a31
-	query, err := buildPsiphonDoHProbeQuery("example.com", queryID)
-	if err != nil {
-		return err
-	}
-	encoded := base64.RawURLEncoding.EncodeToString(query)
-	endpoints := []string{
-		"https://cloudflare-dns.com/dns-query?dns=" + encoded,
-		"https://dns.google/dns-query?dns=" + encoded,
-	}
-	perEndpoint := timeout / time.Duration(len(endpoints))
-	if perEndpoint < time.Second {
-		perEndpoint = time.Second
-	}
-	var failures []string
-	for _, endpoint := range endpoints {
-		ctx, cancel := context.WithTimeout(context.Background(), perEndpoint)
-		transport := &http.Transport{
-			TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12},
-			ForceAttemptHTTP2: true,
-			DisableKeepAlives: true,
-			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-				return dialSOCKS5Context(ctx, proxyAddress, address)
-			},
-		}
-		client := &http.Client{Transport: transport, Timeout: perEndpoint}
-		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-		if reqErr == nil {
-			req.Header.Set("Accept", "application/dns-message")
-		}
-		var requestErr error
-		if reqErr != nil {
-			requestErr = reqErr
-		} else {
-			resp, doErr := client.Do(req)
-			if doErr != nil {
-				requestErr = doErr
-			} else {
-				body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
-				_ = resp.Body.Close()
-				contentType := strings.ToLower(resp.Header.Get("Content-Type"))
-				switch {
-				case readErr != nil:
-					requestErr = readErr
-				case resp.StatusCode != http.StatusOK:
-					requestErr = fmt.Errorf("HTTP %d", resp.StatusCode)
-				case !strings.Contains(contentType, "application/dns-message"):
-					requestErr = fmt.Errorf("unexpected Content-Type %q", contentType)
-				case !validPsiphonDoHResponse(body, queryID):
-					requestErr = errors.New("resolver returned an invalid DNS response")
-				}
-			}
-		}
-		client.CloseIdleConnections()
-		cancel()
-		if requestErr == nil {
-			return nil
-		}
-		failures = append(failures, strings.TrimPrefix(strings.SplitN(endpoint, "?", 2)[0], "https://")+": "+requestErr.Error())
-	}
-	return fmt.Errorf("no DoH resolver returned a valid DNS response through Psiphon SOCKS5: %s", strings.Join(failures, ": "))
-}
-
-// psiphonHubProbeEndpoint returns the exact endpoint used by Agent control
-// lanes over Psiphon. It is deliberately independent of customer-facing
-// mappings and Agent-side Xray target ports.
-func psiphonHubProbeEndpoint(cfg Config) string {
-	if cfg.Role != "agent" || (cfg.Underlay != underlayPsiphon && cfg.Underlay != underlayAdaptive) {
-		return ""
-	}
-	// Adaptive profiles using only CONNECT transports cannot use Psiphon for
-	// their control lanes; they may still use the isolated Psiphon Xray egress.
-	if cfg.Underlay == underlayAdaptive {
-		switch cfg.Transport {
-		case transportHTTP2, transportHTTP1, transportHTTPConnectAuto:
-			return ""
-		}
-	}
-	return strings.TrimSpace(agentHubAddressForUnderlay(cfg, underlayPsiphon))
-}
-
-func psiphonHubProbeTransports(configured string) []string {
-	switch configured {
-	case transportTCP:
-		return []string{transportTCP}
-	case transportWebSocket:
-		return []string{transportWebSocket}
-	case transportHTTP2, transportHTTP1, transportHTTPConnectAuto:
-		return nil
-	default:
-		// auto/adaptive use TCP/TLS first and then WebSocket/TLS over Psiphon.
-		return []string{transportTCP, transportWebSocket}
-	}
-}
-
-// verifyPsiphonHubControlPath authenticates a short-lived Agent control
-// connection through the selected SOCKS5 exit. Checking only api.ipify.org or
-// DoH is insufficient: an exit may allow HTTPS but reject the Hub's actual
-// destination port. This probe uses the same endpoint, TLS pin, ALPN, optional
-// WebSocket upgrade, and token handshake as a real Agent lane.
-func verifyPsiphonHubControlPath(cfg Config, proxyAddress string, timeout time.Duration) error {
-	endpoint := psiphonHubProbeEndpoint(cfg)
-	if endpoint == "" {
-		return nil
-	}
-	if err := validatePsiphonHubAddress(endpoint); err != nil {
-		return fmt.Errorf("invalid Psiphon Hub transit endpoint: %w", err)
-	}
-	transports := psiphonHubProbeTransports(cfg.Transport)
-	if len(transports) == 0 {
-		return fmt.Errorf("configured transport %s cannot establish Agent control lanes over Psiphon", cfg.Transport)
-	}
-	if timeout <= 0 {
-		return errors.New("invalid Psiphon Hub probe timeout")
-	}
-	perTransport := timeout / time.Duration(len(transports))
-	if perTransport < 2*time.Second {
-		perTransport = 2 * time.Second
-	}
-	var failures []string
-	for _, transport := range transports {
-		if err := verifyPsiphonHubControlTransport(cfg, proxyAddress, endpoint, transport, perTransport); err == nil {
-			log.Printf("Psiphon Hub transit verified: authenticated %s lane through SOCKS5", transport)
-			return nil
-		} else {
-			failures = append(failures, transport+": "+err.Error())
-		}
-	}
-	return fmt.Errorf("Hub transit endpoint %s is not reachable/authenticatable through this Psiphon exit: %s", endpoint, strings.Join(failures, " | "))
-}
-
-func verifyPsiphonHubControlTransport(cfg Config, proxyAddress, endpoint, transport string, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	raw, err := dialSOCKS5Context(ctx, proxyAddress, endpoint)
-	if err != nil {
-		return err
-	}
-	defer raw.Close()
-	_ = raw.SetDeadline(time.Now().Add(timeout))
-
-	pin, err := normalizeFingerprint(cfg.Fingerprint)
-	if err != nil {
-		return fmt.Errorf("invalid Hub certificate fingerprint: %w", err)
-	}
-	host, _, err := net.SplitHostPort(endpoint)
-	if err != nil {
-		return fmt.Errorf("invalid Hub transit endpoint %q: %w", endpoint, err)
-	}
-	sni := strings.TrimSpace(cfg.TLSServerName)
-	if sni == "" && net.ParseIP(host) == nil {
-		sni = host
-	}
-	tlsConfig := agentTLSConfig(pin, sni)
-	tlsConfig.NextProtos = []string{controlALPN}
-	tlsConn := tls.Client(raw, tlsConfig)
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		return fmt.Errorf("TLS handshake: %w", err)
-	}
-
-	var authConn net.Conn = tlsConn
-	if transport == transportWebSocket {
-		wsHost := sni
-		if wsHost == "" {
-			wsHost = host
-		}
-		_, port, splitErr := net.SplitHostPort(endpoint)
-		if splitErr == nil {
-			wsHost = net.JoinHostPort(wsHost, port)
-		}
-		authConn, err = clientWebSocketUpgrade(tlsConn, wsHost)
-		if err != nil {
-			return fmt.Errorf("WebSocket upgrade: %w", err)
-		}
-	}
-	if err := writeFull(authConn, []byte("RREV3 "+cfg.Token+"\n")); err != nil {
-		return fmt.Errorf("write Hub authentication preface: %w", err)
-	}
-	reply, err := bufio.NewReaderSize(authConn, 256).ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("read Hub authentication response: %w", err)
-	}
-	if reply != "OK\n" {
-		return fmt.Errorf("Hub rejected Agent authentication/transport (%q)", strings.TrimSpace(reply))
-	}
-	return nil
-}
-
-func verifyPsiphonExit(cfg Config, proxy, expectedRegion, directIP string) (string, string, error) {
-	ip, err := waitForPsiphonPublicEgressIP(proxy, 15*time.Second)
+func verifyPsiphonExit(proxy, expectedRegion, directIP string) (string, string, error) {
+	ip, err := waitForPsiphonPublicEgressIP(proxy, 8*time.Second)
 	if err != nil {
 		return "", "", err
 	}
@@ -1126,13 +514,6 @@ func verifyPsiphonExit(cfg Config, proxy, expectedRegion, directIP string) (stri
 	if country == "US" || !psiphonAllowedEgressRegions[country] {
 		return "", "", fmt.Errorf("Psiphon exit %s (%s) is not in the approved country list", ip, country)
 	}
-	if err := verifyPsiphonDoHEgress(proxy, 8*time.Second); err != nil {
-		return "", "", fmt.Errorf("Psiphon exit %s (%s) passed HTTPS IP verification but DNS-over-HTTPS through SOCKS5 failed: %w", ip, country, err)
-	}
-	if err := verifyPsiphonHubControlPath(cfg, proxy, 16*time.Second); err != nil {
-		return "", "", fmt.Errorf("Psiphon exit %s (%s) passed general egress checks but failed the actual ShahTunnel Hub path: %w", ip, country, err)
-	}
-	log.Printf("Psiphon DNS-over-HTTPS verified through the profile SOCKS5 path")
 	return ip, country, nil
 }
 
@@ -1175,7 +556,7 @@ func selectPsiphonExitByPriority(cfg Config) (string, string, error) {
 				continue
 			}
 		}
-		if ip, country, probeErr := verifyPsiphonExit(cfg, proxy, region, directIP); probeErr == nil {
+		if ip, country, probeErr := verifyPsiphonExit(proxy, region, directIP); probeErr == nil {
 			log.Printf("Psiphon selected preferred exit: country=%s ip=%s direct_vps_ip=%s", country, ip, directIP)
 			return ip, country, nil
 		} else {
@@ -1395,7 +776,7 @@ func rotatePsiphonCountry(cfg Config) error {
 	if oldRegion == "" {
 		return errors.New("country rotation refused: current Psiphon country is not explicitly configured")
 	}
-	oldIP, oldCountry, oldErr := verifyPsiphonExit(cfg, proxy, oldRegion, directIP)
+	oldIP, oldCountry, oldErr := verifyPsiphonExit(proxy, oldRegion, directIP)
 	if oldErr != nil {
 		log.Printf("Psiphon rotation: current exit %s is not presently verifiable; trying the next allowlisted country for recovery: %v", oldRegion, oldErr)
 	}
@@ -1412,7 +793,7 @@ func rotatePsiphonCountry(cfg Config) error {
 			failures = append(failures, region+": Psiphon restart: "+err.Error())
 			continue
 		}
-		if ip, country, verifyErr := verifyPsiphonExit(cfg, proxy, region, directIP); verifyErr == nil {
+		if ip, country, verifyErr := verifyPsiphonExit(proxy, region, directIP); verifyErr == nil {
 			log.Printf("Psiphon hourly country rotation succeeded: country=%s ip=%s previous_country=%s previous_ip=%s", country, ip, oldCountry, oldIP)
 			return nil
 		} else {
@@ -1423,7 +804,7 @@ func rotatePsiphonCountry(cfg Config) error {
 	// Do not leave the profile stranded on a region that failed verification.
 	if _, err := setPsiphonEgressRegionPreference(cfg.PsiphonConfig, oldRegion); err == nil {
 		if restartErr := runSystemctl("restart", service); restartErr == nil {
-			if ip, country, verifyErr := verifyPsiphonExit(cfg, proxy, oldRegion, directIP); verifyErr == nil {
+			if ip, country, verifyErr := verifyPsiphonExit(proxy, oldRegion, directIP); verifyErr == nil {
 				log.Printf("Psiphon country rotation kept previous verified exit: country=%s ip=%s", country, ip)
 				return fmt.Errorf("no alternate country could be verified; retained previous country %s (%s): %s", country, ip, strings.Join(failures, " | "))
 			}
