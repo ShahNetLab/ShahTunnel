@@ -180,7 +180,7 @@ func psiphonHostPerformanceProfile() psiphonPerformanceProfile {
 // Psiphon accepts one EgressRegion per ConsoleClient. An empty value lets
 // Psiphon select its best-performing server; the live exit is independently
 // verified against this explicit allowlist before user traffic is enabled.
-// These are exactly the countries requested for ShahTunnel 5.0.1.
+// These are exactly the countries requested for ShahTunnel 6.0.0.
 var psiphonEgressRegionPriority = []string{
 	"AT", "BR", "CH", "CZ", "DE",
 	"ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO",
