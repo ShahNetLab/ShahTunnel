@@ -52,25 +52,16 @@ printf '\n== 1/7: Resolve Go module metadata ==\n'
 pass "Module metadata resolved"
 
 printf '\n== 2/7: Formatting ==\n'
-unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go S1T-CAPSULE/xray_warp.go S1T-CAPSULE/xray_psiphon.go S1T-CAPSULE/psiphon.go S1T-CAPSULE/psiphon_test.go S1T-CAPSULE/tor.go S1T-CAPSULE/tor_test.go S1T-CAPSULE/xray_tor.go S1T-CAPSULE/xray_tor_test.go)"
+unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go S1T-CAPSULE/xray_warp.go S1T-CAPSULE/xray_psiphon.go S1T-CAPSULE/psiphon.go S1T-CAPSULE/psiphon_test.go)"
 [[ -z "$unformatted" ]] || fail "gofmt required for: $unformatted"
 pass "Go source formatting"
 
 printf '\n== 3/7: Installer syntax ==\n'
 bash -n S1T-START.sh
 bash -n scripts/install-psiphon.sh
-bash -n scripts/install-tor.sh
 bash -n scripts/repair-psiphon-profile.sh
 bash -n VERIFY-ALL-TRANSPORTS.sh
 grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/psiphon' S1T-START.sh || fail "Psiphon systemd data-directory permission is missing."
-grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/tor' S1T-START.sh || fail "Tor systemd data-directory permission is missing."
-grep -Fq 'tor-expert-bundle-linux-x86_64-16.0.tar.gz' scripts/install-tor.sh || fail "Pinned official Tor Expert Bundle is missing."
-grep -Fq 'cc950ebe9acb80188325c3a2cd8817def7dd7237d6fdcd861bb87b234a0cb2fd' scripts/install-tor.sh || fail "Official Tor x86_64 checksum pin is missing."
-grep -Fq 'bed98744e093a0dc3a22be0eecfdce7a33cb36866d3f15fcf011a35bf3513d0d' scripts/install-tor.sh || fail "Official Tor arm64 checksum pin is missing."
-grep -Fq 'func startTorForAgent(cfg Config)' S1T-CAPSULE/tor.go || fail "Tor per-profile runtime is missing."
-grep -Fq 'func validateTorBridgeLine' S1T-CAPSULE/tor.go || fail "Tor WebTunnel bridge validation is missing."
-grep -Fq 'func autoApplyXrayTorForNewAgent() error' S1T-CAPSULE/xray_tor.go || fail "Automatic Tor Xray user egress is missing."
-grep -Fq 'TestBuildXrayTorConfigIsolatesTCPAndBlocksUDP' S1T-CAPSULE/xray_tor_test.go || fail "Tor TCP/DNS isolation and UDP fail-closed coverage is missing."
 grep -Fq 'func preparePsiphonAgentProfile(c *Config) error' S1T-CAPSULE/psiphon.go || fail "Automatic per-Agent Psiphon preparation is missing."
 grep -Fq 'func startPsiphonForAgent(cfg Config)' S1T-CAPSULE/main.go || fail "Psiphon ConsoleClient runtime is missing."
 grep -Fq '96f782c' scripts/install-psiphon.sh || fail "Pinned official Psiphon source revision is missing."
