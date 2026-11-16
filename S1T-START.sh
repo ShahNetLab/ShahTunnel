@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 5.5.3 installer.
+# Shah Tunnel 5.5.4 installer.
 # Downloads the pinned Go 1.26.1 toolchain, verifies its SHA-256, fetches the source,
 # and builds the Linux binary on the target server. No prebuilt release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="5.5.3"
+VERSION="5.5.4"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -27,7 +27,6 @@ for cmd in curl sha256sum install mv grep cp ln date timeout awk cat chmod tar g
   command -v "$cmd" >/dev/null 2>&1 || { echo "Required command missing: $cmd" >&2; exit 1; }
 done
 TMP="$(mktemp -d /tmp/s1t-install.XXXXXX)"
-BUILT_SOURCE_DIR=""
 chmod 0700 "$TMP"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -377,7 +376,6 @@ build_from_official_go_toolchain() {
   source_url="https://codeload.github.com/${OWNER}/${REPO}/tar.gz/refs/heads/main"
   expected_go="go version go${GO_VERSION} linux/${TARGET_ARCH}"
   source_dir="$TMP/source"
-  BUILT_SOURCE_DIR="$source_dir"
   go_bin=""
   go_root=""
 
@@ -510,7 +508,7 @@ build_from_official_go_toolchain() {
       cp -a "$script_dir/scripts" "$source_dir/" || return 1
     else
       mkdir -p "$source_dir/scripts"
-      for helper in install-psiphon.sh repair-psiphon-profile.sh migrate-xray-psiphon-units.py; do
+      for helper in install-psiphon.sh repair-psiphon-profile.sh; do
         [[ -s "$script_dir/$helper" ]] && cp -a "$script_dir/$helper" "$source_dir/scripts/" || {
           echo "Missing required helper: $helper" >&2; return 1;
         }
@@ -534,7 +532,7 @@ build_from_official_go_toolchain() {
   [[ -s "$source_dir/go.mod" && -s "$source_dir/S1T-CAPSULE/main.go" ]] \
     || { echo "The downloaded repository does not contain the expected ShahTunnel source files." >&2; return 1; }
   mkdir -p "$source_dir/scripts"
-  for helper in install-psiphon.sh repair-psiphon-profile.sh migrate-xray-psiphon-units.py; do
+  for helper in install-psiphon.sh repair-psiphon-profile.sh; do
     if [[ -s "$source_dir/scripts/$helper" ]]; then
       cp -f "$source_dir/scripts/$helper" "$source_dir/$helper" || return 1
     elif [[ -s "$source_dir/$helper" ]]; then
@@ -549,7 +547,6 @@ build_from_official_go_toolchain() {
     return 1
   fi
   [[ -s "$source_dir/install-psiphon.sh" ]] || { echo "Pinned Psiphon auto-installer is missing from the ShahTunnel source." >&2; return 1; }
-  [[ -s "$source_dir/scripts/migrate-xray-psiphon-units.py" ]] || { echo "Psiphon Xray sidecar migration helper is missing from the ShahTunnel source." >&2; return 1; }
   if ! bash -n "$source_dir/install-psiphon.sh"; then
     echo "Psiphon auto-installer has invalid shell syntax; refusing to continue." >&2
     return 1
@@ -753,63 +750,48 @@ if ! timeout --kill-after=3s 15s systemctl daemon-reload; then
   exit 1
 fi
 
-# Upgrade existing profile-local Xray/Psiphon sidecars before restarting the
-# Agent. Earlier releases used ProtectHome=yes, which can hide X-UI TLS
-# certificates stored below /root or /home. The helper validates profile role,
-# metadata, exact service name, unit description and exact config path; it only
-# changes ProtectHome to read-only and saves every original unit first.
-migrate_existing_xray_psiphon_sidecars() {
-  local helper="${BUILT_SOURCE_DIR}/scripts/migrate-xray-psiphon-units.py"
-  local manifest="${TMP}/migrated-xray-psiphon-units.tsv"
-  local service backup unit_path
-  if [[ ! -s "$helper" ]]; then
-    echo "ERROR: required Psiphon Xray sidecar migration helper is missing." >&2
-    return 1
-  fi
-  if ! python3 "$helper" --manifest "$manifest"; then
-    echo "ERROR: could not safely validate/migrate all saved Psiphon Xray sidecars; no Agent profiles were restarted." >&2
-    return 1
-  fi
-  [[ -s "$manifest" ]] || return 0
+# Upgrade existing profile-local Psiphon Xray sidecars in place before an
+# Agent is restarted. This uses an existing binary command and embeds the
+# profile scan here so the GitHub repository keeps its exact original file set.
+# It changes only the managed sidecar's read-only certificate visibility and
+# profile-specific DNS route; ports, cloned inbound credentials, X-UI config,
+# and the Agent mapping are preserved.
+repair_existing_psiphon_xray_sidecars() {
+  local config
+  local -a profile_configs=()
+  [[ -s /etc/ravanreverse/config.json ]] && profile_configs+=("/etc/ravanreverse/config.json")
+  shopt -s nullglob
+  for config in /etc/ravanreverse/tunnels/*.json; do
+    [[ -s "$config" ]] && profile_configs+=("$config")
+  done
+  shopt -u nullglob
 
-  if ! timeout --kill-after=2s 12s systemctl daemon-reload; then
-    echo "ERROR: systemd could not reload migrated Psiphon Xray sidecar units; restoring their previous unit files." >&2
-    while IFS=$'\t' read -r service backup; do
-      [[ -n "$service" && -s "$backup" ]] || continue
-      install -o root -g root -m 0644 "$backup" "/etc/systemd/system/$service"
-    done < "$manifest"
-    timeout --kill-after=2s 12s systemctl daemon-reload >/dev/null 2>&1 || true
-    return 1
-  fi
-
-  while IFS=$'\t' read -r service backup; do
-    [[ "$service" =~ ^shah-tunnel-xray-psiphon-[A-Za-z0-9_.-]+\.service$ ]] || {
-      echo "ERROR: invalid sidecar service in migration manifest; refusing restart." >&2
-      return 1
-    }
-    [[ -s "$backup" ]] || { echo "ERROR: missing rollback copy for $service." >&2; return 1; }
-    if ! timeout --kill-after=2s 8s systemctl is-active --quiet "$service"; then
+  for config in "${profile_configs[@]}"; do
+    if ! python3 - "$config" <<'PYPROFILE'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        cfg = json.load(f)
+except Exception:
+    raise SystemExit(1)
+meta = cfg.get("xray_psiphon")
+raise SystemExit(0 if cfg.get("role") == "agent" and
+    cfg.get("underlay") in ("psiphon_socks5", "adaptive_external") and
+    isinstance(meta, dict) and meta else 1)
+PYPROFILE
+    then
       continue
     fi
-    echo "Applying certificate-read access fix to existing sidecar: $service"
-    if ! timeout --kill-after=5s 45s systemctl restart "$service" ||
-       ! timeout --kill-after=2s 8s systemctl is-active --quiet "$service"; then
-      echo "ERROR: migrated sidecar $service did not restart. Restoring its previous unit." >&2
-      unit_path="/etc/systemd/system/$service"
-      install -o root -g root -m 0644 "$backup" "$unit_path"
-      timeout --kill-after=2s 12s systemctl daemon-reload >/dev/null 2>&1 || true
-      if ! timeout --kill-after=5s 45s systemctl restart "$service"; then
-        echo "WARNING: previous $service unit was restored, but the service did not restart; inspect its journal." >&2
-      fi
-      timeout 5s journalctl -u "$service" -n 35 --no-pager >&2 || true
+    echo "Validating and repairing the existing Psiphon Xray sidecar for ${config}..."
+    if ! timeout --kill-after=5s 90s "$BIN" repair-psiphon-sidecar --config "$config"; then
+      echo "ERROR: safe Psiphon Xray sidecar repair failed for ${config}. The Agent upgrade restart was cancelled." >&2
       return 1
     fi
-    echo "Sidecar $service restarted with the migrated read-only home policy."
-  done < "$manifest"
+  done
 }
 
-if ! migrate_existing_xray_psiphon_sidecars; then
-  echo "Installation stopped before Agent restart because the Psiphon Xray sidecar migration was not safe/successful." >&2
+if ! repair_existing_psiphon_xray_sidecars; then
+  echo "Installation stopped before Agent restart because an existing Psiphon user-egress sidecar could not be repaired safely." >&2
   exit 1
 fi
 
