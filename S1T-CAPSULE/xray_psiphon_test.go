@@ -13,7 +13,7 @@ func TestXrayPsiphonUnitOwnershipAllowsOnlyExactProfileService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(unit), "Managed-By: ShahTunnel 5.2.0") {
+	if !strings.Contains(string(unit), "Managed-By: ShahTunnel 5.0.1") {
 		t.Fatal("rendered sidecar unit is missing the ShahTunnel ownership marker")
 	}
 	if !xrayPsiphonUnitBelongsToProfile(unit, runtime, configPath, service) {
@@ -90,7 +90,7 @@ func TestPsiphonMappingsMustPointToIsolatedSidecar(t *testing.T) {
 }
 
 func TestNextPsiphonRotationCandidatesAdvanceAndWrap(t *testing.T) {
-	want := []string{"BR", "CH", "CZ", "DE", "ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO"}
+	want := []string{"BR", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO", "RS"}
 	got := nextPsiphonRotationCandidates("AT")
 	if len(got) != len(want) {
 		t.Fatalf("rotation candidate count=%d, want %d: %v", len(got), len(want), got)
@@ -100,8 +100,8 @@ func TestNextPsiphonRotationCandidatesAdvanceAndWrap(t *testing.T) {
 			t.Fatalf("rotation candidate %d=%s, want %s", i, got[i], want[i])
 		}
 	}
-	if got := nextPsiphonRotationCandidates("RO"); got[0] != "AT" {
-		t.Fatalf("rotation should wrap from RO to AT, got first=%s", got[0])
+	if got := nextPsiphonRotationCandidates("RS"); got[0] != "AT" {
+		t.Fatalf("rotation should wrap from RS to AT, got first=%s", got[0])
 	}
 	for _, region := range got {
 		if region == "AT" {

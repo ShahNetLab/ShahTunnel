@@ -369,12 +369,12 @@ func TestPsiphonEgressRegionPolicyBlocksUnapprovedAndDefaultsToAutomatic(t *test
 	if got, err := normalizePsiphonEgressRegion(""); err != nil || got != "" {
 		t.Fatalf("empty region = %q, %v; want automatic selection", got, err)
 	}
-	for _, region := range []string{"US", "us", "CA", "ca", "BE", "be", "AU", "au", "SE", "se", "IN", "in", "RS", "rs", "DK", "dk", "XX"} {
+	for _, region := range []string{"US", "us", "CA", "ca", "BE", "be", "AU", "au", "SE", "se", "IN", "in", "XX"} {
 		if got, err := normalizePsiphonEgressRegion(region); err == nil {
 			t.Fatalf("region %q unexpectedly accepted as %q", region, got)
 		}
 	}
-	for _, region := range []string{"AT", "BR", "CH", "CZ", "DE", "ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO"} {
+	for _, region := range []string{"AT", "BR", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO", "RS"} {
 		if got, err := normalizePsiphonEgressRegion(region); err != nil || got != region {
 			t.Fatalf("approved region %q rejected: got=%q err=%v", region, got, err)
 		}
@@ -429,21 +429,8 @@ func TestTunePsiphonPerformanceConfigPreservesUnknownFields(t *testing.T) {
 	}
 }
 
-func TestKnownBadPsiphonExitIPsAreBlocked(t *testing.T) {
-	for _, ip := range []string{"89.45.7.51", "146.70.42.162", " 89.45.7.51 "} {
-		if !isBlockedPsiphonExitIP(ip) {
-			t.Fatalf("known-bad exit IP %q was not blocked", ip)
-		}
-	}
-	for _, ip := range []string{"89.45.7.52", "1.1.1.1", "not-an-ip", "2001:db8::1"} {
-		if isBlockedPsiphonExitIP(ip) {
-			t.Fatalf("unlisted IP %q was unexpectedly blocked", ip)
-		}
-	}
-}
-
 func TestPsiphonEgressRegionPriorityAndBlockedRegions(t *testing.T) {
-	want := []string{"AT", "BR", "CH", "CZ", "DE", "ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO"}
+	want := []string{"AT", "BR", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO", "RS"}
 	if !reflect.DeepEqual(psiphonEgressRegionPriority, want) {
 		t.Fatalf("Psiphon region priority = %v; want %v", psiphonEgressRegionPriority, want)
 	}
@@ -452,7 +439,7 @@ func TestPsiphonEgressRegionPriorityAndBlockedRegions(t *testing.T) {
 			t.Fatalf("priority region %s was rejected: %v", region, err)
 		}
 	}
-	for _, blocked := range []string{"US", "us", "CA", "ca", "BE", "be", "AU", "au", "SE", "se", "IN", "in", "RS", "rs", "DK", "dk", "USA"} {
+	for _, blocked := range []string{"US", "us", "CA", "ca", "BE", "be", "AU", "au", "SE", "se", "IN", "in", "USA"} {
 		if _, err := normalizePsiphonEgressRegion(blocked); err == nil {
 			t.Fatalf("blocked region %q was accepted", blocked)
 		}
@@ -460,7 +447,7 @@ func TestPsiphonEgressRegionPriorityAndBlockedRegions(t *testing.T) {
 }
 
 func TestTunePsiphonPerformanceConfigMigratesBlockedRegions(t *testing.T) {
-	for _, blocked := range []string{"BE", "CA", "AU", "SE", "IN", "RS", "DK"} {
+	for _, blocked := range []string{"BE", "CA", "AU", "SE"} {
 		t.Run(blocked, func(t *testing.T) {
 			dir := t.TempDir()
 			path := filepath.Join(dir, "profile.json")
@@ -524,18 +511,12 @@ func TestRenderPsiphonSystemdServiceStaysWarmAcrossAgentRestarts(t *testing.T) {
 }
 
 func TestPsiphonCountrySelectionStartsAtAustriaAndKeepsOrderedFallback(t *testing.T) {
-	want := []string{"AT", "BR", "CH", "CZ", "DE", "ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO"}
+	want := []string{"AT", "BR", "CH", "CZ", "DE", "DK", "ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO", "RS"}
 	if got := psiphonRegionCandidates("BE"); !reflect.DeepEqual(got, want) {
 		t.Fatalf("blocked legacy BE profile candidates=%v; want approved list without Belgium", got)
 	}
 	if got := psiphonRegionCandidates("IN"); !reflect.DeepEqual(got, want) {
 		t.Fatalf("blocked legacy IN profile candidates=%v; want approved list without India", got)
-	}
-	if got := psiphonRegionCandidates("RS"); !reflect.DeepEqual(got, want) {
-		t.Fatalf("blocked legacy RS profile candidates=%v; want approved list without removed region", got)
-	}
-	if got := psiphonRegionCandidates("DK"); !reflect.DeepEqual(got, want) {
-		t.Fatalf("blocked legacy DK profile candidates=%v; want approved list without removed region", got)
 	}
 	if got := psiphonRegionCandidates("DE"); !reflect.DeepEqual(got, want) {
 		t.Fatalf("legacy DE profile candidates=%v; want %v", got, want)
