@@ -3118,7 +3118,7 @@ func TestTUICUDPPortCanShareNumberWithTCPMapping(t *testing.T) {
 	}
 }
 
-func TestTrojanTCPPortCannotShareNumberWithTCPMapping(t *testing.T) {
+func TestTrojanTCPPortConflictsOnlyOnSameSocketAddress(t *testing.T) {
 	cfg := Config{
 		Version: version, Name: "hub-trojan-2083", Role: "hub", Transport: transportAdaptive,
 		Token: strings.Repeat("a", 64), ControlListen: "0.0.0.0:9443",
@@ -3128,8 +3128,14 @@ func TestTrojanTCPPortCannotShareNumberWithTCPMapping(t *testing.T) {
 		ProxyPassword: strings.Repeat("t", 32),
 		Ports:         []PortMapping{{ID: "main", Listen: "0.0.0.0:2083"}},
 	}
-	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "TCP control/transport port") {
-		t.Fatalf("Trojan TCP 2083 should conflict with TCP mapping 2083, got %v", err)
+	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "conflicts with TCP listener") {
+		t.Fatalf("same-address Trojan TCP 2083 should conflict with TCP mapping 2083, got %v", err)
+	}
+	// Same numeric port on a different, explicitly bound address is valid.
+	cfg.ProxyListen = "37.32.12.244:2083"
+	cfg.Ports[0].Listen = "127.0.0.1:2083"
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("different-address TCP 2083 should be accepted: %v", err)
 	}
 }
 

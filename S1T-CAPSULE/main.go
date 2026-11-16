@@ -4202,8 +4202,8 @@ func validateConfig(c Config) error {
 			}
 		}
 		if c.ProxyProtocol == proxyAdaptiveAll {
-			if c.ProxyTrojanPort < 1 || c.ProxyTrojanPort > 65535 || c.ProxyTrojanPort == c.ProxyPort || len(c.ProxyTrojanPassword) < 16 || strings.ContainsAny(c.ProxyTrojanPassword, "\r\n\x00") {
-				return errors.New("adaptive TUIC/Trojan requires a distinct Trojan port and password of at least 16 characters")
+			if c.ProxyTrojanPort < 1 || c.ProxyTrojanPort > 65535 || len(c.ProxyTrojanPassword) < 16 || strings.ContainsAny(c.ProxyTrojanPassword, "\r\n\x00") {
+				return errors.New("adaptive TUIC/Trojan requires a valid Trojan port and password of at least 16 characters")
 			}
 		}
 		if c.Role == "hub" {
@@ -4275,36 +4275,37 @@ func validateConfig(c Config) error {
 				return fmt.Errorf("HTTP/1.1 CONNECT port: %w", err)
 			}
 		}
-		_, controlPortText, _ := net.SplitHostPort(c.ControlListen)
-		controlPort, _ := strconv.Atoi(controlPortText)
-		// ShahTunnel mappings and control/CONNECT listeners use TCP. TUIC uses
-		// UDP, so its numeric port may intentionally match a TCP mapping port
-		// (for example users' TCP 2083 alongside TUIC UDP 2083). Only Trojan,
-		// which also uses TCP, must reserve its port against TCP listeners.
-		reservedTCPPorts := map[int]bool{controlPort: true}
+
+		// Check actual TCP socket collisions, not numeric port reservations.
+		// Different local addresses may use the same port, and TUIC (UDP)
+		// may share a number with a TCP mapping. Wildcard addresses conflict
+		// with every address on the same port and network.
+		tcpListeners := []string{c.ControlListen}
 		if c.ProxyProtocol == transportTrojan {
-			if reservedTCPPorts[c.ProxyPort] {
-				return errors.New("Trojan TCP port conflicts with the ShahTunnel control listener")
-			}
-			reservedTCPPorts[c.ProxyPort] = true
+			tcpListeners = append(tcpListeners, c.ProxyListen)
 		}
 		if c.ProxyProtocol == proxyAdaptiveAll {
-			if reservedTCPPorts[c.ProxyTrojanPort] {
-				return errors.New("Trojan TCP port conflicts with another ShahTunnel listener")
-			}
-			reservedTCPPorts[c.ProxyTrojanPort] = true
+			tcpListeners = append(tcpListeners, c.ProxyTrojanListen)
 		}
 		if transportModeAllowsHTTP2(c.Transport) {
-			h2Addr, _ := adjacentPortAddress(c.ControlListen)
-			_, pText, _ := net.SplitHostPort(h2Addr)
-			p, _ := strconv.Atoi(pText)
-			reservedTCPPorts[p] = true
+			if addr, err := adjacentPortAddress(c.ControlListen); err == nil {
+				tcpListeners = append(tcpListeners, addr)
+			}
 		}
 		if transportModeAllowsHTTP1(c.Transport) {
-			h1Addr, _ := secondAdjacentPortAddress(c.ControlListen)
-			_, pText, _ := net.SplitHostPort(h1Addr)
-			p, _ := strconv.Atoi(pText)
-			reservedTCPPorts[p] = true
+			if addr, err := secondAdjacentPortAddress(c.ControlListen); err == nil {
+				tcpListeners = append(tcpListeners, addr)
+			}
+		}
+		for i, listener := range tcpListeners {
+			if strings.TrimSpace(listener) == "" {
+				continue
+			}
+			for j := 0; j < i; j++ {
+				if strings.TrimSpace(tcpListeners[j]) != "" && listenAddressesConflict(listener, tcpListeners[j]) {
+					return fmt.Errorf("TCP listener %s conflicts with another TCP listener %s on the same local address", listener, tcpListeners[j])
+				}
+			}
 		}
 		for _, p := range c.Ports {
 			if !validMappingID(p.ID) {
@@ -4317,10 +4318,18 @@ func validateConfig(c Config) error {
 			if err := validateTCPAddress("listen for mapping "+p.ID, p.Listen); err != nil {
 				return err
 			}
-			_, lpText, _ := net.SplitHostPort(p.Listen)
-			lp, _ := strconv.Atoi(lpText)
-			if reservedTCPPorts[lp] {
-				return fmt.Errorf("mapping %q uses a TCP control/transport port %s", p.ID, lpText)
+			for _, listener := range tcpListeners {
+				if strings.TrimSpace(listener) != "" && listenAddressesConflict(p.Listen, listener) {
+					return fmt.Errorf("mapping %q listen address %s conflicts with TCP listener %s on the same local address", p.ID, p.Listen, listener)
+				}
+			}
+			for _, existing := range c.Ports {
+				if existing.ID == p.ID {
+					break
+				}
+				if listenAddressesConflict(p.Listen, existing.Listen) {
+					return fmt.Errorf("mapping %q listen address %s conflicts with mapping %q (%s)", p.ID, p.Listen, existing.ID, existing.Listen)
+				}
 			}
 			if addrs[p.Listen] {
 				return fmt.Errorf("duplicate listen address %q", p.Listen)
@@ -5557,13 +5566,13 @@ func setup() error {
 				return fmt.Errorf("Hub address must be host:port: %w", err)
 			}
 			if c.ProxyProtocol == proxyAdaptiveAll {
-				c.ProxyPort, _ = strconv.Atoi(wizardAsk("TUIC v5 server UDP port", "8443"))
+				c.ProxyPort, _ = strconv.Atoi(wizardAsk("Hub TUIC UDP listener port (not the user service port)", "8443"))
 				c.ProxyPassword = wizardAsk("TUIC password (from Hub setup)", "")
 				c.ProxyUUID = wizardAsk("TUIC UUID (from Hub setup)", "")
-				c.ProxyTrojanPort, _ = strconv.Atoi(wizardAsk("Trojan server TCP port", "8444"))
+				c.ProxyTrojanPort, _ = strconv.Atoi(wizardAsk("Hub Trojan TCP listener port (not the user service port)", "8444"))
 				c.ProxyTrojanPassword = wizardAsk("Trojan password (from Hub setup)", "")
 			} else {
-				c.ProxyPort, _ = strconv.Atoi(wizardAsk("TUIC/Trojan server port", "8443"))
+				c.ProxyPort, _ = strconv.Atoi(wizardAsk("Hub TUIC/Trojan listener port (must exactly match the Hub; not the user service port)", "8443"))
 				c.ProxyPassword = wizardAsk("TUIC/Trojan password (from Hub setup)", "")
 				if c.ProxyProtocol == transportTUIC {
 					c.ProxyUUID = wizardAsk("TUIC UUID (from Hub setup)", "")
