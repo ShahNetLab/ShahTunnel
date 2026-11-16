@@ -1,9 +1,9 @@
 <div align="center">
-# ShahTunnel 5.5.7
+# ShahTunnel 5.5.8
 
 <p align="center"><img src="docs/img/ShahTunnel-Logo-Round.png" alt="ShahTunnel logo" width="420" style="max-width: 92%; height: auto;"></p>
 
-[![Version](https://img.shields.io/badge/version-5.5.7-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-5.5.8-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -34,7 +34,7 @@ The Hub-to-Agent forwarding path and optional per-profile Internet egress are se
 Client → Hub public mapping → authenticated Agent lanes → Agent local target
 Selected Xray inbound → loopback-only Xray sidecar → WARP / Psiphon SOCKS5 → Internet
 ```
-## Version 5.5.7
+## Version 5.5.8
 
 Psiphon transport repair: when an adaptive Agent lane uses Psiphon, it now tries only TCP/TLS and WebSocket/TLS over the public Hub Mapping. It no longer attempts HTTP/2 or HTTP/1.1 CONNECT on `ControlPort+1` / `ControlPort+2`, which are commonly outside Psiphon's permitted outbound destination ports and produced repeated SOCKS5 `connection refused` failures. Those CONNECT transports remain available on Direct and WARP/MASQUE paths. The Agent validates only its private Psiphon-to-Hub Mapping endpoint against Psiphon's permitted destination-port set (default TCP/443); this does **not** reserve or restrict customer Mapping ports or Agent-side Xray target ports such as `2083`.
 
@@ -98,7 +98,7 @@ Psiphon has a restricted set of outbound destination ports. ShahTunnel therefore
 
 When Psiphon cannot reach the Hub control port (for example, a custom `9448`), the Agent uses the Hub public Mapping endpoint on `443` for Psiphon egress only; the Direct path continues to use the configured control port. The Step 06 default is independent of the control port and points to TCP/443. The Hub distinguishes ShahTunnel control traffic from ordinary TLS with the dedicated `shah-tunnel-control/1` ALPN and forwards normal ClientHello bytes unchanged. This does not take over the public port, move a Mapping, or modify X-UI.
 
-For the complete ShahTunnel 5.5.7 feature set, run **5.5.7 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles using `HubAddr` on `9443` automatically derive `PsiphonHubAddr` as the same host on port `443`.
+For the complete ShahTunnel 5.5.8 feature set, run **5.5.8 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through Psiphon. The Agent wizard lets you override the alternate endpoint. Existing profiles with a missing, same-as-control, or Psiphon-disallowed `PsiphonHubAddr` are migrated at load time to TCP/443 on that endpoint host (or the Hub host when no endpoint host can be parsed). Explicit Psiphon-allowed endpoints such as `8080` are preserved. This migration changes only the private Agent-to-Hub transit endpoint; customer Xray targets such as `127.0.0.1:2083` remain unchanged. Ensure the Hub public Mapping is actually listening on TCP/443.
 
 ### Automatic Psiphon setup
 
@@ -220,7 +220,7 @@ sudo shah-tunnel menu
 
 ---
 
-## Psiphon behavior and performance in 5.5.7
+## Psiphon behavior and performance in 5.5.8
 
 - A local SOCKS5 listener is not treated as proof that Psiphon has established an external tunnel. The Agent remains active while ConsoleClient retries, and the wizard reports a pending state until a real tunnel and Agent lanes are ready.
 - For the selected Agent profile, TCP and DNS from its cloned Xray inbounds use that profile's loopback Psiphon SOCKS5 proxy. UDP, QUIC and unknown network types are blocked in the isolated sidecar rather than falling back to the server's direct route. ICMP ping is not carried by this SOCKS5 path.
@@ -229,7 +229,7 @@ sudo shah-tunnel menu
 - Psiphon buffer limits remain enabled on hosts with less than 3 GiB RAM. On hosts with at least 3 GiB RAM, the Meek and relay buffer caps are removed and the SSH channel window is set to 16 (512 KiB); low-memory hosts retain the documented default window of 4 (128 KiB). CPU thread limiting remains enabled on single-core hosts. The Psiphon tunnel-pool default is retained.
 - These settings target TCP throughput and more responsive lane selection. They cannot remove the physical latency of the client's route to the Hub, the Psiphon relay, or the selected destination. A client-reported value such as 635 ms must be measured end-to-end before and after deployment; no fixed reduction is guaranteed.
 
-Full-feature deployments should keep Hub and Agent on the same ShahTunnel 5.5.7 release. Historical version numbers in this document describe earlier releases.
+Full-feature deployments should keep Hub and Agent on the same ShahTunnel 5.5.8 release. Historical version numbers in this document describe earlier releases.
 
 
 ## Multi-user performance notes (5.5.0)
