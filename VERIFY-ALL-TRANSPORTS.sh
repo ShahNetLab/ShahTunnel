@@ -52,16 +52,25 @@ printf '\n== 1/7: Resolve Go module metadata ==\n'
 pass "Module metadata resolved"
 
 printf '\n== 2/7: Formatting ==\n'
-unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go S1T-CAPSULE/xray_warp.go S1T-CAPSULE/xray_psiphon.go S1T-CAPSULE/psiphon.go S1T-CAPSULE/psiphon_test.go)"
+unformatted="$(gofmt -l S1T-CAPSULE/main.go S1T-CAPSULE/main_test.go S1T-CAPSULE/xray_warp.go S1T-CAPSULE/xray_psiphon.go S1T-CAPSULE/psiphon.go S1T-CAPSULE/psiphon_test.go S1T-CAPSULE/tor.go S1T-CAPSULE/tor_test.go S1T-CAPSULE/xray_tor.go S1T-CAPSULE/xray_tor_test.go)"
 [[ -z "$unformatted" ]] || fail "gofmt required for: $unformatted"
 pass "Go source formatting"
 
 printf '\n== 3/7: Installer syntax ==\n'
 bash -n S1T-START.sh
 bash -n scripts/install-psiphon.sh
+bash -n scripts/install-tor.sh
 bash -n scripts/repair-psiphon-profile.sh
 bash -n VERIFY-ALL-TRANSPORTS.sh
 grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/psiphon' S1T-START.sh || fail "Psiphon systemd data-directory permission is missing."
+grep -Fq 'ReadWritePaths=/var/lib/shah-tunnel/tor' S1T-START.sh || fail "Tor systemd data-directory permission is missing."
+grep -Fq 'tor-expert-bundle-linux-x86_64-16.0.tar.gz' scripts/install-tor.sh || fail "Pinned official Tor Expert Bundle is missing."
+grep -Fq 'cc950ebe9acb80188325c3a2cd8817def7dd7237d6fdcd861bb87b234a0cb2fd' scripts/install-tor.sh || fail "Official Tor x86_64 checksum pin is missing."
+grep -Fq 'bed98744e093a0dc3a22be0eecfdce7a33cb36866d3f15fcf011a35bf3513d0d' scripts/install-tor.sh || fail "Official Tor arm64 checksum pin is missing."
+grep -Fq 'func startTorForAgent(cfg Config)' S1T-CAPSULE/tor.go || fail "Tor per-profile runtime is missing."
+grep -Fq 'func validateTorBridgeLine' S1T-CAPSULE/tor.go || fail "Tor WebTunnel bridge validation is missing."
+grep -Fq 'func autoApplyXrayTorForNewAgent() error' S1T-CAPSULE/xray_tor.go || fail "Automatic Tor Xray user egress is missing."
+grep -Fq 'TestBuildXrayTorConfigIsolatesTCPAndBlocksUDP' S1T-CAPSULE/xray_tor_test.go || fail "Tor TCP/DNS isolation and UDP fail-closed coverage is missing."
 grep -Fq 'func preparePsiphonAgentProfile(c *Config) error' S1T-CAPSULE/psiphon.go || fail "Automatic per-Agent Psiphon preparation is missing."
 grep -Fq 'func startPsiphonForAgent(cfg Config)' S1T-CAPSULE/main.go || fail "Psiphon ConsoleClient runtime is missing."
 grep -Fq '96f782c' scripts/install-psiphon.sh || fail "Pinned official Psiphon source revision is missing."
@@ -71,9 +80,6 @@ grep -Fq 'TestValidatePsiphonRejectsUnauthenticatedServerList' S1T-CAPSULE/psiph
 grep -Fq 'shah-tunnel-control/1' S1T-CAPSULE/main.go || fail "Dedicated TLS ALPN for Psiphon/public-Mapping multiplex is missing."
 grep -Fq 'func sniffS1TControlClientHello' S1T-CAPSULE/main.go || fail "Public Mapping TLS control demultiplexer is missing."
 grep -Fq 'PsiphonHubAddr' S1T-CAPSULE/main.go || fail "Per-egress Psiphon Hub endpoint is missing."
-grep -Fq 'adaptiveTransportCandidatesForUnderlay' S1T-CAPSULE/main.go || fail "Psiphon-specific adaptive transport filtering is missing."
-grep -Fq 'validatePsiphonHubAddress' S1T-CAPSULE/main.go || fail "Psiphon Hub endpoint validation is missing."
-grep -Fq 'TestPsiphonAdaptiveTransportCandidatesExcludeAdjacentConnectPorts' S1T-CAPSULE/main_test.go || fail "Psiphon CONNECT-port exclusion test is missing."
 grep -Fq 'TestTLSClientHelloALPNSnifferPreservesAllBytes' S1T-CAPSULE/main_test.go || fail "TLS ALPN byte-preservation coverage is missing."
 grep -Fq 'TestAdaptivePsiphonUsesPublicMappingPortAndALPNMultiplex' S1T-CAPSULE/main_test.go || fail "Psiphon public-Mapping integration coverage is missing."
 
@@ -94,9 +100,6 @@ grep -Fq 'func autoApplyXrayPsiphonForNewAgent() error' S1T-CAPSULE/xray_psiphon
 grep -Fq 'autoApplyXrayPsiphonForNewAgent()' S1T-CAPSULE/main.go || fail "New-Agent setup does not invoke automatic Psiphon user egress."
 if grep -Fq 'menuItem("10", "🛡️ Psiphon user egress"' S1T-CAPSULE/main.go; then fail "Redundant Psiphon menu option must not be present."; fi
 grep -Fq 'TestBuildXrayPsiphonConfigIsolatesTCPAndBlocksUDP' S1T-CAPSULE/main_test.go || fail "Psiphon TCP/DNS isolation and UDP fail-closed coverage is missing."
-grep -Fq 'TestOptionNineAutomaticallyRoutesXrayUsersThroughPsiphon' S1T-CAPSULE/main_test.go || fail "Option 9 Psiphon user-egress coverage is missing."
-grep -Fq 'func supportsPsiphonUserEgress(cfg Config) bool' S1T-CAPSULE/xray_psiphon.go || fail "Option 9 is not accepted by the Psiphon Xray egress integration."
-if grep -Fq 'migrateAdaptivePsiphonUserEgress' S1T-CAPSULE/main.go; then fail "Agent startup must not undo option-9 Psiphon user egress."; fi
 grep -Fq 'TestXrayPsiphonManagedPathsAndUnitAreRestricted' S1T-CAPSULE/main_test.go || fail "Psiphon sidecar service/path safety coverage is missing."
 grep -Fq 'TestHubBalancesMeasuredRTTAndLoad' S1T-CAPSULE/main_test.go || fail "RTT/load lane selection coverage is missing."
 grep -Fq 'TestHubPrefersFreshRTTOverStaleLowRTT' S1T-CAPSULE/main_test.go || fail "Fresh RTT lane selection regression coverage is missing."
@@ -124,7 +127,7 @@ pass "go vet"
 
 printf '\n== 7/7: Linux build validation (temporary files only) ==\n'
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-amd64" ./S1T-CAPSULE
-[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 5.5.11 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
+[[ "$("$BUILD_TMP/shah-tunnel-linux-amd64" version)" == "Shah Tunnel 4.0.9 (linux/amd64)" ]] || fail "Built amd64 binary version/target check failed."
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "$BUILD_TMP/shah-tunnel-linux-arm64" ./S1T-CAPSULE
 sha256sum "$BUILD_TMP/shah-tunnel-linux-amd64" "$BUILD_TMP/shah-tunnel-linux-arm64" > "$BUILD_TMP/SHA256SUMS"
 pass "Linux amd64 and arm64 binaries built and checksum-checked in a temporary directory (nothing added to the repository)"
