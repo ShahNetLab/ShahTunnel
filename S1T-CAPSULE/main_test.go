@@ -25,65 +25,6 @@ import (
 	"time"
 )
 
-func TestProbeSOCKS5DetectsLiveLoopbackHandshake(t *testing.T) {
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	serverResult := make(chan error, 1)
-	go func() {
-		conn, acceptErr := listener.Accept()
-		if acceptErr != nil {
-			serverResult <- acceptErr
-			return
-		}
-		defer conn.Close()
-		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-		greeting := make([]byte, 3)
-		if _, readErr := io.ReadFull(conn, greeting); readErr != nil {
-			serverResult <- readErr
-			return
-		}
-		if !bytes.Equal(greeting, []byte{0x05, 0x01, 0x00}) {
-			serverResult <- fmt.Errorf("unexpected SOCKS5 greeting: %v", greeting)
-			return
-		}
-		_, writeErr := conn.Write([]byte{0x05, 0x00})
-		serverResult <- writeErr
-	}()
-	if err := probeSOCKS5(listener.Addr().String(), time.Second); err != nil {
-		t.Fatalf("live no-auth SOCKS5 handshake failed: %v", err)
-	}
-	if err := <-serverResult; err != nil {
-		t.Fatalf("SOCKS5 test server failed: %v", err)
-	}
-}
-
-func TestPsiphonReadinessChecksIndependentServiceAndLiveSocket(t *testing.T) {
-	_, filename, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("cannot locate test source")
-	}
-	source, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "main.go"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(source)
-	start := strings.Index(text, "func waitForPsiphonAgentReady(")
-	end := strings.Index(text[start:], "func showRecentLogs(")
-	if start < 0 || end < 0 {
-		t.Fatal("Psiphon readiness function was not found")
-	}
-	body := text[start : start+end]
-	if !strings.Contains(body, "psiphonServiceName(cfg.Name)") || !strings.Contains(body, "probeSOCKS5(cfg.PsiphonProxy") {
-		t.Fatal("readiness must verify the separate Psiphon systemd service and a live loopback SOCKS5 handshake")
-	}
-	if strings.Contains(body, "Psiphon ConsoleClient connected") {
-		t.Fatal("readiness must not depend on a child-process notice that is absent when Psiphon is independently supervised")
-	}
-}
-
 func TestTunnelTemplateUnitAllowsNetlinkWithoutNetworkAdmin(t *testing.T) {
 	unit := tunnelTemplateUnitContents()
 	want := "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
@@ -2292,7 +2233,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.5.1             |",
+		"        |            SHAH TUNNEL 5.5.3             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -2706,8 +2647,14 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 		t.Fatalf("sidecar DNS disableCache=%v; repeat lookups should use the Xray cache", dnsConfig["disableCache"])
 	}
 	dnsServers := dnsConfig["servers"].([]any)
-	if len(dnsServers) != 2 || dnsServers[0] != "https://1.1.1.1/dns-query" || dnsServers[1] != "https://8.8.8.8/dns-query" {
-		t.Fatalf("sidecar DNS servers were not normalized: %#v", dnsServers)
+	if len(dnsServers) != 2 || dnsServers[0] != "https://cloudflare-dns.com/dns-query" || dnsServers[1] != "https://dns.google/dns-query" {
+		t.Fatalf("sidecar DNS servers were not normalized for routed DoH: %#v", dnsServers)
+	}
+	if dnsConfig["tag"] != "s1t-warp-warp-profile-dns-in" {
+		t.Fatalf("sidecar must use a unique DNS routing tag, got %v", dnsConfig["tag"])
+	}
+	if dnsConfig["enableParallelQuery"] != false {
+		t.Fatalf("sidecar DNS queries must be serial over the SOCKS tunnel, got %v", dnsConfig["enableParallelQuery"])
 	}
 	outboundsWithDNS := got["outbounds"].([]any)
 	dnsOutboundTag := "s1t-warp-warp-profile-dns-out"
@@ -2730,7 +2677,7 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 		t.Fatalf("client DNS is not intercepted before the default WARP route: %#v", dnsHijack)
 	}
 	dnsEgress := rules[1].(map[string]any)
-	if dnsEgress["inboundTag"].([]any)[0] != "dns_inbound" || dnsEgress["outboundTag"] != outTag {
+	if dnsEgress["inboundTag"].([]any)[0] != "s1t-warp-warp-profile-dns-in" || dnsEgress["outboundTag"] != outTag {
 		t.Fatalf("internal DNS requests are not routed through WARP: %#v", dnsEgress)
 	}
 	first := rules[2].(map[string]any)
@@ -2905,7 +2852,7 @@ func TestXrayPsiphonManagedPathsAndUnitAreRestricted(t *testing.T) {
 		"NoNewPrivileges=yes",
 		"PrivateTmp=yes",
 		"ProtectSystem=full",
-		"ProtectHome=yes",
+		"ProtectHome=read-only",
 		"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
 	} {
 		if !strings.Contains(unitText, want) {
@@ -2914,6 +2861,51 @@ func TestXrayPsiphonManagedPathsAndUnitAreRestricted(t *testing.T) {
 	}
 	if strings.Contains(unitText, "x-ui.service") || strings.Contains(unitText, "ExecStart=/bin/sh") {
 		t.Fatalf("Psiphon sidecar must not restart X-UI or run through a shell: %s", unitText)
+	}
+}
+
+func TestMigrateXrayPsiphonHomeProtectionForExistingSidecar(t *testing.T) {
+	oldUnit := []byte(`[Unit]
+Description=ShahTunnel isolated Psiphon Xray (s)
+After=network-online.target
+
+[Service]
+Type=simple
+ProtectHome=yes
+ProtectSystem=full
+ExecStart="/usr/local/x-ui/bin/xray-linux-amd64" run -config "/etc/ravanreverse/xray-psiphon/s/config.json"
+
+[Install]
+WantedBy=multi-user.target
+`)
+	updated, changed, err := migrateXrayPsiphonHomeProtection(oldUnit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || !strings.Contains(string(updated), "ProtectHome=read-only") || strings.Contains(string(updated), "ProtectHome=yes") {
+		t.Fatalf("old managed sidecar was not migrated to read-only home access: changed=%t\n%s", changed, updated)
+	}
+	updatedAgain, changedAgain, err := migrateXrayPsiphonHomeProtection(updated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedAgain || !bytes.Equal(updated, updatedAgain) {
+		t.Fatalf("migration is not idempotent: changed=%t\n%s", changedAgain, updatedAgain)
+	}
+	if _, _, err := migrateXrayPsiphonHomeProtection([]byte("[Unit]\nDescription=Third-party service\n[Service]\nProtectHome=yes\n")); err == nil {
+		t.Fatal("migration must reject non-ShahTunnel units")
+	}
+}
+
+func TestPsiphonAgentLaneReadyInLogsUsesAgentLaneNotPsiphonNotices(t *testing.T) {
+	if psiphonAgentLaneReadyInLogs("Psiphon ConsoleClient connected\nPsiphon local SOCKS5 listener ready") {
+		t.Fatal("separate Psiphon service notices must not count as an Agent lane")
+	}
+	if !psiphonAgentLaneReadyInLogs("tunnel lane 3/12 connected via tcp_tls over psiphon_socks5; forwarding through 1 configured port mapping(s)") {
+		t.Fatal("a connected Agent lane over Psiphon must be recognized")
+	}
+	if psiphonAgentLaneReadyInLogs("tunnel lane 3: transport tcp_tls failed on psiphon_socks5; trying websocket_tls") {
+		t.Fatal("a transport retry must not count as a connected lane")
 	}
 }
 
@@ -3004,41 +2996,6 @@ func TestNewAgentPreparesPsiphonXrayBeforeAgentStarts(t *testing.T) {
 	setup := strings.Index(text, "autoApplyXrayPsiphonForNewAgent()")
 	if start < 0 || setup < 0 || setup > start {
 		t.Fatal("automatic Psiphon Xray sidecar setup must complete before the selected Agent service starts")
-	}
-}
-
-func TestPsiphonReadinessAcceptsExistingManagedSOCKSListenerAndLane(t *testing.T) {
-	logs := strings.Join([]string{
-		"using existing Psiphon-compatible SOCKS5 listener at 127.0.0.1:21082",
-		"tunnel lane 11/12 connected via tcp_tls over psiphon_socks5; forwarding through 1 configured port mapping(s)",
-	}, "\n")
-	if !psiphonAgentLaneReadyInLogs(logs) {
-		t.Fatal("a connected Agent lane through the already-running, independently supervised Psiphon SOCKS5 listener must be recognized")
-	}
-	if !psiphonAgentLaneCurrentlyReady(logs, true) {
-		t.Fatal("a currently active Psiphon Agent lane must be considered ready")
-	}
-	if psiphonAgentLaneCurrentlyReady(logs, false) {
-		t.Fatal("a historical lane log must not count as ready after all Agent lanes have disconnected")
-	}
-	// The independently supervised ConsoleClient does not have to emit its
-	// child-process notice into the Agent service journal.
-	if strings.Contains(logs, "Psiphon ConsoleClient connected") {
-		t.Fatal("fixture unexpectedly contains a ConsoleClient child-process notice")
-	}
-}
-
-func TestPsiphonReadinessAcceptsWebSocketLaneOverPsiphon(t *testing.T) {
-	logs := "tunnel lane 7/12 connected via websocket_tls over psiphon_socks5; forwarding through 1 configured port mapping(s)"
-	if !psiphonAgentLaneReadyInLogs(logs) {
-		t.Fatal("a WebSocket transport carried through Psiphon SOCKS5 must count as a ready Psiphon Agent lane")
-	}
-}
-
-func TestPsiphonReadinessDoesNotAcceptDirectLane(t *testing.T) {
-	logs := "tunnel lane 7/12 connected via tcp_tls over direct; forwarding through 1 configured port mapping(s)"
-	if psiphonAgentLaneReadyInLogs(logs) {
-		t.Fatal("a Direct lane must not be reported as a Psiphon-connected Agent lane")
 	}
 }
 

@@ -415,12 +415,15 @@ func configureXrayProxyDNS(root map[string]any, shortID, proxyOutboundTag string
 		dnsConfig = map[string]any{}
 		root["dns"] = dnsConfig
 	}
-	dnsInboundTag, _ := dnsConfig["tag"].(string)
-	dnsInboundTag = strings.TrimSpace(dnsInboundTag)
-	if dnsInboundTag == "" {
-		dnsInboundTag = "s1t-" + kind + "-" + shortID + "-dns-in"
-		dnsConfig["tag"] = dnsInboundTag
+	// Do not reuse the source X-UI DNS tag: its existing routing rules may
+	// send resolver traffic to a non-Psiphon outbound. Give the sidecar's DNS
+	// module a unique tag and route every non-local DNS-server request through
+	// this profile's SOCKS5 outbound below.
+	dnsInboundTag := "s1t-" + kind + "-" + shortID + "-dns-in"
+	if usedTags[dnsInboundTag] {
+		return nil, nil, fmt.Errorf("Xray DNS tag %q already exists; refusing to share an existing DNS route", dnsInboundTag)
 	}
+	dnsConfig["tag"] = dnsInboundTag
 	dnsOutboundTag := "s1t-" + kind + "-" + shortID + "-dns-out"
 	if usedTags[dnsOutboundTag] || dnsOutboundTag == proxyOutboundTag {
 		return nil, nil, fmt.Errorf("Xray DNS outbound tag %q already exists; refusing to overwrite it", dnsOutboundTag)
@@ -428,11 +431,17 @@ func configureXrayProxyDNS(root map[string]any, shortID, proxyOutboundTag string
 	if len(inboundTags) == 0 {
 		return nil, nil, errors.New("no cloned inbound tags available for isolated DNS routing")
 	}
-	// Provider IPs avoid needing a DNS lookup to bootstrap the DoH connection.
-	dnsConfig["servers"] = []any{"https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"}
+	// Use hostname-based DoH endpoints so TLS SNI/certificate validation is
+	// unambiguous. These are non-local DNS modes: their HTTPS connections carry
+	// the unique dnsInboundTag and are explicitly routed through the profile's
+	// SOCKS5 outbound below. SOCKS5 forwards the resolver hostname to Psiphon,
+	// avoiding a system-DNS bootstrap or a direct-IP DNS leak.
+	dnsConfig["servers"] = []any{"https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query"}
 	dnsConfig["queryStrategy"] = "UseIPv4"
-	// Keep Xray's DNS cache enabled so repeat lookups avoid another DoH round trip.
+	// Keep the cache enabled and queries serial: concurrent duplicate DoH
+	// requests can overload a single profile-local Psiphon tunnel pool.
 	dnsConfig["disableCache"] = false
+	dnsConfig["enableParallelQuery"] = false
 	dnsOutbound := map[string]any{"tag": dnsOutboundTag, "protocol": "dns", "settings": map[string]any{}}
 	dnsRules := []any{
 		map[string]any{

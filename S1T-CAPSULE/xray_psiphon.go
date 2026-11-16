@@ -101,7 +101,9 @@ LimitNOFILE=1048576
 KillSignal=SIGINT
 NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectHome=yes
+# X-UI TLS certificates are often stored below /root or /home. The isolated
+# sidecar must be able to READ those referenced files, but never write them.
+ProtectHome=read-only
 ProtectSystem=full
 ReadWritePaths=/etc/ravanreverse/psiphon /run/lock
 ProtectKernelTunables=yes
@@ -355,9 +357,62 @@ func xrayPsiphonUnitBelongsToConfig(unit []byte, cfg Config) bool {
 	return false
 }
 
+// migrateXrayPsiphonHomeProtection updates only the ProtectHome directive in
+// an already-owned ShahTunnel sidecar unit. Older releases used ProtectHome=yes,
+// which masks /root and /home inside the service mount namespace. Xray can then
+// listen successfully but fail client TLS handshakes when X-UI's certificate or
+// key is stored below one of those paths. read-only preserves certificate reads
+// while still preventing the sidecar from modifying user home directories.
+func migrateXrayPsiphonHomeProtection(unit []byte) ([]byte, bool, error) {
+	if len(unit) == 0 || !strings.Contains(string(unit), "Description=ShahTunnel isolated Psiphon Xray (") {
+		return nil, false, errors.New("refusing to migrate a non-ShahTunnel Xray sidecar unit")
+	}
+	lines := strings.Split(string(unit), "\n")
+	inService := false
+	serviceFound := false
+	directiveFound := false
+	changed := false
+	insertAt := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "[Service]" {
+			inService = true
+			serviceFound = true
+			insertAt = i + 1
+			continue
+		}
+		if strings.HasPrefix(trimmed, "[") {
+			inService = false
+		}
+		if !inService {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "ProtectHome=") {
+			if directiveFound {
+				return nil, false, errors.New("managed Xray sidecar unit contains duplicate ProtectHome directives")
+			}
+			directiveFound = true
+			if trimmed != "ProtectHome=read-only" {
+				indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+				lines[i] = indent + "ProtectHome=read-only"
+				changed = true
+			}
+		}
+	}
+	if !serviceFound {
+		return nil, false, errors.New("managed Xray sidecar unit has no [Service] section")
+	}
+	if !directiveFound {
+		lines = append(lines[:insertAt], append([]string{"ProtectHome=read-only"}, lines[insertAt:]...)...)
+		changed = true
+	}
+	return []byte(strings.Join(lines, "\n")), changed, nil
+}
+
 // ensureXrayPsiphonSidecar starts a previously-created profile-local Xray
 // sidecar before Agent startup. It never adopts a unit that does not point to
-// this exact profile config.
+// this exact profile config. It also upgrades the exact managed unit's home
+// access policy so certificate/key files under /root or /home remain readable.
 func ensureXrayPsiphonSidecar(cfg Config) error {
 	if cfg.XrayPsiphon == nil {
 		return nil
@@ -381,12 +436,31 @@ func ensureXrayPsiphonSidecar(cfg Config) error {
 	if !xrayPsiphonUnitBelongsToConfig(unit, cfg) {
 		return fmt.Errorf("profile Psiphon Xray unit %s does not match saved profile metadata", meta.Service)
 	}
+	updatedUnit, changed, err := migrateXrayPsiphonHomeProtection(unit)
+	if err != nil {
+		return err
+	}
+	wasActive := exec.Command("systemctl", "is-active", "--quiet", meta.Service).Run() == nil
+	if changed {
+		if err := atomicReplaceFile(unitPath, updatedUnit, 0644); err != nil {
+			return fmt.Errorf("update managed Psiphon Xray unit home access: %w", err)
+		}
+	}
 	if err := systemdReload(); err != nil {
 		return err
 	}
-	out, err := exec.Command("systemctl", "enable", "--now", meta.Service).CombinedOutput()
+	var out []byte
+	if changed && wasActive {
+		out, err = exec.Command("systemctl", "restart", meta.Service).CombinedOutput()
+	} else {
+		out, err = exec.Command("systemctl", "enable", "--now", meta.Service).CombinedOutput()
+	}
 	if err != nil {
-		return fmt.Errorf("start profile Psiphon Xray sidecar %s: %w: %s; journal: %s", meta.Service, err, strings.TrimSpace(string(out)), xrayPsiphonJournal(meta.Service))
+		action := "start"
+		if changed && wasActive {
+			action = "restart after certificate-read access migration"
+		}
+		return fmt.Errorf("%s profile Psiphon Xray sidecar %s: %w: %s; journal: %s", action, meta.Service, err, strings.TrimSpace(string(out)), xrayPsiphonJournal(meta.Service))
 	}
 	if err := waitForXrayPsiphonInbounds(meta.Service, meta.Bindings); err != nil {
 		return err
