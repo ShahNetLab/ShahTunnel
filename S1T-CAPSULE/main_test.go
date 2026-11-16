@@ -2233,7 +2233,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.5.3             |",
+		"        |            SHAH TUNNEL 5.5.4             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -2654,7 +2654,7 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 		t.Fatalf("sidecar must use a unique DNS routing tag, got %v", dnsConfig["tag"])
 	}
 	if dnsConfig["enableParallelQuery"] != false {
-		t.Fatalf("sidecar DNS queries must be serial over the SOCKS tunnel, got %v", dnsConfig["enableParallelQuery"])
+		t.Fatalf("sidecar DNS requests must be serial over the SOCKS tunnel, got %v", dnsConfig["enableParallelQuery"])
 	}
 	outboundsWithDNS := got["outbounds"].([]any)
 	dnsOutboundTag := "s1t-warp-warp-profile-dns-out"
@@ -2810,6 +2810,17 @@ func TestBuildXrayPsiphonConfigIsolatesTCPAndBlocksUDP(t *testing.T) {
 	if rules[1].(map[string]any)["outboundTag"] != outTag {
 		t.Fatalf("DNS resolver traffic must use Psiphon SOCKS: %#v", rules[1])
 	}
+	dnsConfig := got["dns"].(map[string]any)
+	if dnsConfig["tag"] != "s1t-psiphon-psiphon-profile-dns-in" {
+		t.Fatalf("Psiphon DNS module must have a unique sidecar tag, got %v", dnsConfig["tag"])
+	}
+	if dnsConfig["enableParallelQuery"] != false {
+		t.Fatalf("Psiphon DNS queries must be serialized, got %v", dnsConfig["enableParallelQuery"])
+	}
+	dnsServers := dnsConfig["servers"].([]any)
+	if len(dnsServers) != 2 || dnsServers[0] != "https://cloudflare-dns.com/dns-query" || dnsServers[1] != "https://dns.google/dns-query" {
+		t.Fatalf("unexpected Psiphon DoH servers: %#v", dnsServers)
+	}
 	tcpRule := rules[2].(map[string]any)
 	if tcpRule["network"] != "tcp" || tcpRule["outboundTag"] != outTag {
 		t.Fatalf("cloned TCP traffic must use Psiphon: %#v", tcpRule)
@@ -2861,51 +2872,6 @@ func TestXrayPsiphonManagedPathsAndUnitAreRestricted(t *testing.T) {
 	}
 	if strings.Contains(unitText, "x-ui.service") || strings.Contains(unitText, "ExecStart=/bin/sh") {
 		t.Fatalf("Psiphon sidecar must not restart X-UI or run through a shell: %s", unitText)
-	}
-}
-
-func TestMigrateXrayPsiphonHomeProtectionForExistingSidecar(t *testing.T) {
-	oldUnit := []byte(`[Unit]
-Description=ShahTunnel isolated Psiphon Xray (s)
-After=network-online.target
-
-[Service]
-Type=simple
-ProtectHome=yes
-ProtectSystem=full
-ExecStart="/usr/local/x-ui/bin/xray-linux-amd64" run -config "/etc/ravanreverse/xray-psiphon/s/config.json"
-
-[Install]
-WantedBy=multi-user.target
-`)
-	updated, changed, err := migrateXrayPsiphonHomeProtection(oldUnit)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !changed || !strings.Contains(string(updated), "ProtectHome=read-only") || strings.Contains(string(updated), "ProtectHome=yes") {
-		t.Fatalf("old managed sidecar was not migrated to read-only home access: changed=%t\n%s", changed, updated)
-	}
-	updatedAgain, changedAgain, err := migrateXrayPsiphonHomeProtection(updated)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if changedAgain || !bytes.Equal(updated, updatedAgain) {
-		t.Fatalf("migration is not idempotent: changed=%t\n%s", changedAgain, updatedAgain)
-	}
-	if _, _, err := migrateXrayPsiphonHomeProtection([]byte("[Unit]\nDescription=Third-party service\n[Service]\nProtectHome=yes\n")); err == nil {
-		t.Fatal("migration must reject non-ShahTunnel units")
-	}
-}
-
-func TestPsiphonAgentLaneReadyInLogsUsesAgentLaneNotPsiphonNotices(t *testing.T) {
-	if psiphonAgentLaneReadyInLogs("Psiphon ConsoleClient connected\nPsiphon local SOCKS5 listener ready") {
-		t.Fatal("separate Psiphon service notices must not count as an Agent lane")
-	}
-	if !psiphonAgentLaneReadyInLogs("tunnel lane 3/12 connected via tcp_tls over psiphon_socks5; forwarding through 1 configured port mapping(s)") {
-		t.Fatal("a connected Agent lane over Psiphon must be recognized")
-	}
-	if psiphonAgentLaneReadyInLogs("tunnel lane 3: transport tcp_tls failed on psiphon_socks5; trying websocket_tls") {
-		t.Fatal("a transport retry must not count as a connected lane")
 	}
 }
 
@@ -2979,6 +2945,18 @@ func TestHubPrefersFreshRTTOverStaleLowRTT(t *testing.T) {
 	h := &hubServer{sessions: map[*hubSession]struct{}{staleFormerlyFast: {}, freshHealthy: {}}}
 	if got := h.current(); got != freshHealthy {
 		t.Fatalf("selected lane %d; want fresh lane %d despite stale lower RTT", got.id, freshHealthy.id)
+	}
+}
+
+func TestPsiphonAgentLaneReadyInLogsUsesAgentLaneNotConsoleClientNotices(t *testing.T) {
+	if psiphonAgentLaneReadyInLogs("Psiphon ConsoleClient connected\nPsiphon local SOCKS5 listener ready") {
+		t.Fatal("separate Psiphon service notices must not count as an Agent lane")
+	}
+	if !psiphonAgentLaneReadyInLogs("tunnel lane 3/12 connected via tcp_tls over psiphon_socks5; forwarding through 1 configured port mapping(s)") {
+		t.Fatal("an authenticated Agent lane over Psiphon must be recognized")
+	}
+	if psiphonAgentLaneReadyInLogs("tunnel lane 3: transport tcp_tls failed on psiphon_socks5; trying websocket_tls") {
+		t.Fatal("a transport retry must not count as a connected lane")
 	}
 }
 

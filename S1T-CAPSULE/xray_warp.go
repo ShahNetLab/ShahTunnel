@@ -415,10 +415,9 @@ func configureXrayProxyDNS(root map[string]any, shortID, proxyOutboundTag string
 		dnsConfig = map[string]any{}
 		root["dns"] = dnsConfig
 	}
-	// Do not reuse the source X-UI DNS tag: its existing routing rules may
-	// send resolver traffic to a non-Psiphon outbound. Give the sidecar's DNS
-	// module a unique tag and route every non-local DNS-server request through
-	// this profile's SOCKS5 outbound below.
+	// Never reuse the source X-UI DNS tag. Existing X-UI routing rules may
+	// send that tag to Direct or another outbound. A unique per-sidecar tag
+	// guarantees that this profile's resolver traffic follows its own proxy.
 	dnsInboundTag := "s1t-" + kind + "-" + shortID + "-dns-in"
 	if usedTags[dnsInboundTag] {
 		return nil, nil, fmt.Errorf("Xray DNS tag %q already exists; refusing to share an existing DNS route", dnsInboundTag)
@@ -431,16 +430,13 @@ func configureXrayProxyDNS(root map[string]any, shortID, proxyOutboundTag string
 	if len(inboundTags) == 0 {
 		return nil, nil, errors.New("no cloned inbound tags available for isolated DNS routing")
 	}
-	// Use hostname-based DoH endpoints so TLS SNI/certificate validation is
-	// unambiguous. These are non-local DNS modes: their HTTPS connections carry
-	// the unique dnsInboundTag and are explicitly routed through the profile's
-	// SOCKS5 outbound below. SOCKS5 forwards the resolver hostname to Psiphon,
-	// avoiding a system-DNS bootstrap or a direct-IP DNS leak.
+	// Hostname-based DoH keeps TLS SNI and certificate validation explicit.
+	// The unique DNS tag below routes these requests through this profile's
+	// SOCKS5 outbound, so bootstrap DNS is resolved by the proxy, not locally.
 	dnsConfig["servers"] = []any{"https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query"}
 	dnsConfig["queryStrategy"] = "UseIPv4"
-	// Keep the cache enabled and queries serial: concurrent duplicate DoH
-	// requests can overload a single profile-local Psiphon tunnel pool.
 	dnsConfig["disableCache"] = false
+	// Avoid parallel duplicate DoH requests over a single Psiphon SOCKS pool.
 	dnsConfig["enableParallelQuery"] = false
 	dnsOutbound := map[string]any{"tag": dnsOutboundTag, "protocol": "dns", "settings": map[string]any{}}
 	dnsRules := []any{

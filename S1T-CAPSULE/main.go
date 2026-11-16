@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.5.3"
+	version                          = "5.5.4"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -4538,7 +4538,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.5.3             |",
+	"        |            SHAH TUNNEL 5.5.4             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -5225,10 +5225,9 @@ func startSelectedTunnel(restartActive bool) error {
 	return nil
 }
 
-// psiphonAgentLaneReadyInLogs checks the Agent journal for a lane that has
-// actually completed a connection through this profile's Psiphon SOCKS5
-// underlay. Psiphon ConsoleClient is a separate systemd service, so its
-// startup notices are not expected in the Agent journal.
+// psiphonAgentLaneReadyInLogs checks for an authenticated Agent lane over the
+// per-profile Psiphon SOCKS5 underlay. Psiphon ConsoleClient is supervised by
+// a separate systemd unit, so its notices never appear in the Agent journal.
 func psiphonAgentLaneReadyInLogs(logText string) bool {
 	for _, line := range strings.Split(logText, "\n") {
 		if strings.Contains(line, "tunnel lane ") &&
@@ -5240,10 +5239,9 @@ func psiphonAgentLaneReadyInLogs(logText string) bool {
 	return false
 }
 
-// waitForPsiphonAgentReady deliberately separates local proxy readiness from
-// end-to-end lane readiness. A healthy SOCKS5 listener with no Hub lane yet is
-// a pending/retrying state, not a startup failure. This avoids the old false
-// failure caused by looking for Psiphon notices in the Agent's journal.
+// waitForPsiphonAgentReady checks the independent Psiphon service, its live
+// SOCKS handshake, and at least one authenticated Agent lane. A healthy proxy
+// with lanes still retrying is pending, not a failed installation.
 func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.Duration) (bool, error) {
 	if timeout <= 0 {
 		return false, errors.New("invalid Psiphon readiness timeout")
@@ -5263,8 +5261,7 @@ func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.
 		agentActive := exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil
 		psiphonActive := exec.Command("systemctl", "is-active", "--quiet", psiphonService).Run() == nil
 		proxyErr := probeSOCKS5(cfg.PsiphonProxy, 900*time.Millisecond)
-		laneReady := psiphonAgentLaneReadyInLogs(string(logs))
-		if agentActive && psiphonActive && proxyErr == nil && laneReady {
+		if agentActive && psiphonActive && proxyErr == nil && psiphonAgentLaneReadyInLogs(string(logs)) {
 			return true, nil
 		}
 		if !agentActive {
@@ -5273,9 +5270,8 @@ func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.
 		time.Sleep(time.Second)
 	}
 
-	// The timeout applies to the first authenticated lane, not to the SOCKS
-	// listener. If the listener still answers and both independent services
-	// remain active, leave the Agent running so its lane retry loop can recover.
+	// Let the Agent retry loop recover if the local proxy is healthy but the
+	// first Hub lane has not connected before the menu's readiness deadline.
 	agentActive := exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil
 	psiphonActive := exec.Command("systemctl", "is-active", "--quiet", psiphonService).Run() == nil
 	proxyErr := probeSOCKS5(cfg.PsiphonProxy, 1500*time.Millisecond)
@@ -5286,7 +5282,7 @@ func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.
 		}
 		return false, nil
 	}
-	return false, fmt.Errorf("Psiphon Agent startup is unhealthy: Agent service active=%t, Psiphon service %s active=%t, SOCKS5 %s probe=%v", agentActive, psiphonService, psiphonActive, cfg.PsiphonProxy, proxyErr)
+	return false, fmt.Errorf("Psiphon Agent startup is unhealthy: Agent active=%t, Psiphon service %s active=%t, SOCKS5 %s probe=%v", agentActive, psiphonService, psiphonActive, cfg.PsiphonProxy, proxyErr)
 }
 
 func showRecentLogs(n int) {
@@ -6331,6 +6327,35 @@ func main() {
 		if err := rotatePsiphonCountry(cfg); err != nil {
 			log.Fatal(err)
 		}
+	case "repair-psiphon-sidecar":
+		if !ensureRoot() {
+			os.Exit(1)
+		}
+		gotConfig := false
+		for i := 2; i < len(os.Args); i++ {
+			if os.Args[i] == "--config" && i+1 < len(os.Args) {
+				configPath = filepath.Clean(os.Args[i+1])
+				gotConfig = true
+				i++
+			} else {
+				log.Fatalf("unknown repair-psiphon-sidecar argument %q", os.Args[i])
+			}
+		}
+		if !gotConfig {
+			log.Fatal("repair-psiphon-sidecar requires --config PATH")
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if cfg.XrayPsiphon == nil {
+			fmt.Printf("Profile %s has no isolated Psiphon Xray sidecar; no changes needed.\n", cfg.Name)
+			return
+		}
+		if err := repairXrayPsiphonSidecar(cfg, false); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("Profile %s Psiphon Xray sidecar repair completed.\n", cfg.Name)
 	case "uninstall":
 		if !ensureRoot() {
 			os.Exit(1)
@@ -6341,7 +6366,7 @@ func main() {
 	case "version", "--version", "-v":
 		fmt.Printf("Shah Tunnel %s (%s)\n", version, runtimeArch())
 	default:
-		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|run [--config PATH]|rotate-psiphon-country --config PATH|uninstall|version]\n", version)
+		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|run [--config PATH]|rotate-psiphon-country --config PATH|repair-psiphon-sidecar --config PATH|uninstall|version]\n", version)
 	}
 }
 
