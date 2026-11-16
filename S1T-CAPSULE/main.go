@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.5.8"
+	version                          = "5.5.9"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -2945,11 +2945,12 @@ func adaptiveTransportCandidates(preferred string) []string {
 	return out
 }
 
-// Psiphon restricts outbound destination ports. The Hub's HTTP/2 and
-// HTTP/1.1 CONNECT listeners are deliberately placed at ControlPort+1/+2;
-// trying those ports through Psiphon creates predictable SOCKS5 connection
-// refusals and noisy retry loops. TCP/TLS and WebSocket/TLS instead use the
-// public Mapping endpoint, whose port is validated separately below.
+// HTTP/2 and HTTP/1.1 CONNECT listeners are deliberately placed at
+// ControlPort+1/+2. Those derived endpoints are not the independently
+// configured public Mapping endpoint and are not attempted over Psiphon.
+// TCP/TLS and WebSocket/TLS use PsiphonHubAddr exactly as configured. Whether
+// a particular Psiphon exit permits that destination port is determined by
+// the live SOCKS5 CONNECT result, not a local static port allowlist.
 func adaptiveTransportCandidatesForUnderlay(preferred, underlay string) []string {
 	candidates := adaptiveTransportCandidates(preferred)
 	if underlay != underlayPsiphon {
@@ -2964,28 +2965,14 @@ func adaptiveTransportCandidatesForUnderlay(preferred, underlay string) []string
 	return out
 }
 
-func isPsiphonAllowedDestinationPort(port int) bool {
-	switch port {
-	case 53, 80, 443, 465, 587, 993, 995, 8080:
-		return true
-	default:
-		return false
-	}
-}
-
+// validatePsiphonHubAddress validates only the endpoint syntax and TCP port
+// range. Do not hard-reject custom Mapping ports here: Psiphon exit policies
+// can vary, and a local allowlist previously prevented configurations that
+// had worked in the user's environment (for example TCP/2083) from even being
+// attempted. A real SOCKS5 CONNECT determines whether the selected exit allows
+// the destination. This check never examines customer Mapping targets.
 func validatePsiphonHubAddress(addr string) error {
-	_, portText, err := net.SplitHostPort(strings.TrimSpace(addr))
-	if err != nil {
-		return fmt.Errorf("invalid Psiphon Hub Mapping address: %w", err)
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil || port < 1 || port > 65535 {
-		return errors.New("Psiphon Hub Mapping port must be a number from 1 to 65535")
-	}
-	if !isPsiphonAllowedDestinationPort(port) {
-		return fmt.Errorf("Psiphon cannot reach the Hub Mapping on TCP/%d: allowed outbound destination ports are 53, 80, 443, 465, 587, 993, 995, and 8080; use an allowed public Mapping port (normally 443). This restriction does not apply to customer Mapping ports", port)
-	}
-	return nil
+	return validateTCPAddress("Psiphon Hub Mapping", strings.TrimSpace(addr))
 }
 
 func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
@@ -3098,7 +3085,7 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 		if mode == transportAdaptive {
 			routeTransports = adaptiveTransportCandidatesForUnderlay(preferredTransport, route)
 			if route == underlayPsiphon && len(routeTransports) < len(transportCandidates) {
-				log.Printf("tunnel lane %d: Psiphon permits only its approved destination ports; skipping HTTP/2 and HTTP/1.1 CONNECT control ports and using the public Mapping endpoint", channel)
+				log.Printf("tunnel lane %d: using TCP/TLS and WebSocket/TLS over the configured Psiphon Mapping endpoint; adjacent HTTP CONNECT control ports are skipped", channel)
 			}
 		}
 		for i, candidate := range routeTransports {
@@ -3123,7 +3110,7 @@ func connectAndRunAgent(cfg Config, pin []byte, channel int) error {
 
 func connectAndRunAgentWithTransport(cfg Config, pin []byte, channel int, mode string) error {
 	if cfg.Underlay == underlayPsiphon && (mode == transportHTTP2 || mode == transportHTTP1 || mode == transportHTTPConnectAuto) {
-		return fmt.Errorf("transport %s is not available over Psiphon: its CONNECT listener uses a non-approved destination port; use TCP/TLS or WebSocket/TLS over the public Hub Mapping", mode)
+		return fmt.Errorf("transport %s is not available over Psiphon: it uses an adjacent control listener rather than the configured public Mapping; use TCP/TLS or WebSocket/TLS over the Psiphon Mapping endpoint", mode)
 	}
 	// Psiphon has two distinct Hub destinations: TCP/TLS and WebSocket/TLS
 	// use the public Mapping listener (which advertises the ShahTunnel ALPN),
@@ -3809,8 +3796,8 @@ func normalizeConfig(c Config) Config {
 		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
 			configuredPsiphonHub := strings.TrimSpace(c.PsiphonHubAddr)
 			// Upgrade old profiles that copied the control endpoint into the
-			// Psiphon Mapping field. Psiphon cannot reach arbitrary control ports;
-			// the public Mapping endpoint is independently derived (normally 443).
+			// Psiphon Mapping field. Keep the public Mapping endpoint separate
+			// from the control listener; explicit custom Mapping ports are kept.
 			if strings.TrimSpace(c.HubAddr) != "" && (configuredPsiphonHub == "" || configuredPsiphonHub == strings.TrimSpace(c.HubAddr)) {
 				c.PsiphonHubAddr = defaultPsiphonHubAddress(c.HubAddr)
 			}
@@ -4072,34 +4059,12 @@ func normalizeFingerprint(s string) ([]byte, error) {
 	return b, nil
 }
 
-// normalizeLoadedConfig migrates stale persisted Psiphon transit endpoints.
-// The Agent-to-Hub transit endpoint is distinct from every customer Xray target.
-// Psiphon cannot connect to arbitrary destination ports, so a saved unsupported
-// endpoint is moved to TCP/443 on the same host. This migration never reads,
-// reserves, or changes customer mapping target ports.
+// normalizeLoadedConfig applies safe legacy defaults but preserves every
+// explicit PsiphonHubAddr. In particular, custom endpoints such as TCP/2083
+// must not be silently rewritten to 443 on config load or sidecar repair.
+// Actual Psiphon reachability is tested at runtime by the SOCKS5 CONNECT path.
 func normalizeLoadedConfig(c Config) (Config, string) {
-	c = normalizeConfig(c)
-	if !supportsPsiphonUserEgress(c) || strings.TrimSpace(c.PsiphonHubAddr) == "" {
-		return c, ""
-	}
-	if validateErr := validatePsiphonHubAddress(c.PsiphonHubAddr); validateErr == nil {
-		return c, ""
-	}
-
-	oldAddress := strings.TrimSpace(c.PsiphonHubAddr)
-	host, _, splitErr := net.SplitHostPort(oldAddress)
-	if splitErr != nil || strings.TrimSpace(host) == "" {
-		host, _, splitErr = net.SplitHostPort(strings.TrimSpace(c.HubAddr))
-	}
-	if splitErr != nil || strings.TrimSpace(host) == "" {
-		return c, ""
-	}
-	corrected := net.JoinHostPort(host, "443")
-	if validatePsiphonHubAddress(corrected) != nil {
-		return c, ""
-	}
-	c.PsiphonHubAddr = corrected
-	return c, oldAddress
+	return normalizeConfig(c), ""
 }
 
 func decodeConfigData(data []byte) (Config, string, error) {
@@ -4129,7 +4094,7 @@ func loadConfigForPsiphonSidecarRepair() (Config, error) {
 		return Config{}, err
 	}
 	if migratedFrom != "" {
-		log.Printf("migrated saved Agent-to-Hub Psiphon transit endpoint %s to %s; customer Xray targets and mappings were not changed; ensure the Hub public Mapping listens on TCP/443", migratedFrom, c.PsiphonHubAddr)
+		log.Printf("normalized legacy Agent-to-Hub Psiphon endpoint %s to %s; customer Xray targets and mappings were not changed", migratedFrom, c.PsiphonHubAddr)
 	}
 	// Deliberately do not run full Agent config validation here. The sidecar
 	// repair owns only the profile-local Xray/Psiphon files and validates its
@@ -4148,7 +4113,7 @@ func loadConfig() (Config, error) {
 		return Config{}, err
 	}
 	if migratedFrom != "" {
-		log.Printf("migrated saved Agent-to-Hub Psiphon transit endpoint %s to %s; customer Xray targets and mappings were not changed; ensure the Hub public Mapping listens on TCP/443", migratedFrom, c.PsiphonHubAddr)
+		log.Printf("normalized legacy Agent-to-Hub Psiphon endpoint %s to %s; customer Xray targets and mappings were not changed", migratedFrom, c.PsiphonHubAddr)
 	}
 	if err = validateConfig(c); err != nil {
 		return Config{}, err
@@ -4675,7 +4640,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.5.8             |",
+	"        |            SHAH TUNNEL 5.5.9             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -5101,7 +5066,7 @@ func setup() error {
 		}
 		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
 			defaultEndpoint := defaultPsiphonHubAddress(c.HubAddr)
-			c.PsiphonHubAddr = wizardAsk("Hub public Mapping address reachable through Psiphon SOCKS5 (IP:PORT; permitted ports only, normally 443)", defaultEndpoint)
+			c.PsiphonHubAddr = wizardAsk("Hub public Mapping address reachable through Psiphon SOCKS5 (IP:PORT; normally 443; custom ports are attempted as configured)", defaultEndpoint)
 			if strings.TrimSpace(c.PsiphonHubAddr) == "" {
 				c.PsiphonHubAddr = defaultEndpoint
 			}
