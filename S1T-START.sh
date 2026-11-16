@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 5.2.0 installer.
-# Downloads the pinned Go 1.27.4 toolchain, verifies its SHA-256, fetches the source,
+# Shah Tunnel 5.0.0 installer.
+# Downloads the pinned Go 1.26.1 toolchain, verifies its SHA-256, fetches the source,
 # and builds the Linux binary on the target server. No prebuilt release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="5.2.0"
-GO_VERSION="1.27.4"
+VERSION="5.0.0"
+GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
 STATE_DIR="/usr/local/lib/shah-tunnel"
 GO_CACHE_DIR="/var/cache/shah-tunnel"
 PHASE_HAS_DOWNLOAD=0
+RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/main"
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64) TARGET_ARCH="amd64" ;;
   Linux:aarch64|Linux:arm64) TARGET_ARCH="arm64" ;;
   *) echo "Shah Tunnel ${VERSION} supports Linux amd64 and arm64 only." >&2; exit 1 ;;
 esac
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-  echo "Run as root. If raw.githubusercontent.com is blocked, fetch this installer through the GitHub API:" >&2
-  echo "set -o pipefail; curl -fsSL --connect-timeout 10 --max-time 30 -H 'Accept: application/vnd.github+json' -H 'User-Agent: ShahTunnel-bootstrap' 'https://api.github.com/repos/${OWNER}/${REPO}/contents/S1T-START.sh?ref=main' | python3 -c 'import sys,json,base64; d=json.load(sys.stdin); sys.stdout.buffer.write(base64.b64decode(d[\"content\"]))' | bash" >&2
+  echo "Run as root: bash <(curl -fsSL ${RAW_BASE}/S1T-START.sh)" >&2
   exit 1
 fi
 command -v systemctl >/dev/null 2>&1 || { echo "systemd/systemctl is required." >&2; exit 1; }
@@ -352,8 +352,8 @@ verify_binary() {
 }
 official_go_sha256() {
   case "$TARGET_ARCH" in
-    amd64) printf '%s' '7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840' ;;
-    arm64) printf '%s' '3392582988a273a87ab5043ee1b2c9c17a2c3c00580bf9326c47a2e0aaaeac92' ;;
+    amd64) printf '%s' '031f088e5d955bab8657ede27ad4e3bc5b7c1ba281f05f245bcc304f327c987a' ;;
+    arm64) printf '%s' 'a290581cfe4fe28ddd737dde3095f3dbeb7f2e4065cab4eae44dfc53b760c2f7' ;;
     *) return 1 ;;
   esac
 }
@@ -508,7 +508,7 @@ build_from_official_go_toolchain() {
       cp -a "$script_dir/scripts" "$source_dir/" || return 1
     else
       mkdir -p "$source_dir/scripts"
-      for helper in install-psiphon.sh install-tor.sh repair-psiphon-profile.sh safe_extract_tar.py; do
+      for helper in install-psiphon.sh install-tor.sh repair-psiphon-profile.sh; do
         [[ -s "$script_dir/$helper" ]] && cp -a "$script_dir/$helper" "$source_dir/scripts/" || {
           echo "Missing required helper: $helper" >&2; return 1;
         }
@@ -524,41 +524,6 @@ build_from_official_go_toolchain() {
       echo "Could not download the source archive from ${source_url}." >&2
       return 1
     fi
-    # Preflight the GitHub source archive before handing it to tar. Reject
-    # traversal, absolute paths, links/special files, multiple roots and bombs.
-    if ! python3 - "$TMP/shah-tunnel-source.tar.gz" <<'PY'
-import sys, tarfile
-archive = sys.argv[1]
-try:
-    with tarfile.open(archive, "r:gz") as tf:
-        members = tf.getmembers()
-        if not members or len(members) > 200000:
-            raise ValueError("empty archive or too many entries")
-        roots, total = set(), 0
-        for m in members:
-            name = m.name
-            if not name or name.startswith("/") or "\\" in name:
-                raise ValueError("absolute or invalid archive path")
-            parts = name.rstrip("/").split("/")
-            if not parts or any(p in ("", ".", "..") for p in parts):
-                raise ValueError("path traversal in archive")
-            roots.add(parts[0])
-            if len(roots) != 1:
-                raise ValueError("archive must contain one top-level directory")
-            if not (m.isdir() or m.isfile()):
-                raise ValueError("links and special archive entries are forbidden")
-            if m.isfile():
-                total += m.size
-                if m.size < 0 or total > 2 * 1024 * 1024 * 1024:
-                    raise ValueError("archive exceeds extraction size limit")
-except (OSError, tarfile.TarError, ValueError) as exc:
-    print(f"Unsafe ShahTunnel source archive: {exc}", file=sys.stderr)
-    raise SystemExit(1)
-PY
-    then
-      echo "The ShahTunnel source archive failed its safety checks." >&2
-      return 1
-    fi
     if ! tar -xzf "$TMP/shah-tunnel-source.tar.gz" -C "$source_dir" --strip-components=1; then
       echo "Could not extract the ShahTunnel source archive." >&2
       return 1
@@ -567,7 +532,7 @@ PY
   [[ -s "$source_dir/go.mod" && -s "$source_dir/S1T-CAPSULE/main.go" ]] \
     || { echo "The downloaded repository does not contain the expected ShahTunnel source files." >&2; return 1; }
   mkdir -p "$source_dir/scripts"
-  for helper in install-psiphon.sh install-tor.sh repair-psiphon-profile.sh safe_extract_tar.py; do
+  for helper in install-psiphon.sh install-tor.sh repair-psiphon-profile.sh; do
     if [[ -s "$source_dir/scripts/$helper" ]]; then
       cp -f "$source_dir/scripts/$helper" "$source_dir/$helper" || return 1
     elif [[ -s "$source_dir/$helper" ]]; then
@@ -638,8 +603,6 @@ install -o root -g root -m 0750 "$TMP/source/install-psiphon.sh" "$STATE_DIR/ins
 mv -f "$STATE_DIR/install-psiphon.sh.new" "$STATE_DIR/install-psiphon.sh"
 install -o root -g root -m 0750 "$TMP/source/install-tor.sh" "$STATE_DIR/install-tor.sh.new"
 mv -f "$STATE_DIR/install-tor.sh.new" "$STATE_DIR/install-tor.sh"
-install -o root -g root -m 0750 "$TMP/source/safe_extract_tar.py" "$STATE_DIR/safe_extract_tar.py.new"
-mv -f "$STATE_DIR/safe_extract_tar.py.new" "$STATE_DIR/safe_extract_tar.py"
 install -d -o root -g root -m 0700 /var/lib/shah-tunnel/tor
 [[ -s "$TMP/source/repair-psiphon-profile.sh" ]] || { echo "Psiphon profile repair helper is missing from the source archive." >&2; exit 1; }
 install -o root -g root -m 0750 "$TMP/source/repair-psiphon-profile.sh" "$STATE_DIR/repair-psiphon-profile.sh.new"
@@ -762,25 +725,6 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 NETLINK
   install -o root -g root -m 0644 "$TMP/netlink-${unit}.conf" "$dropin_dir/10-psiphon-netlink.conf"
 done
-
-# Migrate installed per-profile Psiphon dependencies from Requires to Wants.
-# Requires makes systemd send SIGTERM to the Agent whenever ConsoleClient is
-# restarted; this is unsafe for adaptive lanes and leaves the Agent stopped.
-# Wants + After still starts Psiphon with the Agent, but Psiphon may recover
-# independently without taking down the authenticated Agent service.
-for dependency_dropin in \
-  /etc/systemd/system/ravanreverse@*.service.d/shah-tunnel-psiphon.conf \
-  /etc/systemd/system/ravanreverse.service.d/shah-tunnel-psiphon.conf; do
-  [[ -f "$dependency_dropin" ]] || continue
-  if grep -q '^Requires=shah-tunnel-psiphon-' "$dependency_dropin"; then
-    migrated_dropin="$TMP/psiphon-dependency-migrated.conf"
-    sed 's/^Requires=shah-tunnel-psiphon-/Wants=shah-tunnel-psiphon-/' \
-      "$dependency_dropin" > "$migrated_dropin"
-    install -o root -g root -m 0644 "$migrated_dropin" "$dependency_dropin"
-    echo "Migrated Psiphon dependency to non-fatal Wants/After: $dependency_dropin"
-  fi
-done
-
 if ! timeout --kill-after=3s 15s systemctl daemon-reload; then
   echo "systemd daemon-reload timed out. The binary is installed, but service metadata may need: systemctl daemon-reload" >&2
   exit 1
