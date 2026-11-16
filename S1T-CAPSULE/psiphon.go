@@ -177,13 +177,18 @@ func psiphonHostPerformanceProfile() psiphonPerformanceProfile {
 	return psiphonPerformanceProfileForHost(totalRAM, runtime.NumCPU())
 }
 
-// Psiphon accepts one EgressRegion per ConsoleClient. An empty value lets
-// Psiphon select its best-performing server; the live exit is independently
-// verified against this explicit allowlist before user traffic is enabled.
-// These are exactly the countries requested for ShahTunnel 5.0.1.
+// Psiphon region preferences intentionally exclude the United States.
+// A requested region is only a preference; the live exit country is verified
+// independently before Xray user egress is enabled.
+// The ordered region list is the approved candidate order. Psiphon accepts
+// one EgressRegion per ConsoleClient instance; DE is the initial preference,
+// while the complete list is used to validate permitted exit countries. The
+// actual country is always verified because availability is network-dependent.
 var psiphonEgressRegionPriority = []string{
-	"AT", "BR", "CH", "CZ", "DE",
-	"ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO",
+	// Priority 1: nearer alternatives to Iran.
+	"DE", "TR", "AE", "RS", "RO", "BG", "GR", "GE", "AM", "AZ",
+	// Priority 2: secondary alternatives.
+	"NL", "CH", "AT", "PL", "CZ", "SK", "HU", "FR", "SE", "FI",
 }
 
 var psiphonAllowedEgressRegions = func() map[string]bool {
@@ -197,7 +202,7 @@ var psiphonAllowedEgressRegions = func() map[string]bool {
 func normalizePsiphonEgressRegion(region string) (string, error) {
 	region = strings.ToUpper(strings.TrimSpace(region))
 	if region == "" {
-		return "", nil // Psiphon auto-selects its best-performing country.
+		return "DE", nil
 	}
 	if region == "US" || !psiphonAllowedEgressRegions[region] {
 		return "", fmt.Errorf("Psiphon egress region %q is blocked or not in the approved non-US region list", region)
@@ -207,16 +212,12 @@ func normalizePsiphonEgressRegion(region string) (string, error) {
 
 func newPsiphonClientConfig(port int) psiphonClientConfig {
 	performance := psiphonHostPerformanceProfile()
-	preferredRegion := "AT"
-	if len(psiphonEgressRegionPriority) > 0 {
-		preferredRegion = psiphonEgressRegionPriority[0]
-	}
 	return psiphonClientConfig{
 		ClientVersion:                      "1",
 		ClientPlatform:                     "Linux",
 		PropagationChannelID:               psiphonPropagationChannelID,
 		SponsorID:                          psiphonSponsorID,
-		EgressRegion:                       preferredRegion,
+		EgressRegion:                       "DE",
 		LocalSocksProxyPort:                port,
 		DisableLocalHTTPProxy:              true,
 		UseUnixDomainSockets:               false,
@@ -313,8 +314,8 @@ Description=ShahTunnel per-profile Psiphon ConsoleClient (%s)
 After=network-online.target
 Wants=network-online.target
 # Deliberately not PartOf=Agent: an Agent restart must not cold-restart Psiphon.
-# Agent Wants/After ordering starts Psiphon when needed without coupling their
-# lifecycles; the manager stops it explicitly when the profile is stopped/deleted.
+# Agent Requires/After ordering starts Psiphon when needed; the manager stops it
+# explicitly when the profile is stopped or deleted.
 
 [Service]
 Type=simple
@@ -413,15 +414,12 @@ func ensurePsiphonSystemdService(cfg Config) error {
 			return fmt.Errorf("write per-profile Psiphon systemd unit: %w", err)
 		}
 	}
-	// Pull in Psiphon and order Agent startup after it, but do not make the
-	// Agent lifecycle depend on Psiphon remaining active. Psiphon ConsoleClient
-	// can restart independently; systemd Requires= would stop the Agent with
-	// SIGTERM whenever Psiphon restarts, leaving it failed until manual start.
+	// Make Agent startup depend on the independently supervised Psiphon unit.
 	dropInDir := filepath.Join("/etc/systemd/system", agentService+".service.d")
 	if err := os.MkdirAll(dropInDir, 0755); err != nil {
 		return fmt.Errorf("create Agent Psiphon dependency drop-in: %w", err)
 	}
-	dropIn := []byte(fmt.Sprintf("[Unit]\nWants=%s\nAfter=%s\n", service, service))
+	dropIn := []byte(fmt.Sprintf("[Unit]\nRequires=%s\nAfter=%s\n", service, service))
 	if err := atomicReplaceFile(filepath.Join(dropInDir, "shah-tunnel-psiphon.conf"), dropIn, 0644); err != nil {
 		return fmt.Errorf("write Agent Psiphon dependency drop-in: %w", err)
 	}
@@ -466,13 +464,6 @@ func psiphonServiceUnitBelongsToProfile(unit []byte, cfg Config) bool {
 func stopPsiphonSystemdService(cfg Config) error {
 	if cfg.Role != "agent" || cfg.PsiphonConfig == "" {
 		return nil
-	}
-	// A stopped Agent must not be restarted by its hourly country-rotation timer.
-	// The next verified Agent start recreates and enables the profile-local timer.
-	if cfg.XrayPsiphon != nil {
-		if err := removePsiphonRotationTimer(cfg.Name); err != nil {
-			return fmt.Errorf("disable hourly Psiphon rotation before stopping profile: %w", err)
-		}
 	}
 	service := psiphonServiceName(cfg.Name)
 	unitPath, err := psiphonServiceUnitPath(service)
@@ -553,7 +544,7 @@ func removePsiphonSystemdService(cfg Config, agentService string) error {
 			return readErr
 		}
 		text := string(dropIn)
-		if (strings.Contains(text, "Wants="+service+"\n") || strings.Contains(text, "Requires="+service+"\n")) && strings.Contains(text, "After="+service+"\n") {
+		if strings.Contains(text, "Requires="+service+"\n") && strings.Contains(text, "After="+service+"\n") {
 			if err := os.Remove(dropInPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
@@ -898,45 +889,6 @@ func repairLegacyPsiphonClientConfig(configPath, proxyAddress string) (bool, err
 	return true, nil
 }
 
-// setPsiphonEgressRegionPreference updates only the EgressRegion field in a
-// profile-local Psiphon config. Psiphon supports exactly one requested country
-// per ConsoleClient process; ShahTunnel changes this value and restarts only
-// this profile's service when advancing through the user's ordered list.
-func setPsiphonEgressRegionPreference(configPath, region string) (bool, error) {
-	region, err := normalizePsiphonEgressRegion(region)
-	if err != nil || region == "" {
-		if err == nil {
-			err = errors.New("an explicit Psiphon region is required")
-		}
-		return false, err
-	}
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return false, err
-	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil || raw == nil {
-		if err == nil {
-			err = errors.New("Psiphon config must be a JSON object")
-		}
-		return false, fmt.Errorf("read Psiphon region preference: %w", err)
-	}
-	encoded, _ := json.Marshal(region)
-	if old, ok := raw["EgressRegion"]; ok && string(old) == string(encoded) {
-		return false, nil
-	}
-	raw["EgressRegion"] = encoded
-	updated, err := json.MarshalIndent(raw, "", "  ")
-	if err != nil {
-		return false, err
-	}
-	updated = append(updated, '\n')
-	if err := atomicReplaceFile(configPath, updated, 0600); err != nil {
-		return false, fmt.Errorf("write Psiphon region preference %s: %w", region, err)
-	}
-	return true, nil
-}
-
 // tunePsiphonPerformanceConfig updates only the performance settings owned by
 // ShahTunnel, preserving every other field and unknown Psiphon option.
 func tunePsiphonPerformanceConfig(configPath string) (bool, error) {
@@ -961,22 +913,6 @@ func tunePsiphonPerformanceConfigForProfile(configPath string, profile psiphonPe
 		"LimitRelayBufferSizes": profile.LimitRelayBufferSizes,
 		"SSHChannelWindowSize":  profile.SSHChannelWindowSize,
 		"TunnelPoolSize":        profile.TunnelPoolSize,
-	}
-	// The previous release used either a hard-coded DE value or an empty
-	// value (Psiphon's unrestricted automatic selection). Both caused Germany
-	// to be selected repeatedly. New and legacy profiles now start with the
-	// user's first requested priority (Austria), then the selector explicitly
-	// advances through the remaining allowlisted regions only when needed.
-	if existing, ok := raw["EgressRegion"]; !ok || string(existing) == `"DE"` || string(existing) == `""` {
-		settings["EgressRegion"] = psiphonEgressRegionPriority[0]
-	} else {
-		var existingRegion string
-		if json.Unmarshal(existing, &existingRegion) != nil {
-			settings["EgressRegion"] = psiphonEgressRegionPriority[0]
-		} else if normalized, regionErr := normalizePsiphonEgressRegion(existingRegion); regionErr != nil || normalized != existingRegion {
-			// Migrate profiles pinned to a country that is no longer approved.
-			settings["EgressRegion"] = psiphonEgressRegionPriority[0]
-		}
 	}
 	changed := false
 	for key, value := range settings {

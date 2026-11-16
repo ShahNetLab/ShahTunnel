@@ -52,14 +52,6 @@ func TestInstallerPersistsNetlinkPolicyForExistingAndNewUnits(t *testing.T) {
 	if !strings.Contains(installer, `"$dropin_dir/10-psiphon-netlink.conf"`) {
 		t.Fatalf("installer must generate the same 10-psiphon-netlink.conf override used by the successful manual repair")
 	}
-	if !strings.Contains(installer, `sed 's/^Requires=shah-tunnel-psiphon-/Wants=shah-tunnel-psiphon-/'`) {
-		t.Fatal("installer must migrate existing per-profile Psiphon Requires dependencies to Wants")
-	}
-	migrate := strings.Index(installer, "Migrate installed per-profile Psiphon dependencies")
-	reload := strings.Index(installer, "systemctl daemon-reload")
-	if migrate < 0 || reload < 0 || migrate > reload {
-		t.Fatal("old Psiphon Requires drop-ins must be migrated before systemd daemon-reload")
-	}
 	if !strings.Contains(installer, "RestrictAddressFamilies=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK") {
 		t.Fatalf("installer Netlink drop-in must reset and then reapply the explicit address-family allow-list")
 	}
@@ -1646,24 +1638,6 @@ func TestAdaptiveUnderlayCandidatesPreferLastSuccessfulEgress(t *testing.T) {
 	if !equalStrings(got, []string{underlayPsiphon, underlayDirect}) {
 		t.Fatalf("preferred Psiphon candidates = %v", got)
 	}
-	// The isolated Xray sidecar keeps mapped user TCP/DNS fail-closed through
-	// Psiphon, but Agent-to-Hub lanes retain independent adaptive failover.
-	strict := cfg
-	strict.XrayPsiphon = &XrayPsiphonIntegration{Proxy: "127.0.0.1:21082"}
-	for _, tc := range []struct {
-		preferred string
-		want      []string
-	}{
-		{"", []string{underlayDirect, underlayPsiphon}},
-		{underlayDirect, []string{underlayDirect, underlayPsiphon}},
-		{underlayPsiphon, []string{underlayPsiphon, underlayDirect}},
-		{underlayMASQUE, []string{underlayPsiphon, underlayDirect}},
-	} {
-		got = adaptiveUnderlayCandidates(strict, tc.preferred)
-		if !equalStrings(got, tc.want) {
-			t.Fatalf("Psiphon-integrated Agent lane candidates for preferred=%q: got %v want %v", tc.preferred, got, tc.want)
-		}
-	}
 	got = adaptiveUnderlayCandidates(Config{Underlay: underlayAdaptive}, underlayPsiphon)
 	if !equalStrings(got, []string{underlayDirect}) {
 		t.Fatalf("without Psiphon config, candidates = %v; want direct only", got)
@@ -1692,11 +1666,6 @@ esac
 	}
 	if got, want := adaptiveUnderlayCandidates(cfg, ""), []string{underlayMASQUE, underlayPsiphon, underlayDirect}; !equalStrings(got, want) {
 		t.Fatalf("active MASQUE candidate order = %v; want %v", got, want)
-	}
-	withIsolatedUserEgress := cfg
-	withIsolatedUserEgress.XrayPsiphon = &XrayPsiphonIntegration{Proxy: "127.0.0.1:21082"}
-	if got, want := adaptiveUnderlayCandidates(withIsolatedUserEgress, ""), []string{underlayMASQUE, underlayPsiphon, underlayDirect}; !equalStrings(got, want) {
-		t.Fatalf("active MASQUE candidate order with isolated Psiphon user egress = %v; want %v", got, want)
 	}
 
 	t.Setenv("FAKE_WARP_SETTINGS", "WARP tunnel protocol: unsupported-protocol")
@@ -2247,7 +2216,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.0.1             |",
+		"        |            SHAH TUNNEL 5.0.0             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -2484,14 +2453,14 @@ func TestTunnelIDIsStableAndSystemdSafe(t *testing.T) {
 }
 
 func TestUploadFlowControlWindowIsExpanded(t *testing.T) {
-	if streamWindowFrames < 512 {
-		t.Fatalf("stream window = %d frames; want at least 512", streamWindowFrames)
+	if streamWindowFrames < 256 {
+		t.Fatalf("stream window = %d frames; want at least 256", streamWindowFrames)
 	}
 	if maxFrame < 64*1024 {
 		t.Fatalf("maximum frame = %d bytes; want at least 64 KiB", maxFrame)
 	}
-	if got := int64(streamWindowFrames) * int64(maxFrame); got < 32<<20 {
-		t.Fatalf("per-stream in-flight window = %d bytes; want at least 32 MiB", got)
+	if got := int64(streamWindowFrames) * int64(maxFrame); got < 16<<20 {
+		t.Fatalf("per-stream in-flight window = %d bytes; want at least 16 MiB", got)
 	}
 	if maxQueuedPayloadBytes < 64<<20 {
 		t.Fatalf("global queued payload budget = %d bytes; want at least 64 MiB", maxQueuedPayloadBytes)
@@ -2883,49 +2852,14 @@ func TestHubBalancesMeasuredRTTAndLoad(t *testing.T) {
 		w.lastPongAt.Store(time.Now().UnixNano())
 		return &hubSession{id: id, streams: streams, wire: w}
 	}
-	// A small RTT advantage must not outweigh a large queue of established
-	// streams when another healthy lane is available.
-	loadedFast := mkSession(1, 32, 14*time.Millisecond)
-	idleSlower := mkSession(2, 0, 30*time.Millisecond)
-	h := &hubServer{sessions: map[*hubSession]struct{}{loadedFast: {}, idleSlower: {}}}
-	if got := h.current(); got != idleSlower {
-		t.Fatalf("selected lane %d (RTT %s, load %d); want the idle healthy lane %d", got.id, got.wire.roundTripTime(), got.activeStreams(), idleSlower.id)
-	}
-}
-
-func TestHubSpreadsStreamsAcrossFreshRTTLanes(t *testing.T) {
-	const lanes = 12
-	sessions := make([]*hubSession, lanes)
-	set := make(map[*hubSession]struct{}, lanes)
-	for i := 0; i < lanes; i++ {
-		w := &wire{done: make(chan struct{})}
-		w.rttNanos.Store(int64(20 * time.Millisecond))
-		w.lastPongAt.Store(time.Now().UnixNano())
-		sessions[i] = &hubSession{id: uint64(i + 1), streams: make(map[uint32]*hubStream), wire: w}
-		set[sessions[i]] = struct{}{}
-	}
-	h := &hubServer{sessions: set}
-	for streamID := 1; streamID <= 120; streamID++ {
-		selected := h.current()
-		if selected == nil {
-			t.Fatalf("no healthy lane selected for stream %d", streamID)
+	// The 14ms lane has some load but a lower weighted RTT than the idle 30ms lane.
+	fast := mkSession(1, 32, 14*time.Millisecond)
+	slower := mkSession(2, 0, 30*time.Millisecond)
+	h := &hubServer{sessions: map[*hubSession]struct{}{fast: {}, slower: {}}}
+	for i := 0; i < 20; i++ {
+		if got := h.current(); got != fast {
+			t.Fatalf("selected lane %d (RTT %s, load %d), want the lower weighted RTT lane", got.id, got.wire.roundTripTime(), got.activeStreams())
 		}
-		selected.mu.Lock()
-		selected.streams[uint32(streamID)] = &hubStream{}
-		selected.mu.Unlock()
-	}
-	minLoad, maxLoad := 121, 0
-	for _, session := range sessions {
-		load := session.activeStreams()
-		if load < minLoad {
-			minLoad = load
-		}
-		if load > maxLoad {
-			maxLoad = load
-		}
-	}
-	if maxLoad-minLoad > 1 {
-		t.Fatalf("fresh-RTT scheduler did not balance 120 streams over %d lanes: min=%d max=%d", lanes, minLoad, maxLoad)
 	}
 }
 
@@ -2986,11 +2920,8 @@ func TestPsiphonSupervisorPreparedBeforeAgentServiceStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(psiphonSource), `Wants=%s\nAfter=%s\n`) {
-		t.Fatal("Agent must pull in Psiphon with Wants/After ordering without being stopped when Psiphon restarts")
-	}
-	if strings.Contains(string(psiphonSource), `Requires=%s\nAfter=%s\n`) {
-		t.Fatal("Agent must not use Requires for Psiphon: Psiphon restarts must not terminate Agent lanes")
+	if !strings.Contains(string(psiphonSource), `Requires=%s\nAfter=%s\n`) {
+		t.Fatal("Agent must have systemd Requires/After ordering for the Psiphon service")
 	}
 }
 

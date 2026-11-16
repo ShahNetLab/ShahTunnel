@@ -16,7 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -85,7 +84,7 @@ func renderXrayPsiphonUnit(runtime xrayRuntime, configPath, service string) ([]b
 		}
 	}
 	unit := fmt.Sprintf(`[Unit]
-# Managed-By: ShahTunnel 5.0.1
+# Managed-By: ShahTunnel 5.0.0
 Description=ShahTunnel isolated Psiphon Xray (%s)
 After=network-online.target
 Wants=network-online.target
@@ -103,7 +102,6 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=full
-ReadWritePaths=/etc/ravanreverse/psiphon /run/lock
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
@@ -433,386 +431,10 @@ func stopXrayPsiphonSidecar(cfg Config) error {
 	return nil
 }
 
-// psiphonRegionCandidates returns the persisted working region first (except
-// the legacy DE default), followed by the exact country order supplied by the
-// user. Germany remains an allowed fallback, but is never the initial choice.
-func psiphonRegionCandidates(preferred string) []string {
-	preferred = strings.ToUpper(strings.TrimSpace(preferred))
-	result := make([]string, 0, len(psiphonEgressRegionPriority))
-	seen := make(map[string]bool, len(psiphonEgressRegionPriority))
-	if preferred != "" && preferred != "DE" && psiphonAllowedEgressRegions[preferred] {
-		result = append(result, preferred)
-		seen[preferred] = true
-	}
-	for _, region := range psiphonEgressRegionPriority {
-		if !seen[region] {
-			result = append(result, region)
-			seen[region] = true
-		}
-	}
-	return result
-}
-
-func readPsiphonPreferredRegion(configPath string) string {
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return ""
-	}
-	var cfg psiphonClientConfig
-	if json.Unmarshal(data, &cfg) != nil {
-		return ""
-	}
-	region, _ := normalizePsiphonEgressRegion(cfg.EgressRegion)
-	return region
-}
-
-// psiphonBlockedExitIPs is a defensive denylist for specific exits reported
-// by the operator. The country allowlist remains the primary policy; this list
-// prevents a known-bad address from being accepted even if a GeoIP provider
-// later misclassifies it or returns inconsistent metadata.
-var psiphonBlockedExitIPs = map[string]struct{}{
-	"89.45.7.51":    {},
-	"146.70.42.162": {},
-}
-
-func isBlockedPsiphonExitIP(exitIP string) bool {
-	ip := net.ParseIP(strings.TrimSpace(exitIP))
-	if ip == nil || ip.To4() == nil {
-		return false
-	}
-	_, blocked := psiphonBlockedExitIPs[ip.To4().String()]
-	return blocked
-}
-
-func psiphonExitMatchesVPSDirectIP(exitIP, directIP string) bool {
-	exit := net.ParseIP(strings.TrimSpace(exitIP))
-	direct := net.ParseIP(strings.TrimSpace(directIP))
-	return exit != nil && direct != nil && exit.To4() != nil && direct.To4() != nil && exit.To4().Equal(direct.To4())
-}
-
-func verifyPsiphonExit(proxy, expectedRegion, directIP string) (string, string, error) {
-	ip, err := waitForPsiphonPublicEgressIP(proxy, 8*time.Second)
-	if err != nil {
-		return "", "", err
-	}
-	if isBlockedPsiphonExitIP(ip) {
-		return "", "", fmt.Errorf("Psiphon returned a manually blocked exit IP %s", ip)
-	}
-	if psiphonExitMatchesVPSDirectIP(ip, directIP) {
-		return "", "", fmt.Errorf("SOCKS5 returned the VPS direct public IP %s; refusing this as a Psiphon exit", ip)
-	}
-	country, geoErr := psiphonPublicEgressCountry(proxy, ip, 5*time.Second)
-	if geoErr != nil {
-		country, geoErr = psiphonCountryFromDirectIPLookup(ip)
-	}
-	if geoErr != nil {
-		return "", "", fmt.Errorf("cannot verify country for Psiphon exit %s: %w", ip, geoErr)
-	}
-	if country != expectedRegion {
-		return "", "", fmt.Errorf("requested country %s but Psiphon returned %s (%s)", expectedRegion, country, ip)
-	}
-	if country == "US" || !psiphonAllowedEgressRegions[country] {
-		return "", "", fmt.Errorf("Psiphon exit %s (%s) is not in the approved country list", ip, country)
-	}
-	return ip, country, nil
-}
-
-// selectPsiphonExitByPriority enforces the ordered country list instead of
-// relying on Psiphon's unrestricted empty-region auto-selection. It also
-// compares the SOCKS exit with the VPS's independently discovered direct IP;
-// an identical address is rejected and is never exposed to Xray users.
-func selectPsiphonExitByPriority(cfg Config) (string, string, error) {
-	proxy := strings.TrimSpace(cfg.PsiphonProxy)
-	configPath := strings.TrimSpace(cfg.PsiphonConfig)
-	if !isLoopbackProxyAddress(proxy) || configPath == "" {
-		return "", "", errors.New("Psiphon profile is missing a valid loopback proxy or config path")
-	}
-	// This transport explicitly disables HTTP proxy environment variables, so
-	// the value is the VPS's ordinary public egress address, not Psiphon.
-	directIP := detectPublicIPv4FromAPIs()
-	if directIP == "" {
-		if cached := readServerGeoCache(); cached.Valid {
-			directIP = cached.IP
-		}
-	}
-	if directIP == "" {
-		return "", "", errors.New("cannot establish the VPS direct public IP baseline; refusing to enable Psiphon user egress without leak detection")
-	}
-	service := psiphonServiceName(cfg.Name)
-	preferred := readPsiphonPreferredRegion(configPath)
-	candidates := psiphonRegionCandidates(preferred)
-	var failures []string
-	for index, region := range candidates {
-		log.Printf("Psiphon country selection: trying %s (%d/%d)", region, index+1, len(candidates))
-		changed, err := setPsiphonEgressRegionPreference(configPath, region)
-		if err != nil {
-			return "", "", err
-		}
-		// A matching live process is probed first to preserve warm tunnels. If
-		// the preference changes, restart only this profile to apply the region.
-		if changed || index > 0 {
-			if err := runSystemctl("restart", service); err != nil {
-				failures = append(failures, region+": restart failed: "+err.Error())
-				continue
-			}
-		}
-		if ip, country, probeErr := verifyPsiphonExit(proxy, region, directIP); probeErr == nil {
-			log.Printf("Psiphon selected preferred exit: country=%s ip=%s direct_vps_ip=%s", country, ip, directIP)
-			return ip, country, nil
-		} else {
-			log.Printf("Psiphon country %s was not verified: %v; trying the next requested country", region, probeErr)
-			failures = append(failures, region+": "+probeErr.Error())
-		}
-	}
-	return "", "", fmt.Errorf("no Psiphon exit was verified in the requested country order (%s); Xray user traffic remains fail-closed", strings.Join(failures, " | "))
-}
-
-// ensurePsiphonUserEgressReady also verifies that every saved Agent mapping
-// points to the profile's isolated Xray sidecar, never the original Xray port.
-func validatePsiphonMappingTargets(cfg Config) error {
-	if cfg.XrayPsiphon == nil {
-		return errors.New("profile has no isolated Psiphon Xray integration")
-	}
-	bindings := make(map[string]XrayPsiphonBinding, len(cfg.XrayPsiphon.Bindings))
-	for _, binding := range cfg.XrayPsiphon.Bindings {
-		if binding.MappingID == "" || binding.PsiphonTarget == "" || binding.OriginalTarget == "" {
-			return errors.New("Psiphon Xray integration contains an incomplete mapping binding")
-		}
-		bindings[binding.MappingID] = binding
-	}
-	for _, mapping := range cfg.Ports {
-		binding, ok := bindings[mapping.ID]
-		if !ok || mapping.Target != binding.PsiphonTarget || mapping.Target == binding.OriginalTarget {
-			return fmt.Errorf("mapping %s is not pointed at its isolated Psiphon Xray inbound; refusing possible direct-IP fallback", mapping.ID)
-		}
-	}
-	return nil
-}
-
-// nextPsiphonRotationCandidates starts immediately after the currently verified
-// region and wraps once. It never selects the current region as the first choice.
-func nextPsiphonRotationCandidates(current string) []string {
-	current = strings.ToUpper(strings.TrimSpace(current))
-	start := 0
-	for i, region := range psiphonEgressRegionPriority {
-		if region == current {
-			start = (i + 1) % len(psiphonEgressRegionPriority)
-			break
-		}
-	}
-	result := make([]string, 0, len(psiphonEgressRegionPriority)-1)
-	for offset := 0; offset < len(psiphonEgressRegionPriority); offset++ {
-		region := psiphonEgressRegionPriority[(start+offset)%len(psiphonEgressRegionPriority)]
-		if region != current {
-			result = append(result, region)
-		}
-	}
-	return result
-}
-
-func psiphonRotationUnitNames(profileID string) (string, string) {
-	id := tunnelID(profileID)
-	base := "shah-tunnel-psiphon-rotate-" + id
-	return base + ".service", base + ".timer"
-}
-
-func renderPsiphonRotationUnits(profileID, binary, absConfig string) ([]byte, []byte, error) {
-	if strings.TrimSpace(profileID) == "" || !filepath.IsAbs(binary) || !filepath.IsAbs(absConfig) {
-		return nil, nil, errors.New("invalid Psiphon rotation unit parameters")
-	}
-	for _, value := range []string{binary, absConfig} {
-		if strings.ContainsAny(value, "\x00\n\r") {
-			return nil, nil, errors.New("country rotation unit contains invalid control characters")
-		}
-	}
-	service, _ := psiphonRotationUnitNames(profileID)
-	serviceUnit := fmt.Sprintf(`[Unit]
-Description=ShahTunnel hourly Psiphon country rotation (%s)
-After=network-online.target %s
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-User=root
-ExecStart=%s rotate-psiphon-country --config %s
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectHome=yes
-ProtectSystem=full
-ReadWritePaths=/etc/ravanreverse/psiphon /run/lock
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-`, tunnelID(profileID), psiphonServiceName(profileID), systemdExecQuote(binary), systemdExecQuote(absConfig))
-	timerUnit := fmt.Sprintf(`[Unit]
-Description=Hourly Psiphon country rotation for ShahTunnel profile %s
-
-[Timer]
-OnBootSec=1h
-OnUnitActiveSec=1h
-AccuracySec=1min
-Persistent=true
-Unit=%s
-
-[Install]
-WantedBy=timers.target
-`, tunnelID(profileID), service)
-	return []byte(serviceUnit), []byte(timerUnit), nil
-}
-
-func ensurePsiphonRotationTimer(cfg Config) error {
-	if cfg.Role != "agent" || cfg.XrayPsiphon == nil {
-		return nil
-	}
-	if !isLoopbackProxyAddress(cfg.PsiphonProxy) || cfg.PsiphonConfig == "" {
-		return errors.New("cannot schedule Psiphon country rotation without a profile-local SOCKS proxy and config")
-	}
-	service, timer := psiphonRotationUnitNames(cfg.Name)
-	servicePath := filepath.Join("/etc/systemd/system", service)
-	timerPath := filepath.Join("/etc/systemd/system", timer)
-	binary, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("resolve ShahTunnel executable for country rotation: %w", err)
-	}
-	absConfig, err := filepath.Abs(configPath)
-	if err != nil || absConfig == "." {
-		return errors.New("invalid Agent profile config path for country rotation")
-	}
-	serviceUnit, timerUnit, err := renderPsiphonRotationUnits(cfg.Name, binary, absConfig)
-	if err != nil {
-		return err
-	}
-	if err := atomicReplaceFile(servicePath, serviceUnit, 0644); err != nil {
-		return fmt.Errorf("write Psiphon country rotation service: %w", err)
-	}
-	if err := atomicReplaceFile(timerPath, timerUnit, 0644); err != nil {
-		return fmt.Errorf("write Psiphon country rotation timer: %w", err)
-	}
-	if err := systemdReload(); err != nil {
-		return err
-	}
-	if err := runSystemctl("enable", "--now", timer); err != nil {
-		return fmt.Errorf("enable hourly Psiphon country rotation: %w", err)
-	}
-	return nil
-}
-
-func removePsiphonRotationTimer(profileID string) error {
-	service, timer := psiphonRotationUnitNames(profileID)
-	profile := tunnelID(profileID)
-	for _, item := range []struct{ unit, marker string }{
-		{timer, "Description=Hourly Psiphon country rotation for ShahTunnel profile " + profile},
-		{service, "Description=ShahTunnel hourly Psiphon country rotation (" + profile + ")"},
-	} {
-		path := filepath.Join("/etc/systemd/system", item.unit)
-		if st, err := os.Lstat(path); err == nil {
-			if !st.Mode().IsRegular() || st.Mode()&os.ModeSymlink != 0 {
-				return fmt.Errorf("refusing to remove non-regular rotation unit %s", path)
-			}
-			body, readErr := os.ReadFile(path)
-			if readErr != nil {
-				return readErr
-			}
-			if !strings.Contains(string(body), item.marker) {
-				return fmt.Errorf("rotation unit %s is not owned by this ShahTunnel profile; refusing removal", path)
-			}
-			_, _ = exec.Command("systemctl", "disable", "--now", item.unit).CombinedOutput()
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	return systemdReload()
-}
-
-// rotatePsiphonCountry changes only the selected profile's Psiphon country.
-// The Xray sidecar remains SOCKS-only, so a failed rotation cannot fall back to
-// the VPS's direct route. If every alternate region fails, it restores and
-// verifies the previously working region before returning an error.
-func rotatePsiphonCountry(cfg Config) error {
-	if !isRoot() {
-		return errors.New("hourly Psiphon country rotation requires root")
-	}
-	if cfg.Role != "agent" || cfg.XrayPsiphon == nil {
-		return errors.New("hourly rotation requires an Agent with isolated Xray Psiphon egress")
-	}
-	if err := validatePsiphonMappingTargets(cfg); err != nil {
-		return err
-	}
-	proxy := strings.TrimSpace(cfg.PsiphonProxy)
-	if !isLoopbackProxyAddress(proxy) || proxy != strings.TrimSpace(cfg.XrayPsiphon.Proxy) {
-		return errors.New("country rotation refused: Xray is not bound to this profile's private Psiphon SOCKS endpoint")
-	}
-	lockPath := filepath.Join("/run/lock", "shah-tunnel-psiphon-rotate-"+tunnelID(cfg.Name)+".lock")
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return fmt.Errorf("open Psiphon rotation lock: %w", err)
-	}
-	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
-			log.Printf("Psiphon hourly rotation skipped: another rotation is already running")
-			return nil
-		}
-		return fmt.Errorf("lock Psiphon rotation: %w", err)
-	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-
-	directIP := detectPublicIPv4FromAPIs()
-	if directIP == "" {
-		if cached := readServerGeoCache(); cached.Valid {
-			directIP = cached.IP
-		}
-	}
-	if directIP == "" {
-		return errors.New("country rotation refused: cannot establish direct VPS IP baseline for leak protection")
-	}
-	oldRegion := readPsiphonPreferredRegion(cfg.PsiphonConfig)
-	if oldRegion == "" {
-		return errors.New("country rotation refused: current Psiphon country is not explicitly configured")
-	}
-	oldIP, oldCountry, oldErr := verifyPsiphonExit(proxy, oldRegion, directIP)
-	if oldErr != nil {
-		log.Printf("Psiphon rotation: current exit %s is not presently verifiable; trying the next allowlisted country for recovery: %v", oldRegion, oldErr)
-	}
-	service := psiphonServiceName(cfg.Name)
-	candidates := nextPsiphonRotationCandidates(oldRegion)
-	var failures []string
-	for _, region := range candidates {
-		log.Printf("Psiphon hourly country rotation: %s -> %s", oldRegion, region)
-		if _, err := setPsiphonEgressRegionPreference(cfg.PsiphonConfig, region); err != nil {
-			failures = append(failures, region+": config update: "+err.Error())
-			continue
-		}
-		if err := runSystemctl("restart", service); err != nil {
-			failures = append(failures, region+": Psiphon restart: "+err.Error())
-			continue
-		}
-		if ip, country, verifyErr := verifyPsiphonExit(proxy, region, directIP); verifyErr == nil {
-			log.Printf("Psiphon hourly country rotation succeeded: country=%s ip=%s previous_country=%s previous_ip=%s", country, ip, oldCountry, oldIP)
-			return nil
-		} else {
-			failures = append(failures, region+": "+verifyErr.Error())
-		}
-	}
-
-	// Do not leave the profile stranded on a region that failed verification.
-	if _, err := setPsiphonEgressRegionPreference(cfg.PsiphonConfig, oldRegion); err == nil {
-		if restartErr := runSystemctl("restart", service); restartErr == nil {
-			if ip, country, verifyErr := verifyPsiphonExit(proxy, oldRegion, directIP); verifyErr == nil {
-				log.Printf("Psiphon country rotation kept previous verified exit: country=%s ip=%s", country, ip)
-				return fmt.Errorf("no alternate country could be verified; retained previous country %s (%s): %s", country, ip, strings.Join(failures, " | "))
-			}
-		}
-	}
-	return fmt.Errorf("Psiphon country rotation failed for all alternate regions; user traffic remains fail-closed: %s", strings.Join(failures, " | "))
-}
-
+// ensurePsiphonUserEgressReady proves that the SOCKS listener has a real,
+// approved Psiphon exit before mapped user traffic is exposed. On a warm
+// ConsoleClient this is one fast probe; after a cold start it waits for the
+// first usable tunnel and verifies the actual exit country.
 func ensurePsiphonUserEgressReady(cfg Config) error {
 	if cfg.XrayPsiphon == nil {
 		return nil
@@ -821,17 +443,27 @@ func ensurePsiphonUserEgressReady(cfg Config) error {
 	if !isLoopbackProxyAddress(proxy) || proxy != strings.TrimSpace(cfg.PsiphonProxy) {
 		return errors.New("saved Xray Psiphon route does not match the profile's loopback SOCKS5 endpoint")
 	}
-	if err := validatePsiphonMappingTargets(cfg); err != nil {
-		return err
+	if err := waitForPsiphonProxy(proxy, 10*time.Second); err != nil {
+		return fmt.Errorf("Psiphon SOCKS5 is not ready: %w", err)
 	}
-	ip, country, err := selectPsiphonExitByPriority(cfg)
+	ip, err := psiphonPublicEgressIP(proxy, 5*time.Second)
 	if err != nil {
-		return fmt.Errorf("Psiphon user egress is not ready; Xray remains gated: %w", err)
+		ip, err = waitForPsiphonPublicEgressIP(proxy, 75*time.Second)
 	}
-	log.Printf("Psiphon user egress verified: %s (%s); Agent direct IP is excluded", ip, country)
-	if err := ensurePsiphonRotationTimer(cfg); err != nil {
-		return fmt.Errorf("enable hourly Psiphon country rotation: %w", err)
+	if err != nil {
+		return fmt.Errorf("Psiphon user egress is not ready; Xray remains gated until a real exit is available: %w", err)
 	}
+	country, geoErr := psiphonPublicEgressCountry(proxy, ip, 8*time.Second)
+	if geoErr != nil {
+		country, geoErr = psiphonCountryFromDirectIPLookup(ip)
+	}
+	if geoErr != nil {
+		return fmt.Errorf("cannot verify the actual Psiphon exit %s before enabling user traffic: %w", ip, geoErr)
+	}
+	if country == "US" || !psiphonAllowedEgressRegions[country] {
+		return fmt.Errorf("refusing to expose user traffic through unapproved Psiphon exit %s (%s)", ip, country)
+	}
+	log.Printf("Psiphon user egress is warm and verified: %s (%s)", ip, country)
 	return nil
 }
 
@@ -1094,13 +726,37 @@ func applyXrayPsiphonEgress(restartAgent, confirm bool) error {
 	if !isLoopbackProxyAddress(proxy) {
 		return errors.New("Agent config does not contain a valid loopback Psiphon SOCKS5 endpoint")
 	}
-	// Select an actual exit by the user's ordered country list and reject the
-	// VPS's own direct IP before creating or exposing the Xray user route.
-	ip, country, err := selectPsiphonExitByPriority(cfg)
+	// Always prove readiness and verify the real exit before creating user
+	// egress. Automatic setup runs this before the Agent service is started.
+	if err := waitForPsiphonProxy(proxy, 120*time.Second); err != nil {
+		return fmt.Errorf("Psiphon SOCKS5 did not become ready at %s: %w; ConsoleClient may still be bootstrapping, so keep the Agent service running and retry", proxy, err)
+	}
+	ip, err := waitForPsiphonPublicEgressIP(proxy, 90*time.Second)
 	if err != nil {
 		return err
 	}
-	uiSuccess(fmt.Sprintf("Verified Psiphon exit in requested country: %s (country %s)", ip, country))
+	country, proxyGeoErr := psiphonPublicEgressCountry(proxy, ip, 10*time.Second)
+	if proxyGeoErr != nil {
+		// Some relays block geo APIs. Look up the exact public IP observed through
+		// SOCKS using multiple independent providers; never classify the Agent IP.
+		country, err = psiphonCountryFromDirectIPLookup(ip)
+		if err != nil {
+			return fmt.Errorf("refusing Psiphon egress because the exact exit IP country could not be verified (SOCKS lookup: %v; independent IP lookup: %w)", proxyGeoErr, err)
+		}
+		uiWarn(fmt.Sprintf("Psiphon geolocation APIs were unreachable through SOCKS; exact exit IP %s was verified using independent IP lookup (%s).", ip, country))
+	}
+	if country == "US" || !psiphonAllowedEgressRegions[country] {
+		return fmt.Errorf("refusing Psiphon exit %s (%s): US is prohibited and only approved non-US regions are allowed", ip, country)
+	}
+	var requested psiphonClientConfig
+	if raw, readErr := os.ReadFile(cfg.PsiphonConfig); readErr == nil {
+		if json.Unmarshal(raw, &requested) == nil {
+			if wanted, normalizeErr := normalizePsiphonEgressRegion(requested.EgressRegion); normalizeErr == nil && wanted != country {
+				uiWarn(fmt.Sprintf("Psiphon preferred %s but returned an approved alternate exit in %s (%s); continuing because the actual country is allowlisted.", wanted, country, ip))
+			}
+		}
+	}
+	uiSuccess(fmt.Sprintf("Verified live Psiphon HTTPS exit IP: %s (country %s)", ip, country))
 	if confirm {
 		fmt.Println()
 		uiWarn("A private Xray sidecar will route only this Agent's mapped user traffic through Psiphon SOCKS5.")
@@ -1205,17 +861,28 @@ func applyXrayPsiphonEgress(restartAgent, confirm bool) error {
 			rollbackSidecar()
 			return fmt.Errorf("restart ShahTunnel profile %s failed; previous Agent config was restored: %w", service, err)
 		}
-		// Verify the actual selected-country proxy exit again after Agent restart,
-		// and assert every saved mapping still targets the isolated sidecar.
-		if err = ensurePsiphonUserEgressReady(cfg); err != nil {
+		// The Psiphon ConsoleClient is independently supervised and remains warm
+		// across Agent restarts. Verify the user-egress path before returning.
+		if err = waitForPsiphonProxy(proxy, 120*time.Second); err == nil {
+			var refreshedIP string
+			refreshedIP, err = waitForPsiphonPublicEgressIP(proxy, 90*time.Second)
+			if err == nil {
+				var refreshedCountry string
+				refreshedCountry, err = psiphonPublicEgressCountry(proxy, refreshedIP, 10*time.Second)
+				if err != nil {
+					refreshedCountry, err = psiphonCountryFromDirectIPLookup(refreshedIP)
+				}
+				if err == nil && (refreshedCountry == "US" || !psiphonAllowedEgressRegions[refreshedCountry]) {
+					err = fmt.Errorf("reconnected Psiphon exit %s (%s) is not in the approved non-US country list", refreshedIP, refreshedCountry)
+				}
+			}
+		}
+		if err != nil {
 			_ = atomicReplaceFile(configPath, oldProfile, 0600)
 			_ = runSystemctl("restart", service)
 			rollbackSidecar()
-			return fmt.Errorf("Psiphon user-egress verification failed after Agent restart; previous profile was restored: %w", err)
+			return fmt.Errorf("Psiphon did not recover with a verified approved exit after Agent restart; previous profile was restored: %w", err)
 		}
-	}
-	if err = ensurePsiphonRotationTimer(cfg); err != nil {
-		return fmt.Errorf("Psiphon user egress is configured but hourly country rotation could not be enabled: %w", err)
 	}
 	if restartAgent {
 		uiSuccess("Per-tunnel Psiphon TCP egress is active. DNS is also routed through Psiphon; UDP is fail-closed.")
@@ -1233,9 +900,6 @@ func removeXrayPsiphonIntegration(cfg *Config) error {
 		return nil
 	}
 	meta := cfg.XrayPsiphon
-	if err := removePsiphonRotationTimer(cfg.Name); err != nil {
-		return fmt.Errorf("remove hourly Psiphon country rotation: %w", err)
-	}
 	if err := removeXrayPsiphonSidecar(meta); err != nil {
 		return fmt.Errorf("remove dedicated Psiphon Xray service: %w", err)
 	}

@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.0.1"
+	version                          = "5.0.0"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -56,7 +56,7 @@ const (
 	msgPing                     byte = 6
 	msgPong                     byte = 7
 	maxStreams                       = 512
-	streamWindowFrames               = 512
+	streamWindowFrames               = 256
 	maxQueuedPayloadBytes            = int64(64 << 20)
 	wireWriteTimeout                 = 30 * time.Second
 	reverseStreamOpenTimeout         = 18 * time.Second
@@ -1793,26 +1793,6 @@ func (s *agentSession) run() {
 	}
 }
 
-// laneLoadPenalty gives each established TCP stream a meaningful share of the
-// lane score. RTT remains important, but a small RTT advantage must not pin
-// nearly every new flow to one lane while the other independent lanes sit idle.
-// The cap prevents an overloaded lane from producing unbounded score values.
-const (
-	laneStreamLoadPenalty = 2 * time.Millisecond
-	laneMaxLoadPenalty    = 500 * time.Millisecond
-)
-
-func laneLoadPenalty(activeStreams int) time.Duration {
-	if activeStreams <= 0 {
-		return 0
-	}
-	penalty := time.Duration(activeStreams) * laneStreamLoadPenalty
-	if penalty > laneMaxLoadPenalty {
-		return laneMaxLoadPenalty
-	}
-	return penalty
-}
-
 type hubServer struct {
 	cfg              Config
 	controlTLSConfig *tls.Config
@@ -1909,9 +1889,9 @@ func (h *hubServer) current() *hubSession {
 	}
 	if len(freshMetrics) > 0 {
 		best := freshMetrics[0]
-		bestScore := best.rtt + laneLoadPenalty(best.load) + best.pressure
+		bestScore := best.rtt + best.rtt*time.Duration(best.load)/time.Duration(maxStreams) + best.pressure
 		for _, metric := range freshMetrics[1:] {
-			score := metric.rtt + laneLoadPenalty(metric.load) + metric.pressure
+			score := metric.rtt + metric.rtt*time.Duration(metric.load)/time.Duration(maxStreams) + metric.pressure
 			if score < bestScore {
 				best, bestScore = metric, score
 			}
@@ -1920,12 +1900,12 @@ func (h *hubServer) current() *hubSession {
 		return best.session
 	}
 
-	// Before the first fresh RTT sample, use the same least-load/queue score.
-	// This avoids piling startup flows onto the first lane to reconnect.
+	// Before the first fresh RTT sample, use a combined least-load/queue score.
+	// This also avoids piling startup flows onto the first lane to reconnect.
 	bestScore := time.Duration(1<<62 - 1)
 	var best *hubSession
 	for _, metric := range metrics {
-		score := laneLoadPenalty(metric.load) + metric.pressure
+		score := time.Duration(metric.load)*2*time.Millisecond + metric.pressure
 		if score < bestScore {
 			best, bestScore = metric.session, score
 		}
@@ -2852,12 +2832,9 @@ func runAgent(cfg Config) error {
 	case underlayAdaptive:
 		cleanup, err := startPsiphonForAgent(cfg)
 		if err != nil {
-			// A profile with an isolated Psiphon Xray sidecar is explicitly
-			// fail-closed: do not start Agent lanes on a direct underlay.
-			if cfg.XrayPsiphon != nil {
-				return fmt.Errorf("Psiphon is required by this profile's user-egress policy; refusing direct fallback: %w", err)
-			}
-			// Generic adaptive mode retains its documented Direct fallback.
+			// Option 9 must retain the direct path even when Psiphon cannot
+			// start at boot. Its SOCKS candidate will fail fast and the lane
+			// remains able to use the other configured egress path.
 			log.Printf("Psiphon is not ready at startup; direct egress remains enabled: %v", err)
 		} else {
 			cleanupUnderlay = cleanup
@@ -2959,10 +2936,6 @@ func adaptiveTransportCandidates(preferred string) []string {
 }
 
 func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
-	// Agent-to-Hub lanes have their own adaptive egress policy, independent of
-	// the isolated Xray Psiphon sidecar used for mapped user TCP/DNS traffic.
-	// Falling back here does not change host routes or the sidecar's fail-closed
-	// user-traffic policy; it only keeps the authenticated control/data lanes up.
 	// WARP is only a candidate when its client reports a connected MASQUE path.
 	// Other WARP protocols are never selected by adaptive routing.
 	warpMode := detectActiveWarpUnderlay()
@@ -4618,7 +4591,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.0.1             |",
+	"        |            SHAH TUNNEL 5.0.0             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -6398,25 +6371,6 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-	case "rotate-psiphon-country":
-		if !ensureRoot() {
-			os.Exit(1)
-		}
-		for i := 2; i < len(os.Args); i++ {
-			if os.Args[i] == "--config" && i+1 < len(os.Args) {
-				configPath = filepath.Clean(os.Args[i+1])
-				i++
-			} else {
-				log.Fatalf("unknown rotate-psiphon-country argument %q", os.Args[i])
-			}
-		}
-		cfg, err := loadConfig()
-		if err != nil {
-			log.Fatal(err)
-		}
-		if err := rotatePsiphonCountry(cfg); err != nil {
-			log.Fatal(err)
-		}
 	case "uninstall":
 		if !ensureRoot() {
 			os.Exit(1)
@@ -6427,7 +6381,7 @@ func main() {
 	case "version", "--version", "-v":
 		fmt.Printf("Shah Tunnel %s (%s)\n", version, runtimeArch())
 	default:
-		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|run [--config PATH]|rotate-psiphon-country --config PATH|uninstall|version]\n", version)
+		fmt.Printf("Shah Tunnel %s\nUsage: shah-tunnel [menu|setup|run [--config PATH]|uninstall|version]\n", version)
 	}
 }
 

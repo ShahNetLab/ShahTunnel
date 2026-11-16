@@ -13,7 +13,7 @@ func TestXrayPsiphonUnitOwnershipAllowsOnlyExactProfileService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(unit), "Managed-By: ShahTunnel 5.0.1") {
+	if !strings.Contains(string(unit), "Managed-By: ShahTunnel 5.0.0") {
 		t.Fatal("rendered sidecar unit is missing the ShahTunnel ownership marker")
 	}
 	if !xrayPsiphonUnitBelongsToProfile(unit, runtime, configPath, service) {
@@ -70,68 +70,5 @@ func TestXrayPsiphonLifecycleOwnershipRequiresExactProfileMetadata(t *testing.T)
 	other.XrayPsiphon = &XrayPsiphonIntegration{ConfigPath: "/etc/ravanreverse/xray-psiphon/other/config.json", Service: cfg.XrayPsiphon.Service, Proxy: cfg.PsiphonProxy, Bindings: cfg.XrayPsiphon.Bindings}
 	if xrayPsiphonUnitBelongsToConfig(unit, other) {
 		t.Fatal("Xray Psiphon unit was accepted for a different managed config")
-	}
-}
-
-func TestPsiphonMappingsMustPointToIsolatedSidecar(t *testing.T) {
-	cfg := Config{
-		Ports: []PortMapping{{ID: "main", Target: "127.0.0.1:31083"}},
-		XrayPsiphon: &XrayPsiphonIntegration{
-			Bindings: []XrayPsiphonBinding{{MappingID: "main", OriginalTarget: "127.0.0.1:2083", PsiphonTarget: "127.0.0.1:31083"}},
-		},
-	}
-	if err := validatePsiphonMappingTargets(cfg); err != nil {
-		t.Fatalf("valid isolated mapping rejected: %v", err)
-	}
-	cfg.Ports[0].Target = "127.0.0.1:2083"
-	if err := validatePsiphonMappingTargets(cfg); err == nil {
-		t.Fatal("original Xray target must be rejected as possible direct egress")
-	}
-}
-
-func TestNextPsiphonRotationCandidatesAdvanceAndWrap(t *testing.T) {
-	want := []string{"BR", "CH", "CZ", "DE", "ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO"}
-	got := nextPsiphonRotationCandidates("AT")
-	if len(got) != len(want) {
-		t.Fatalf("rotation candidate count=%d, want %d: %v", len(got), len(want), got)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("rotation candidate %d=%s, want %s", i, got[i], want[i])
-		}
-	}
-	if got := nextPsiphonRotationCandidates("RO"); got[0] != "AT" {
-		t.Fatalf("rotation should wrap from RO to AT, got first=%s", got[0])
-	}
-	for _, region := range got {
-		if region == "AT" {
-			t.Fatal("rotation list must not retry the currently active country")
-		}
-	}
-}
-
-func TestRenderPsiphonRotationUnitsAreProfileScopedAndHourly(t *testing.T) {
-	service, timer, err := renderPsiphonRotationUnits("s", "/usr/local/bin/ravanreverse", "/etc/ravanreverse/tunnels/s.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	serviceText, timerText := string(service), string(timer)
-	for _, want := range []string{
-		"Description=ShahTunnel hourly Psiphon country rotation (s)",
-		`"/usr/local/bin/ravanreverse" rotate-psiphon-country --config "/etc/ravanreverse/tunnels/s.json"`,
-		"ProtectSystem=full",
-		"ReadWritePaths=/etc/ravanreverse/psiphon /run/lock",
-	} {
-		if !strings.Contains(serviceText, want) {
-			t.Fatalf("rotation service missing %q:\n%s", want, serviceText)
-		}
-	}
-	for _, want := range []string{"OnBootSec=1h", "OnUnitActiveSec=1h", "AccuracySec=1min", "Unit=shah-tunnel-psiphon-rotate-s.service"} {
-		if !strings.Contains(timerText, want) {
-			t.Fatalf("rotation timer missing %q:\n%s", want, timerText)
-		}
-	}
-	if _, _, err := renderPsiphonRotationUnits("s", "relative/binary", "/etc/ravanreverse/tunnels/s.json"); err == nil {
-		t.Fatal("relative executable path must be rejected")
 	}
 }
