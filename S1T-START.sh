@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Shah Tunnel 5.5.2 installer.
+# Shah Tunnel 5.5.1 installer.
 # Downloads the pinned Go 1.26.1 toolchain, verifies its SHA-256, fetches the source,
 # and builds the Linux binary on the target server. No prebuilt release binary is used.
 OWNER="ShahNetLab"
 REPO="ShahTunnel"
-VERSION="5.5.2"
+VERSION="5.5.1"
 GO_VERSION="1.26.1"
 GO_BASE="https://dl.google.com/go"
 GO_FALLBACK_BASE="https://go.dev/dl"
@@ -607,17 +607,6 @@ fi
 install -o root -g root -m 0750 "$TMP/S1T-CORE" /usr/local/bin/ravanreverse.new
 mv -f /usr/local/bin/ravanreverse.new "$BIN"
 ln -sfn /usr/local/bin/ravanreverse /usr/local/bin/shah-tunnel
-installed_version="$(timeout --kill-after=1s 5s "$BIN" version 2>/dev/null || true)"
-if [[ "$installed_version" != "Shah Tunnel ${VERSION} (linux/${TARGET_ARCH})" ]]; then
-  echo "ERROR: installed executable version mismatch; expected Shah Tunnel ${VERSION} (linux/${TARGET_ARCH}), got: ${installed_version:-<no version output>}" >&2
-  if [[ -n "${BACKUP:-}" && -s "$BACKUP" ]]; then
-    install -o root -g root -m 0750 "$BACKUP" "${BIN}.rollback"
-    mv -f "${BIN}.rollback" "$BIN"
-    echo "Previous executable restored from $BACKUP." >&2
-  fi
-  exit 1
-fi
-echo "Installed executable verified: ${installed_version}" >&2
 
 # Remove legacy Tor/Snowflake components from older ShahTunnel releases.
 # Only ShahTunnel-owned units, drop-ins, and private state paths are touched.
