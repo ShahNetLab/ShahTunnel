@@ -87,8 +87,9 @@ type psiphonClientConfig struct {
 	LimitRelayBufferSizes       bool   `json:"LimitRelayBufferSizes"`
 	SSHChannelWindowSize        *int   `json:"SSHChannelWindowSize,omitempty"`
 	ConnectionWorkerPoolMaxSize int    `json:"ConnectionWorkerPoolMaxSize,omitempty"`
-	// TunnelPoolSize is the number of independent Psiphon tunnels carrying
-	// multiplexed port-forward streams. Upstream defaults to one.
+	// TunnelPoolSize is kept at Psiphon's upstream-recommended default (1).
+	// Raising it created multiple independently failing egress relays and
+	// caused unstable SOCKS port-forwarding on real VPS paths.
 	TunnelPoolSize        int  `json:"TunnelPoolSize,omitempty"`
 	EmitDiagnosticNotices bool `json:"EmitDiagnosticNotices,omitempty"`
 }
@@ -128,23 +129,13 @@ func psiphonPerformanceProfileForHost(totalRAMBytes uint64, cpuCount int) psipho
 		// window (512 KiB) improves throughput on high-RTT paths when RAM allows.
 		windowSize = 4
 	}
-	// Psiphon's upstream TunnelPoolSize defaults to one. Scale conservatively
-	// with RAM and CPU so a single SOCKS endpoint is not forced through one
-	// long-lived Psiphon tunnel. This does not manufacture bandwidth; it exposes
-	// independent relays when the Psiphon network and VPS have capacity.
-	tunnelPoolSize := 2
-	if cpuCount >= 2 && totalRAMBytes >= 2<<30 {
-		tunnelPoolSize = 4
-	}
-	if cpuCount >= 2 && totalRAMBytes >= 4<<30 {
-		tunnelPoolSize = 8
-	}
-	if cpuCount >= 4 && totalRAMBytes >= 8<<30 {
-		tunnelPoolSize = 12
-	}
-	if cpuCount >= 8 && totalRAMBytes >= 16<<30 {
-		tunnelPoolSize = 16
-	}
+	// Keep one Psiphon tunnel. Upstream explicitly recommends its default
+	// TUNNEL_POOL_SIZE=1; a SOCKS endpoint already multiplexes many TCP port
+	// forwards over that tunnel. Increasing this pool creates independent relay
+	// paths with different failure behavior, not guaranteed extra bandwidth.
+	// In production this had manifested as rapidly increasing port-forward
+	// failures and intermittently closed Agent Hub lanes.
+	tunnelPoolSize := 1
 	return psiphonPerformanceProfile{
 		LimitMeekBufferSizes:  lowMemory,
 		LimitCPUThreads:       cpuCount < 2,
@@ -182,8 +173,12 @@ func psiphonHostPerformanceProfile() psiphonPerformanceProfile {
 // verified against this explicit allowlist before user traffic is enabled.
 // These are exactly the countries requested for ShahTunnel 5.0.1.
 var psiphonEgressRegionPriority = []string{
-	"AT", "BR", "CH", "CZ", "DE",
-	"ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO",
+	// First try regions that this Agent has already reached successfully in the
+	// user's diagnostic log. The previous order repeatedly restarted Psiphon
+	// through regions that returned SOCKS5 general-failure before reaching the
+	// first known-good exits (CH/ES/GB/LT/NL/NO/RO).
+	"CH", "ES", "GB", "LT", "NL", "NO", "RO",
+	"AT", "BR", "CZ", "DE", "IE", "IT", "PL",
 }
 
 var psiphonAllowedEgressRegions = func() map[string]bool {
@@ -207,7 +202,7 @@ func normalizePsiphonEgressRegion(region string) (string, error) {
 
 func newPsiphonClientConfig(port int) psiphonClientConfig {
 	performance := psiphonHostPerformanceProfile()
-	preferredRegion := "AT"
+	preferredRegion := ""
 	if len(psiphonEgressRegionPriority) > 0 {
 		preferredRegion = psiphonEgressRegionPriority[0]
 	}
