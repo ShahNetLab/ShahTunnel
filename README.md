@@ -1,9 +1,9 @@
 <div align="center">
-# ShahTunnel 5.5.10
+# ShahTunnel 5.5.11
 
 <p align="center"><img src="docs/img/ShahTunnel-Logo-Round.png" alt="ShahTunnel logo" width="420" style="max-width: 92%; height: auto;"></p>
 
-[![Version](https://img.shields.io/badge/version-5.5.10-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
+[![Version](https://img.shields.io/badge/version-5.5.11-168BFF?style=flat-square)](https://github.com/ShahNetLab/ShahTunnel)
 ![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 [![Build Go 1.26.1](https://img.shields.io/badge/build-Go%201.26.1-00ADD8?style=flat-square&logo=go)](S1T-START.sh)
 
@@ -34,7 +34,11 @@ The Hub-to-Agent forwarding path and optional per-profile Internet egress are se
 Client → Hub public mapping → authenticated Agent lanes → Agent local target
 Selected Xray inbound → loopback-only Xray sidecar → WARP / Psiphon SOCKS5 → Internet
 ```
-## Version 5.5.10
+## Version 5.5.11
+
+**Psiphon port-forward stability:** 5.5.10 scaled `TunnelPoolSize` from 2 to 16 based on VPS RAM/CPU. That departed from Psiphon's own recommended default: upstream defines `TUNNEL_POOL_SIZE` as 1 and explicitly recommends it. Separate pool tunnels can have different relay quality and produce intermittent SOCKS5 failures, rising `port forward failures`, and flapping Agent lanes. This release pins `TunnelPoolSize` to 1 for new and existing profiles. The profile's dedicated Psiphon service is restarted only when its configuration changes so the corrected setting takes effect.
+
+This does not change the number of ShahTunnel port mappings, customer-facing ports (including `2083`), custom ports, Xray targets, or customer credentials. The configured 12 Agent lanes remain configured; their TCP streams are multiplexed over Psiphon's recommended single tunnel. End-to-end success still depends on the selected exit reaching the Hub and users' Internet destinations and must be verified on the live VPS.
 
 Psiphon Hub-path verification: the Agent still uses only TCP/TLS and WebSocket/TLS over the separately configured `PsiphonHubAddr`; HTTP/2 and HTTP/1.1 CONNECT remain excluded from Psiphon lanes because they use adjacent control ports. An explicit custom transit port such as `2083` is preserved and is never silently rewritten to `443`. More importantly, an exit is no longer considered usable merely because public-IP and DoH checks succeed: ShahTunnel now verifies a real TLS/ALPN/Token-authenticated Hub connection through that exact SOCKS5 endpoint. If an exit refuses the Hub port (for example, SOCKS5 `reply=5`) or fails the Hub handshake, the next approved Psiphon region is tried before that exit is accepted. This test concerns the Agent-to-Hub transit endpoint only; customer-facing mappings and Agent-side Xray targets such as `127.0.0.1:2083` remain independent and unchanged.
 
@@ -98,7 +102,7 @@ Psiphon exits may restrict outbound destination ports. ShahTunnel therefore uses
 
 When Psiphon cannot reach the Hub control port (for example, a custom `9448`), the Agent uses the Hub public Mapping endpoint on `443` for Psiphon egress only; the Direct path continues to use the configured control port. The Step 06 default is independent of the control port and points to TCP/443. The Hub distinguishes ShahTunnel control traffic from ordinary TLS with the dedicated `shah-tunnel-control/1` ALPN and forwards normal ClientHello bytes unchanged. This does not take over the public port, move a Mapping, or modify X-UI.
 
-For the complete ShahTunnel 5.5.10 feature set, run **5.5.10 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through the selected Psiphon exit. The Agent wizard defaults the separate Psiphon endpoint to TCP/443 but preserves an explicitly entered custom port. Existing profiles with an empty or same-as-control endpoint still receive the legacy default Mapping endpoint; explicit custom endpoints (including `2083`) are preserved on load and sidecar repair. Psiphon itself documents outbound port restrictions, so a nonstandard port may still be refused by a particular exit; ShahTunnel now makes the actual SOCKS5 attempt and reports the result rather than rewriting the requested endpoint or rejecting it before dialing. Customer Xray targets such as `127.0.0.1:2083` are never changed by this logic.
+For the complete ShahTunnel 5.5.11 feature set, run **5.5.11 on both Hub and Agent**. A public Mapping must already be enabled on the Hub and reachable through the selected Psiphon exit. The Agent wizard defaults the separate Psiphon endpoint to TCP/443 but preserves an explicitly entered custom port. Existing profiles with an empty or same-as-control endpoint still receive the legacy default Mapping endpoint; explicit custom endpoints (including `2083`) are preserved on load and sidecar repair. Psiphon itself documents outbound port restrictions, so a nonstandard port may still be refused by a particular exit; ShahTunnel now makes the actual SOCKS5 attempt and reports the result rather than rewriting the requested endpoint or rejecting it before dialing. Customer Xray targets such as `127.0.0.1:2083` are never changed by this logic.
 
 ### Automatic Psiphon setup
 
@@ -220,7 +224,7 @@ sudo shah-tunnel menu
 
 ---
 
-## Psiphon behavior and performance in 5.5.10
+## Psiphon behavior and performance in 5.5.11
 
 - A local SOCKS5 listener is not treated as proof that Psiphon has established an external tunnel. The Agent remains active while ConsoleClient retries, and the wizard reports a pending state until a real tunnel and Agent lanes are ready.
 - For the selected Agent profile, TCP and DNS from its cloned Xray inbounds use that profile's loopback Psiphon SOCKS5 proxy. UDP, QUIC and unknown network types are blocked in the isolated sidecar rather than falling back to the server's direct route. ICMP ping is not carried by this SOCKS5 path.
@@ -229,11 +233,11 @@ sudo shah-tunnel menu
 - Psiphon buffer limits remain enabled on hosts with less than 3 GiB RAM. On hosts with at least 3 GiB RAM, the Meek and relay buffer caps are removed and the SSH channel window is set to 16 (512 KiB); low-memory hosts retain the documented default window of 4 (128 KiB). CPU thread limiting remains enabled on single-core hosts. The Psiphon tunnel-pool default is retained.
 - These settings target TCP throughput and more responsive lane selection. They cannot remove the physical latency of the client's route to the Hub, the Psiphon relay, or the selected destination. A client-reported value such as 635 ms must be measured end-to-end before and after deployment; no fixed reduction is guaranteed.
 
-Full-feature deployments should keep Hub and Agent on the same ShahTunnel 5.5.10 release. Historical version numbers in this document describe earlier releases.
+Full-feature deployments should keep Hub and Agent on the same ShahTunnel 5.5.11 release. Historical version numbers in this document describe earlier releases.
 
 
 ## Multi-user performance notes (5.5.0)
 
-The Hub lane scheduler considers authenticated RTT, active stream count, pending payload bytes, and recent data-write wait. Active streams now have a meaningful load weight even when RTT samples are fresh, so a small RTT advantage cannot keep pinning new connections to one busy lane. The per-stream in-flight window is 512 × 64 KiB (32 MiB), while the process-wide queued-payload ceiling remains 64 MiB; this adds bandwidth-delay-product headroom without allowing unbounded aggregate buffering. Queue-pressure and write-wait telemetry continue to steer new flows away from congested lanes. Important: the current protocol distributes independent TCP connections across lanes; one long-lived TCP connection remains pinned to one lane and its bandwidth is not the sum of all 12 lanes. Psiphon `TunnelPoolSize` is selected from RAM/CPU (2–16); exit candidates outside the configured policy are rejected and live egress-IP verification remains mandatory. In option 9, each Agent profile gets one isolated Xray sidecar that sends mapped TCP/DNS flows through its own Psiphon SOCKS5 endpoint; the Agent-to-Hub lanes retain independent Direct/Psiphon/active-MASQUE failover. This is not a host-wide route and does not change SSH or unrelated Xray inbounds. Psiphon capacity is still shared by users of that profile and can be the throughput bottleneck under concurrency. WARP per-tunnel proxy integration currently supports Cloudflare MASQUE Local Proxy only; WireGuard is not advertised as a compatible Xray Local Proxy underlay. 
+The Hub lane scheduler considers authenticated RTT, active stream count, pending payload bytes, and recent data-write wait. Active streams now have a meaningful load weight even when RTT samples are fresh, so a small RTT advantage cannot keep pinning new connections to one busy lane. The per-stream in-flight window is 512 × 64 KiB (32 MiB), while the process-wide queued-payload ceiling remains 64 MiB; this adds bandwidth-delay-product headroom without allowing unbounded aggregate buffering. Queue-pressure and write-wait telemetry continue to steer new flows away from congested lanes. Important: the current protocol distributes independent TCP connections across lanes; one long-lived TCP connection remains pinned to one lane and its bandwidth is not the sum of all 12 lanes. Psiphon `TunnelPoolSize` stays at the upstream-recommended value of 1; exit candidates outside the configured policy are rejected and live egress-IP verification remains mandatory. In option 9, each Agent profile gets one isolated Xray sidecar that sends mapped TCP/DNS flows through its own Psiphon SOCKS5 endpoint; the Agent-to-Hub lanes retain independent Direct/Psiphon/active-MASQUE failover. This is not a host-wide route and does not change SSH or unrelated Xray inbounds. Psiphon capacity is still shared by users of that profile and can be the throughput bottleneck under concurrency. WARP per-tunnel proxy integration currently supports Cloudflare MASQUE Local Proxy only; WireGuard is not advertised as a compatible Xray Local Proxy underlay. 
 
 These changes improve scheduling and queue discipline but cannot guarantee 100 simultaneous users on every VPS. Actual capacity depends on CPU, RAM, NIC throughput, the Hub's bandwidth, and the available WARP/Psiphon relay capacity. Validate with a staged load test before serving production users.
