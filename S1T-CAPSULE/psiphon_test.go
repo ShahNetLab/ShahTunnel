@@ -12,6 +12,9 @@ import (
 
 func TestNewPsiphonClientConfigUsesAuthenticatedBootstrap(t *testing.T) {
 	cfg := newPsiphonClientConfig(23456)
+	if cfg.EgressRegion != "CH" {
+		t.Fatalf("new profiles must prefer the first diagnostic-confirmed region, got %q", cfg.EgressRegion)
+	}
 	if cfg.LocalSocksProxyPort != 23456 {
 		t.Fatalf("SOCKS port = %d, want 23456", cfg.LocalSocksProxyPort)
 	}
@@ -341,37 +344,37 @@ func TestPsiphonConsoleClientArgsUseDefaultLoopbackBinding(t *testing.T) {
 
 func TestPsiphonPerformanceProfileIsMemoryAndCPUAware(t *testing.T) {
 	low := psiphonPerformanceProfileForHost(1<<30, 1)
-	if !low.LimitMeekBufferSizes || !low.LimitRelayBufferSizes || !low.LimitCPUThreads || low.SSHChannelWindowSize != 4 || low.TunnelPoolSize != 2 {
-		t.Fatalf("low-resource profile should retain safety limits and the default SSH window: %+v", low)
+	if !low.LimitMeekBufferSizes || !low.LimitRelayBufferSizes || !low.LimitCPUThreads || low.SSHChannelWindowSize != 4 || low.TunnelPoolSize != 1 {
+		t.Fatalf("low-resource profile should retain safety limits, the default SSH window, and one recommended Psiphon tunnel: %+v", low)
 	}
 	highMemorySingleCore := psiphonPerformanceProfileForHost(4<<30, 1)
-	if highMemorySingleCore.LimitMeekBufferSizes || highMemorySingleCore.LimitRelayBufferSizes || !highMemorySingleCore.LimitCPUThreads || highMemorySingleCore.SSHChannelWindowSize != 16 || highMemorySingleCore.TunnelPoolSize != 2 {
-		t.Fatalf("high-memory single-core profile should expand buffers/window but limit CPU threads: %+v", highMemorySingleCore)
+	if highMemorySingleCore.LimitMeekBufferSizes || highMemorySingleCore.LimitRelayBufferSizes || !highMemorySingleCore.LimitCPUThreads || highMemorySingleCore.SSHChannelWindowSize != 16 || highMemorySingleCore.TunnelPoolSize != 1 {
+		t.Fatalf("high-memory single-core profile should expand buffers/window, limit CPU threads, and retain one Psiphon tunnel: %+v", highMemorySingleCore)
 	}
 	high := psiphonPerformanceProfileForHost(4<<30, 4)
-	if high.LimitMeekBufferSizes || high.LimitRelayBufferSizes || high.LimitCPUThreads || high.SSHChannelWindowSize != 16 || high.TunnelPoolSize != 8 {
-		t.Fatalf("high-resource profile should lift conservative throughput limits and use a moderate larger SSH window: %+v", high)
+	if high.LimitMeekBufferSizes || high.LimitRelayBufferSizes || high.LimitCPUThreads || high.SSHChannelWindowSize != 16 || high.TunnelPoolSize != 1 {
+		t.Fatalf("high-resource profile should lift conservative buffer limits, use the larger SSH window, and retain the recommended single Psiphon tunnel: %+v", high)
 	}
-	large := psiphonPerformanceProfileForHost(8<<30, 4)
-	if large.TunnelPoolSize != 12 {
-		t.Fatalf("8 GiB / 4 CPU profile TunnelPoolSize=%d; want 12", large.TunnelPoolSize)
-	}
-	max := psiphonPerformanceProfileForHost(16<<30, 8)
-	if max.TunnelPoolSize != 16 {
-		t.Fatalf("16 GiB / 8 CPU profile TunnelPoolSize=%d; want 16", max.TunnelPoolSize)
+	for _, tc := range []struct {
+		ram uint64
+		cpu int
+	}{{8 << 30, 4}, {16 << 30, 8}} {
+		if got := psiphonPerformanceProfileForHost(tc.ram, tc.cpu).TunnelPoolSize; got != 1 {
+			t.Fatalf("%d GiB / %d CPU profile TunnelPoolSize=%d; want the upstream-recommended 1", tc.ram>>30, tc.cpu, got)
+		}
 	}
 }
 
-func TestPsiphonEgressRegionPolicyBlocksUSAndDefaultsToGermany(t *testing.T) {
-	if got, err := normalizePsiphonEgressRegion(""); err != nil || got != "DE" {
-		t.Fatalf("empty region = %q, %v; want DE", got, err)
+func TestPsiphonEgressRegionPolicyBlocksUnapprovedAndDefaultsToAutomatic(t *testing.T) {
+	if got, err := normalizePsiphonEgressRegion(""); err != nil || got != "" {
+		t.Fatalf("empty region = %q, %v; want automatic selection", got, err)
 	}
-	for _, region := range []string{"US", "us", "GB", "XX"} {
+	for _, region := range []string{"US", "us", "CA", "ca", "BE", "be", "AU", "au", "SE", "se", "IN", "in", "RS", "rs", "DK", "dk", "XX"} {
 		if got, err := normalizePsiphonEgressRegion(region); err == nil {
 			t.Fatalf("region %q unexpectedly accepted as %q", region, got)
 		}
 	}
-	for _, region := range []string{"AE", "TR", "DE", "RS", "RO", "FR"} {
+	for _, region := range []string{"AT", "BR", "CH", "CZ", "DE", "ES", "GB", "IE", "IT", "LT", "NL", "NO", "PL", "RO"} {
 		if got, err := normalizePsiphonEgressRegion(region); err != nil || got != region {
 			t.Fatalf("approved region %q rejected: got=%q err=%v", region, got, err)
 		}
@@ -381,7 +384,7 @@ func TestPsiphonEgressRegionPolicyBlocksUSAndDefaultsToGermany(t *testing.T) {
 func TestTunePsiphonPerformanceConfigPreservesUnknownFields(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "profile.json")
-	original := []byte(`{"EgressRegion":"DE","LocalSocksProxyPort":21086,"UnknownFuturePsiphonOption":{"keep":"me"},"LimitMeekBufferSizes":true,"LimitCPUThreads":true,"LimitRelayBufferSizes":true,"SSHChannelWindowSize":4,"TunnelPoolSize":1}`)
+	original := []byte(`{"EgressRegion":"DE","LocalSocksProxyPort":21086,"UnknownFuturePsiphonOption":{"keep":"me"},"LimitMeekBufferSizes":true,"LimitCPUThreads":true,"LimitRelayBufferSizes":true,"SSHChannelWindowSize":4,"TunnelPoolSize":8}`)
 	if err := os.WriteFile(path, original, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -400,14 +403,14 @@ func TestTunePsiphonPerformanceConfigPreservesUnknownFields(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatal(err)
 	}
-	if string(got["EgressRegion"]) != `"DE"` || string(got["LocalSocksProxyPort"]) != "21086" {
+	if string(got["EgressRegion"]) != `"CH"` || string(got["LocalSocksProxyPort"]) != "21086" {
 		t.Fatalf("known profile fields were not preserved: region=%s port=%s", got["EgressRegion"], got["LocalSocksProxyPort"])
 	}
 	if string(got["SSHChannelWindowSize"]) != "16" {
 		t.Fatalf("SSHChannelWindowSize=%s; want 16 for high-memory host", got["SSHChannelWindowSize"])
 	}
-	if string(got["TunnelPoolSize"]) != "8" {
-		t.Fatalf("TunnelPoolSize=%s; want 8 for 4 GiB / 4 CPU host", got["TunnelPoolSize"])
+	if string(got["TunnelPoolSize"]) != "1" {
+		t.Fatalf("TunnelPoolSize=%s; want 1 (Psiphon's recommended default) even on a 4 GiB / 4 CPU host", got["TunnelPoolSize"])
 	}
 	var unknown map[string]string
 	if err := json.Unmarshal(got["UnknownFuturePsiphonOption"], &unknown); err != nil || unknown["keep"] != "me" {
@@ -426,8 +429,21 @@ func TestTunePsiphonPerformanceConfigPreservesUnknownFields(t *testing.T) {
 	}
 }
 
-func TestPsiphonEgressRegionPriorityAndUSBlock(t *testing.T) {
-	want := []string{"DE", "TR", "AE", "RS", "RO", "BG", "GR", "GE", "AM", "AZ", "NL", "CH", "AT", "PL", "CZ", "SK", "HU", "FR", "SE", "FI"}
+func TestKnownBadPsiphonExitIPsAreBlocked(t *testing.T) {
+	for _, ip := range []string{"89.45.7.51", "146.70.42.162", " 89.45.7.51 "} {
+		if !isBlockedPsiphonExitIP(ip) {
+			t.Fatalf("known-bad exit IP %q was not blocked", ip)
+		}
+	}
+	for _, ip := range []string{"89.45.7.52", "1.1.1.1", "not-an-ip", "2001:db8::1"} {
+		if isBlockedPsiphonExitIP(ip) {
+			t.Fatalf("unlisted IP %q was unexpectedly blocked", ip)
+		}
+	}
+}
+
+func TestPsiphonEgressRegionPriorityAndBlockedRegions(t *testing.T) {
+	want := []string{"CH", "ES", "GB", "LT", "NL", "NO", "RO", "AT", "BR", "CZ", "DE", "IE", "IT", "PL"}
 	if !reflect.DeepEqual(psiphonEgressRegionPriority, want) {
 		t.Fatalf("Psiphon region priority = %v; want %v", psiphonEgressRegionPriority, want)
 	}
@@ -436,14 +452,42 @@ func TestPsiphonEgressRegionPriorityAndUSBlock(t *testing.T) {
 			t.Fatalf("priority region %s was rejected: %v", region, err)
 		}
 	}
-	for _, blocked := range []string{"US", "us", "USA"} {
+	for _, blocked := range []string{"US", "us", "CA", "ca", "BE", "be", "AU", "au", "SE", "se", "IN", "in", "RS", "rs", "DK", "dk", "USA"} {
 		if _, err := normalizePsiphonEgressRegion(blocked); err == nil {
 			t.Fatalf("blocked region %q was accepted", blocked)
 		}
 	}
 }
 
-func TestRenderPsiphonSystemdServiceIsRestartedAndTiedToAgent(t *testing.T) {
+func TestTunePsiphonPerformanceConfigMigratesBlockedRegions(t *testing.T) {
+	for _, blocked := range []string{"BE", "CA", "AU", "SE", "IN", "RS", "DK"} {
+		t.Run(blocked, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "profile.json")
+			original := []byte(`{"EgressRegion":"` + blocked + `","TunnelPoolSize":4}`)
+			if err := os.WriteFile(path, original, 0600); err != nil {
+				t.Fatal(err)
+			}
+			changed, err := tunePsiphonPerformanceConfigForProfile(path, psiphonPerformanceProfileForHost(4<<30, 2))
+			if err != nil || !changed {
+				t.Fatalf("tune blocked %s profile: changed=%t err=%v", blocked, changed, err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]json.RawMessage
+			if err := json.Unmarshal(data, &got); err != nil {
+				t.Fatal(err)
+			}
+			if string(got["EgressRegion"]) != `"CH"` {
+				t.Fatalf("blocked %s profile migrated to %s; want CH", blocked, got["EgressRegion"])
+			}
+		})
+	}
+}
+
+func TestRenderPsiphonSystemdServiceStaysWarmAcrossAgentRestarts(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{
 		Name:           "profile-s",
@@ -458,9 +502,8 @@ func TestRenderPsiphonSystemdServiceIsRestartedAndTiedToAgent(t *testing.T) {
 	}
 	text := string(unit)
 	for _, want := range []string{
-		"PartOf=ravanreverse@s.service",
 		"Restart=always",
-		"RestartSec=5",
+		"RestartSec=2",
 		`ExecStart="/usr/local/bin/psiphon-console-client" "-config"`,
 		"-dataRootDirectory",
 		"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
@@ -469,10 +512,59 @@ func TestRenderPsiphonSystemdServiceIsRestartedAndTiedToAgent(t *testing.T) {
 			t.Fatalf("Psiphon unit missing %q:\n%s", want, text)
 		}
 	}
+	if strings.Contains(text, "PartOf=ravanreverse@s.service") {
+		t.Fatalf("Psiphon must not be coupled to Agent restart jobs; its tunnels should remain warm:\n%s", text)
+	}
 	if strings.Contains(text, "[Install]") || strings.Contains(text, "WantedBy=multi-user.target") {
 		t.Fatalf("per-profile Psiphon service must be started through its Agent dependency, not enabled globally:\n%s", text)
 	}
 	if strings.Contains(text, "0.0.0.0") || strings.Contains(text, "CAP_NET_ADMIN") {
 		t.Fatalf("Psiphon unit must not expose a public proxy or grant network-admin capability:\n%s", text)
+	}
+}
+
+func TestPsiphonCountrySelectionStartsAtAustriaAndKeepsOrderedFallback(t *testing.T) {
+	want := []string{"CH", "ES", "GB", "LT", "NL", "NO", "RO", "AT", "BR", "CZ", "DE", "IE", "IT", "PL"}
+	if got := psiphonRegionCandidates("BE"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("blocked legacy BE profile candidates=%v; want approved list without Belgium", got)
+	}
+	if got := psiphonRegionCandidates("IN"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("blocked legacy IN profile candidates=%v; want approved list without India", got)
+	}
+	if got := psiphonRegionCandidates("RS"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("blocked legacy RS profile candidates=%v; want approved list without removed region", got)
+	}
+	if got := psiphonRegionCandidates("DK"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("blocked legacy DK profile candidates=%v; want approved list without removed region", got)
+	}
+	if got := psiphonRegionCandidates("DE"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("legacy DE profile candidates=%v; want %v", got, want)
+	}
+	if got := psiphonRegionCandidates("NL"); got[0] != "NL" || len(got) != len(want) {
+		t.Fatalf("persisted working region should be reused first, got %v", got)
+	}
+	dir := t.TempDir()
+	path, err := writePsiphonProfileConfig("country-order", 24680, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := setPsiphonEgressRegionPreference(path, "BR")
+	if err != nil || !changed {
+		t.Fatalf("set Psiphon region: changed=%v err=%v", changed, err)
+	}
+	if got := readPsiphonPreferredRegion(path); got != "BR" {
+		t.Fatalf("saved region=%q; want BR", got)
+	}
+}
+
+func TestPsiphonExitDirectIPIsRejected(t *testing.T) {
+	if !psiphonExitMatchesVPSDirectIP("203.0.113.10", "203.0.113.10") {
+		t.Fatal("same IP must be treated as direct VPS egress")
+	}
+	if psiphonExitMatchesVPSDirectIP("203.0.113.10", "198.51.100.20") {
+		t.Fatal("different IPs must not be treated as identical")
+	}
+	if psiphonExitMatchesVPSDirectIP("not-an-ip", "198.51.100.20") {
+		t.Fatal("invalid IP must not compare as a direct exit")
 	}
 }
