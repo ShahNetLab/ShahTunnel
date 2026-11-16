@@ -25,6 +25,65 @@ import (
 	"time"
 )
 
+func TestProbeSOCKS5DetectsLiveLoopbackHandshake(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	serverResult := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverResult <- acceptErr
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		greeting := make([]byte, 3)
+		if _, readErr := io.ReadFull(conn, greeting); readErr != nil {
+			serverResult <- readErr
+			return
+		}
+		if !bytes.Equal(greeting, []byte{0x05, 0x01, 0x00}) {
+			serverResult <- fmt.Errorf("unexpected SOCKS5 greeting: %v", greeting)
+			return
+		}
+		_, writeErr := conn.Write([]byte{0x05, 0x00})
+		serverResult <- writeErr
+	}()
+	if err := probeSOCKS5(listener.Addr().String(), time.Second); err != nil {
+		t.Fatalf("live no-auth SOCKS5 handshake failed: %v", err)
+	}
+	if err := <-serverResult; err != nil {
+		t.Fatalf("SOCKS5 test server failed: %v", err)
+	}
+}
+
+func TestPsiphonReadinessChecksIndependentServiceAndLiveSocket(t *testing.T) {
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate test source")
+	}
+	source, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func waitForPsiphonAgentReady(")
+	end := strings.Index(text[start:], "func showRecentLogs(")
+	if start < 0 || end < 0 {
+		t.Fatal("Psiphon readiness function was not found")
+	}
+	body := text[start : start+end]
+	if !strings.Contains(body, "psiphonServiceName(cfg.Name)") || !strings.Contains(body, "probeSOCKS5(cfg.PsiphonProxy") {
+		t.Fatal("readiness must verify the separate Psiphon systemd service and a live loopback SOCKS5 handshake")
+	}
+	if strings.Contains(body, "Psiphon ConsoleClient connected") {
+		t.Fatal("readiness must not depend on a child-process notice that is absent when Psiphon is independently supervised")
+	}
+}
+
 func TestTunnelTemplateUnitAllowsNetlinkWithoutNetworkAdmin(t *testing.T) {
 	unit := tunnelTemplateUnitContents()
 	want := "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
@@ -2233,7 +2292,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.5.0             |",
+		"        |            SHAH TUNNEL 5.5.1             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -2945,6 +3004,41 @@ func TestNewAgentPreparesPsiphonXrayBeforeAgentStarts(t *testing.T) {
 	setup := strings.Index(text, "autoApplyXrayPsiphonForNewAgent()")
 	if start < 0 || setup < 0 || setup > start {
 		t.Fatal("automatic Psiphon Xray sidecar setup must complete before the selected Agent service starts")
+	}
+}
+
+func TestPsiphonReadinessAcceptsExistingManagedSOCKSListenerAndLane(t *testing.T) {
+	logs := strings.Join([]string{
+		"using existing Psiphon-compatible SOCKS5 listener at 127.0.0.1:21082",
+		"tunnel lane 11/12 connected via tcp_tls over psiphon_socks5; forwarding through 1 configured port mapping(s)",
+	}, "\n")
+	if !psiphonAgentLaneReadyInLogs(logs) {
+		t.Fatal("a connected Agent lane through the already-running, independently supervised Psiphon SOCKS5 listener must be recognized")
+	}
+	if !psiphonAgentLaneCurrentlyReady(logs, true) {
+		t.Fatal("a currently active Psiphon Agent lane must be considered ready")
+	}
+	if psiphonAgentLaneCurrentlyReady(logs, false) {
+		t.Fatal("a historical lane log must not count as ready after all Agent lanes have disconnected")
+	}
+	// The independently supervised ConsoleClient does not have to emit its
+	// child-process notice into the Agent service journal.
+	if strings.Contains(logs, "Psiphon ConsoleClient connected") {
+		t.Fatal("fixture unexpectedly contains a ConsoleClient child-process notice")
+	}
+}
+
+func TestPsiphonReadinessAcceptsWebSocketLaneOverPsiphon(t *testing.T) {
+	logs := "tunnel lane 7/12 connected via websocket_tls over psiphon_socks5; forwarding through 1 configured port mapping(s)"
+	if !psiphonAgentLaneReadyInLogs(logs) {
+		t.Fatal("a WebSocket transport carried through Psiphon SOCKS5 must count as a ready Psiphon Agent lane")
+	}
+}
+
+func TestPsiphonReadinessDoesNotAcceptDirectLane(t *testing.T) {
+	logs := "tunnel lane 7/12 connected via tcp_tls over direct; forwarding through 1 configured port mapping(s)"
+	if psiphonAgentLaneReadyInLogs(logs) {
+		t.Fatal("a Direct lane must not be reported as a Psiphon-connected Agent lane")
 	}
 }
 

@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.5.0"
+	version                          = "5.5.1"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -4538,7 +4538,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.5.0             |",
+	"        |            SHAH TUNNEL 5.5.1             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -5225,33 +5225,61 @@ func startSelectedTunnel(restartActive bool) error {
 	return nil
 }
 
+// psiphonAgentLaneReadyInLogs detects an authenticated Agent lane that has
+// actually completed its connection through the profile's Psiphon SOCKS5
+// underlay. The Psiphon ConsoleClient is supervised by a separate systemd unit;
+// its startup notices therefore do not necessarily appear in the Agent journal.
+func psiphonAgentLaneReadyInLogs(logText string) bool {
+	for _, line := range strings.Split(logText, "\n") {
+		if strings.Contains(line, "tunnel lane ") &&
+			strings.Contains(line, " connected via ") &&
+			strings.Contains(line, " over psiphon_socks5") {
+			return true
+		}
+	}
+	return false
+}
+
+func psiphonAgentLaneCurrentlyReady(logText string, hasActiveLane bool) bool {
+	return hasActiveLane && psiphonAgentLaneReadyInLogs(logText)
+}
+
 func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.Duration) (bool, error) {
 	if timeout <= 0 {
 		return false, errors.New("invalid Psiphon readiness timeout")
 	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return false, fmt.Errorf("load selected Psiphon Agent profile for readiness check: %w", err)
+	}
+	if cfg.Role != "agent" || cfg.Underlay != underlayPsiphon || !isLoopbackProxyAddress(cfg.PsiphonProxy) {
+		return false, errors.New("selected profile does not contain a valid loopback-only Psiphon Agent endpoint")
+	}
+	psiphonService := psiphonServiceName(cfg.Name)
 	startMarker := fmt.Sprintf("@%d", startedAt.Unix())
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		logs, _ := exec.Command("journalctl", "-u", service, "--since", startMarker, "--no-pager", "-o", "cat").CombinedOutput()
-		logText := string(logs)
-		psiphonReady := strings.Contains(logText, "Psiphon ConsoleClient connected")
-		agentLaneReady := false
-		proxyReady := strings.Contains(logText, "Psiphon local SOCKS5 listener ready")
-		for _, line := range strings.Split(logText, "\n") {
-			if strings.Contains(line, "tunnel lane ") && strings.Contains(line, " connected via ") && strings.Contains(line, " over psiphon_socks5") {
-				agentLaneReady = true
-				break
-			}
-		}
-		if psiphonReady && agentLaneReady && exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
+		agentActive := exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil
+		psiphonActive := exec.Command("systemctl", "is-active", "--quiet", psiphonService).Run() == nil
+		proxyErr := probeSOCKS5(cfg.PsiphonProxy, 700*time.Millisecond)
+		proxyReady := agentActive && psiphonActive && proxyErr == nil
+		if proxyReady && psiphonAgentLaneCurrentlyReady(string(logs), metricConnected.Load()) {
 			return true, nil
-		}
-		if proxyReady && exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
-			return false, nil
 		}
 		time.Sleep(time.Second)
 	}
-	return false, fmt.Errorf("service %s did not start its local Psiphon SOCKS5 listener within %s", service, timeout)
+
+	// A responsive loopback SOCKS5 listener is a valid pending state even if
+	// Psiphon or the Hub has not produced a connected lane before the menu
+	// timeout. Keep both supervised services running so their retry loops can
+	// recover; do not convert a slow first relay into a false startup failure.
+	agentActive := exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil
+	psiphonActive := exec.Command("systemctl", "is-active", "--quiet", psiphonService).Run() == nil
+	if agentActive && psiphonActive && probeSOCKS5(cfg.PsiphonProxy, 1500*time.Millisecond) == nil {
+		return false, nil
+	}
+	return false, fmt.Errorf("Agent %s or its supervised Psiphon service %s did not keep the loopback SOCKS5 endpoint %s ready within %s", service, psiphonService, cfg.PsiphonProxy, timeout)
 }
 
 func showRecentLogs(n int) {
