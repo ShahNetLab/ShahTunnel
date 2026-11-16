@@ -52,6 +52,14 @@ func TestInstallerPersistsNetlinkPolicyForExistingAndNewUnits(t *testing.T) {
 	if !strings.Contains(installer, `"$dropin_dir/10-psiphon-netlink.conf"`) {
 		t.Fatalf("installer must generate the same 10-psiphon-netlink.conf override used by the successful manual repair")
 	}
+	if !strings.Contains(installer, `sed 's/^Requires=shah-tunnel-psiphon-/Wants=shah-tunnel-psiphon-/'`) {
+		t.Fatal("installer must migrate existing per-profile Psiphon Requires dependencies to Wants")
+	}
+	migrate := strings.Index(installer, "Migrate installed per-profile Psiphon dependencies")
+	reload := strings.Index(installer, "systemctl daemon-reload")
+	if migrate < 0 || reload < 0 || migrate > reload {
+		t.Fatal("old Psiphon Requires drop-ins must be migrated before systemd daemon-reload")
+	}
 	if !strings.Contains(installer, "RestrictAddressFamilies=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK") {
 		t.Fatalf("installer Netlink drop-in must reset and then reapply the explicit address-family allow-list")
 	}
@@ -1556,6 +1564,10 @@ func TestPsiphonHubAddressDefaultsToPublicMappingPort(t *testing.T) {
 	if legacy.PsiphonHubAddr != "37.32.12.244:443" {
 		t.Fatalf("legacy adaptive profile PsiphonHubAddr = %q; want 37.32.12.244:443", legacy.PsiphonHubAddr)
 	}
+	legacySameAsControl := normalizeConfig(Config{Role: "agent", Underlay: underlayPsiphon, HubAddr: "37.32.12.244:557", PsiphonHubAddr: "37.32.12.244:557"})
+	if legacySameAsControl.PsiphonHubAddr != "37.32.12.244:443" {
+		t.Fatalf("legacy Psiphon endpoint copied from control port = %q; want 37.32.12.244:443", legacySameAsControl.PsiphonHubAddr)
+	}
 	explicit := Config{Role: "agent", Underlay: underlayPsiphon, HubAddr: "37.32.12.244:9443", PsiphonHubAddr: "37.32.12.244:8443"}
 	if got := agentHubAddressForUnderlay(explicit, underlayPsiphon); got != "37.32.12.244:8443" {
 		t.Fatalf("explicit Psiphon endpoint = %q; want 37.32.12.244:8443", got)
@@ -1563,25 +1575,11 @@ func TestPsiphonHubAddressDefaultsToPublicMappingPort(t *testing.T) {
 	if got := agentHubAddressForUnderlay(explicit, underlayDirect); got != explicit.HubAddr {
 		t.Fatalf("Direct endpoint = %q; want unchanged %q", got, explicit.HubAddr)
 	}
-	torDefault := Config{Role: "agent", Underlay: underlayTor, HubAddr: "37.32.12.244:9448"}
-	if got := agentHubAddressForUnderlay(torDefault, underlayTor); got != "37.32.12.244:443" {
-		t.Fatalf("default Tor Mapping endpoint = %q; want 37.32.12.244:443", got)
-	}
-	torCustom := torDefault
-	torCustom.TorHubAddr = "37.32.12.244:8443"
-	if got := agentHubAddressForUnderlay(torCustom, underlayTor); got != torCustom.TorHubAddr {
-		t.Fatalf("explicit Tor Mapping endpoint = %q; want %q", got, torCustom.TorHubAddr)
-	}
-	if got := agentHubAddressForTransport(torDefault, transportTCP); got != "37.32.12.244:443" {
-		t.Fatalf("Tor TCP lane endpoint = %q; want public Mapping on 443", got)
-	}
-	if got := agentHubAddressForTransport(torDefault, transportHTTP2); got != torDefault.HubAddr {
-		t.Fatalf("Tor HTTP/2 CONNECT endpoint = %q; want control port %q", got, torDefault.HubAddr)
-	}
+
 }
 
 func TestUnderlayModesAndLoopbackValidation(t *testing.T) {
-	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayTor, underlayAdaptive} {
+	for _, mode := range []string{underlayDirect, underlayMASQUE, underlayPsiphon, underlayAdaptive} {
 		if !validUnderlayMode(mode) {
 			t.Fatalf("valid underlay %q was rejected", mode)
 		}
@@ -1638,12 +1636,22 @@ func TestAdaptiveUnderlayCandidatesPreferLastSuccessfulEgress(t *testing.T) {
 	if !equalStrings(got, []string{underlayPsiphon, underlayDirect}) {
 		t.Fatalf("preferred Psiphon candidates = %v", got)
 	}
+	// The isolated Xray sidecar keeps mapped user TCP/DNS fail-closed through
+	// Psiphon, but Agent-to-Hub lanes retain independent adaptive failover.
 	strict := cfg
 	strict.XrayPsiphon = &XrayPsiphonIntegration{Proxy: "127.0.0.1:21082"}
-	for _, preferred := range []string{"", underlayDirect, underlayPsiphon, underlayMASQUE} {
-		got = adaptiveUnderlayCandidates(strict, preferred)
-		if !equalStrings(got, []string{underlayPsiphon}) {
-			t.Fatalf("Psiphon-integrated profile must fail closed; preferred=%q candidates=%v", preferred, got)
+	for _, tc := range []struct {
+		preferred string
+		want      []string
+	}{
+		{"", []string{underlayDirect, underlayPsiphon}},
+		{underlayDirect, []string{underlayDirect, underlayPsiphon}},
+		{underlayPsiphon, []string{underlayPsiphon, underlayDirect}},
+		{underlayMASQUE, []string{underlayPsiphon, underlayDirect}},
+	} {
+		got = adaptiveUnderlayCandidates(strict, tc.preferred)
+		if !equalStrings(got, tc.want) {
+			t.Fatalf("Psiphon-integrated Agent lane candidates for preferred=%q: got %v want %v", tc.preferred, got, tc.want)
 		}
 	}
 	got = adaptiveUnderlayCandidates(Config{Underlay: underlayAdaptive}, underlayPsiphon)
@@ -1674,6 +1682,11 @@ esac
 	}
 	if got, want := adaptiveUnderlayCandidates(cfg, ""), []string{underlayMASQUE, underlayPsiphon, underlayDirect}; !equalStrings(got, want) {
 		t.Fatalf("active MASQUE candidate order = %v; want %v", got, want)
+	}
+	withIsolatedUserEgress := cfg
+	withIsolatedUserEgress.XrayPsiphon = &XrayPsiphonIntegration{Proxy: "127.0.0.1:21082"}
+	if got, want := adaptiveUnderlayCandidates(withIsolatedUserEgress, ""), []string{underlayMASQUE, underlayPsiphon, underlayDirect}; !equalStrings(got, want) {
+		t.Fatalf("active MASQUE candidate order with isolated Psiphon user egress = %v; want %v", got, want)
 	}
 
 	t.Setenv("FAKE_WARP_SETTINGS", "WARP tunnel protocol: unsupported-protocol")
@@ -1831,6 +1844,71 @@ func TestAdaptiveTransportCandidatesPreferLastSuccessfulPath(t *testing.T) {
 		if len(seen) != len(wantAll) {
 			t.Fatalf("preferred %q candidates miss a path: %v", preferred, got)
 		}
+	}
+}
+
+func TestPsiphonAdaptiveTransportCandidatesExcludeAdjacentConnectPorts(t *testing.T) {
+	want := []string{transportTCP, transportWebSocket}
+	for _, preferred := range []string{"", transportTCP, transportWebSocket, transportHTTP2, transportHTTP1} {
+		got := adaptiveTransportCandidatesForUnderlay(preferred, underlayPsiphon)
+		if len(got) != len(want) {
+			t.Fatalf("Psiphon candidates for preference %q = %v; want only %v", preferred, got, want)
+		}
+		for _, candidate := range got {
+			if candidate != transportTCP && candidate != transportWebSocket {
+				t.Fatalf("Psiphon candidate %q would use a restricted CONNECT port", candidate)
+			}
+		}
+		if preferred == transportTCP || preferred == transportWebSocket {
+			if got[0] != preferred {
+				t.Fatalf("last successful Psiphon-compatible transport %q was not preferred: %v", preferred, got)
+			}
+		}
+	}
+	for _, underlay := range []string{underlayDirect, underlayMASQUE} {
+		got := adaptiveTransportCandidatesForUnderlay(transportHTTP2, underlay)
+		if len(got) != 4 || got[0] != transportHTTP2 {
+			t.Fatalf("non-Psiphon underlay %q lost HTTP CONNECT fallback: %v", underlay, got)
+		}
+	}
+}
+
+func TestPsiphonHubPortRestrictionDoesNotConstrainCustomerMappingPorts(t *testing.T) {
+	for _, port := range []int{53, 80, 443, 465, 587, 993, 995, 8080} {
+		if !isPsiphonAllowedDestinationPort(port) {
+			t.Errorf("Psiphon-documented destination port %d was rejected", port)
+		}
+	}
+	for _, port := range []int{2083, 557, 9449} {
+		if isPsiphonAllowedDestinationPort(port) {
+			t.Errorf("non-approved Psiphon destination port %d was accepted", port)
+		}
+	}
+	cfg := Config{
+		Role:           "agent",
+		Transport:      transportAdaptive,
+		Underlay:       underlayPsiphon,
+		HubAddr:        "hub.example.net:555",
+		PsiphonHubAddr: "hub.example.net:443",
+		PsiphonConfig:  "/etc/ravanreverse/psiphon/s.json",
+		PsiphonProxy:   "127.0.0.1:21082",
+		Token:          strings.Repeat("a", 48),
+		Fingerprint:    strings.Repeat("a", 64),
+		TunnelChannels: 1,
+		// 2083 is a customer-side Xray target port. It must remain unrestricted.
+		Ports: []PortMapping{{ID: "main", Target: "127.0.0.1:2083"}},
+	}
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("customer mapping on port 2083 was incorrectly restricted: %v", err)
+	}
+	cfg.PsiphonHubAddr = "hub.example.net:557"
+	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "Psiphon cannot reach") {
+		t.Fatalf("non-approved Psiphon Hub port was not rejected clearly: %v", err)
+	}
+	cfg.PsiphonHubAddr = "hub.example.net:443"
+	cfg.Transport = transportHTTP1
+	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "adjacent control ports") {
+		t.Fatalf("fixed HTTP/1.1 CONNECT was not rejected for Psiphon: %v", err)
 	}
 }
 
@@ -2224,7 +2302,7 @@ func TestShahTunnelLogoBitmap(t *testing.T) {
 func TestShahTunnelHeaderLayout(t *testing.T) {
 	want := []string{
 		"        +------------------------------------------+",
-		"        |            SHAH TUNNEL 5.0.0             |",
+		"        |            SHAH TUNNEL 5.5.7             |",
 		"        |          SECURE RELAY / TLS 1.3          |",
 		"        +==========================================+",
 		"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -2461,14 +2539,14 @@ func TestTunnelIDIsStableAndSystemdSafe(t *testing.T) {
 }
 
 func TestUploadFlowControlWindowIsExpanded(t *testing.T) {
-	if streamWindowFrames < 256 {
-		t.Fatalf("stream window = %d frames; want at least 256", streamWindowFrames)
+	if streamWindowFrames < 512 {
+		t.Fatalf("stream window = %d frames; want at least 512", streamWindowFrames)
 	}
 	if maxFrame < 64*1024 {
 		t.Fatalf("maximum frame = %d bytes; want at least 64 KiB", maxFrame)
 	}
-	if got := int64(streamWindowFrames) * int64(maxFrame); got < 16<<20 {
-		t.Fatalf("per-stream in-flight window = %d bytes; want at least 16 MiB", got)
+	if got := int64(streamWindowFrames) * int64(maxFrame); got < 32<<20 {
+		t.Fatalf("per-stream in-flight window = %d bytes; want at least 32 MiB", got)
 	}
 	if maxQueuedPayloadBytes < 64<<20 {
 		t.Fatalf("global queued payload budget = %d bytes; want at least 64 MiB", maxQueuedPayloadBytes)
@@ -2638,8 +2716,14 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 		t.Fatalf("sidecar DNS disableCache=%v; repeat lookups should use the Xray cache", dnsConfig["disableCache"])
 	}
 	dnsServers := dnsConfig["servers"].([]any)
-	if len(dnsServers) != 2 || dnsServers[0] != "https://1.1.1.1/dns-query" || dnsServers[1] != "https://8.8.8.8/dns-query" {
-		t.Fatalf("sidecar DNS servers were not normalized: %#v", dnsServers)
+	if len(dnsServers) != 2 || dnsServers[0] != "https://cloudflare-dns.com/dns-query" || dnsServers[1] != "https://dns.google/dns-query" {
+		t.Fatalf("sidecar DNS servers were not normalized for routed DoH: %#v", dnsServers)
+	}
+	if dnsConfig["tag"] != "s1t-warp-warp-profile-dns-in" {
+		t.Fatalf("sidecar must use a unique DNS routing tag, got %v", dnsConfig["tag"])
+	}
+	if dnsConfig["enableParallelQuery"] != false {
+		t.Fatalf("sidecar DNS requests must be serial over the SOCKS tunnel, got %v", dnsConfig["enableParallelQuery"])
 	}
 	outboundsWithDNS := got["outbounds"].([]any)
 	dnsOutboundTag := "s1t-warp-warp-profile-dns-out"
@@ -2662,7 +2746,7 @@ func TestBuildXrayWarpConfigIsolatesOnlyClonedInbound(t *testing.T) {
 		t.Fatalf("client DNS is not intercepted before the default WARP route: %#v", dnsHijack)
 	}
 	dnsEgress := rules[1].(map[string]any)
-	if dnsEgress["inboundTag"].([]any)[0] != "dns_inbound" || dnsEgress["outboundTag"] != outTag {
+	if dnsEgress["inboundTag"].([]any)[0] != "s1t-warp-warp-profile-dns-in" || dnsEgress["outboundTag"] != outTag {
 		t.Fatalf("internal DNS requests are not routed through WARP: %#v", dnsEgress)
 	}
 	first := rules[2].(map[string]any)
@@ -2795,6 +2879,17 @@ func TestBuildXrayPsiphonConfigIsolatesTCPAndBlocksUDP(t *testing.T) {
 	if rules[1].(map[string]any)["outboundTag"] != outTag {
 		t.Fatalf("DNS resolver traffic must use Psiphon SOCKS: %#v", rules[1])
 	}
+	dnsConfig := got["dns"].(map[string]any)
+	if dnsConfig["tag"] != "s1t-psiphon-psiphon-profile-dns-in" {
+		t.Fatalf("Psiphon DNS module must have a unique sidecar tag, got %v", dnsConfig["tag"])
+	}
+	if dnsConfig["enableParallelQuery"] != false {
+		t.Fatalf("Psiphon DNS queries must be serialized, got %v", dnsConfig["enableParallelQuery"])
+	}
+	dnsServers := dnsConfig["servers"].([]any)
+	if len(dnsServers) != 2 || dnsServers[0] != "https://cloudflare-dns.com/dns-query" || dnsServers[1] != "https://dns.google/dns-query" {
+		t.Fatalf("unexpected Psiphon DoH servers: %#v", dnsServers)
+	}
 	tcpRule := rules[2].(map[string]any)
 	if tcpRule["network"] != "tcp" || tcpRule["outboundTag"] != outTag {
 		t.Fatalf("cloned TCP traffic must use Psiphon: %#v", tcpRule)
@@ -2837,7 +2932,7 @@ func TestXrayPsiphonManagedPathsAndUnitAreRestricted(t *testing.T) {
 		"NoNewPrivileges=yes",
 		"PrivateTmp=yes",
 		"ProtectSystem=full",
-		"ProtectHome=yes",
+		"ProtectHome=read-only",
 		"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
 	} {
 		if !strings.Contains(unitText, want) {
@@ -2860,14 +2955,49 @@ func TestHubBalancesMeasuredRTTAndLoad(t *testing.T) {
 		w.lastPongAt.Store(time.Now().UnixNano())
 		return &hubSession{id: id, streams: streams, wire: w}
 	}
-	// The 14ms lane has some load but a lower weighted RTT than the idle 30ms lane.
-	fast := mkSession(1, 32, 14*time.Millisecond)
-	slower := mkSession(2, 0, 30*time.Millisecond)
-	h := &hubServer{sessions: map[*hubSession]struct{}{fast: {}, slower: {}}}
-	for i := 0; i < 20; i++ {
-		if got := h.current(); got != fast {
-			t.Fatalf("selected lane %d (RTT %s, load %d), want the lower weighted RTT lane", got.id, got.wire.roundTripTime(), got.activeStreams())
+	// A small RTT advantage must not outweigh a large queue of established
+	// streams when another healthy lane is available.
+	loadedFast := mkSession(1, 32, 14*time.Millisecond)
+	idleSlower := mkSession(2, 0, 30*time.Millisecond)
+	h := &hubServer{sessions: map[*hubSession]struct{}{loadedFast: {}, idleSlower: {}}}
+	if got := h.current(); got != idleSlower {
+		t.Fatalf("selected lane %d (RTT %s, load %d); want the idle healthy lane %d", got.id, got.wire.roundTripTime(), got.activeStreams(), idleSlower.id)
+	}
+}
+
+func TestHubSpreadsStreamsAcrossFreshRTTLanes(t *testing.T) {
+	const lanes = 12
+	sessions := make([]*hubSession, lanes)
+	set := make(map[*hubSession]struct{}, lanes)
+	for i := 0; i < lanes; i++ {
+		w := &wire{done: make(chan struct{})}
+		w.rttNanos.Store(int64(20 * time.Millisecond))
+		w.lastPongAt.Store(time.Now().UnixNano())
+		sessions[i] = &hubSession{id: uint64(i + 1), streams: make(map[uint32]*hubStream), wire: w}
+		set[sessions[i]] = struct{}{}
+	}
+	h := &hubServer{sessions: set}
+	for streamID := 1; streamID <= 120; streamID++ {
+		selected := h.current()
+		if selected == nil {
+			t.Fatalf("no healthy lane selected for stream %d", streamID)
 		}
+		selected.mu.Lock()
+		selected.streams[uint32(streamID)] = &hubStream{}
+		selected.mu.Unlock()
+	}
+	minLoad, maxLoad := 121, 0
+	for _, session := range sessions {
+		load := session.activeStreams()
+		if load < minLoad {
+			minLoad = load
+		}
+		if load > maxLoad {
+			maxLoad = load
+		}
+	}
+	if maxLoad-minLoad > 1 {
+		t.Fatalf("fresh-RTT scheduler did not balance 120 streams over %d lanes: min=%d max=%d", lanes, minLoad, maxLoad)
 	}
 }
 
@@ -2884,6 +3014,18 @@ func TestHubPrefersFreshRTTOverStaleLowRTT(t *testing.T) {
 	h := &hubServer{sessions: map[*hubSession]struct{}{staleFormerlyFast: {}, freshHealthy: {}}}
 	if got := h.current(); got != freshHealthy {
 		t.Fatalf("selected lane %d; want fresh lane %d despite stale lower RTT", got.id, freshHealthy.id)
+	}
+}
+
+func TestPsiphonAgentLaneReadyInLogsUsesAgentLaneNotConsoleClientNotices(t *testing.T) {
+	if psiphonAgentLaneReadyInLogs("Psiphon ConsoleClient connected\nPsiphon local SOCKS5 listener ready") {
+		t.Fatal("separate Psiphon service notices must not count as an Agent lane")
+	}
+	if !psiphonAgentLaneReadyInLogs("tunnel lane 3/12 connected via tcp_tls over psiphon_socks5; forwarding through 1 configured port mapping(s)") {
+		t.Fatal("an authenticated Agent lane over Psiphon must be recognized")
+	}
+	if psiphonAgentLaneReadyInLogs("tunnel lane 3: transport tcp_tls failed on psiphon_socks5; trying websocket_tls") {
+		t.Fatal("a transport retry must not count as a connected lane")
 	}
 }
 
@@ -2928,8 +3070,11 @@ func TestPsiphonSupervisorPreparedBeforeAgentServiceStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(psiphonSource), `Requires=%s\nAfter=%s\n`) {
-		t.Fatal("Agent must have systemd Requires/After ordering for the Psiphon service")
+	if !strings.Contains(string(psiphonSource), `Wants=%s\nAfter=%s\n`) {
+		t.Fatal("Agent must pull in Psiphon with Wants/After ordering without being stopped when Psiphon restarts")
+	}
+	if strings.Contains(string(psiphonSource), `Requires=%s\nAfter=%s\n`) {
+		t.Fatal("Agent must not use Requires for Psiphon: Psiphon restarts must not terminate Agent lanes")
 	}
 }
 
