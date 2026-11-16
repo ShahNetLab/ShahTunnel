@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.5.2"
+	version                          = "5.5.0"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -67,14 +67,10 @@ const (
 	transportHTTP2                   = "http2_connect"
 	transportHTTP1                   = "http1_connect"
 	transportHTTPConnectAuto         = "http_connect_auto"
-	transportTUIC                    = "tuic_v5"
-	transportTrojan                  = "trojan"
 	underlayDirect                   = "direct"
 	underlayMASQUE                   = "warp_masque"
 	underlayPsiphon                  = "psiphon_socks5"
 	underlayAdaptive                 = "adaptive_external"
-	underlaySingBox                  = "singbox_proxy"
-	proxyAdaptiveAll                 = "adaptive_all"
 	http2TokenHeader                 = "X-S1T-Token"
 	controlALPN                      = "shah-tunnel-control/1"
 	webSocketPath                    = "/s1t-tunnel"
@@ -86,7 +82,6 @@ const (
 )
 
 var (
-	singBoxRuntimeDir       = "/run/shah-tunnel"
 	errMaxConcurrentStreams = errors.New("maximum concurrent stream limit reached")
 	errHubLaneClosed        = errors.New("tunnel lane is closed")
 )
@@ -138,21 +133,10 @@ type Config struct {
 	Fingerprint    string `json:"fingerprint,omitempty"`
 	// TunnelChannels controls the number of independent authenticated TCP/TLS lanes
 	// between Agent and Hub. Missing values on old configs are upgraded in memory to the current default.
-	TunnelChannels      int                     `json:"tunnel_channels,omitempty"`
-	Ports               []PortMapping           `json:"ports,omitempty"`
-	XrayWARP            *XrayWarpIntegration    `json:"xray_warp,omitempty"`
-	XrayPsiphon         *XrayPsiphonIntegration `json:"xray_psiphon,omitempty"`
-	ProxyProtocol       string                  `json:"proxy_protocol,omitempty"` // sing-box transport: tuic_v5 or trojan
-	ProxyListen         string                  `json:"proxy_listen,omitempty"`   // Hub sing-box inbound listen address
-	ProxyPort           int                     `json:"proxy_port,omitempty"`     // TUIC/Trojan UDP or TCP port
-	ProxyPassword       string                  `json:"proxy_password,omitempty"`
-	ProxyUUID           string                  `json:"proxy_uuid,omitempty"`   // TUIC UUID
-	ProxyServer         string                  `json:"proxy_server,omitempty"` // Agent remote server hostname/IP
-	ProxySocks          string                  `json:"proxy_socks,omitempty"`  // Agent local sing-box SOCKS listener
-	ProxyPin            string                  `json:"proxy_pin,omitempty"`    // Base64 SHA-256 SPKI pin for sing-box TLS
-	ProxyTrojanListen   string                  `json:"proxy_trojan_listen,omitempty"`
-	ProxyTrojanPort     int                     `json:"proxy_trojan_port,omitempty"`
-	ProxyTrojanPassword string                  `json:"proxy_trojan_password,omitempty"`
+	TunnelChannels int                     `json:"tunnel_channels,omitempty"`
+	Ports          []PortMapping           `json:"ports,omitempty"`
+	XrayWARP       *XrayWarpIntegration    `json:"xray_warp,omitempty"`
+	XrayPsiphon    *XrayPsiphonIntegration `json:"xray_psiphon,omitempty"`
 }
 
 type RuntimeSnapshot struct {
@@ -671,7 +655,7 @@ func validTransportMode(mode string) bool {
 }
 
 func validUnderlayMode(mode string) bool {
-	return mode == underlayDirect || mode == underlayMASQUE || mode == underlayPsiphon || mode == underlayAdaptive || mode == underlaySingBox
+	return mode == underlayDirect || mode == underlayMASQUE || mode == underlayPsiphon || mode == underlayAdaptive
 }
 
 func isLoopbackProxyAddress(address string) bool {
@@ -2602,14 +2586,6 @@ func acceptRetryDelay(attempt int) time.Duration {
 
 func runHub(cfg Config) error {
 	cfg = normalizeConfig(cfg)
-	if cfg.ProxyProtocol != "" {
-		cleanup, err := startSingBox(cfg, true)
-		if err != nil {
-			return fmt.Errorf("start TUIC/Trojan Hub endpoint: %w", err)
-		}
-		defer cleanup()
-		log.Printf("sing-box %s Hub endpoint active; TUIC=%s Trojan=%s", cfg.ProxyProtocol, cfg.ProxyListen, cfg.ProxyTrojanListen)
-	}
 	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
 	if err != nil {
 		return fmt.Errorf("load hub certificate/key: %w; run setup again", err)
@@ -2848,17 +2824,6 @@ func validAuth(line, token string) bool { return authProtocol(line, token) != ""
 
 func runAgent(cfg Config) error {
 	cfg = normalizeConfig(cfg)
-	if cfg.ProxyProtocol != "" {
-		cleanup, err := startSingBox(cfg, false)
-		if err != nil {
-			return fmt.Errorf("start TUIC/Trojan Agent endpoint: %w", err)
-		}
-		defer cleanup()
-		if cfg.Underlay != underlayAdaptive {
-			cfg.Underlay = underlaySingBox
-		}
-		log.Printf("sing-box %s Agent outbound active through loopback SOCKS5 %s", cfg.ProxyProtocol, cfg.ProxySocks)
-	}
 	var cleanupUnderlay func()
 	cleanupUnderlay = func() {}
 	switch cfg.Underlay {
@@ -2986,7 +2951,7 @@ func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
 	// Other WARP protocols are never selected by adaptive routing.
 	warpMode := detectActiveWarpUnderlay()
 	usesPsiphon := strings.TrimSpace(cfg.PsiphonConfig) != ""
-	all := make([]string, 0, 4)
+	all := make([]string, 0, 3)
 	appendCandidate := func(candidate string) {
 		if candidate == underlayPsiphon && !usesPsiphon {
 			return
@@ -3005,24 +2970,16 @@ func adaptiveUnderlayCandidates(cfg Config, preferred string) []string {
 	if warpMode != "" {
 		appendCandidate(warpMode)
 		appendCandidate(underlayPsiphon)
-		if cfg.ProxyProtocol == proxyAdaptiveAll {
-			appendCandidate(underlaySingBox)
-		}
 		appendCandidate(underlayDirect)
 		return all
 	}
 	switch preferred {
 	case underlayPsiphon, underlayMASQUE:
 		appendCandidate(underlayPsiphon)
-	case underlaySingBox:
-		appendCandidate(underlaySingBox)
 	case underlayDirect, "":
 		appendCandidate(underlayDirect)
 	}
 	appendCandidate(underlayPsiphon)
-	if cfg.ProxyProtocol == proxyAdaptiveAll {
-		appendCandidate(underlaySingBox)
-	}
 	appendCandidate(underlayDirect)
 	return all
 }
@@ -3204,15 +3161,6 @@ func dialAgentUnderlay(ctx context.Context, cfg Config, network, address string)
 	switch cfg.Underlay {
 	case underlayPsiphon:
 		return dialSOCKS5Context(ctx, cfg.PsiphonProxy, address)
-	case underlaySingBox:
-		// Preserve the requested listener port (control, HTTP/2 +1, HTTP/1.1 +2)
-		// but force the destination host to loopback on the Hub. This keeps every
-		// native ShahTunnel transport inside the authenticated TUIC/Trojan tunnel.
-		_, port, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, fmt.Errorf("invalid Hub transport address: %w", err)
-		}
-		return dialSOCKS5Context(ctx, cfg.ProxySocks, net.JoinHostPort("127.0.0.1", port))
 	case underlayMASQUE:
 		proxyAddress, localProxyMode, err := warpProxyAddressFromCLI()
 		if err != nil {
@@ -3808,9 +3756,6 @@ func normalizeConfig(c Config) Config {
 		if c.PsiphonProxy == "" {
 			c.PsiphonProxy = "127.0.0.1:1080"
 		}
-		if c.ProxySocks == "" && c.ProxyProtocol != "" {
-			c.ProxySocks = defaultSingBoxSocksAddress(c.Name)
-		}
 		if c.PsiphonClient == "" {
 			c.PsiphonClient = "ConsoleClient"
 		}
@@ -3847,284 +3792,6 @@ func normalizeConfig(c Config) Config {
 	return c
 }
 
-// validUUID/newUUID keep TUIC credentials compatible with sing-box's UUID user format.
-func validUUID(value string) bool {
-	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
-		return false
-	}
-	compact := strings.ReplaceAll(value, "-", "")
-	_, err := hex.DecodeString(compact)
-	return err == nil
-}
-func newUUID() (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	h := hex.EncodeToString(b)
-	return h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:], nil
-}
-
-func singBoxBinary() (string, error) {
-	path, err := exec.LookPath("sing-box")
-	if err != nil {
-		return "", errors.New("sing-box is required for TUIC v5/Trojan; install the official sing-box package first")
-	}
-	out, err := exec.Command(path, "version").CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("cannot verify sing-box version: %w", err)
-	}
-	versionText := ""
-	for _, field := range strings.Fields(string(out)) {
-		if len(field) > 0 && field[0] >= '0' && field[0] <= '9' {
-			versionText = field
-			break
-		}
-	}
-	parts := strings.Split(versionText, ".")
-	if len(parts) < 2 {
-		return "", fmt.Errorf("unrecognized sing-box version output: %s", strings.TrimSpace(string(out)))
-	}
-	major, _ := strconv.Atoi(parts[0])
-	minorText := strings.TrimRightFunc(parts[1], func(r rune) bool { return r < '0' || r > '9' })
-	minor, _ := strconv.Atoi(minorText)
-	if major < 1 || (major == 1 && minor < 13) {
-		return "", fmt.Errorf("sing-box %s is too old; version 1.13.0 or newer is required for TLS public-key pinning", versionText)
-	}
-	return path, nil
-}
-
-func singBoxTLSKeyPin(certPath string) (string, error) {
-	data, err := os.ReadFile(certPath)
-	if err != nil {
-		return "", err
-	}
-	block, _ := pem.Decode(data)
-	if block == nil {
-		return "", errors.New("invalid Hub certificate PEM")
-	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return "", err
-	}
-	der, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(der)
-	return base64.StdEncoding.EncodeToString(sum[:]), nil
-}
-
-func singBoxProtocolType(protocol string) string {
-	if protocol == transportTUIC {
-		return "tuic"
-	}
-	if protocol == transportTrojan {
-		return "trojan"
-	}
-	return ""
-}
-
-func defaultSingBoxSocksAddress(profileName string) string {
-	seed := sha256.Sum256([]byte(tunnelID(profileName)))
-	port := 19000 + int(binary.BigEndian.Uint16(seed[:2])%10000)
-	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-}
-
-func singBoxConfigPath(cfg Config) string {
-	name := tunnelID(cfg.Name)
-	if name == "" {
-		name = "default"
-	}
-	return filepath.Join(singBoxRuntimeDir, "singbox-"+name+".json")
-}
-
-func writeSingBoxConfig(cfg Config, hub bool) (string, error) {
-	if _, err := singBoxBinary(); err != nil {
-		return "", err
-	}
-	var document map[string]interface{}
-	if hub {
-		inbounds := make([]interface{}, 0, 2)
-		addInbound := func(protocol, tag, listen string, port int, password, uuid string) error {
-			host, _, err := net.SplitHostPort(listen)
-			if err != nil {
-				return fmt.Errorf("invalid Hub %s listener: %w", protocol, err)
-			}
-			tls := map[string]interface{}{"enabled": true, "certificate_path": cfg.CertFile, "key_path": cfg.KeyFile}
-			inbound := map[string]interface{}{"type": singBoxProtocolType(protocol), "tag": tag, "listen": host, "listen_port": port, "tls": tls}
-			if protocol == transportTUIC {
-				inbound["users"] = []interface{}{map[string]interface{}{"name": "shah-tunnel", "uuid": uuid, "password": password}}
-				inbound["congestion_control"] = "bbr"
-				inbound["zero_rtt_handshake"] = false
-				tls["alpn"] = []string{"h3"}
-			} else {
-				inbound["users"] = []interface{}{map[string]interface{}{"name": "shah-tunnel", "password": password}}
-			}
-			inbounds = append(inbounds, inbound)
-			return nil
-		}
-		if cfg.ProxyProtocol == proxyAdaptiveAll {
-			if err := addInbound(transportTUIC, "shah-tuic-in", cfg.ProxyListen, cfg.ProxyPort, cfg.ProxyPassword, cfg.ProxyUUID); err != nil {
-				return "", err
-			}
-			if err := addInbound(transportTrojan, "shah-trojan-in", cfg.ProxyTrojanListen, cfg.ProxyTrojanPort, cfg.ProxyTrojanPassword, ""); err != nil {
-				return "", err
-			}
-		} else {
-			if err := addInbound(cfg.ProxyProtocol, "shah-proxy-in", cfg.ProxyListen, cfg.ProxyPort, cfg.ProxyPassword, cfg.ProxyUUID); err != nil {
-				return "", err
-			}
-		}
-		document = map[string]interface{}{"log": map[string]interface{}{"level": "info", "timestamp": true}, "inbounds": inbounds, "outbounds": []interface{}{map[string]interface{}{"type": "direct", "tag": "direct"}}}
-	} else {
-		if cfg.ProxyPin == "" {
-			return "", errors.New("sing-box TLS public-key pin is missing; copy the pin shown by Hub setup")
-		}
-		tlsOptions := func(alpn []string) map[string]interface{} {
-			options := map[string]interface{}{"enabled": true, "server_name": cfg.TLSServerName, "insecure": false, "certificate_public_key_sha256": []string{cfg.ProxyPin}}
-			if len(alpn) > 0 {
-				options["alpn"] = alpn
-			}
-			return options
-		}
-		makeOutbound := func(protocol, tag string, port int, password, uuid string) map[string]interface{} {
-			outbound := map[string]interface{}{"type": singBoxProtocolType(protocol), "tag": tag, "server": cfg.ProxyServer, "server_port": port, "password": password, "tls": tlsOptions(nil)}
-			if protocol == transportTUIC {
-				outbound["uuid"] = uuid
-				outbound["congestion_control"] = "bbr"
-				outbound["udp_relay_mode"] = "native"
-				outbound["zero_rtt_handshake"] = false
-				outbound["tls"] = tlsOptions([]string{"h3"})
-			}
-			return outbound
-		}
-		outbounds := make([]interface{}, 0, 4)
-		finalOutbound := "shah-proxy-out"
-		if cfg.ProxyProtocol == proxyAdaptiveAll {
-			outbounds = append(outbounds, makeOutbound(transportTUIC, "shah-tuic-out", cfg.ProxyPort, cfg.ProxyPassword, cfg.ProxyUUID))
-			outbounds = append(outbounds, makeOutbound(transportTrojan, "shah-trojan-out", cfg.ProxyTrojanPort, cfg.ProxyTrojanPassword, ""))
-			outbounds = append(outbounds, map[string]interface{}{"type": "urltest", "tag": "shah-proxy-auto", "outbounds": []string{"shah-tuic-out", "shah-trojan-out"}, "url": "https://cp.cloudflare.com/generate_204", "interval": "20s", "tolerance": 100, "interrupt_exist_connections": true})
-			finalOutbound = "shah-proxy-auto"
-		} else {
-			outbounds = append(outbounds, makeOutbound(cfg.ProxyProtocol, "shah-proxy-out", cfg.ProxyPort, cfg.ProxyPassword, cfg.ProxyUUID))
-		}
-		outbounds = append(outbounds, map[string]interface{}{"type": "direct", "tag": "direct"})
-		_, socksPortText, socksErr := net.SplitHostPort(cfg.ProxySocks)
-		if socksErr != nil {
-			return "", fmt.Errorf("invalid local SOCKS5 address: %w", socksErr)
-		}
-		socksPort, _ := strconv.Atoi(socksPortText)
-		socksHost, _, _ := net.SplitHostPort(cfg.ProxySocks)
-		inbound := map[string]interface{}{"type": "socks", "tag": "shah-local-socks", "listen": socksHost, "listen_port": socksPort}
-		document = map[string]interface{}{"log": map[string]interface{}{"level": "info", "timestamp": true}, "inbounds": []interface{}{inbound}, "outbounds": outbounds, "route": map[string]interface{}{"final": finalOutbound}}
-	}
-	if err := os.MkdirAll(singBoxRuntimeDir, 0700); err != nil {
-		return "", err
-	}
-	path := singBoxConfigPath(cfg)
-	b, err := json.MarshalIndent(document, "", "  ")
-	if err != nil {
-		return "", err
-	}
-	if err = os.WriteFile(path, b, 0600); err != nil {
-		return "", err
-	}
-	return path, nil
-}
-
-func startSingBox(cfg Config, hub bool) (func(), error) {
-	path, err := writeSingBoxConfig(cfg, hub)
-	if err != nil {
-		return nil, err
-	}
-	bin, err := singBoxBinary()
-	if err != nil {
-		return nil, err
-	}
-	check := exec.Command(bin, "check", "-c", path)
-	if out, e := check.CombinedOutput(); e != nil {
-		return nil, fmt.Errorf("sing-box rejected generated config: %w: %s", e, strings.TrimSpace(string(out)))
-	}
-	cmd := exec.Command(bin, "run", "-c", path)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err = cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start sing-box: %w", err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	cleanup := func() {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
-		}
-		_ = os.Remove(path)
-	}
-	if hub {
-		if cfg.ProxyProtocol == transportTUIC {
-			select {
-			case e := <-done:
-				return nil, fmt.Errorf("sing-box exited during startup: %v", e)
-			case <-time.After(700 * time.Millisecond):
-			}
-		} else {
-			probePort := cfg.ProxyPort
-			if cfg.ProxyProtocol == proxyAdaptiveAll {
-				probePort = cfg.ProxyTrojanPort
-			}
-			address := net.JoinHostPort("127.0.0.1", strconv.Itoa(probePort))
-			ready := false
-			deadline := time.Now().Add(8 * time.Second)
-			for time.Now().Before(deadline) {
-				select {
-				case e := <-done:
-					return nil, fmt.Errorf("sing-box exited during startup: %v", e)
-				default:
-				}
-				c, e := net.DialTimeout("tcp", address, 250*time.Millisecond)
-				if e == nil {
-					_ = c.Close()
-					ready = true
-					break
-				}
-				time.Sleep(150 * time.Millisecond)
-			}
-			if !ready {
-				cleanup()
-				return nil, errors.New("sing-box Trojan listener did not become ready")
-			}
-		}
-	} else {
-		ready := false
-		deadline := time.Now().Add(8 * time.Second)
-		for time.Now().Before(deadline) {
-			select {
-			case e := <-done:
-				return nil, fmt.Errorf("sing-box exited during startup: %v", e)
-			default:
-			}
-			c, e := net.DialTimeout("tcp", cfg.ProxySocks, 250*time.Millisecond)
-			if e == nil {
-				_ = c.Close()
-				ready = true
-				break
-			}
-			time.Sleep(150 * time.Millisecond)
-		}
-		if !ready {
-			cleanup()
-			return nil, errors.New("sing-box local SOCKS5 listener did not become ready")
-		}
-	}
-	return cleanup, nil
-}
-
 // validTLSServerName accepts a DNS hostname for TLS SNI. It intentionally does
 // not accept URL syntax, IP literals, whitespace, or wildcard names.
 func validTLSServerName(name string) bool {
@@ -4143,13 +3810,6 @@ func validTLSServerName(name string) bool {
 		}
 	}
 	return true
-}
-
-func validTLSNameOrIP(name string) bool {
-	if ip := net.ParseIP(strings.TrimSpace(name)); ip != nil && strings.TrimSpace(name) == name {
-		return true
-	}
-	return validTLSServerName(name)
 }
 
 func validateConfig(c Config) error {
@@ -4186,71 +3846,6 @@ func validateConfig(c Config) error {
 			}
 		}
 	}
-	if c.ProxyProtocol != "" && c.Role != "hub" && c.Role != "agent" {
-		return errors.New("TUIC/Trojan sing-box transport is supported only for Hub and Agent roles")
-	}
-	if c.ProxyProtocol != "" && c.ProxyProtocol != transportTUIC && c.ProxyProtocol != transportTrojan && c.ProxyProtocol != proxyAdaptiveAll {
-		return fmt.Errorf("unsupported sing-box protocol %q", c.ProxyProtocol)
-	}
-	if c.ProxyProtocol != "" {
-		if c.ProxyPort < 1 || c.ProxyPort > 65535 || len(c.ProxyPassword) < 16 || strings.ContainsAny(c.ProxyPassword, "\r\n\x00") {
-			return errors.New("TUIC/Trojan requires a valid port and a password of at least 16 characters")
-		}
-		if c.ProxyProtocol == transportTUIC || c.ProxyProtocol == proxyAdaptiveAll {
-			if !validUUID(c.ProxyUUID) {
-				return errors.New("TUIC requires a valid UUID")
-			}
-		}
-		if c.ProxyProtocol == proxyAdaptiveAll {
-			if c.ProxyTrojanPort < 1 || c.ProxyTrojanPort > 65535 || len(c.ProxyTrojanPassword) < 16 || strings.ContainsAny(c.ProxyTrojanPassword, "\r\n\x00") {
-				return errors.New("adaptive TUIC/Trojan requires a valid Trojan port and password of at least 16 characters")
-			}
-		}
-		if c.Role == "hub" {
-			if !validTLSNameOrIP(c.TLSServerName) {
-				return errors.New("Hub TUIC/Trojan requires a public TLS hostname or IP to place in the certificate SAN")
-			}
-			if err := validateTCPAddress("TUIC/Trojan listener", c.ProxyListen); err != nil {
-				return err
-			}
-			_, portText, _ := net.SplitHostPort(c.ProxyListen)
-			port, _ := strconv.Atoi(portText)
-			if port != c.ProxyPort {
-				return errors.New("ProxyPort must match the port in ProxyListen")
-			}
-			if c.ProxyProtocol == proxyAdaptiveAll {
-				if err := validateTCPAddress("Trojan listener", c.ProxyTrojanListen); err != nil {
-					return err
-				}
-				_, trojanText, _ := net.SplitHostPort(c.ProxyTrojanListen)
-				trojanPort, _ := strconv.Atoi(trojanText)
-				if trojanPort != c.ProxyTrojanPort {
-					return errors.New("ProxyTrojanPort must match the port in ProxyTrojanListen")
-				}
-			}
-		}
-		if c.Role == "agent" {
-			if (c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive) && c.PsiphonProxy != "" && listenAddressesConflict(c.ProxySocks, c.PsiphonProxy) {
-				return errors.New("sing-box and Psiphon local SOCKS listeners must use different loopback ports")
-			}
-			if c.ProxyServer == "" || !isLoopbackProxyAddress(c.ProxySocks) {
-				return errors.New("TUIC/Trojan Agent requires a server address and loopback SOCKS listener")
-			}
-			if err := validateTCPAddress("TUIC/Trojan server", net.JoinHostPort(c.ProxyServer, strconv.Itoa(c.ProxyPort))); err != nil {
-				return err
-			}
-			if c.ProxyProtocol == proxyAdaptiveAll {
-				if err := validateTCPAddress("Trojan server", net.JoinHostPort(c.ProxyServer, strconv.Itoa(c.ProxyTrojanPort))); err != nil {
-					return err
-				}
-			}
-			pin, err := base64.StdEncoding.DecodeString(c.ProxyPin)
-			if err != nil || len(pin) != sha256.Size || !validTLSNameOrIP(c.TLSServerName) {
-				return errors.New("TUIC/Trojan Agent requires the Hub certificate SAN hostname/IP and SHA-256 public-key pin")
-			}
-		}
-	}
-
 	if len(c.Token) < 48 || len(c.Token) > 240 || strings.ContainsAny(c.Token, "\r\n") {
 		return errors.New("token must be 48–240 characters and contain no line breaks")
 	}
@@ -4275,37 +3870,20 @@ func validateConfig(c Config) error {
 				return fmt.Errorf("HTTP/1.1 CONNECT port: %w", err)
 			}
 		}
-
-		// Check actual TCP socket collisions, not numeric port reservations.
-		// Different local addresses may use the same port, and TUIC (UDP)
-		// may share a number with a TCP mapping. Wildcard addresses conflict
-		// with every address on the same port and network.
-		tcpListeners := []string{c.ControlListen}
-		if c.ProxyProtocol == transportTrojan {
-			tcpListeners = append(tcpListeners, c.ProxyListen)
-		}
-		if c.ProxyProtocol == proxyAdaptiveAll {
-			tcpListeners = append(tcpListeners, c.ProxyTrojanListen)
-		}
+		_, controlPortText, _ := net.SplitHostPort(c.ControlListen)
+		controlPort, _ := strconv.Atoi(controlPortText)
+		reservedPorts := map[int]bool{controlPort: true}
 		if transportModeAllowsHTTP2(c.Transport) {
-			if addr, err := adjacentPortAddress(c.ControlListen); err == nil {
-				tcpListeners = append(tcpListeners, addr)
-			}
+			h2Addr, _ := adjacentPortAddress(c.ControlListen)
+			_, pText, _ := net.SplitHostPort(h2Addr)
+			p, _ := strconv.Atoi(pText)
+			reservedPorts[p] = true
 		}
 		if transportModeAllowsHTTP1(c.Transport) {
-			if addr, err := secondAdjacentPortAddress(c.ControlListen); err == nil {
-				tcpListeners = append(tcpListeners, addr)
-			}
-		}
-		for i, listener := range tcpListeners {
-			if strings.TrimSpace(listener) == "" {
-				continue
-			}
-			for j := 0; j < i; j++ {
-				if strings.TrimSpace(tcpListeners[j]) != "" && listenAddressesConflict(listener, tcpListeners[j]) {
-					return fmt.Errorf("TCP listener %s conflicts with another TCP listener %s on the same local address", listener, tcpListeners[j])
-				}
-			}
+			h1Addr, _ := secondAdjacentPortAddress(c.ControlListen)
+			_, pText, _ := net.SplitHostPort(h1Addr)
+			p, _ := strconv.Atoi(pText)
+			reservedPorts[p] = true
 		}
 		for _, p := range c.Ports {
 			if !validMappingID(p.ID) {
@@ -4318,18 +3896,10 @@ func validateConfig(c Config) error {
 			if err := validateTCPAddress("listen for mapping "+p.ID, p.Listen); err != nil {
 				return err
 			}
-			for _, listener := range tcpListeners {
-				if strings.TrimSpace(listener) != "" && listenAddressesConflict(p.Listen, listener) {
-					return fmt.Errorf("mapping %q listen address %s conflicts with TCP listener %s on the same local address", p.ID, p.Listen, listener)
-				}
-			}
-			for _, existing := range c.Ports {
-				if existing.ID == p.ID {
-					break
-				}
-				if listenAddressesConflict(p.Listen, existing.Listen) {
-					return fmt.Errorf("mapping %q listen address %s conflicts with mapping %q (%s)", p.ID, p.Listen, existing.ID, existing.Listen)
-				}
+			_, lpText, _ := net.SplitHostPort(p.Listen)
+			lp, _ := strconv.Atoi(lpText)
+			if reservedPorts[lp] {
+				return fmt.Errorf("mapping %q uses reserved control/transport port %s", p.ID, lpText)
 			}
 			if addrs[p.Listen] {
 				return fmt.Errorf("duplicate listen address %q", p.Listen)
@@ -4345,14 +3915,8 @@ func validateConfig(c Config) error {
 				return err
 			}
 		}
-		if c.TLSServerName != "" {
-			validName := validTLSServerName(c.TLSServerName)
-			if c.ProxyProtocol != "" {
-				validName = validTLSNameOrIP(c.TLSServerName)
-			}
-			if !validName {
-				return errors.New("tls_server_name must be a valid DNS hostname (or an IP SAN when using TUIC/Trojan)")
-			}
+		if c.TLSServerName != "" && !validTLSServerName(c.TLSServerName) {
+			return errors.New("tls_server_name must be a DNS hostname (no URL, port, IP, or whitespace)")
 		}
 		for _, p := range c.Ports {
 			if !validMappingID(p.ID) {
@@ -4633,15 +4197,9 @@ func listTunnelProfiles() ([]TunnelProfile, error) {
 
 func profileListenAddresses(c Config) []string {
 	c = normalizeConfig(c)
-	addresses := make([]string, 0, len(c.Ports)+4)
+	addresses := make([]string, 0, len(c.Ports)+3)
 	switch c.Role {
 	case "hub":
-		if c.ProxyProtocol != "" && c.ProxyPort > 0 {
-			addresses = append(addresses, c.ProxyListen)
-		}
-		if c.ProxyProtocol == proxyAdaptiveAll && c.ProxyTrojanPort > 0 {
-			addresses = append(addresses, c.ProxyTrojanListen)
-		}
 		if c.ControlListen != "" {
 			addresses = append(addresses, c.ControlListen)
 			if transportModeAllowsHTTP2(c.Transport) {
@@ -4659,10 +4217,6 @@ func profileListenAddresses(c Config) []string {
 			if mapping.Listen != "" {
 				addresses = append(addresses, mapping.Listen)
 			}
-		}
-	case "agent":
-		if c.ProxyProtocol != "" && c.ProxySocks != "" {
-			addresses = append(addresses, c.ProxySocks)
 		}
 	case "relay":
 		for _, mapping := range c.Ports {
@@ -4685,59 +4239,9 @@ func listenAddressesConflict(a, b string) bool {
 	return ha == hb || wildcard(ha) || wildcard(hb)
 }
 
-type profileListenEndpoint struct {
-	Address string
-	Network string // "tcp" or "udp"
-}
-
-// profileListenEndpoints keeps transport protocols distinct: a TCP mapping
-// may share a numeric port with a TUIC UDP listener, but not with Trojan TCP.
-func profileListenEndpoints(c Config) []profileListenEndpoint {
-	var endpoints []profileListenEndpoint
-	add := func(address, network string) {
-		if strings.TrimSpace(address) != "" {
-			endpoints = append(endpoints, profileListenEndpoint{Address: address, Network: network})
-		}
-	}
-	switch c.Role {
-	case "hub":
-		if c.ProxyProtocol == transportTUIC || c.ProxyProtocol == proxyAdaptiveAll {
-			add(c.ProxyListen, "udp")
-		} else if c.ProxyProtocol == transportTrojan {
-			add(c.ProxyListen, "tcp")
-		}
-		if c.ProxyProtocol == proxyAdaptiveAll {
-			add(c.ProxyTrojanListen, "tcp")
-		}
-		add(c.ControlListen, "tcp")
-		if transportModeAllowsHTTP2(c.Transport) {
-			if addr, err := adjacentPortAddress(c.ControlListen); err == nil {
-				add(addr, "tcp")
-			}
-		}
-		if transportModeAllowsHTTP1(c.Transport) {
-			if addr, err := secondAdjacentPortAddress(c.ControlListen); err == nil {
-				add(addr, "tcp")
-			}
-		}
-		for _, mapping := range c.Ports {
-			add(mapping.Listen, "tcp")
-		}
-	case "agent":
-		if c.ProxyProtocol != "" {
-			add(c.ProxySocks, "tcp")
-		}
-	case "relay":
-		for _, mapping := range c.Ports {
-			add(mapping.Listen, "tcp")
-		}
-	}
-	return endpoints
-}
-
 func ensureNoPortConflicts(c Config, skipPath string) error {
-	newEndpoints := profileListenEndpoints(c)
-	if len(newEndpoints) == 0 {
+	newAddresses := profileListenAddresses(c)
+	if len(newAddresses) == 0 {
 		return nil
 	}
 	profiles, err := listTunnelProfiles()
@@ -4756,10 +4260,10 @@ func ensureNoPortConflicts(c Config, skipPath string) error {
 		if json.Unmarshal(data, &existing) != nil {
 			continue
 		}
-		for _, newEndpoint := range newEndpoints {
-			for _, oldEndpoint := range profileListenEndpoints(existing) {
-				if newEndpoint.Network == oldEndpoint.Network && listenAddressesConflict(newEndpoint.Address, oldEndpoint.Address) {
-					return fmt.Errorf("%s listen address %s conflicts with tunnel %q (%s); choose a different port. Existing tunnel remains unchanged", newEndpoint.Network, newEndpoint.Address, profile.Name, oldEndpoint.Address)
+		for _, newAddr := range newAddresses {
+			for _, oldAddr := range profileListenAddresses(existing) {
+				if listenAddressesConflict(newAddr, oldAddr) {
+					return fmt.Errorf("listen address %s conflicts with tunnel %q (%s); choose a different port. Existing tunnel remains unchanged", newAddr, profile.Name, oldAddr)
 				}
 			}
 		}
@@ -4802,9 +4306,7 @@ LockPersonality=true
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
-RuntimeDirectory=shah-tunnel
-RuntimeDirectoryMode=0700
-ReadWritePaths=/etc/ravanreverse /var/lib/shah-tunnel/psiphon /run/shah-tunnel
+ReadWritePaths=/etc/ravanreverse /var/lib/shah-tunnel/psiphon
 [Install]
 WantedBy=multi-user.target
 `
@@ -5036,7 +4538,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.5.2             |",
+	"        |            SHAH TUNNEL 5.5.0             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -5214,9 +4716,8 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 	fmt.Printf("  %s\n", "6) Automatic fallback — TCP/TLS, then WebSocket/TLS")
 	fmt.Printf("  %s\n", paint(ansiPinkGlow, "7) FULL ADAPTIVE FAILOVER — all 4 implemented transports"))
 	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "8) EXTERNAL EGRESS — Cloudflare MASQUE / Psiphon"))
-	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) ALL-PROTOCOL ADAPTIVE — native transports + TUIC v5 + Trojan + egress failover"))
-	fmt.Printf("  %s\n", paint(ansiCyan+ansiBold, "10) NEW PROTOCOLS — TUIC v5 / Trojan via sing-box (real protocol endpoints)"))
-	choice := wizardAsk(prompt+" (1-10)", "7")
+	fmt.Printf("  %s\n", paint(ansiPinkGlow, "9) ALL-PROTOCOL ADAPTIVE — 4 transports + Psiphon user egress + lane failover"))
+	choice := wizardAsk(prompt+" (1-9)", "7")
 	switch choice {
 	case "1":
 		return transportTCP, underlayDirect, "", nil
@@ -5256,29 +4757,16 @@ func wizardAskTransport(prompt string, role string) (string, string, string, err
 		default:
 			return "", "", "", errors.New("invalid external egress selection; enter 1 or 2")
 		}
-	case "10":
-		fmt.Printf("\n  %s\n", paint(ansiCyan+ansiBold, "SING-BOX PROTOCOL"))
-		fmt.Println("  1) TUIC v5 — QUIC/UDP + TLS")
-		fmt.Println("  2) Trojan — TCP + TLS")
-		sub := wizardAsk("Select protocol (1/2)", "1")
-		switch sub {
-		case "1":
-			return transportAdaptive, underlaySingBox, transportTUIC, nil
-		case "2":
-			return transportAdaptive, underlaySingBox, transportTrojan, nil
-		default:
-			return "", "", "", errors.New("invalid sing-box protocol selection")
-		}
 	case "9":
 		if role != "agent" {
-			uiInfo("Hub will expose all native ShahTunnel transports plus TUIC v5 and Trojan listeners. Configure option 9 on the matching Agent to enable automatic protocol and egress failover.")
-			return transportAdaptive, underlayDirect, proxyAdaptiveAll, nil
+			uiInfo("Hub accepts all four inner transports. Configure option 9 on the Agent for Psiphon user TCP/DNS egress and adaptive Agent-to-Hub lane failover.")
+			return transportAdaptive, underlayDirect, "", nil
 		}
-		// Option 9 runs both sing-box protocols under an automatic health-tested
-		// selector, plus the existing Direct/Psiphon/MASQUE egress candidates.
-		return transportAdaptive, underlayAdaptive, proxyAdaptiveAll, nil
+		// Option 9 provisions Psiphon for mapped user TCP/DNS and also retains
+		// independent Direct/Psiphon/active-MASQUE failover for Agent-to-Hub lanes.
+		return transportAdaptive, underlayAdaptive, "", nil
 	default:
-		return "", "", "", errors.New("invalid transport selection; enter a number from 1 to 10")
+		return "", "", "", errors.New("invalid transport selection; enter a number from 1 to 9")
 	}
 }
 
@@ -5331,11 +4819,7 @@ func uiCard(title string, rows []uiCardRow, _ string) {
 	}
 	fmt.Printf("  %s\n", border("╰"+strings.Repeat("─", width+2)+"╯"))
 }
-func generateCertificate(certPath, keyPath string, sanNames ...string) (string, error) {
-	sanName := ""
-	if len(sanNames) > 0 {
-		sanName = sanNames[0]
-	}
+func generateCertificate(certPath, keyPath string) (string, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return "", err
@@ -5345,12 +4829,7 @@ func generateCertificate(certPath, keyPath string, sanNames ...string) (string, 
 	if err != nil {
 		return "", err
 	}
-	tmpl := x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "Shah Tunnel Hub"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().AddDate(10, 0, 0), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, IsCA: true, BasicConstraintsValid: true}
-	if ip := net.ParseIP(sanName); ip != nil {
-		tmpl.IPAddresses = []net.IP{ip}
-	} else if validTLSServerName(sanName) {
-		tmpl.DNSNames = []string{sanName}
-	}
+	tmpl := x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "Shah Tunnel Hub"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().AddDate(10, 0, 0), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true}
 	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
 	if err != nil {
 		return "", err
@@ -5414,71 +4893,14 @@ func setup() error {
 	case "1", "hub", "iran":
 		c.Role = "hub"
 		c.ControlListen = wizardAsk("Agent control listener address", "0.0.0.0:9443")
-		var ignoredUnderlay, selectedProxyProtocol string
-		c.Transport, ignoredUnderlay, selectedProxyProtocol, err = wizardAskTransport("Hub accepted transport", "hub")
+		var ignoredUnderlay, ignoredPsiphon string
+		c.Transport, ignoredUnderlay, ignoredPsiphon, err = wizardAskTransport("Hub accepted transport", "hub")
 		_ = ignoredUnderlay
-		if selectedProxyProtocol != "" {
-			c.ProxyProtocol = selectedProxyProtocol
-			if c.ProxyProtocol == proxyAdaptiveAll {
-				c.ProxyListen = wizardAsk("TUIC v5 public UDP listen address", "0.0.0.0:8443")
-				_, portText, splitErr := net.SplitHostPort(c.ProxyListen)
-				if splitErr != nil {
-					return fmt.Errorf("invalid TUIC listen address: %w", splitErr)
-				}
-				c.ProxyPort, _ = strconv.Atoi(portText)
-				c.ProxyPassword, err = randomHex(32)
-				if err != nil {
-					return err
-				}
-				c.ProxyUUID, err = newUUID()
-				if err != nil {
-					return err
-				}
-				c.ProxyTrojanListen = wizardAsk("Trojan public TCP listen address", "0.0.0.0:8444")
-				_, trojanPortText, splitErr := net.SplitHostPort(c.ProxyTrojanListen)
-				if splitErr != nil {
-					return fmt.Errorf("invalid Trojan listen address: %w", splitErr)
-				}
-				c.ProxyTrojanPort, _ = strconv.Atoi(trojanPortText)
-				c.ProxyTrojanPassword, err = randomHex(32)
-				if err != nil {
-					return err
-				}
-			} else {
-				c.ProxyListen = wizardAsk("TUIC/Trojan public listen address", "0.0.0.0:8443")
-				_, portText, splitErr := net.SplitHostPort(c.ProxyListen)
-				if splitErr != nil {
-					return fmt.Errorf("invalid protocol listen address: %w", splitErr)
-				}
-				c.ProxyPort, _ = strconv.Atoi(portText)
-				c.ProxyPassword, err = randomHex(32)
-				if err != nil {
-					return err
-				}
-				if c.ProxyProtocol == transportTUIC {
-					c.ProxyUUID, err = newUUID()
-					if err != nil {
-						return err
-					}
-				}
-			}
-			c.TLSServerName = wizardAsk("Public TLS hostname or IP for the Hub certificate SAN (Agent must use the same value)", "")
-			uiInfo("The Hub certificate is self-signed and CA-capable; Agent verifies its SAN and exact SHA-256 public-key pin. Never omit or substitute that pin.")
-			uiInfo("Install sing-box on the Hub and Agent. These listeners are independent from the native ShahTunnel control port.")
-		}
+		_ = ignoredPsiphon
 		if err != nil {
 			return err
 		}
-		uiInfo("Allow the TCP control/CONNECT ports and any selected sing-box listeners. External Direct/Psiphon/MASQUE egress selection is configured on the Agent.")
-		if c.ProxyProtocol == transportTUIC || c.ProxyProtocol == proxyAdaptiveAll {
-			uiWarn("Open UDP " + strconv.Itoa(c.ProxyPort) + " on the Hub firewall for TUIC v5.")
-		}
-		if c.ProxyProtocol == transportTrojan {
-			uiWarn("Open TCP " + strconv.Itoa(c.ProxyPort) + " on the Hub firewall for Trojan.")
-		}
-		if c.ProxyProtocol == proxyAdaptiveAll {
-			uiWarn("Open TCP " + strconv.Itoa(c.ProxyTrojanPort) + " on the Hub firewall for Trojan.")
-		}
+		uiInfo("Allow the selected TCP control/CONNECT ports. Hub accepts the inner protocol; MASQUE/WARP/Psiphon egress is configured on the Agent only.")
 		c.CertFile = filepath.Join(tunnelConfigDir, id+".crt")
 		c.KeyFile = filepath.Join(tunnelConfigDir, id+".key")
 		for i := 1; i <= 100; i++ {
@@ -5504,17 +4926,11 @@ func setup() error {
 		if err = validateConfig(c); err != nil {
 			return err
 		}
-		fp, certErr := generateCertificate(c.CertFile, c.KeyFile, c.TLSServerName)
+		fp, certErr := generateCertificate(c.CertFile, c.KeyFile)
 		if certErr != nil {
 			return certErr
 		}
 		c.Fingerprint = fp
-		if c.ProxyProtocol != "" {
-			c.ProxyPin, err = singBoxTLSKeyPin(c.CertFile)
-			if err != nil {
-				return err
-			}
-		}
 		if err = saveConfig(c); err != nil {
 			_ = os.Remove(c.CertFile)
 			_ = os.Remove(c.KeyFile)
@@ -5524,17 +4940,6 @@ func setup() error {
 		uiCard("✅ HUB CONFIGURED  /  "+name, []uiCardRow{{Text: "A new independent tunnel profile was saved.", Color: ansiGreen}}, ansiGreen+ansiBold)
 		uiCard("🔐 AGENT TOKEN", []uiCardRow{{Text: c.Token, Color: ansiYellow + ansiBold}}, ansiYellow)
 		uiCard("🛡️ CERTIFICATE SHA-256 FINGERPRINT", []uiCardRow{{Text: c.Fingerprint, Color: ansiCyan + ansiBold}}, ansiCyan)
-		if c.ProxyProtocol != "" {
-			rows := []uiCardRow{{Text: "Protocol: " + c.ProxyProtocol, Color: ansiGreen}, {Text: "Listen: " + c.ProxyListen, Color: ansiCyan}, {Text: "Password: " + c.ProxyPassword, Color: ansiYellow + ansiBold}}
-			if c.ProxyProtocol == transportTUIC || c.ProxyProtocol == proxyAdaptiveAll {
-				rows = append(rows, uiCardRow{Text: "TUIC UUID: " + c.ProxyUUID, Color: ansiPurple})
-			}
-			if c.ProxyProtocol == proxyAdaptiveAll {
-				rows = append(rows, uiCardRow{Text: "Trojan listen: " + c.ProxyTrojanListen, Color: ansiCyan}, uiCardRow{Text: "Trojan password: " + c.ProxyTrojanPassword, Color: ansiYellow + ansiBold})
-			}
-			rows = append(rows, uiCardRow{Text: "TLS public-key pin: " + c.ProxyPin, Color: ansiCyan})
-			uiCard("🔐 SING-BOX PROTOCOL CREDENTIALS", rows, ansiPinkGlow)
-		}
 		uiCard("🔌 CONTROL PORTS", []uiCardRow{
 			{Text: "TCP/TLS + WebSocket/TLS: " + portOf(c.ControlListen), Color: ansiPurple + ansiBold},
 			{Text: "HTTP/2 CONNECT: " + nextPortLabel(c.ControlListen) + " (TCP)", Color: ansiBlue + ansiBold},
@@ -5548,46 +4953,14 @@ func setup() error {
 		uiCard("⚠️ SECURITY REMINDER", []uiCardRow{
 			{Text: "Keep the token secret; enter it only on the Agent.", Color: ansiYellow + ansiBold},
 			{Text: "Copy the exact certificate fingerprint into the Agent setup.", Color: ansiDim},
-			{Text: "For TUIC/Trojan, also copy the TLS public-key pin and protocol credentials.", Color: ansiDim},
 		}, ansiYellow)
 	case "2", "agent", "outside":
 		c.Role = "agent"
 		c.TunnelChannels = defaultTunnelChannels
 		c.HubAddr = wizardAsk("Reachable Iran Hub address as IP:PORT or hostname:PORT (control port)", "")
-		var selectedProxyProtocol string
-		c.Transport, c.Underlay, selectedProxyProtocol, err = wizardAskTransport("Agent transport mode (must be allowed by Hub)", "agent")
+		c.Transport, c.Underlay, _, err = wizardAskTransport("Agent transport mode (must be allowed by Hub)", "agent")
 		if err != nil {
 			return err
-		}
-		if selectedProxyProtocol != "" {
-			c.ProxyProtocol = selectedProxyProtocol
-			c.ProxyServer, _, err = net.SplitHostPort(c.HubAddr)
-			if err != nil {
-				return fmt.Errorf("Hub address must be host:port: %w", err)
-			}
-			if c.ProxyProtocol == proxyAdaptiveAll {
-				c.ProxyPort, _ = strconv.Atoi(wizardAsk("Hub TUIC UDP listener port (not the user service port)", "8443"))
-				c.ProxyPassword = wizardAsk("TUIC password (from Hub setup)", "")
-				c.ProxyUUID = wizardAsk("TUIC UUID (from Hub setup)", "")
-				c.ProxyTrojanPort, _ = strconv.Atoi(wizardAsk("Hub Trojan TCP listener port (not the user service port)", "8444"))
-				c.ProxyTrojanPassword = wizardAsk("Trojan password (from Hub setup)", "")
-			} else {
-				c.ProxyPort, _ = strconv.Atoi(wizardAsk("Hub TUIC/Trojan listener port (must exactly match the Hub; not the user service port)", "8443"))
-				c.ProxyPassword = wizardAsk("TUIC/Trojan password (from Hub setup)", "")
-				if c.ProxyProtocol == transportTUIC {
-					c.ProxyUUID = wizardAsk("TUIC UUID (from Hub setup)", "")
-				}
-			}
-			sniDefault := ""
-			if validTLSNameOrIP(c.ProxyServer) {
-				sniDefault = c.ProxyServer
-			}
-			c.TLSServerName = wizardAsk("TLS hostname/IP (must match the Hub certificate SAN)", sniDefault)
-			c.ProxyPin = wizardAsk("Hub sing-box TLS public-key pin (base64, from Hub setup)", "")
-			c.ProxySocks = wizardAsk("Local sing-box SOCKS5 address (loopback only)", defaultSingBoxSocksAddress(name))
-			if c.Underlay != underlayAdaptive {
-				c.Underlay = underlaySingBox
-			}
 		}
 		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
 			defaultEndpoint := defaultPsiphonHubAddress(c.HubAddr)
@@ -5603,9 +4976,7 @@ func setup() error {
 		if transportModeAllowsHTTP1(c.Transport) {
 			uiInfo("HTTP/1.1 CONNECT uses TCP port " + secondNextPortLabel(c.HubAddr) + ". Open it in the Hub firewall if selected.")
 		}
-		if c.ProxyProtocol == "" {
-			c.TLSServerName = wizardAsk("Optional TLS SNI hostname on a domain you control (leave blank to derive from Hub hostname)", "")
-		}
+		c.TLSServerName = wizardAsk("Optional TLS SNI hostname on a domain you control (leave blank to derive from Hub hostname)", "")
 		c.Token = wizardAsk("Token shown on the Iran Hub", "")
 		c.Fingerprint = wizardAsk("Hub certificate SHA-256 fingerprint", "")
 		for i := 1; i <= 100; i++ {
@@ -5643,7 +5014,7 @@ func setup() error {
 			uiInfo("This Agent's Xray mappings and DNS use its isolated WARP Local Proxy sidecar; system routes and SSH are untouched.")
 		}
 		if c.Underlay == underlayPsiphon || c.Underlay == underlayAdaptive {
-			uiInfo("Option 9 runs both TUIC v5 and Trojan through a sing-box health-tested selector, and fails Agent-to-Hub lanes across native Direct, Psiphon, active MASQUE and sing-box paths. The isolated Xray user TCP/DNS egress remains on this profile's Psiphon SOCKS5 path; UDP is blocked to prevent direct-IP leaks. No TUN device or host route changes are made.")
+			uiInfo("A per-profile Psiphon service provides loopback SOCKS5. Agent-to-Hub lanes use adaptive Direct/Psiphon failover, while this Agent's isolated Xray user TCP/DNS egress uses Psiphon; UDP is blocked to prevent direct-IP leaks. No TUN device or host route changes are made.")
 		}
 		uiSuccess("Agent configuration saved. Reconnection is automatic if a lane drops.")
 	case "3", "relay", "front":
