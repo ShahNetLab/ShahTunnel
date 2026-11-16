@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.5.1"
+	version                          = "5.5.2"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -4538,7 +4538,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.5.1             |",
+	"        |            SHAH TUNNEL 5.5.2             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -5240,8 +5240,34 @@ func psiphonAgentLaneReadyInLogs(logText string) bool {
 	return false
 }
 
-func psiphonAgentLaneCurrentlyReady(logText string, hasActiveLane bool) bool {
-	return hasActiveLane && psiphonAgentLaneReadyInLogs(logText)
+func psiphonAgentRuntimeConnected(path string, startedAt, now time.Time, maxAge time.Duration) bool {
+	if maxAge <= 0 {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var snapshot RuntimeSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return false
+	}
+	if snapshot.Role != "agent" || !snapshot.Connected || snapshot.Updated.IsZero() {
+		return false
+	}
+	// The menu and the systemd Agent are different processes. Never consult
+	// metricConnected in the menu process: its atomic value is not shared with
+	// the Agent. Read the Agent-owned runtime snapshot, require it to have been
+	// written after this start/restart, and reject stale snapshots.
+	if snapshot.Updated.Before(startedAt) || snapshot.Updated.After(now.Add(5*time.Second)) {
+		return false
+	}
+	age := now.Sub(snapshot.Updated)
+	return age >= 0 && age <= maxAge
+}
+
+func psiphonAgentLaneCurrentlyReady(logText string, runtimeConnected bool) bool {
+	return runtimeConnected && psiphonAgentLaneReadyInLogs(logText)
 }
 
 func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.Duration) (bool, error) {
@@ -5257,6 +5283,7 @@ func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.
 	}
 	psiphonService := psiphonServiceName(cfg.Name)
 	startMarker := fmt.Sprintf("@%d", startedAt.Unix())
+	runtimePath := runtimeStatsPath()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		logs, _ := exec.Command("journalctl", "-u", service, "--since", startMarker, "--no-pager", "-o", "cat").CombinedOutput()
@@ -5264,22 +5291,26 @@ func waitForPsiphonAgentReady(service string, startedAt time.Time, timeout time.
 		psiphonActive := exec.Command("systemctl", "is-active", "--quiet", psiphonService).Run() == nil
 		proxyErr := probeSOCKS5(cfg.PsiphonProxy, 700*time.Millisecond)
 		proxyReady := agentActive && psiphonActive && proxyErr == nil
-		if proxyReady && psiphonAgentLaneCurrentlyReady(string(logs), metricConnected.Load()) {
+		runtimeConnected := psiphonAgentRuntimeConnected(runtimePath, startedAt, time.Now(), 20*time.Second)
+		if proxyReady && psiphonAgentLaneCurrentlyReady(string(logs), runtimeConnected) {
 			return true, nil
 		}
 		time.Sleep(time.Second)
 	}
 
-	// A responsive loopback SOCKS5 listener is a valid pending state even if
-	// Psiphon or the Hub has not produced a connected lane before the menu
-	// timeout. Keep both supervised services running so their retry loops can
-	// recover; do not convert a slow first relay into a false startup failure.
+	// A live SOCKS5 handshake is the correct local-readiness criterion. A
+	// healthy listener with no authenticated Hub lane yet is a pending state,
+	// not a startup failure; every Agent lane already has its own reconnect loop.
 	agentActive := exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil
 	psiphonActive := exec.Command("systemctl", "is-active", "--quiet", psiphonService).Run() == nil
-	if agentActive && psiphonActive && probeSOCKS5(cfg.PsiphonProxy, 1500*time.Millisecond) == nil {
+	proxyErr := probeSOCKS5(cfg.PsiphonProxy, 1500*time.Millisecond)
+	if agentActive && psiphonActive && proxyErr == nil {
+		if psiphonAgentRuntimeConnected(runtimePath, startedAt, time.Now(), 20*time.Second) {
+			return true, nil
+		}
 		return false, nil
 	}
-	return false, fmt.Errorf("Agent %s or its supervised Psiphon service %s did not keep the loopback SOCKS5 endpoint %s ready within %s", service, psiphonService, cfg.PsiphonProxy, timeout)
+	return false, fmt.Errorf("Psiphon Agent is not ready: Agent service active=%t, Psiphon service %s active=%t, SOCKS5 %s probe=%v; check the two service journals", agentActive, psiphonService, psiphonActive, cfg.PsiphonProxy, proxyErr)
 }
 
 func showRecentLogs(n int) {
