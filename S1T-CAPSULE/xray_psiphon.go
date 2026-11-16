@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,7 +87,7 @@ func renderXrayPsiphonUnit(runtime xrayRuntime, configPath, service string) ([]b
 		}
 	}
 	unit := fmt.Sprintf(`[Unit]
-# Managed-By: ShahTunnel 5.5.4
+# Managed-By: ShahTunnel 5.5.6
 Description=ShahTunnel isolated Psiphon Xray (%s)
 After=network-online.target
 Wants=network-online.target
@@ -508,6 +509,10 @@ func migrateXrayPsiphonDNSConfig(data []byte, profileID, proxyOutboundTag string
 		dnsConfig = map[string]any{}
 		root["dns"] = dnsConfig
 	}
+	// Use provider hostnames so TLS SNI and certificate validation remain
+	// explicit. Xray's non-local DNS requests carry dnsInboundTag into routing;
+	// the profile-specific rule sends them through the Psiphon SOCKS outbound,
+	// where the remote proxy resolves the destination hostname.
 	dnsConfig["tag"] = dnsInboundTag
 	dnsConfig["servers"] = []any{"https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query"}
 	dnsConfig["queryStrategy"] = "UseIPv4"
@@ -869,6 +874,108 @@ func psiphonExitMatchesVPSDirectIP(exitIP, directIP string) bool {
 	return exit != nil && direct != nil && exit.To4() != nil && direct.To4() != nil && exit.To4().Equal(direct.To4())
 }
 
+// buildPsiphonDoHProbeQuery creates a minimal RFC 1035 A query used to verify
+// that the selected Psiphon SOCKS5 path can reach a real DoH resolver. The
+// destination hostname is deliberately retained so the SOCKS proxy performs
+// remote resolution and TLS SNI/certificate validation remains standard.
+func buildPsiphonDoHProbeQuery(name string, id uint16) ([]byte, error) {
+	name = strings.TrimSuffix(strings.TrimSpace(name), ".")
+	if name == "" || len(name) > 253 {
+		return nil, errors.New("invalid DNS probe name")
+	}
+	query := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	for _, label := range strings.Split(name, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return nil, errors.New("invalid DNS probe label")
+		}
+		query = append(query, byte(len(label)))
+		query = append(query, label...)
+	}
+	query = append(query, 0x00, 0x00, 0x01, 0x00, 0x01) // QNAME terminator, A, IN
+	return query, nil
+}
+
+func validPsiphonDoHResponse(body []byte, id uint16) bool {
+	if len(body) < 12 {
+		return false
+	}
+	responseID := uint16(body[0])<<8 | uint16(body[1])
+	return responseID == id && body[2]&0x80 != 0 && body[3]&0x0f == 0
+}
+
+// verifyPsiphonDoHEgress proves that DNS-over-HTTPS works over the same
+// profile-local SOCKS5 route that the Xray sidecar will use. A listening
+// SOCKS port or a successful generic HTTPS request alone is not sufficient.
+func verifyPsiphonDoHEgress(proxyAddress string, timeout time.Duration) error {
+	if !isLoopbackProxyAddress(proxyAddress) {
+		return errors.New("Psiphon DoH probe requires a loopback SOCKS5 proxy")
+	}
+	if timeout <= 0 {
+		return errors.New("invalid Psiphon DoH probe timeout")
+	}
+	const queryID = 0x5a31
+	query, err := buildPsiphonDoHProbeQuery("example.com", queryID)
+	if err != nil {
+		return err
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(query)
+	endpoints := []string{
+		"https://cloudflare-dns.com/dns-query?dns=" + encoded,
+		"https://dns.google/dns-query?dns=" + encoded,
+	}
+	perEndpoint := timeout / time.Duration(len(endpoints))
+	if perEndpoint < time.Second {
+		perEndpoint = time.Second
+	}
+	var failures []string
+	for _, endpoint := range endpoints {
+		ctx, cancel := context.WithTimeout(context.Background(), perEndpoint)
+		transport := &http.Transport{
+			TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12},
+			ForceAttemptHTTP2: true,
+			DisableKeepAlives: true,
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				return dialSOCKS5Context(ctx, proxyAddress, address)
+			},
+		}
+		client := &http.Client{Transport: transport, Timeout: perEndpoint}
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if reqErr == nil {
+			req.Header.Set("Accept", "application/dns-message")
+		}
+		var requestErr error
+		if reqErr != nil {
+			requestErr = reqErr
+		} else {
+			resp, doErr := client.Do(req)
+			if doErr != nil {
+				requestErr = doErr
+			} else {
+				body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+				_ = resp.Body.Close()
+				contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+				switch {
+				case readErr != nil:
+					requestErr = readErr
+				case resp.StatusCode != http.StatusOK:
+					requestErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+				case !strings.Contains(contentType, "application/dns-message"):
+					requestErr = fmt.Errorf("unexpected Content-Type %q", contentType)
+				case !validPsiphonDoHResponse(body, queryID):
+					requestErr = errors.New("resolver returned an invalid DNS response")
+				}
+			}
+		}
+		client.CloseIdleConnections()
+		cancel()
+		if requestErr == nil {
+			return nil
+		}
+		failures = append(failures, strings.TrimPrefix(strings.SplitN(endpoint, "?", 2)[0], "https://")+": "+requestErr.Error())
+	}
+	return fmt.Errorf("no DoH resolver returned a valid DNS response through Psiphon SOCKS5: %s", strings.Join(failures, ": "))
+}
+
 func verifyPsiphonExit(proxy, expectedRegion, directIP string) (string, string, error) {
 	ip, err := waitForPsiphonPublicEgressIP(proxy, 8*time.Second)
 	if err != nil {
@@ -893,6 +1000,10 @@ func verifyPsiphonExit(proxy, expectedRegion, directIP string) (string, string, 
 	if country == "US" || !psiphonAllowedEgressRegions[country] {
 		return "", "", fmt.Errorf("Psiphon exit %s (%s) is not in the approved country list", ip, country)
 	}
+	if err := verifyPsiphonDoHEgress(proxy, 8*time.Second); err != nil {
+		return "", "", fmt.Errorf("Psiphon exit %s (%s) passed HTTPS IP verification but DNS-over-HTTPS through SOCKS5 failed: %w", ip, country, err)
+	}
+	log.Printf("Psiphon DNS-over-HTTPS verified through the profile SOCKS5 path")
 	return ip, country, nil
 }
 

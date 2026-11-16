@@ -430,9 +430,11 @@ func configureXrayProxyDNS(root map[string]any, shortID, proxyOutboundTag string
 	if len(inboundTags) == 0 {
 		return nil, nil, errors.New("no cloned inbound tags available for isolated DNS routing")
 	}
-	// Hostname-based DoH keeps TLS SNI and certificate validation explicit.
-	// The unique DNS tag below routes these requests through this profile's
-	// SOCKS5 outbound, so bootstrap DNS is resolved by the proxy, not locally.
+	// These are non-local DoH servers. Xray tags their internal requests
+	// with dnsInboundTag; the matching routing rule sends the hostname-based
+	// HTTPS connection through this profile's SOCKS5 outbound. This preserves
+	// provider SNI/certificate validation while keeping resolver traffic off
+	// the Agent's direct network path.
 	dnsConfig["servers"] = []any{"https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query"}
 	dnsConfig["queryStrategy"] = "UseIPv4"
 	dnsConfig["disableCache"] = false

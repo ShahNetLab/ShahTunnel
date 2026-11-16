@@ -6,6 +6,30 @@ import (
 	"testing"
 )
 
+func TestBuildPsiphonDoHProbeQueryAndResponseValidation(t *testing.T) {
+	query, err := buildPsiphonDoHProbeQuery("example.com", 0x5a31)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(query) < 12 || query[0] != 0x5a || query[1] != 0x31 || query[5] != 1 {
+		t.Fatalf("unexpected DNS query header: %x", query[:12])
+	}
+	// A minimal valid response echoes the transaction ID and sets QR with RCODE=0.
+	response := append([]byte(nil), query[:12]...)
+	response[2] = 0x81
+	response[3] = 0x80
+	if !validPsiphonDoHResponse(response, 0x5a31) {
+		t.Fatal("valid DoH DNS response was rejected")
+	}
+	response[1]++
+	if validPsiphonDoHResponse(response, 0x5a31) {
+		t.Fatal("DoH response with a different transaction ID was accepted")
+	}
+	if _, err := buildPsiphonDoHProbeQuery("bad..example", 1); err == nil {
+		t.Fatal("malformed DNS labels must be rejected")
+	}
+}
+
 func TestXrayPsiphonUnitOwnershipAllowsOnlyExactProfileService(t *testing.T) {
 	runtime := xrayRuntime{Binary: "/usr/local/bin/xray", CWD: "/usr/local/bin"}
 	service := "shah-tunnel-xray-psiphon-s.service"
@@ -14,7 +38,7 @@ func TestXrayPsiphonUnitOwnershipAllowsOnlyExactProfileService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(unit), "Managed-By: ShahTunnel 5.5.4") {
+	if !strings.Contains(string(unit), "Managed-By: ShahTunnel 5.5.6") {
 		t.Fatal("rendered sidecar unit is missing the ShahTunnel ownership marker")
 	}
 	if !xrayPsiphonUnitBelongsToProfile(unit, runtime, configPath, service) {
@@ -181,7 +205,7 @@ func TestMigrateXrayPsiphonDNSConfig(t *testing.T) {
     {"tag":"s1t-psiphon-profile-s-out","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":21082}]}},
     {"tag":"s1t-psiphon-profile-s-dns-out","protocol":"dns","settings":{}}
   ],
-  "dns": {"tag":"dns_inbound","servers":["https://1.1.1.1/dns-query"]},
+  "dns": {"tag":"dns_inbound","servers":["https://cloudflare-dns.com/dns-query"]},
   "routing": {"rules":[
     {"type":"field","inboundTag":["s1t-psiphon-profile-s-main"],"network":"tcp,udp","port":"53","outboundTag":"s1t-psiphon-profile-s-dns-out","ruleTag":"s1t-psiphon-profile-s-dns-hijack"},
     {"type":"field","inboundTag":["dns_inbound"],"outboundTag":"s1t-psiphon-profile-s-out","ruleTag":"s1t-psiphon-profile-s-dns-egress"},

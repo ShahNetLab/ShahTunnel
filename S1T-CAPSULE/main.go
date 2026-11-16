@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version                          = "5.5.4"
+	version                          = "5.5.6"
 	legacyConfigPath                 = "/etc/ravanreverse/config.json"
 	tunnelConfigDir                  = "/etc/ravanreverse/tunnels"
 	maxFrame                         = 64 * 1024
@@ -1638,10 +1638,11 @@ func (s *agentSession) openTarget(ctx context.Context, id uint32, key string) {
 		if ctx.Err() != nil {
 			return
 		}
-		log.Printf("local target unavailable for mapping %q after bounded retries (details suppressed)", key)
+		log.Printf("local target unavailable for mapping %q at %s after bounded retries: %v", key, target, err)
 		_ = s.wire.send(msgOpenErr, id, []byte("local target unavailable"))
 		return
 	}
+	log.Printf("mapping %q opened its local target stream at %s", key, target)
 	tuneTCPConn(c)
 	st := &agentStream{conn: c, inflight: make(chan struct{}, streamWindowFrames)}
 	st.writer = newStreamWriter(c,
@@ -1977,10 +1978,12 @@ func (h *hubServer) acceptPublic(ln net.Listener, portID string) {
 			}
 			if _, _, err := h.openStream(wrapped, portID); err != nil {
 				if !errors.Is(err, net.ErrClosed) {
-					log.Printf("open reverse stream: %v", err)
+					log.Printf("public mapping %q could not open an Agent stream: %v", portID, err)
 				}
 				_ = wrapped.Close()
+				return
 			}
+			log.Printf("public client stream accepted and forwarded for mapping %q", portID)
 		}()
 	}
 }
@@ -4538,7 +4541,7 @@ func uiRule() {
 // reflow or truncate these lines as part of menu rendering.
 var shahTunnelHeaderArt = []string{
 	"        +------------------------------------------+",
-	"        |            SHAH TUNNEL 5.5.4             |",
+	"        |            SHAH TUNNEL 5.5.6             |",
 	"        |          SECURE RELAY / TLS 1.3          |",
 	"        +==========================================+",
 	"        | CLIENT > TLS 1.3 > HUB > AGENT > TARGET  |",
@@ -5296,6 +5299,23 @@ func showRecentLogs(n int) {
 	}
 }
 
+func showRelatedServiceStatus(label, service string, logLines int) {
+	fmt.Printf("\n--- %s (%s) ---\n", label, service)
+	out, statusErr := exec.Command("systemctl", "status", service, "--no-pager", "-l").CombinedOutput()
+	if len(out) > 0 {
+		fmt.Print(string(out))
+	} else if statusErr != nil {
+		fmt.Printf("Service status unavailable: %v\n", statusErr)
+	}
+	logs, logErr := exec.Command("journalctl", "-u", service, "-n", strconv.Itoa(logLines), "--no-pager", "-o", "short-iso").CombinedOutput()
+	if len(logs) > 0 {
+		fmt.Printf("--- Recent %s logs ---\n", label)
+		fmt.Print(string(logs))
+	} else if logErr != nil {
+		fmt.Printf("Could not read %s logs: %v\n", label, logErr)
+	}
+}
+
 func showStatusAndLogs() error {
 	service := currentServiceName()
 	if filepath.Clean(configPath) != filepath.Clean(legacyConfigPath) {
@@ -5309,8 +5329,16 @@ func showStatusAndLogs() error {
 	if len(out) > 0 {
 		fmt.Print(string(out))
 	}
-	fmt.Println("\n--- Recent service logs ---")
+	fmt.Println("\n--- Recent Agent service logs ---")
 	showRecentLogs(40)
+	if cfg, cfgErr := loadConfig(); cfgErr == nil && cfg.Role == "agent" {
+		if cfg.XrayPsiphon != nil {
+			showRelatedServiceStatus("Psiphon Xray user-egress sidecar", xrayPsiphonServiceName(cfg.Name), 25)
+		}
+		if cfg.Underlay == underlayPsiphon || cfg.Underlay == underlayAdaptive {
+			showRelatedServiceStatus("Per-profile Psiphon SOCKS5", psiphonServiceName(cfg.Name), 20)
+		}
+	}
 	if err != nil && !tunnelIsActive() {
 		return errors.New("selected tunnel is not active; see logs above")
 	}
